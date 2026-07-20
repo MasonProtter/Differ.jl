@@ -1,0 +1,164 @@
+using Test
+using ADNext
+using ADNext: Dual, NoFData, frule, struct_zero, primal_type, tangent_type
+
+# Primal functions used by the forward-AD fallback. Defined at top level so the
+# generated `frule` fallback can resolve them via the method table.
+plus1(x)   = sin(x) + 1
+nest(x)    = sin(cos(x))
+prod2(x,y) = x*y + sin(x)
+sqr(x)     = x*x
+mul3(x)    = (x*x)*x   # explicit 2-arg grouping; `x*x*x` would be a 3-arg (vararg) `*`, unsupported
+sincosp(x) = sin(x)*cos(x)
+
+# control flow + local assignments
+relu(x)    = x > 0.0 ? x : -x                    # branch (== abs here)
+function p4(x)                                    # local reassignment: x^4
+    r = x*x
+    r = r*x
+    r = r*x
+    r
+end
+function sumk(x, k)                               # while loop (backward goto): k*x
+    s = x - x                                     # 0, without needing an frule for zero()
+    i = 0
+    while i < k
+        s = s + x
+        i = i + 1
+    end
+    s
+end
+
+trycatch(x) = try sin(x) catch; cos(x) end       # exception handling: still unsupported (should bail)
+
+struct Point; x::Float64; y::Float64; end
+
+# Tier-2 (post-optimization IRCode) targets: these differentiate through intrinsics /
+# getfield / %new, with NO hand-written frule methods for +, -, *, /.
+struct V2; a::Float64; b::Float64; end
+vprod(v::V2) = v.a * v.b
+poly32(x::Float32) = x*x + x
+
+@testset "ADNext" begin
+
+    @testset "struct_zero" begin
+        @test struct_zero(2.0) === 0.0
+        @test struct_zero(3)   === 0
+        @test struct_zero(-1.5) === 0.0
+        # singleton / fieldless types (e.g. functions) get NoFData()
+        @test struct_zero(sin) === NoFData()
+        @test struct_zero(+)   === NoFData()
+        # composite non-Number struct: recurse structurally
+        @test struct_zero(Point(1.0, 2.0)) === Point(0.0, 0.0)
+        # Number subtypes (Complex) go through the Number method
+        @test struct_zero(1.0 + 2.0im) === 0.0 + 0.0im
+    end
+
+    @testset "Dual basics" begin
+        d = Dual(3.0, 4.0)
+        @test d.x === 3.0
+        @test d.dx === 4.0
+        # getproperty aliases: x/y/z -> primal, dx/dy/dz -> tangent
+        @test d.y === 3.0 && d.z === 3.0
+        @test d.dy === 4.0 && d.dz === 4.0
+        @test primal_type(typeof(d)) === Float64
+        @test tangent_type(typeof(d)) === Float64
+        @test primal_type(typeof(Dual(sin, NoFData()))) === typeof(sin)
+        @test tangent_type(typeof(Dual(sin, NoFData()))) === NoFData
+    end
+
+    @testset "scalar rules" begin
+        x, dx = 0.7, 2.0
+        @test frule(Dual(sin, NoFData()), Dual(x, dx)) === Dual(sin(x), cos(x)*dx)
+        @test frule(Dual(cos, NoFData()), Dual(x, dx)) === Dual(cos(x), -sin(x)*dx)
+        # unary + is identity; unary - negates
+        @test frule(Dual(+, NoFData()), Dual(x, dx)) === Dual(x, dx)
+        @test frule(Dual(-, NoFData()), Dual(x, dx)) === Dual(-x, -dx)
+        # binary +, -, *
+        y, dy = 1.5, 3.0
+        @test frule(Dual(+, NoFData()), Dual(x,dx), Dual(y,dy)) === Dual(x+y, dx+dy)
+        @test frule(Dual(-, NoFData()), Dual(x,dx), Dual(y,dy)) === Dual(x-y, dx-dy)
+        @test frule(Dual(*, NoFData()), Dual(x,dx), Dual(y,dy)) === Dual(x*y, x*dy + dx*y)
+    end
+
+    @testset "composite fallback (forward AD)" begin
+        # d/dx sin(x)+1 = cos(x)
+        d = frule(Dual(plus1, NoFData()), Dual(1.0, 2.0))
+        @test d.x  ≈ sin(1.0) + 1
+        @test d.dx ≈ cos(1.0) * 2.0
+
+        # nested: d/dx sin(cos(x)) = cos(cos(x))*(-sin(x))
+        dn = frule(Dual(nest, NoFData()), Dual(0.5, 1.0))
+        @test dn.x  ≈ sin(cos(0.5))
+        @test dn.dx ≈ cos(cos(0.5)) * (-sin(0.5))
+
+        # multi-arg: p(x,y)=x*y+sin(x); ∂/∂x and ∂/∂y via tangent seeding
+        px = frule(Dual(prod2, NoFData()), Dual(2.0,1.0), Dual(3.0,0.0))
+        @test px.x  ≈ 2.0*3.0 + sin(2.0)
+        @test px.dx ≈ 3.0 + cos(2.0)                 # ∂/∂x = y + cos(x)
+        py = frule(Dual(prod2, NoFData()), Dual(2.0,0.0), Dual(3.0,1.0))
+        @test py.dx ≈ 2.0                            # ∂/∂y = x
+
+        # products: d/dx x^2 = 2x, d/dx x^3 = 3x^2
+        @test frule(Dual(sqr,  NoFData()), Dual(3.0,1.0)).dx ≈ 2*3.0
+        @test frule(Dual(mul3, NoFData()), Dual(2.0,1.0)).dx ≈ 3*2.0^2
+
+        # d/dx sin(x)cos(x) = cos(2x)
+        dsc = frule(Dual(sincosp, NoFData()), Dual(0.9, 1.0))
+        @test dsc.dx ≈ cos(2*0.9)
+    end
+
+    @testset "Tier 2: intrinsic-level rules (no arithmetic frules)" begin
+        # Complex arithmetic differentiated via add_float/mul_float/getfield/%new.
+        z, w   = 1.0 + 2.0im, 3.0 + 4.0im
+        dz, dw = 0.5 + 0.0im, 0.0 + 1.0im
+        da = frule(Dual(+, NoFData()), Dual(z, dz), Dual(w, dw))
+        @test da.x  == z + w
+        @test da.dx == dz + dw
+        dm = frule(Dual(*, NoFData()), Dual(z, dz), Dual(w, dw))
+        @test dm.x  == z * w
+        @test dm.dx == z*dw + dz*w                    # complex product rule
+        ds = frule(Dual(-, NoFData()), Dual(z, dz), Dual(w, dw))
+        @test ds.dx == dz - dw
+
+        # Float32 straight-line composite: d/dx (x^2 + x) = 2x + 1
+        d32 = frule(Dual(poly32, NoFData()), Dual(2.0f0, 1.0f0))
+        @test d32.x  === 2.0f0^2 + 2.0f0
+        @test d32.dx === 2*2.0f0 + 1.0f0              # stays Float32
+
+        # user struct via getfield: d/dv (v.a * v.b), tangent seed (da,db)
+        dv = frule(Dual(vprod, NoFData()), Dual(V2(2.0, 3.0), V2(1.0, 0.0)))
+        @test dv.x  == 6.0
+        @test dv.dx == 1.0*3.0 + 2.0*0.0              # = b*da + a*db
+    end
+
+    @testset "control flow and assignments" begin
+        # branch: relu(x)=abs(x) here, derivative sign(x)
+        @test frule(Dual(relu, NoFData()), Dual( 2.0, 1.0)) === Dual( 2.0,  1.0)
+        @test frule(Dual(relu, NoFData()), Dual(-2.0, 1.0)) === Dual( 2.0, -1.0)
+
+        # local reassignment: p4(x)=x^4, derivative 4x^3
+        d4 = frule(Dual(p4, NoFData()), Dual(2.0, 1.0))
+        @test d4.x  ≈ 2.0^4
+        @test d4.dx ≈ 4 * 2.0^3
+
+        # while loop: sumk(x,k)=k*x, ∂/∂x = k (k carried as a Dual with zero tangent)
+        ds = frule(Dual(sumk, NoFData()), Dual(3.0, 1.0), Dual(4, 0))
+        @test ds.x  ≈ 12.0
+        @test ds.dx ≈ 4.0
+    end
+
+    @testset "derivative matches finite differences" begin
+        fd(f, x; h=1e-6) = (f(x+h) - f(x-h)) / 2h
+        for (f, x) in ((plus1, 1.3), (nest, 0.4), (sqr, 2.1), (mul3, -0.7), (sincosp, 0.6))
+            got = frule(Dual(f, NoFData()), Dual(x, 1.0)).dx
+            @test got ≈ fd(f, x) rtol=1e-5
+        end
+    end
+
+    @testset "graceful bail on unsupported IR" begin
+        # exception handling is not yet supported: should error, not miscompile
+        @test_throws ErrorException frule(Dual(trycatch, NoFData()), Dual(1.0, 1.0))
+    end
+
+end
