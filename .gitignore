@@ -1,0 +1,15 @@
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+Manifest.toml
+Manifest-v*.toml
+.vscode
+neuroblox.code-workspace
+*.mat
+.DS_Store
+docs/build/
+*~
+*#
+/LocalPreferences.toml
+.claude/settings.local.json
+.localdev/
