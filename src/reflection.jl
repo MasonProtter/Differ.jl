@@ -2,7 +2,7 @@
 #
 # `code_dual_ircode(f, argtypes)` reproduces exactly what the `optimize` seam installs for the
 # `dualized_impl` compile of `f`: the split-shadow transform on `f`'s post-optimization primal
-# `IRCode` (`build_dual_ir`) followed by the IPO-safe passes (`run_dual_passes!`). It does not go
+# `IRCode` (`build_dual_ir`) followed by the IPO-safe passes (`run_ipo_passes!`). It does not go
 # through `typeinf_ircode`, which would recompute from the throwing stub and bypass the seam.
 
 """
@@ -21,7 +21,7 @@ See also [`@code_dual_ircode`](@ref).
 """
 function code_dual_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
                           world::UInt = Base.get_world_counter())
-    interp = ContextualInterpreter(; world)
+    interp = ADInterpreter{Forward}(; world)
     dualtys = Any[Dual{typeof(f), NoFData}]
     for T in argtypes
         (T isa Type) || throw(ArgumentError("argtypes must be a tuple of types, got $(repr(T))"))
@@ -36,7 +36,7 @@ function code_dual_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
     ir === nothing && error("ADNext could not dualize $f$argtypes on optimized IRCode " *
                             "(unsupported construct, e.g. control flow — not yet handled).")
     opt = CC.OptimizationState(impl_mi, CC.retrieve_code_info(impl_mi, world), interp)
-    ir = run_dual_passes!(ir, opt)
+    ir = run_ipo_passes!(ir, opt)
     return ir => CC.compute_ir_rettype(ir)
 end
 

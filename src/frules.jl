@@ -40,7 +40,7 @@ end
 
 # NOTE: arithmetic (`+`, `-`, `*`, `/`) and comparisons are intentionally NOT given `frule`
 # methods here. They inline to intrinsics (`add_float`, `mul_float`, `lt_float`, …), which the
-# Tier-2 post-optimization IRCode pass (`ir_dualize.jl`) differentiates directly. A bare
+# post-optimization IRCode dualization engine (`forward_interp.jl`) differentiates directly. A bare
 # `frule(Dual(+), …)` therefore routes through the generated fallback into that pass, so `+`/`*`
 # work for any type (Complex, Float32, …) without a per-type rule. Keep `frule` methods only for
 # functions we'd rather not differentiate through (transcendentals like `sin`/`cos` above).
