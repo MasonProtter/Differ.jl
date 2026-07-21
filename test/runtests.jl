@@ -29,9 +29,73 @@ function sumk(x, k)                               # while loop (backward goto): 
     s
 end
 
+function sumk2(x, k, m)                           # nested while loops: k*m*x
+    s = x - x
+    i = 0
+    while i < k
+        j = 0
+        while j < m
+            s = s + x
+            j = j + 1
+        end
+        i = i + 1
+    end
+    s
+end
+
+function branch3(x)                               # if/elseif/else: 3-way merge into one phi
+    if x > 2.0
+        x*x
+    elseif x > 0.0
+        x + 1.0
+    else
+        -x
+    end
+end
+
+function multiret(x)                              # multiple returns from nested branches
+    if x > 10.0
+        return x*x
+    end
+    if x > 0.0
+        if x > 5.0
+            return x + 100.0
+        end
+        return x + 1.0
+    end
+    return -x
+end
+
+function sinloop(x, k)                            # loop body calls a surviving frule (sin): k*sin(x)
+    s = x - x
+    i = 0
+    while i < k
+        s = s + sin(x)
+        i = i + 1
+    end
+    s
+end
+
+function sumk_multi(x, y, k)                      # two live loop-carried phis in one block
+    s = x - x
+    t = y - y
+    i = 0
+    while i < k
+        s = s + x
+        t = t + y
+        i = i + 1
+    end
+    s + t
+end
+
 trycatch(x) = try sin(x) catch; cos(x) end       # exception handling: still unsupported (should bail)
 
 struct Point; x::Float64; y::Float64; end
+
+function pointphi(x)                              # PhiNode merging a Point; one arm a compile-time
+    p = x > 0.0 ? Point(1.0, 2.0) : Point(x, x)   # constant, exercising `const_tangent` on structs
+    p.x + p.y
+end
 
 # Intrinsic-level targets: these differentiate through intrinsics / getfield / %new on the
 # post-optimization IRCode, with NO hand-written frule methods for +, -, *, /.
@@ -140,12 +204,62 @@ poly32(x::Float32) = x*x + x
         @test d4.dx ≈ 4 * 2.0^3
     end
 
-    @testset "control flow: bails (IRCode CF support is the next milestone)" begin
-        # The single post-optimization IRCode engine is straight-line only. Real control flow
-        # (branches -> GotoIfNot, loops -> PhiNode) bails, so these currently throw. Marked broken
-        # until PhiNode / multi-basic-block split-shadow lands.
-        @test_broken frule(Dual(relu, NoFData()), Dual( 2.0, 1.0)) === Dual( 2.0,  1.0)  # abs, d=sign
-        @test_broken frule(Dual(sumk, NoFData()), Dual(3.0, 1.0), Dual(4, 0)).dx ≈ 4.0    # while loop: k*x
+    @testset "control flow: branches and loops" begin
+        # Block topology is preserved 1:1 from the primal IR; GotoNode/GotoIfNot/PhiNode are
+        # supported by duplicating each PhiNode into a primal phi + a shadow phi.
+        function checkverify(f, argtypes)
+            ir, _ = code_dual_ircode(f, argtypes)
+            Core.Compiler.verify_ir(ir)
+        end
+
+        # branch (== abs here): d/dx = sign(x)
+        r1 = frule(Dual(relu, NoFData()), Dual(2.0, 1.0));  @test r1.x ≈ 2.0  && r1.dx ≈ 1.0
+        r2 = frule(Dual(relu, NoFData()), Dual(-2.0, 1.0)); @test r2.x ≈ 2.0  && r2.dx ≈ -1.0
+        checkverify(relu, (Float64,))
+
+        # while loop: k*x
+        s1 = frule(Dual(sumk, NoFData()), Dual(3.0, 1.0), Dual(4, 0))
+        @test s1.x ≈ 12.0 && s1.dx ≈ 4.0
+        checkverify(sumk, (Float64, Int))
+
+        # nested while loops: k*m*x
+        n1 = frule(Dual(sumk2, NoFData()), Dual(2.0, 1.0), Dual(3, 0), Dual(5, 0))
+        @test n1.x ≈ 2.0*3*5 && n1.dx ≈ 3.0*5.0
+        checkverify(sumk2, (Float64, Int, Int))
+
+        # if/elseif/else 3-way merge
+        for (x, expected_x, expected_dx) in ((3.0, 9.0, 6.0), (1.0, 2.0, 1.0), (-1.0, 1.0, -1.0))
+            b = frule(Dual(branch3, NoFData()), Dual(x, 1.0))
+            @test b.x ≈ expected_x && b.dx ≈ expected_dx
+        end
+        checkverify(branch3, (Float64,))
+
+        # multiple returns from nested branches
+        for (x, expected_x, expected_dx) in ((20.0, 400.0, 40.0), (7.0, 107.0, 1.0),
+                                              (3.0, 4.0, 1.0), (-3.0, 3.0, -1.0))
+            m = frule(Dual(multiret, NoFData()), Dual(x, 1.0))
+            @test m.x ≈ expected_x && m.dx ≈ expected_dx
+        end
+        checkverify(multiret, (Float64,))
+
+        # loop body calling a surviving frule (sin): k*sin(x)
+        sl = frule(Dual(sinloop, NoFData()), Dual(0.6, 1.0), Dual(3, 0))
+        @test sl.x ≈ 3*sin(0.6) && sl.dx ≈ 3*cos(0.6)
+        checkverify(sinloop, (Float64, Int))
+
+        # two live loop-carried phis in one block: seed x and y independently
+        mx = frule(Dual(sumk_multi, NoFData()), Dual(2.0, 1.0), Dual(3.0, 0.0), Dual(4, 0))
+        @test mx.dx ≈ 4.0                                  # ds/dx = k
+        my = frule(Dual(sumk_multi, NoFData()), Dual(2.0, 0.0), Dual(3.0, 1.0), Dual(4, 0))
+        @test my.dx ≈ 4.0                                  # dt/dy = k
+        checkverify(sumk_multi, (Float64, Float64, Int))
+
+        # PhiNode merging a Point struct, one arm a compile-time constant
+        pt = frule(Dual(pointphi, NoFData()), Dual(1.0, 1.0))
+        @test pt.x ≈ 3.0 && pt.dx ≈ 0.0                    # constant arm: d/dx = 0
+        pf = frule(Dual(pointphi, NoFData()), Dual(-1.0, 1.0))
+        @test pf.x ≈ -2.0 && pf.dx ≈ 2.0                   # Point(x,x): d/dx (x+x) = 2
+        checkverify(pointphi, (Float64,))
     end
 
     @testset "derivative matches finite differences" begin

@@ -10,7 +10,7 @@
 
 Return `ir => rettype`, the optimized dualized `IRCode` for differentiating `f` at arguments of
 types `argtypes` (each primal type `T` is seeded with a `Dual{T,T}`; the function itself with
-`Dual{typeof(f),NoFData}`). Errors if dualization bails (e.g. control flow — not yet supported).
+`Dual{typeof(f),NoFData}`). Errors if dualization bails (e.g. exception handling — not yet supported).
 
 # Examples
 ```julia
@@ -34,7 +34,7 @@ function code_dual_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
 
     ir = build_dual_ir(interp, impl_mi)
     ir === nothing && error("ADNext could not dualize $f$argtypes on optimized IRCode " *
-                            "(unsupported construct, e.g. control flow — not yet handled).")
+                            "(unsupported construct, e.g. exception handling — not yet handled).")
     opt = CC.OptimizationState(impl_mi, CC.retrieve_code_info(impl_mi, world), interp)
     ir = run_ipo_passes!(ir, opt)
     return ir => CC.compute_ir_rettype(ir)

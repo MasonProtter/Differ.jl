@@ -13,7 +13,7 @@
 # body must never actually run.
 dualized_impl(dualargs::Dual...) =
     error("ADNext.dualized_impl ran directly: ADInterpreter could not dualize the primal ",
-          "(likely unsupported IR — e.g. control flow, which is not handled in this first cut).")
+          "(likely unsupported IR — e.g. exception handling (try/catch), which is not handled yet).")
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +91,11 @@ end
 # statement shares its primal statement's type `Ti`; a `Dual{R,R}` wrapper uses `R = Ti`; a
 # surviving `frule` result is `Dual{R,R}` with `R` the primal call's result type. The result is
 # therefore a fully typed `IRCode` that installs as the optimization result and whose return type
-# `finishinfer!` reads off via `compute_ir_rettype` — no re-inference. Straight-line only; returns
-# `nothing` to bail on control flow / unsupported constructs (the caller then bails gracefully).
+# `finishinfer!` reads off via `compute_ir_rettype` — no re-inference. Branches and loops
+# (`GotoNode`/`GotoIfNot`/`PhiNode`) are supported: block topology is preserved 1:1 from the primal,
+# so only within-block instruction counts change. Returns `nothing` to bail on exception handling
+# (`EnterNode`/`PhiCNode`/`UpsilonNode`) or other unsupported constructs (the caller then bails
+# gracefully).
 # ===========================================================================
 
 const _Intr = Core.Intrinsics
@@ -107,16 +110,24 @@ _calleeval(@nospecialize(x)) =
 function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
     pstmts = pir.stmts
     N = length(pstmts)
-    for i in 1:N                                    # straight-line only
+    for i in 1:N                                    # exception handling not yet supported
         s = pstmts[i][:stmt]
-        if isa(s, Core.GotoNode) || isa(s, Core.GotoIfNot) || isa(s, Core.PhiNode) ||
-           isa(s, Core.PhiCNode) || isa(s, Core.UpsilonNode) || isa(s, Core.EnterNode)
+        if isa(s, Core.PhiCNode) || isa(s, Core.UpsilonNode) || isa(s, Core.EnterNode)
             return nothing
         end
     end
+    # Defensive: a leading PhiNode in block 1 (predecessor-free) would collide with the
+    # unconditional arg-extraction prologue below, which must land before any real phi. Not
+    # observed in practice (slot2ssa! always keeps block 1 phi-free), but bail rather than emit
+    # invalid IR if it ever occurs.
+    isa(pstmts[1][:stmt], Core.PhiNode) && return nothing
 
-    zerog  = GlobalRef(@__MODULE__(), :struct_zero)
-    fruleg = GlobalRef(@__MODULE__(), :frule)
+    # Embed the actual (stable, singleton) function objects as literals rather than `GlobalRef`s
+    # to a non-Core/Base module: `Core.Compiler.verify_ir` rejects a bare `GlobalRef` used directly
+    # as a value unless its binding is proven constant across the IR's valid worlds, which these
+    # ADNext-module bindings aren't considered to be even though they never change identity.
+    zerog  = struct_zero
+    fruleg = frule
     getf   = GlobalRef(Core, :getfield)
     intrg(name) = GlobalRef(Core.Intrinsics, name)
 
@@ -128,9 +139,11 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
     dual!(@nospecialize(P), @nospecialize(T), @nospecialize(p), @nospecialize(t)) =
         emit!(Expr(:new, Dual{P,T}, p, t), Dual{P,T})
     # The tangent of a compile-time-constant primal is itself a constant: compute it now and embed
-    # it as a literal, so no `struct_zero` call survives into the IR.
-    const_tangent(@nospecialize x) = (v = isa(x, QuoteNode) ? x.value : x;
-                                      isa(v, Number) ? struct_zero(v) : NoFData())
+    # it as a literal, so no `struct_zero` call survives into the IR. `struct_zero` already handles
+    # arbitrary structs (recursing per field) and singletons (-> `NoFData()`), so this covers
+    # composite constants too (needed so a constant struct arm of a `PhiNode` gets a same-shaped
+    # zero tangent rather than a type-inconsistent `NoFData()`).
+    const_tangent(@nospecialize x) = struct_zero(isa(x, QuoteNode) ? x.value : x)
     # The zero tangent for a value of concrete Number type is a literal; otherwise fall back.
     zero_of_type(@nospecialize T) = (T isa DataType && isconcretetype(T) && T <: Number) ?
                                     (zero(T)::T) : nothing
@@ -156,8 +169,15 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
 
     function frule_split!(fpos, actual, R)
         # Dual(callee, NoFData()) and each Dual(arg_primal, arg_tangent), constructed via %new.
-        ftype = _valtype(fpos)
-        fd = dual!(ftype, NoFData, fpos, NoFData())
+        # Embed the *resolved* callee value (e.g. the `sin` function object) rather than the raw
+        # callee-position AST node: a bare `GlobalRef` outside Core/Base used directly as a value
+        # is rejected by `Core.Compiler.verify_ir` unless its binding is proven constant across the
+        # IR's valid worlds, which a plain `GlobalRef(Main, :sin)` isn't. Falls back to the raw node
+        # (rare: a dynamic/unresolvable callee) when resolution fails, matching prior behavior.
+        fval = _calleeval(fpos)
+        fcallee = fval === nothing ? fpos : fval
+        ftype = fval === nothing ? _valtype(fpos) : typeof(fval)
+        fd = dual!(ftype, NoFData, fcallee, NoFData())
         dualtys = Any[Dual{_optype(pir,a),_optype(pir,a)} for a in actual]
         duals = Any[dual!(_optype(pir,a), _optype(pir,a), presolve(a), tresolve(a)) for a in actual]
         # Emit the surviving high-level rule as a static `:invoke` to a compiled `CodeInstance`
@@ -168,7 +188,34 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
         return emit!(Expr(:call, getf, dd, 1), R), emit!(Expr(:call, getf, dd, 2), R)
     end
 
+    # Block topology (block count, order, preds/succs) is preserved 1:1 from the primal: this
+    # transform only expands each original statement into more instructions, never splits, merges,
+    # or reorders blocks. So `GotoNode.label`/`GotoIfNot.dest`/`PhiNode.edges` (already basic-block
+    # numbers in post-optimization IRCode) carry over unchanged; only each block's `StmtRange` needs
+    # recomputing, tracked live below as blocks are crossed during the single linear pass.
+    nblocks = length(pir.cfg.blocks)
+    block_start_new = Vector{Int}(undef, nblocks)
+    block_start_new[1] = 1                          # includes the arg-extraction prologue above
+    bidx = 1
+
+    # Forward-reference patches for `PhiNode` operands not yet resolved when the phi is processed
+    # (loop back-edges: the operand is defined later in the linear statement order). Keyed by the
+    # referenced *original* SSA index; each entry is (target values-vector, slot, want_primal).
+    # `PhiNode.values` is a plain `Vector`, mutable in place even though `PhiNode` is immutable.
+    pending = Dict{Int,Vector{Tuple{Vector{Any},Int,Bool}}}()
+
     for i in 1:N
+        while bidx < nblocks && i > pir.cfg.blocks[bidx].stmts.stop
+            # A block whose every original statement is a pure alias (e.g. a bare `nothing`
+            # fallthrough placeholder block, common between adjacent loops) emits no instructions
+            # at all, which would leave it an empty `StmtRange`. Backfill a placeholder so every
+            # block keeps at least one statement, matching the primal's own convention.
+            if length(code) < block_start_new[bidx]
+                push!(code, nothing); push!(types, Nothing)
+            end
+            bidx += 1
+            block_start_new[bidx] = length(code) + 1
+        end
         s = pstmts[i][:stmt]; Ti = pstmts[i][:type]
         if isa(s, Core.ReturnNode)
             isdefined(s, :val) || return nothing
@@ -227,12 +274,41 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
             else
                 primal[i], shadow[i] = frule_split!(fpos, actual, Ti)
             end
+        elseif isa(s, Core.GotoNode)
+            push!(code, Core.GotoNode(s.label)); push!(types, Any)
+        elseif isa(s, Core.GotoIfNot)
+            push!(code, Core.GotoIfNot(presolve(s.cond), s.dest)); push!(types, Any)
+        elseif isa(s, Core.PhiNode)
+            k = length(s.values)
+            pvals = Vector{Any}(undef, k); tvals = Vector{Any}(undef, k)
+            for j in 1:k
+                isassigned(s.values, j) || continue    # mirror the primal's own unassigned slot
+                v = s.values[j]
+                if isa(v, Core.SSAValue) && !isassigned(primal, v.id)
+                    push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (pvals, j, true))
+                    push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (tvals, j, false))
+                else
+                    pvals[j] = presolve(v); tvals[j] = tresolve(v)
+                end
+            end
+            primal[i] = emit!(Core.PhiNode(s.edges, pvals), Ti)
+            shadow[i] = emit!(Core.PhiNode(s.edges, tvals), Ti)
         elseif isa(s, GlobalRef) || !isa(s, Expr)
             primal[i] = presolve(s); shadow[i] = tresolve(s)
         else
             return nothing
         end
+        if haskey(pending, i)
+            for (arr, slot, wantp) in pending[i]
+                arr[slot] = wantp ? primal[i] : shadow[i]
+            end
+            delete!(pending, i)
+        end
     end
+    if length(code) < block_start_new[nblocks]      # the final block emitted nothing; see above
+        push!(code, nothing); push!(types, Nothing)
+    end
+    isempty(pending) || return nothing               # unreachable on well-formed IR; bail, don't emit invalid IR
 
     len = length(code)
     stream = CC.InstructionStream(len)
@@ -241,11 +317,21 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
         stream.type[i] = types[i]
         stream.flag[i] = CC.IR_FLAG_NULL
     end
-    cfg = CC.CFG([CC.BasicBlock(CC.StmtRange(1, len), Int[], Int[])], Int[1])
+    new_blocks = Vector{CC.BasicBlock}(undef, nblocks)
+    for b in 1:nblocks
+        lo = block_start_new[b]
+        hi = b == nblocks ? len : block_start_new[b+1] - 1
+        ob = pir.cfg.blocks[b]
+        new_blocks[b] = CC.BasicBlock(CC.StmtRange(lo, hi), copy(ob.preds), copy(ob.succs))
+    end
+    cfg = CC.CFG(new_blocks, Int[bb.stmts.stop + 1 for bb in new_blocks])   # index[b] is one past block b's end
     di  = CC.DebugInfoStream(stream.line)
     di.def = impl_mi                                # required: Core.DebugInfo(di, n) does something(di.def)
     argtypes = Any[impl_mi.specTypes.parameters[1], vararg_tt]
-    return CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[])
+    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[])
+    CC.verify_ir(ir)                                # a failure here is a bug in this transform, not
+                                                     # unsupported input IR — let it throw plainly
+    return ir
 end
 
 # Type helpers. Types are taken directly from the primal IR (`_optype`), so they are exact rather
