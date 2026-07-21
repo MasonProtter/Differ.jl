@@ -1,15 +1,18 @@
-# Tier 2: post-optimization forward-AD on typed `IRCode`.
+# Post-optimization forward-AD on typed `IRCode` — the one dualization engine.
 #
 # Transforms a primal method's fully optimized `IRCode` into a *dualized* `IRCode` using the
 # "split-shadow" scheme: the primal computation is reconstructed and a parallel tangent
 # computation is emitted beside it, then packed into a `Dual`. Low-level rules describe how
 # each intrinsic (`add_float`, `mul_float`, …), builtin (`getfield`), and `%new` propagates
-# tangents; surviving `:invoke`/`:call`s go through `frule` dispatch (Tier 1).
+# tangents; surviving `:invoke`/`:call`s (e.g. `sin`/`cos`) go through `frule` dispatch, which
+# picks up hand-written rules.
 #
-# The result is a *typed* IRCode (types are computed directly from the primal IR — shadow
-# statements share their primal's type, a surviving call yields `Dual{R,R}`), so it can be
-# installed as the optimization result and the `CodeInstance` return type *determined* from it,
-# with no re-inference. Straight-line only; returns `nothing` to bail (caller falls back).
+# Types are derived directly and exactly from the primal IR, not guessed: every shadow (tangent)
+# statement shares its primal statement's type `Ti`; a `Dual{R,R}` wrapper uses `R = Ti`; a
+# surviving `frule` result is `Dual{R,R}` with `R` the primal call's result type. The result is
+# therefore a fully typed `IRCode` that installs as the optimization result and whose return type
+# `finishinfer!` reads off via `compute_ir_rettype` — no re-inference. Straight-line only; returns
+# `nothing` to bail on control flow / unsupported constructs (the caller then bails gracefully).
 
 const _Intr = Core.Intrinsics
 
@@ -19,8 +22,8 @@ _calleeval(@nospecialize(x)) =
 
 # Build the dualized IRCode for `impl_mi` (a `dualized_impl` specialization) from the primal's
 # optimized IRCode `pir`. `n` = number of dual arguments (= primal args incl. #self#).
-# Returns `(ir::IRCode, rettype)` or `nothing`.
-function dualize_to_ircode(impl_mi::MethodInstance, pir, n::Int)
+# Returns `ir::IRCode` or `nothing`.
+function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
     pstmts = pir.stmts
     N = length(pstmts)
     for i in 1:N                                    # straight-line only
@@ -31,16 +34,25 @@ function dualize_to_ircode(impl_mi::MethodInstance, pir, n::Int)
         end
     end
 
-    dualg  = GlobalRef(@__MODULE__(), :Dual)
     zerog  = GlobalRef(@__MODULE__(), :struct_zero)
     fruleg = GlobalRef(@__MODULE__(), :frule)
-    nofg   = GlobalRef(@__MODULE__(), :NoFData)
     getf   = GlobalRef(Core, :getfield)
     intrg(name) = GlobalRef(Core.Intrinsics, name)
 
     code = Any[]; types = Any[]
     emit!(ex, @nospecialize(ty)) = (push!(code, ex); push!(types, ty); Core.SSAValue(length(code)))
-     opf(name, ty, args...) = emit!(Expr(:call, intrg(name), args...), ty)
+    opf(name, ty, args...) = emit!(Expr(:call, intrg(name), args...), ty)
+    # Construct a `Dual{P,T}` directly with `%new` (an immutable-struct construction, no dispatch /
+    # allocation) rather than a dynamic `Dual(...)` call the inliner couldn't reach in synthetic IR.
+    dual!(@nospecialize(P), @nospecialize(T), @nospecialize(p), @nospecialize(t)) =
+        emit!(Expr(:new, Dual{P,T}, p, t), Dual{P,T})
+    # The tangent of a compile-time-constant primal is itself a constant: compute it now and embed
+    # it as a literal, so no `struct_zero` call survives into the IR.
+    const_tangent(@nospecialize x) = (v = isa(x, QuoteNode) ? x.value : x;
+                                      isa(v, Number) ? struct_zero(v) : NoFData())
+    # The zero tangent for a value of concrete Number type is a literal; otherwise fall back.
+    zero_of_type(@nospecialize T) = (T isa DataType && isconcretetype(T) && T <: Number) ?
+                                    (zero(T)::T) : nothing
 
     dualparams = impl_mi.specTypes.parameters[2:end]     # the Dual{…} argument types
     vararg_tt = Tuple{dualparams...}                     # dualargs is one vararg tuple (Argument 2)
@@ -59,14 +71,19 @@ function dualize_to_ircode(impl_mi::MethodInstance, pir, n::Int)
     tresolve(@nospecialize x) =
         isa(x, Core.SSAValue) ? shadow[x.id] :
         isa(x, Core.Argument) ? targ[x.n] :
-        emit!(Expr(:call, zerog, x), _zerotype(x))       # constant tangent
+        const_tangent(x)                                 # constant tangent (literal)
 
     function frule_split!(fpos, actual, R)
-        fz = emit!(Expr(:call, zerog, fpos), NoFData)
-        fd = emit!(Expr(:call, dualg, fpos, fz), Dual{_valtype(fpos),NoFData})
-        duals = Any[emit!(Expr(:call, dualg, presolve(a), tresolve(a)),
-                          Dual{_optype(pir,a),_optype(pir,a)}) for a in actual]
-        dd = emit!(Expr(:call, fruleg, fd, duals...), Dual{R,R})
+        # Dual(callee, NoFData()) and each Dual(arg_primal, arg_tangent), constructed via %new.
+        ftype = _valtype(fpos)
+        fd = dual!(ftype, NoFData, fpos, NoFData())
+        dualtys = Any[Dual{_optype(pir,a),_optype(pir,a)} for a in actual]
+        duals = Any[dual!(_optype(pir,a), _optype(pir,a), presolve(a), tresolve(a)) for a in actual]
+        # Emit the surviving high-level rule as a static `:invoke` to a compiled `CodeInstance`
+        # when we can resolve one (direct, unboxed call); otherwise a plain non-inlined `:call`.
+        ci = frule_codeinstance(interp, ftype, dualtys)
+        dd = ci === nothing ? emit!(Expr(:call, fruleg, fd, duals...), Dual{R,R}) :
+                              emit!(Expr(:invoke, ci, fruleg, fd, duals...), Dual{R,R})
         return emit!(Expr(:call, getf, dd, 1), R), emit!(Expr(:call, getf, dd, 2), R)
     end
 
@@ -75,7 +92,8 @@ function dualize_to_ircode(impl_mi::MethodInstance, pir, n::Int)
         if isa(s, Core.ReturnNode)
             isdefined(s, :val) || return nothing
             p = presolve(s.val); t = tresolve(s.val)
-            res = emit!(Expr(:call, dualg, p, t), Dual{_optype(pir,s.val), _optype(pir,s.val)})
+            R = _optype(pir, s.val)
+            res = dual!(R, R, p, t)
             push!(code, Core.ReturnNode(res)); push!(types, Any)
         elseif isa(s, Core.PiNode)
             primal[i] = presolve(s.val); shadow[i] = tresolve(s.val)
@@ -113,9 +131,12 @@ function dualize_to_ircode(impl_mi::MethodInstance, pir, n::Int)
                     shadow[i] = opf(:div_float, Ti, num, opf(:mul_float, Ti, pb, pb))
                 else
                     # non-differentiable intrinsic (int arithmetic, comparisons, conversions):
-                    # primal computed, tangent is the structural zero of the primal result.
+                    # primal computed, tangent is the structural zero of the primal result. When the
+                    # result type is a concrete Number the zero is a literal; else fall back to a
+                    # runtime `struct_zero` of the computed primal.
                     primal[i] = opf(nm, Ti, (presolve(a) for a in actual)...)
-                    shadow[i] = emit!(Expr(:call, zerog, primal[i]), _zerotype_of(Ti))
+                    z = zero_of_type(Ti)
+                    shadow[i] = z === nothing ? emit!(Expr(:call, zerog, primal[i]), _zerotype_of(Ti)) : z
                 end
             elseif f === Core.getfield
                 primal[i] = emit!(Expr(:call, getf, presolve(actual[1]), actual[2]), Ti)
@@ -143,17 +164,12 @@ function dualize_to_ircode(impl_mi::MethodInstance, pir, n::Int)
     di  = CC.DebugInfoStream(stream.line)
     di.def = impl_mi                                # required: Core.DebugInfo(di, n) does something(di.def)
     argtypes = Any[impl_mi.specTypes.parameters[1], vararg_tt]
-    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[])
-    rettype = types[end-0]  # type of the returned Dual (second-to-last emitted, before ReturnNode)
-    # the ReturnNode itself has type Any; the Dual it returns is the last SSAValue emitted
-    retval = (code[end]::Core.ReturnNode).val
-    rettype = isa(retval, Core.SSAValue) ? types[retval.id] : Any
-    return ir, rettype
+    return CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[])
 end
 
-# Type helpers (best-effort; conservative fallbacks keep the IR well-formed).
+# Type helpers. Types are taken directly from the primal IR (`_optype`), so they are exact rather
+# than guessed; the fallbacks only cover genuine constants/globals.
 _valtype(@nospecialize x) = isa(x, GlobalRef) && isdefined(x.mod, x.name) ? typeof(getglobal(x.mod, x.name)) : Any
 _optype(pir, @nospecialize x) = isa(x, Core.SSAValue) ? pir.stmts[x.id][:type] :
                                 isa(x, Core.Argument) ? pir.argtypes[x.n] : typeof(x)
-_zerotype(@nospecialize x) = (T = typeof(x); T <: Number ? T : NoFData)
 _zerotype_of(@nospecialize T) = (T <: Number ? T : NoFData)

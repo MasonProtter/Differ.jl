@@ -33,8 +33,8 @@ trycatch(x) = try sin(x) catch; cos(x) end       # exception handling: still uns
 
 struct Point; x::Float64; y::Float64; end
 
-# Tier-2 (post-optimization IRCode) targets: these differentiate through intrinsics /
-# getfield / %new, with NO hand-written frule methods for +, -, *, /.
+# Intrinsic-level targets: these differentiate through intrinsics / getfield / %new on the
+# post-optimization IRCode, with NO hand-written frule methods for +, -, *, /.
 struct V2; a::Float64; b::Float64; end
 vprod(v::V2) = v.a * v.b
 poly32(x::Float32) = x*x + x
@@ -108,7 +108,7 @@ poly32(x::Float32) = x*x + x
         @test dsc.dx ≈ cos(2*0.9)
     end
 
-    @testset "Tier 2: intrinsic-level rules (no arithmetic frules)" begin
+    @testset "intrinsic-level rules (no arithmetic frules)" begin
         # Complex arithmetic differentiated via add_float/mul_float/getfield/%new.
         z, w   = 1.0 + 2.0im, 3.0 + 4.0im
         dz, dw = 0.5 + 0.0im, 0.0 + 1.0im
@@ -132,20 +132,20 @@ poly32(x::Float32) = x*x + x
         @test dv.dx == 1.0*3.0 + 2.0*0.0              # = b*da + a*db
     end
 
-    @testset "control flow and assignments" begin
-        # branch: relu(x)=abs(x) here, derivative sign(x)
-        @test frule(Dual(relu, NoFData()), Dual( 2.0, 1.0)) === Dual( 2.0,  1.0)
-        @test frule(Dual(relu, NoFData()), Dual(-2.0, 1.0)) === Dual( 2.0, -1.0)
-
-        # local reassignment: p4(x)=x^4, derivative 4x^3
+    @testset "local reassignment (straight-line after optimization)" begin
+        # p4(x)=x^4 via reassignment; optimization lowers it to straight-line SSA (no phi),
+        # so the IRCode engine handles it. derivative 4x^3
         d4 = frule(Dual(p4, NoFData()), Dual(2.0, 1.0))
         @test d4.x  ≈ 2.0^4
         @test d4.dx ≈ 4 * 2.0^3
+    end
 
-        # while loop: sumk(x,k)=k*x, ∂/∂x = k (k carried as a Dual with zero tangent)
-        ds = frule(Dual(sumk, NoFData()), Dual(3.0, 1.0), Dual(4, 0))
-        @test ds.x  ≈ 12.0
-        @test ds.dx ≈ 4.0
+    @testset "control flow: bails (IRCode CF support is the next milestone)" begin
+        # The single post-optimization IRCode engine is straight-line only. Real control flow
+        # (branches -> GotoIfNot, loops -> PhiNode) bails, so these currently throw. Marked broken
+        # until PhiNode / multi-basic-block split-shadow lands.
+        @test_broken frule(Dual(relu, NoFData()), Dual( 2.0, 1.0)) === Dual( 2.0,  1.0)  # abs, d=sign
+        @test_broken frule(Dual(sumk, NoFData()), Dual(3.0, 1.0), Dual(4, 0)).dx ≈ 4.0    # while loop: k*x
     end
 
     @testset "derivative matches finite differences" begin
@@ -159,6 +159,16 @@ poly32(x::Float32) = x*x + x
     @testset "graceful bail on unsupported IR" begin
         # exception handling is not yet supported: should error, not miscompile
         @test_throws ErrorException frule(Dual(trycatch, NoFData()), Dual(1.0, 1.0))
+    end
+
+    @testset "allocation-free (dualization is fully inlined)" begin
+        # The dualized code is real post-optimization IRCode: Duals are built with %new and
+        # surviving high-level rules are `:invoke`s to CodeInstances, so a straight-line dual is
+        # allocation-free. `sincosp` exercises the surviving `frule(sin)`/`frule(cos)` :invoke path.
+        allocs(f, x) = (d = Dual(x, 1.0); df = Dual(f, NoFData());
+                        frule(df, d); @allocated frule(df, d))     # measure warmed
+        @test allocs(sqr, 2.0)     == 0        # pure intrinsics
+        @test allocs(sincosp, 0.6) == 0        # surviving sin/cos rule :invokes
     end
 
 end

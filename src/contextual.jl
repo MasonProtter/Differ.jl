@@ -1,46 +1,22 @@
-using Core: MethodMatch, MethodInstance, CodeInstance, Compiler
+using Core: MethodInstance, CodeInstance, CodeInfo, Compiler
 using Core.Compiler:
-    _methods_by_ftype,
-    InferenceParams,
-    get_world_counter,
-    tls_world_age,
-    InferenceResult,
-    typeinf,
-    InternalMethodTable,
-    InferenceState,
-    NativeInterpreter,
-    AbstractInterpreter,
-    OptimizationParams,
-    MethodTableView,
-    OverlayMethodTable,
-    WorldRange,
-    finish,
-    InferenceResult,
-    OptimizationState,
-    OptimizationParams,
-    optimize,
-    store_backedges,
-    finish!,
-    CodeInfo,
-    isexpr,
-    argextype,
-    singleton_type,
-    Builtin,
-    GlobalRef,
-    CodeInstance,
-    ir_to_codeinf!,
-    typeinf_ext_toplevel,
-    IRCode,
-    argextype,
-    widenconst
+    AbstractInterpreter, InferenceParams, OptimizationParams, InferenceResult, IRCode
+using Base: specialize_method
 
 const CC = Core.Compiler
 
-using Base:
-    specialize_method,
-    isexpr
+# ---------------------------------------------------------------------------
+# ContextualInterpreter: a custom AbstractInterpreter that compiles the *dualized*
+# version of a primal method. The dualization is a single source-to-source transform on the
+# primal's post-optimization `IRCode` (see `ir_dualize.jl`), installed into the normal typeinf
+# pipeline so it produces an ordinary `invoke`-able `CodeInstance`. Modeled on the plugin shape in
+# `julia/Compiler/extras/CompilerDevTools`.
+# ---------------------------------------------------------------------------
 
-struct MyCtx end
+struct MyCtx
+    world::UInt
+end
+MyCtx(;world) = MyCtx(world)
 
 struct ContextualInterpreter <: AbstractInterpreter
     inf_cache::Vector{InferenceResult}
@@ -48,6 +24,11 @@ struct ContextualInterpreter <: AbstractInterpreter
     inf_params::InferenceParams
     opt_params::OptimizationParams
     codegen_cache::IdDict{CodeInstance, CodeInfo}
+    # Per-compile scratch: the dualized IRCode built in `finishinfer!` (which also supplies the
+    # return type) and installed as the optimization result in `optimize`. Keyed by the
+    # `dualized_impl` MethodInstance being compiled. Safe because one interpreter instance serves
+    # both hooks of a given frame.
+    dual_ir::IdDict{MethodInstance, IRCode}
     function ContextualInterpreter(world::UInt,
                                    ip::InferenceParams,
                                    op::OptimizationParams)
@@ -57,13 +38,14 @@ struct ContextualInterpreter <: AbstractInterpreter
             world,
             ip,
             op,
-            IdDict{CodeInstance, CodeInfo}()
+            IdDict{CodeInstance, CodeInfo}(),
+            IdDict{MethodInstance, IRCode}(),
         )
     end
 end
 function ContextualInterpreter(;world=Base.get_world_counter(),
                                inf_params=InferenceParams(),
-                               opt_params=OptimizationParams()) 
+                               opt_params=OptimizationParams())
     ContextualInterpreter(world, inf_params, opt_params)
 end
 
@@ -71,23 +53,24 @@ Core.Compiler.InferenceParams(interp::ContextualInterpreter) = interp.inf_params
 Core.Compiler.OptimizationParams(interp::ContextualInterpreter) = interp.opt_params
 Core.Compiler.get_inference_world(interp::ContextualInterpreter) = interp.world
 Core.Compiler.get_inference_cache(interp::ContextualInterpreter) = interp.inf_cache
-Core.Compiler.cache_owner(interp::ContextualInterpreter) = MyCtx()
+Core.Compiler.cache_owner(interp::ContextualInterpreter) = MyCtx(interp.world)
 Core.Compiler.codegen_cache(interp::ContextualInterpreter) = interp.codegen_cache
 
 
-@noinline function Core.OptimizedGenerics.CompilerPlugins.typeinf(::MyCtx, mi::MethodInstance, source_mode::UInt8)
-    # Base.invoke_in_world(which(Core.OptimizedGenerics.CompilerPlugins.typeinf, Tuple{ContextOwner, MethodInstance, UInt8}).primary_world,
-    Compiler.typeinf_ext_toplevel(ContextualInterpreter(; world=Base.tls_world_age()),
+@noinline function Core.OptimizedGenerics.CompilerPlugins.typeinf(ctx::MyCtx, mi::MethodInstance, source_mode::UInt8)
+    Compiler.typeinf_ext_toplevel(ContextualInterpreter(; world=ctx.world),
                                   mi, source_mode)
 end
 
-@noinline function Core.OptimizedGenerics.CompilerPlugins.typeinf_edge(::MyCtx, mi::MethodInstance, parent_frame::Compiler.InferenceState, world::UInt, source_mode::UInt8)
+@noinline function Core.OptimizedGenerics.CompilerPlugins.typeinf_edge(ctx::MyCtx, mi::MethodInstance, parent_frame::Compiler.InferenceState, world::UInt, source_mode::UInt8)
     interp = ContextualInterpreter(; world)
     Compiler.typeinf_edge(interp, mi.def, mi.specTypes, Core.svec(),
                           parent_frame, false, false)
 end
 
 
+# Build a lowered `CodeInfo` from an expression. Used by `frule_body` (`forward_interp.jl`) to
+# produce the trivial generated body that `invoke`s the compiled dual `CodeInstance`.
 function expr_to_codeinfo(m::Module, argnames, spnames, sp, e::Expr, isva::Bool=false)
     lam = Expr(:lambda, argnames,
                Expr(Symbol("scope-block"),
@@ -107,57 +90,24 @@ function expr_to_codeinfo(m::Module, argnames, spnames, sp, e::Expr, isva::Bool=
 end
 
 
-function with_ctx_interpreter(f, args...)
-    cinst = generated_ci_in_absint(f, args)
-    invoke(f, cinst, args...)
-end
-
-
-function generated_ci_in_absint_body(world::UInt, lnn, this, f, args)
-    sig = Type{Tuple{f, args.parameters...}}
-    sig isa Type{<:Type{<:Tuple}} || error()
-    tt = sig.parameters[1]
-    interp = ContextualInterpreter(; world)
-
-    match, valid_worlds = Core.Compiler.findsup(tt, Core.Compiler.method_table(interp))
-    if match === nothing
-        error(lazy"Unable to find matching $tt")
-    end
-    mi = specialize_method(match.method, match.spec_types, match.sparams)::MethodInstance
-    
-    cinst = Core.OptimizedGenerics.CompilerPlugins.typeinf(MyCtx(), mi, Compiler.SOURCE_MODE_ABI)
-    
-    ci = expr_to_codeinfo(@__MODULE__(), [Symbol("#self#"), :f, :args], [], (), :(return $cinst))
-    
-    matches = Base._methods_by_ftype(sig, -1, world)
-    if !isnothing(matches)
-        ci.edges = Core.MethodInstance[]
-        for match in Base._methods_by_ftype(sig, -1, world)
-            mi = Base.specialize_method(match) 
-            push!(ci.edges, mi)
-        end
-    end
-    return ci
-end
-
-function refresh_generated_ci_in_absint()
-    @eval function generated_ci_in_absint(f, args)
-        $(Expr(:meta, :generated_only))
-        $(Expr(:meta, :generated, generated_ci_in_absint_body))
-    end
-end
-refresh_generated_ci_in_absint()
-
-
 # ---------------------------------------------------------------------------
-# The dualization pass, injected at the interp-dispatched InferenceState seam.
+# The dualization seam.
 #
-# When ContextualInterpreter is asked to build an InferenceState for a
-# `dualized_impl` MethodInstance (whose specTypes is the *dual* signature), we
-# discard the stub source and instead hand inference the *dualized* body derived
-# from the corresponding primal method. Inference then derives the correct `Dual`
-# types itself, and optimization (inlining control, post-inlining transforms)
-# runs normally under this interpreter.
+# The generated `frule` fallback (`forward_interp.jl`) asks this interpreter to compile a
+# `dualized_impl` MethodInstance whose `specTypes` is the *dual* signature. We compile it by
+# transforming the corresponding primal method's post-optimization `IRCode` into a dualized
+# `IRCode` (`build_dual_ir`), and splice that transform into the pipeline at two points:
+#
+#   * `finishinfer!` — the pipeline function that *supplies* the `CodeInstance` return type. We
+#     build the dual IR here and set `me.bestguess` to its return type, so the ordinary
+#     `jl_fill_codeinst` writes the correct dual type once (no post-hoc patching).
+#   * `optimize` — installs the already-built dual IR as the optimization result via the ordinary
+#     `ipo_dataflow_analysis!` + `finishopt!`.
+#
+# When the primal IR contains constructs the transform can't handle (control flow, unsupported
+# builtins, …), `build_dual_ir` returns `nothing`: we leave `me.bestguess`/the cache untouched, the
+# stub's throwing body flows through the pipeline normally, and the compiled CI raises the
+# `dualized_impl` `ErrorException` when invoked — a graceful bail.
 # ---------------------------------------------------------------------------
 
 is_dualized_impl(mi) = isa(mi.def, Method) && !isempty(mi.specTypes.parameters) &&
@@ -176,180 +126,75 @@ function primal_of_impl(interp::ContextualInterpreter, impl_mi::MethodInstance)
     return (primal_mi, length(dualparams))
 end
 
-# Tier 2: build the dualized *IRCode* from the primal's optimized IRCode. Returns
-# `(ir::IRCode, rettype)` or `nothing` (control flow / unsupported).
-function tier2_dual_ircode(interp::ContextualInterpreter, impl_mi::MethodInstance)
+# Build the dualized `IRCode` for a `dualized_impl` specialization from the primal's optimized
+# `IRCode`. Returns the dual `IRCode` or `nothing` (unsupported IR → bail).
+function build_dual_ir(interp::ContextualInterpreter, impl_mi::MethodInstance)
     info = primal_of_impl(interp, impl_mi)
     info === nothing && return nothing
     primal_mi, n = info
     world = CC.get_inference_world(interp)
-    # Optimized primal IR via the internal `typeinf_ircode` (reflection `code_ircode` is blocked
-    # inside generators). NativeInterpreter so `sin`/`cos` survive as `:invoke`s for Tier 1.
+    # Optimized primal IR via the internal `typeinf_ircode`. A NativeInterpreter is used so that
+    # `sin`/`cos` and other hand-ruled functions survive as `:invoke`s (routed through `frule`).
     pir, _ = CC.typeinf_ircode(CC.NativeInterpreter(world), primal_mi, nothing)
     pir === nothing && return nothing
-    return dualize_to_ircode(impl_mi, pir, n)
+    return dualize_to_ircode(interp, impl_mi, pir, n)
 end
 
-# ── Tier 1 (control-flow fallback) via the InferenceState seam ─────────────────────────────
-# Tier 2 is preferred and installed in `optimize` below. When it can't apply (control flow), we
-# inject a dualized *lowered* CodeInfo here so inference derives the `Dual` return type and
-# `optimize` runs normally.
-function Core.Compiler.InferenceState(result::CC.InferenceResult, cache_mode::UInt8,
-                                      interp::ContextualInterpreter)
-    mi = result.linfo
-    if is_dualized_impl(mi) && tier2_dual_ircode(interp, mi) === nothing   # Tier 2 not applicable
-        src = tier1_dualized_source(interp, mi)
-        src !== nothing && return CC.InferenceState(result, src, cache_mode, interp)
-    end
-    return @invoke CC.InferenceState(result::CC.InferenceResult, cache_mode::UInt8,
-                                     interp::CC.AbstractInterpreter)
+# Resolve and compile the `frule(Dual{typeof(f),NoFData}, dualargs...)` rule for a surviving
+# high-level call to an *invoke-able `CodeInstance`*, so the dualized IR can emit a static
+# `:invoke` (mirroring how the primal IR keeps `sin`/`cos` as `:invoke`s to a `CodeInstance`).
+# `:invoke` targets *must* be `CodeInstance`s: `collectinvokes!` only JITs those, so a bare
+# `MethodInstance` would fall back to a boxed dynamic call. Returns `nothing` if unresolved.
+function frule_codeinstance(interp::ContextualInterpreter, @nospecialize(ftype), dual_argtypes)
+    frule_tt = Tuple{typeof(frule), Dual{ftype,NoFData}, dual_argtypes...}
+    fm, _ = CC.findsup(frule_tt, CC.method_table(interp))
+    fm === nothing && return nothing
+    isa(fm.method, Method) || return nothing
+    frule_mi = specialize_method(fm.method, fm.spec_types, fm.sparams)::MethodInstance
+    world = CC.get_inference_world(interp)
+    return CC.typeinf_ext_toplevel(CC.NativeInterpreter(world), frule_mi, CC.SOURCE_MODE_ABI)::CodeInstance
 end
 
-function tier1_dualized_source(interp::ContextualInterpreter, impl_mi::MethodInstance)
-    info = primal_of_impl(interp, impl_mi)
-    info === nothing && return nothing
-    primal_mi, n = info
-    psrc = CC.retrieve_code_info(primal_mi, CC.get_inference_world(interp))
-    isa(psrc, CodeInfo) || return nothing
-    src = copy(psrc)
-    dualize!(primal_mi, src, n) || return nothing
-    errs = CC.validate_code(impl_mi, src)
-    isempty(errs) || (foreach(Core.println, errs); return nothing)
-    return src
-end
-
-# ── Tier 2 install: replace the optimized IR with the dualized IRCode and *determine* the
-# CodeInstance return type (finishinfer! froze it before optimize; jl_update_codeinst won't
-# revise it, so we re-fill it from the dual IR's return type).
-function Core.Compiler.optimize(interp::ContextualInterpreter, opt::CC.OptimizationState,
-                                caller::CC.InferenceResult)
-    if is_dualized_impl(caller.linfo)
-        res = tier2_dual_ircode(interp, caller.linfo)
-        if res !== nothing
-            dual_ir, rettype = res
-            CC.ipo_dataflow_analysis!(interp, opt, dual_ir, caller)
-            CC.finishopt!(interp, opt, dual_ir)
-            if isdefined(caller, :ci)
-                ci = caller.ci
-                mw, Mw = first(caller.valid_worlds), last(caller.valid_worlds)
-                ccall(:jl_fill_codeinst, Cvoid,
-                      (Any, Any, Any, Any, Int32, UInt, UInt, UInt32, Any, Any, Any),
-                      ci, rettype, Any, nothing, Int32(0), mw, Mw,
-                      CC.encode_effects(caller.ipo_effects), nothing, nothing, Core.svec())
-            end
-            return nothing
+# Return-type seam: for a `dualized_impl` MI, build the dual IR and set `me.bestguess` to its
+# return type so the generic `finishinfer!` freezes the correct dual type into the CodeInstance.
+function CC.finishinfer!(me::CC.InferenceState, interp::ContextualInterpreter, cycleid::Int,
+                         opt_cache::IdDict{MethodInstance, CodeInstance})
+    mi = me.linfo
+    if is_dualized_impl(mi)
+        ir = build_dual_ir(interp, mi)
+        if ir !== nothing
+            interp.dual_ir[mi] = ir
+            me.bestguess = CC.compute_ir_rettype(ir)
         end
+    end
+    return @invoke CC.finishinfer!(me::CC.InferenceState, interp::CC.AbstractInterpreter,
+                                   cycleid::Int, opt_cache::IdDict{MethodInstance, CodeInstance})
+end
+
+# Install seam: replace the optimization result with the dual IR built in `finishinfer!`, then run
+# the ordinary IPO-safe optimization passes on it (inlining, SROA, ADCE, …) so the `Dual` /
+# `struct_zero` / `getfield` / `frule` calls are inlined and the immutable duals scalar-replaced.
+function CC.optimize(interp::ContextualInterpreter, opt::CC.OptimizationState,
+                     caller::CC.InferenceResult)
+    ir = get(interp.dual_ir, caller.linfo, nothing)
+    if ir !== nothing
+        ir = run_dual_passes!(ir, opt)
+        CC.ipo_dataflow_analysis!(interp, opt, ir, caller)
+        CC.finishopt!(interp, opt, ir)
+        return nothing
     end
     return @invoke CC.optimize(interp::CC.AbstractInterpreter, opt::CC.OptimizationState,
                                caller::CC.InferenceResult)
 end
 
-# Dualization: rewrite each `f(a...)` into `frule(Dual(f, struct_zero(f)), <dualified a>...)`,
-# unpacking `dualargs`. Supports straight-line code, local-variable assignments, and control
-# flow (branches/loops); every value flowing through the body is a `Dual`. `GotoIfNot`
-# conditions are reduced to a primal `Bool` via `getfield(cond, 1)`. `n` = number of primal
-# argument slots (including #self#) = number of dual args. Returns `false` (bails) on
-# constructs not yet handled: exception handling, `:new`/`:foreigncall`, reassigned arguments.
-function dualize!(primal_mi::MethodInstance, src::CodeInfo, n::Int)
-    old = src.code
-    nold = length(old)
-    for s in old                                        # exception handling not yet supported
-        if isa(s, Core.EnterNode) ||
-           (isa(s, Expr) && s.head in (:enter, :leave, :pop_exception, :the_exception))
-            return false
-        end
-    end
-
-    fruleg = GlobalRef(@__MODULE__(), :frule)
-    dualg  = GlobalRef(@__MODULE__(), :Dual)
-    zerog  = GlobalRef(@__MODULE__(), :struct_zero)
-    getf   = GlobalRef(Core, :getfield)
-
-    new = Any[]
-    for i in 1:n                                        # primal SlotNumber(i) -> SSAValue(i)
-        push!(new, Expr(:call, getf, Core.SlotNumber(2), i))
-    end
-    ssamap = zeros(Int, nold)                           # orig stmt -> new index of its value
-    stmt_start = zeros(Int, nold)                       # orig stmt -> new index of its first stmt
-    produces_dual = falses(nold)
-    fixups = Tuple{Int,Symbol}[]                        # (new index, :goto|:ifnot) to patch
-
-    remapslot(id) = id <= n ? Core.SSAValue(id) : Core.SlotNumber(id - n + 2)
-    remap(x) =
-        isa(x, Core.SSAValue)   ? Core.SSAValue(ssamap[x.id]) :
-        isa(x, Core.SlotNumber) ? remapslot(x.id) :
-        isa(x, Core.Argument)   ? remapslot(x.n) : x
-    # Every argument slot (unpacked to a Dual) and every local (only ever assigned dualified
-    # values) holds a Dual; an SSA value is a Dual iff its defining statement produced one.
-    is_dual(x) =
-        isa(x, Core.SSAValue)   ? produces_dual[x.id] :
-        isa(x, Core.SlotNumber) ? true :
-        isa(x, Core.Argument)   ? true : false
-    function dualify(x)
-        rx = remap(x)
-        is_dual(x) && return rx
-        push!(new, Expr(:call, zerog, rx)); z = Core.SSAValue(length(new))
-        push!(new, Expr(:call, dualg, rx, z)); return Core.SSAValue(length(new))
-    end
-    function emit_call!(ce::Expr)                       # -> SSAValue of the frule result (a Dual)
-        callee = dualify(ce.args[1])
-        dargs = Any[dualify(ce.args[k]) for k in 2:length(ce.args)]
-        push!(new, Expr(:call, fruleg, callee, dargs...))
-        return Core.SSAValue(length(new))
-    end
-
-    for (j, s) in enumerate(old)
-        stmt_start[j] = length(new) + 1
-        if isa(s, Expr) && s.head === :call
-            ssamap[j] = emit_call!(s).id; produces_dual[j] = true
-        elseif isa(s, Expr) && s.head === :(=)
-            lhs = s.args[1]
-            (isa(lhs, Core.SlotNumber) && lhs.id > n) || return false   # only local-slot assignment
-            rhs = s.args[2]
-            v = (isa(rhs, Expr) && rhs.head === :call) ? emit_call!(rhs) : dualify(rhs)
-            push!(new, Expr(:(=), remapslot(lhs.id), v))
-            ssamap[j] = length(new); produces_dual[j] = true
-        elseif isa(s, Core.ReturnNode)
-            push!(new, isdefined(s, :val) ? Core.ReturnNode(dualify(s.val)) : s)
-            ssamap[j] = length(new)
-        elseif isa(s, Core.GotoNode)
-            push!(new, s); ssamap[j] = length(new)                      # label patched below
-            push!(fixups, (length(new), :goto))
-        elseif isa(s, Core.GotoIfNot)
-            c = s.cond
-            cond = is_dual(c) ?
-                (push!(new, Expr(:call, getf, remap(c), 1)); Core.SSAValue(length(new))) : remap(c)
-            push!(new, Core.GotoIfNot(cond, s.dest)); ssamap[j] = length(new)   # dest patched below
-            push!(fixups, (length(new), :ifnot))
-        elseif isa(s, Core.NewvarNode)
-            push!(new, Core.NewvarNode(remapslot(s.slot.id))); ssamap[j] = length(new)
-        elseif isa(s, GlobalRef) || isa(s, QuoteNode) || isa(s, Core.SSAValue) ||
-               isa(s, Core.SlotNumber) || isa(s, Core.Argument) || !isa(s, Expr)
-            push!(new, remap(s)); ssamap[j] = length(new)
-            produces_dual[j] = is_dual(s)
-        elseif isa(s, Expr) && s.head in (:boundscheck, :meta, :inbounds, :loopinfo,
-                                          :gc_preserve_begin, :gc_preserve_end)
-            push!(new, s); ssamap[j] = length(new)                      # non-value / passthrough
-        else
-            return false                                               # unsupported (e.g. :new, :foreigncall)
-        end
-    end
-
-    for (pos, kind) in fixups                           # patch jump targets to new indices
-        st = new[pos]
-        new[pos] = kind === :goto ? Core.GotoNode(stmt_start[st.label]) :
-                                    Core.GotoIfNot(st.cond, stmt_start[st.dest])
-    end
-
-    src.code = new
-    src.slotnames = Symbol[Symbol("#self#"), :dualargs, src.slotnames[n+1:end]...]
-    src.slotflags = UInt8[0x00, 0x00, src.slotflags[n+1:end]...]
-    src.nargs = 2
-    src.isva = true
-    src.ssavaluetypes = length(new)
-    src.ssaflags = fill(UInt32(0), length(new))
-    src.debuginfo = Core.DebugInfo(:dualized)
-    return true
+# The IRCode half of `run_passes_ipo_safe` (our dual IR is already SSA IRCode, so CONVERT/SLOT2REG
+# are skipped).
+function run_dual_passes!(ir::IRCode, opt::CC.OptimizationState)
+    ir = CC.compact!(ir)
+    ir = CC.ssa_inlining_pass!(ir, opt.inlining, opt.src.propagate_inbounds)
+    ir = CC.compact!(ir)
+    ir = CC.sroa_pass!(ir, opt.inlining)
+    ir, _ = CC.adce_pass!(ir, opt.inlining)
+    ir = CC.compact!(ir, true)
+    return ir
 end
-
-
