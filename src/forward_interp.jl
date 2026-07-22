@@ -13,7 +13,7 @@
 # body must never actually run.
 dualized_impl(dualargs::Dual...) =
     error("ADNext.dualized_impl ran directly: ADInterpreter could not dualize the primal ",
-          "(likely unsupported IR — e.g. exception handling (try/catch), which is not handled yet).")
+          "(likely unsupported IR — e.g. array indexing / a builtin with no rule, or a vararg call).")
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ is_dualized_impl(mi) = isa(mi.def, Method) && !isempty(mi.specTypes.parameters) 
 function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance)
     dualparams = impl_mi.specTypes.parameters[2:end]
     all(P -> P isa Type && P <: Dual, dualparams) || return nothing
-    primal_tt = Base.to_tuple_type(Any[primal_type(P) for P in dualparams])
+    primal_tt = Base.to_tuple_type(Any[_dual_primal_type(P) for P in dualparams])
     pmatch, _ = CC.findsup(primal_tt, CC.method_table(interp))
     pmatch === nothing && return nothing
     isa(pmatch.method, Method) || return nothing
@@ -49,25 +49,75 @@ end
 
 # Build the dualized `IRCode` for a `dualized_impl` specialization from the primal's optimized
 # `IRCode`. Returns the dual `IRCode` or `nothing` (unsupported IR → bail).
+#
+# Two cases, distinguished by whether any *value* argument's primal is itself a `Dual`:
+#
+#  * First order (base case): the primal is an ordinary user method (or a hand-written `frule`),
+#    found via `primal_of_impl`, and dualized directly. `pir` has scalar positional arguments.
+#  * Higher order (Option A — compose the transform): a request whose value args are nested Duals
+#    (e.g. `Dual{Dual{F,F},Dual{F,F}}`) is differentiating the *order-(k-1) dualized function*. That
+#    function's optimized dual IR is obtained by peeling one `Dual` level off each value arg,
+#    resolving the inner `dualized_impl` carrier, and recursing through `optimized_dual_ir`; the
+#    result is then re-dualized. That inner dual IR is vararg-shaped (`dualized_impl(dualargs...)`),
+#    so `pir_is_vararg=true` selects the tuple-reconstruction prologue in `dualize_to_ircode`.
 function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance)
+    dualparams = impl_mi.specTypes.parameters[2:end]
+    all(P -> P isa Type && P <: Dual, dualparams) || return nothing
+    n = length(dualparams)
+    # All arguments — the function included — are nested uniformly to the differentiation order (a
+    # constant/function nests too, carrying `NoTangent` at the leaf), so an order-≥2 request is one
+    # where *any* argument's primal is itself a `Dual`. The `frule` guard is the one exception:
+    # `frule` is the only Dual-consuming function in the system, so a Dual-valued arg *under `frule`*
+    # means "differentiate a hand rule once" (the base case — the rule is an ordinary method taking
+    # Duals), not "differentiate the derivative". That guard is what lets the recursion peel down to
+    # `frule` and hand off to `primal_of_impl`.
+    higher_order = n >= 1 && _dual_primal_type(dualparams[1]) !== typeof(frule) &&
+                   any(i -> _dual_primal_type(dualparams[i]) <: Dual, 1:n)
+
+    if higher_order
+        # Peel exactly one Dual level off every arg uniformly (the function like any other value):
+        # `Dual{Dual{f,NoTangent},…}` → `Dual{f,NoTangent}`, `Dual{Dual{F,F},Dual{F,F}}` → `Dual{F,F}`.
+        # That yields the order-(k-1) carrier signature.
+        inner_dualparams = Any[_dual_primal_type(P) for P in dualparams]
+        inner_tt = Tuple{typeof(dualized_impl), inner_dualparams...}
+        m, _ = CC.findsup(inner_tt, CC.method_table(interp))
+        m === nothing && return nothing
+        inner_mi = specialize_method(m.method, m.spec_types, m.sparams)::MethodInstance
+        pir = optimized_dual_ir(interp, inner_mi)
+        pir === nothing && return nothing
+        return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=true)
+    end
+
     info = primal_of_impl(interp, impl_mi)
     info === nothing && return nothing
-    primal_mi, n = info
+    primal_mi, _ = info
     world = CC.get_inference_world(interp)
     # Optimized primal IR via the internal `typeinf_ircode`. A NativeInterpreter is used so that
     # `sin`/`cos` and other hand-ruled functions survive as `:invoke`s (routed through `frule`).
     pir, _ = CC.typeinf_ircode(CC.NativeInterpreter(world), primal_mi, nothing)
     pir === nothing && return nothing
-    return dualize_to_ircode(interp, impl_mi, pir, n)
+    return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=false)
 end
 
-# Resolve and compile the `frule(Dual{typeof(f),NoFData}, dualargs...)` rule for a surviving
+# The optimized dual `IRCode` for a `dualized_impl` carrier: exactly what the `optimize` seam
+# installs (and what `code_dual_ircode` returns) — `build_dual_ir` followed by the IPO-safe passes.
+# Used both by the higher-order recursion above (to obtain the order-(k-1) dual IR as a primal) and
+# by the reflection entry point.
+function optimized_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance)
+    ir = build_dual_ir(interp, impl_mi)
+    ir === nothing && return nothing
+    world = CC.get_inference_world(interp)
+    opt = CC.OptimizationState(impl_mi, CC.retrieve_code_info(impl_mi, world), interp)
+    return run_ipo_passes!(ir, opt)
+end
+
+# Resolve and compile the `frule(Dual{typeof(f),NoTangent}, dualargs...)` rule for a surviving
 # high-level call to an *invoke-able `CodeInstance`*, so the dualized IR can emit a static
 # `:invoke` (mirroring how the primal IR keeps `sin`/`cos` as `:invoke`s to a `CodeInstance`).
 # `:invoke` targets *must* be `CodeInstance`s: `collectinvokes!` only JITs those, so a bare
 # `MethodInstance` would fall back to a boxed dynamic call. Returns `nothing` if unresolved.
 function frule_codeinstance(interp::ADInterpreter, @nospecialize(ftype), dual_argtypes)
-    frule_tt = Tuple{typeof(frule), Dual{ftype,NoFData}, dual_argtypes...}
+    frule_tt = Tuple{typeof(frule), Dual{ftype,NoTangent}, dual_argtypes...}
     fm, _ = CC.findsup(frule_tt, CC.method_table(interp))
     fm === nothing && return nothing
     isa(fm.method, Method) || return nothing
@@ -93,9 +143,13 @@ end
 # therefore a fully typed `IRCode` that installs as the optimization result and whose return type
 # `finishinfer!` reads off via `compute_ir_rettype` — no re-inference. Branches and loops
 # (`GotoNode`/`GotoIfNot`/`PhiNode`) are supported: block topology is preserved 1:1 from the primal,
-# so only within-block instruction counts change. Returns `nothing` to bail on exception handling
-# (`EnterNode`/`PhiCNode`/`UpsilonNode`) or other unsupported constructs (the caller then bails
-# gracefully).
+# so only within-block instruction counts change. Throwing error paths are supported too: a block
+# terminating in an unreachable `ReturnNode` (a domain/bounds check's throw target) is reconstructed
+# primal-only (the derivative reproduces the same throw) — see `unreachable_block` below. Exception
+# *handling* (`try`/`catch`) is supported as well: `UpsilonNode`/`PhiCNode` are duplicated into
+# primal + shadow copies and `EnterNode`/`:leave`/`:pop_exception` carry over as control markers.
+# Returns `nothing` to bail on still-unsupported constructs — e.g. a `Core.Builtin` with no rule
+# (array/memoryref indexing) or a vararg call — and the caller then bails gracefully.
 # ===========================================================================
 
 const _Intr = Core.Intrinsics
@@ -106,16 +160,13 @@ _calleeval(@nospecialize(x)) =
 
 # Build the dualized IRCode for `impl_mi` (a `dualized_impl` specialization) from the primal's
 # optimized IRCode `pir`. `n` = number of dual arguments (= primal args incl. #self#).
+# `pir_is_vararg` selects the argument-unpacking prologue: `false` for an ordinary primal (scalar
+# positional args, first-order/base case), `true` when `pir` is itself an order-(k-1) dual IR (a
+# vararg `dualized_impl` taking one tuple of Duals — the higher-order case; see the prologue below).
 # Returns `ir::IRCode` or `nothing`.
-function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
+function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_vararg::Bool=false)
     pstmts = pir.stmts
     N = length(pstmts)
-    for i in 1:N                                    # exception handling not yet supported
-        s = pstmts[i][:stmt]
-        if isa(s, Core.PhiCNode) || isa(s, Core.UpsilonNode) || isa(s, Core.EnterNode)
-            return nothing
-        end
-    end
     # Defensive: a leading PhiNode in block 1 (predecessor-free) would collide with the
     # unconditional arg-extraction prologue below, which must land before any real phi. Not
     # observed in practice (slot2ssa! always keeps block 1 phi-free), but bail rather than emit
@@ -126,10 +177,19 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
     # to a non-Core/Base module: `Core.Compiler.verify_ir` rejects a bare `GlobalRef` used directly
     # as a value unless its binding is proven constant across the IR's valid worlds, which these
     # ADNext-module bindings aren't considered to be even though they never change identity.
-    zerog  = struct_zero
+    # Embed the actual functions as literals (see comment above re: value-position GlobalRefs).
+    zerotang_g   = zero_tangent       # runtime zero-tangent fallback for non-diff results
+    buildtang_g  = build_tangent      # construct a struct's `Tangent`/`MutableTangent` shadow
+    gettfield_g  = get_tangent_field  # read a field's tangent out of a `Tangent`/`MutableTangent`
     fruleg = frule
     getf   = GlobalRef(Core, :getfield)
     intrg(name) = GlobalRef(Core.Intrinsics, name)
+
+    # Tangent type of a primal type — drives every shadow SSA's declared type. For scalars
+    # (`Float64`, `Float32`, `Complex`, …) `tt(T) == T`, so scalar shadows are unchanged from the
+    # old same-typed scheme; for general structs it is a `Tangent`/`MutableTangent`, for tuples a
+    # per-field tangent tuple, and for a `Dual` carrier the `Dual` itself (see `dual.jl`).
+    tt(@nospecialize T) = tangent_type(T)
 
     code = Any[]; types = Any[]
     emit!(ex, @nospecialize(ty)) = (push!(code, ex); push!(types, ty); Core.SSAValue(length(code)))
@@ -138,26 +198,58 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
     # allocation) rather than a dynamic `Dual(...)` call the inliner couldn't reach in synthetic IR.
     dual!(@nospecialize(P), @nospecialize(T), @nospecialize(p), @nospecialize(t)) =
         emit!(Expr(:new, Dual{P,T}, p, t), Dual{P,T})
-    # The tangent of a compile-time-constant primal is itself a constant: compute it now and embed
-    # it as a literal, so no `struct_zero` call survives into the IR. `struct_zero` already handles
-    # arbitrary structs (recursing per field) and singletons (-> `NoFData()`), so this covers
-    # composite constants too (needed so a constant struct arm of a `PhiNode` gets a same-shaped
-    # zero tangent rather than a type-inconsistent `NoFData()`).
-    const_tangent(@nospecialize x) = struct_zero(isa(x, QuoteNode) ? x.value : x)
-    # The zero tangent for a value of concrete Number type is a literal; otherwise fall back.
-    zero_of_type(@nospecialize T) = (T isa DataType && isconcretetype(T) && T <: Number) ?
-                                    (zero(T)::T) : nothing
+    # The tangent of a compile-time-constant primal is its zero tangent, computed now and embedded
+    # as a literal so no call survives into the IR. `zero_tangent` handles singletons (-> the zero
+    # tangent, e.g. `NoTangent()` for a function/`Int`), scalars (`0.0`), `Dual` carriers (a
+    # same-typed zero), and composite constants (a `Tangent`/tuple of zeros).
+    const_tangent(@nospecialize x) = zero_tangent(isa(x, QuoteNode) ? x.value : x)
+    # Zero tangent for a *computed* primal value of type `Ti` (the tangent of a non-differentiable
+    # operation's result). `NoTangent()` when the tangent type is trivial (`Int`, `Bool`, …), a
+    # literal `zero(Ti)` for a concrete `Number`, otherwise a runtime `zero_tangent` on the primal.
+    function zero_shadow(@nospecialize(Ti), @nospecialize(primal_ssa))
+        T = tt(Ti)
+        T === NoTangent && return NoTangent()
+        (Ti isa DataType && isconcretetype(Ti) && Ti <: Number) && return zero(Ti)::Ti
+        return emit!(Expr(:call, zerotang_g, primal_ssa), T)
+    end
 
     dualparams = impl_mi.specTypes.parameters[2:end]     # the Dual{…} argument types
     vararg_tt = Tuple{dualparams...}                     # dualargs is one vararg tuple (Argument 2)
 
     primal = Vector{Any}(undef, N); shadow = Vector{Any}(undef, N)
-    parg   = Vector{Any}(undef, n); targ   = Vector{Any}(undef, n)
-    for i in 1:n
-        Di = dualparams[i]
-        di = emit!(Expr(:call, getf, Core.Argument(2), i), Di)
-        parg[i] = emit!(Expr(:call, getf, di, 1), primal_type(Di))
-        targ[i] = emit!(Expr(:call, getf, di, 2), tangent_type(Di))
+    if !pir_is_vararg
+        # Base case: `pir` has scalar positional args (`Argument(k)` is the k-th primal arg). Unpack
+        # each incoming `Dual` into its primal/tangent, indexed by argument position so `presolve`/
+        # `tresolve` can treat `Argument`s uniformly with `SSAValue`s.
+        parg = Vector{Any}(undef, n); targ = Vector{Any}(undef, n)
+        for i in 1:n
+            Di = dualparams[i]
+            di = emit!(Expr(:call, getf, Core.Argument(2), i), Di)
+            parg[i] = emit!(Expr(:call, getf, di, 1), _dual_primal_type(Di))
+            targ[i] = emit!(Expr(:call, getf, di, 2), _dual_tangent_type(Di))
+        end
+    else
+        # Higher-order case: `pir` is a vararg `dualized_impl` whose only real argument is
+        # `Argument(2)`, the tuple of order-(k-1) dual args (accessed as `getfield(Argument(2), i)`).
+        # Every arg is nested uniformly (the function included), so each `Di` has `primal_type(Di) <:
+        # Dual`. Peel one level off each: reconstruct a primal tuple (each element the order-(k-1) dual
+        # value) and a tangent tuple (its new, k-th tangent direction), so the existing getfield branch
+        # resolves `getfield(Argument(2), i)` with no changes. `pir` has exactly two arguments (#self#
+        # and the tuple), so `parg`/`targ` are length 2 regardless of `n`.
+        pelts = Vector{Any}(undef, n); telts = Vector{Any}(undef, n)
+        ptys  = Vector{Any}(undef, n); ttys  = Vector{Any}(undef, n)
+        for i in 1:n
+            Di = dualparams[i]
+            _dual_primal_type(Di) <: Dual || return nothing  # non-uniformly-nested seed at order ≥2 → bail
+            di = emit!(Expr(:call, getf, Core.Argument(2), i), Di)
+            pelts[i] = emit!(Expr(:call, getf, di, 1), _dual_primal_type(Di));  ptys[i] = _dual_primal_type(Di)
+            telts[i] = emit!(Expr(:call, getf, di, 2), _dual_tangent_type(Di)); ttys[i] = _dual_tangent_type(Di)
+        end
+        ctuple = GlobalRef(Core, :tuple)
+        ptuple = emit!(Expr(:call, ctuple, pelts...), Tuple{ptys...})
+        ttuple = emit!(Expr(:call, ctuple, telts...), Tuple{ttys...})
+        @assert Tuple{ptys...} === pir.argtypes[2]     # reconstructed tuple == pir's own arg type
+        parg = Any[dualized_impl, ptuple]; targ = Any[NoTangent(), ttuple]
     end
 
     presolve(@nospecialize x) =
@@ -168,7 +260,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
         const_tangent(x)                                 # constant tangent (literal)
 
     function frule_split!(fpos, actual, R)
-        # Dual(callee, NoFData()) and each Dual(arg_primal, arg_tangent), constructed via %new.
+        # Dual(callee, NoTangent()) and each Dual(arg_primal, arg_tangent), constructed via %new.
         # Embed the *resolved* callee value (e.g. the `sin` function object) rather than the raw
         # callee-position AST node: a bare `GlobalRef` outside Core/Base used directly as a value
         # is rejected by `Core.Compiler.verify_ir` unless its binding is proven constant across the
@@ -177,15 +269,18 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
         fval = _calleeval(fpos)
         fcallee = fval === nothing ? fpos : fval
         ftype = fval === nothing ? _valtype(fpos) : typeof(fval)
-        fd = dual!(ftype, NoFData, fcallee, NoFData())
-        dualtys = Any[Dual{_optype(pir,a),_optype(pir,a)} for a in actual]
-        duals = Any[dual!(_optype(pir,a), _optype(pir,a), presolve(a), tresolve(a)) for a in actual]
+        fd = dual!(ftype, NoTangent, fcallee, NoTangent())
+        # Each argument dual is `Dual{P, tangent_type(P)}` (the Mooncake invariant). For scalar
+        # primals `tangent_type(P) == P`, so this matches the old `Dual{P,P}`.
+        dualtys = Any[Dual{_optype(pir,a),tt(_optype(pir,a))} for a in actual]
+        duals = Any[dual!(_optype(pir,a), tt(_optype(pir,a)), presolve(a), tresolve(a)) for a in actual]
         # Emit the surviving high-level rule as a static `:invoke` to a compiled `CodeInstance`
         # when we can resolve one (direct, unboxed call); otherwise a plain non-inlined `:call`.
         ci = frule_codeinstance(interp, ftype, dualtys)
-        dd = ci === nothing ? emit!(Expr(:call, fruleg, fd, duals...), Dual{R,R}) :
-                              emit!(Expr(:invoke, ci, fruleg, fd, duals...), Dual{R,R})
-        return emit!(Expr(:call, getf, dd, 1), R), emit!(Expr(:call, getf, dd, 2), R)
+        DR = Dual{R,tt(R)}
+        dd = ci === nothing ? emit!(Expr(:call, fruleg, fd, duals...), DR) :
+                              emit!(Expr(:invoke, ci, fruleg, fd, duals...), DR)
+        return emit!(Expr(:call, getf, dd, 1), R), emit!(Expr(:call, getf, dd, 2), tt(R))
     end
 
     # Block topology (block count, order, preds/succs) is preserved 1:1 from the primal: this
@@ -197,6 +292,18 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
     block_start_new = Vector{Int}(undef, nblocks)
     block_start_new[1] = 1                          # includes the arg-extraction prologue above
     bidx = 1
+
+    # A block that terminates in an *unreachable* `ReturnNode` (one with no `val`) is an error/throw
+    # block: `GotoIfNot -> error block -> unreachable`. Every statement in it only ever leads to a
+    # `throw` and never contributes to a returned value (nor reaches a live `PhiNode` — dominance
+    # guarantees this), so such statements are reconstructed *primal-only* below (see the main loop):
+    # the primal computation is rebuilt faithfully so the derivative raises the same error on the
+    # same inputs, but no shadow/tangent is computed for it.
+    unreachable_block = falses(nblocks)
+    for b in 1:nblocks
+        term = pstmts[pir.cfg.blocks[b].stmts.stop][:stmt]
+        unreachable_block[b] = isa(term, Core.ReturnNode) && !isdefined(term, :val)
+    end
 
     # Forward-reference patches for `PhiNode` operands not yet resolved when the phi is processed
     # (loop back-edges: the operand is defined later in the linear statement order). Keyed by the
@@ -217,20 +324,81 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
             block_start_new[bidx] = length(code) + 1
         end
         s = pstmts[i][:stmt]; Ti = pstmts[i][:type]
-        if isa(s, Core.ReturnNode)
-            isdefined(s, :val) || return nothing
-            p = presolve(s.val); t = tresolve(s.val)
-            R = _optype(pir, s.val)
-            res = dual!(R, R, p, t)
-            push!(code, Core.ReturnNode(res)); push!(types, Any)
+        if unreachable_block[bidx]
+            # Primal-only reconstruction (see `unreachable_block` above). `shadow[i] = primal[i]` is
+            # a never-consumed placeholder so `presolve`/`tresolve` on later error-path operands
+            # still resolve, without emitting a bogus tangent computation.
+            if isa(s, Core.ReturnNode)
+                push!(code, Core.ReturnNode()); push!(types, Union{})   # unreachable terminator
+            elseif isa(s, Expr) && s.head === :invoke
+                # Resolve the display-callee to its value: a bare non-Core/Base `GlobalRef` in the
+                # invoke's callee position is a value position `verify_ir` rejects (see frule_split!).
+                fv = _calleeval(s.args[2])
+                ex = Expr(:invoke, s.args[1], fv === nothing ? s.args[2] : fv,
+                          (presolve(a) for a in s.args[3:end])...)
+                primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
+            elseif isa(s, Expr) && s.head === :call
+                # Resolve the callee to its value too: `userefs` checks the callee operand, and a
+                # bare non-Core/Base `GlobalRef` (e.g. `throw`) fails the const-binding check when
+                # re-embedded in this synthetic IR's world range.
+                fv = _calleeval(s.args[1])
+                ex = Expr(:call, fv === nothing ? s.args[1] : fv,
+                          (presolve(a) for a in s.args[2:end])...)
+                primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
+            elseif isa(s, Expr) && s.head === :new
+                ex = Expr(:new, s.args[1], (presolve(a) for a in s.args[2:end])...)
+                primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
+            elseif isa(s, Core.PiNode)
+                primal[i] = presolve(s.val); shadow[i] = primal[i]
+            elseif isa(s, GlobalRef) || !isa(s, Expr)
+                primal[i] = presolve(s); shadow[i] = primal[i]
+            else
+                return nothing                                          # unexpected in an error block
+            end
+        elseif isa(s, Core.ReturnNode)
+            if !isdefined(s, :val)
+                push!(code, Core.ReturnNode()); push!(types, Union{})   # unreachable terminator
+            else
+                p = presolve(s.val); t = tresolve(s.val)
+                R = _optype(pir, s.val)
+                res = dual!(R, tt(R), p, t)
+                push!(code, Core.ReturnNode(res)); push!(types, Any)
+            end
         elseif isa(s, Core.PiNode)
             primal[i] = presolve(s.val); shadow[i] = tresolve(s.val)
         elseif isa(s, Expr) && s.head === :new
             T = s.args[1]
-            pf = Any[presolve(a) for a in @view s.args[2:end]]
-            tf = Any[tresolve(a) for a in @view s.args[2:end]]
+            args = @view s.args[2:end]
+            pf = Any[presolve(a) for a in args]
             primal[i] = emit!(Expr(:new, T, pf...), Ti)
-            shadow[i] = emit!(Expr(:new, T, tf...), Ti)
+            TT = tt(Ti)
+            if T <: Dual
+                # `Dual` is its own tangent type, so its shadow is a same-typed `Dual` built via
+                # `%new`. Each field is its `tresolve`d tangent, except a *non-differentiable
+                # singleton* field (a function/constant, whose tangent is `NoTangent` and can't fill
+                # e.g. a `typeof(sin)` slot) which carries the primal value through unchanged. This is
+                # what lets a `Dual{typeof(sin),NoTangent}` be re-dualized at higher order.
+                tf = Any[_nondiff_singleton(fieldtype(T, j)) ? presolve(args[j]) : tresolve(args[j])
+                         for j in eachindex(args)]
+                shadow[i] = emit!(Expr(:new, T, tf...), Ti)
+            elseif TT === NoTangent
+                # Whole aggregate is non-differentiable (e.g. `Tuple{Int,Int}`, a fieldless struct).
+                shadow[i] = NoTangent()
+            elseif T <: Tuple || T <: NamedTuple
+                # Tuple/NamedTuple tangents are same-shape but tangent-typed: a non-differentiable
+                # slot holds `NoTangent()`, differentiable slots hold their tangent. Built via `%new`
+                # of the (tangent-typed) aggregate.
+                tf = Any[tt(fieldtype(T, j)) === NoTangent ? NoTangent() : tresolve(args[j])
+                         for j in eachindex(args)]
+                shadow[i] = emit!(Expr(:new, TT, tf...), TT)
+            else
+                # General (im)mutable user struct → `Tangent`/`MutableTangent` via `build_tangent`,
+                # which wraps possibly-undef fields in `PossiblyUninitTangent` and fills the backing
+                # `NamedTuple`. `tresolve`d field tangents already carry `NoTangent()` for non-diff
+                # fields, which `build_tangent` places in the corresponding `NoTangent` slot.
+                tf = Any[tresolve(args[j]) for j in eachindex(args)]
+                shadow[i] = emit!(Expr(:call, buildtang_g, T, tf...), TT)
+            end
         elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
             fpos = s.head === :invoke ? s.args[2] : s.args[1]
             actual = s.head === :invoke ? s.args[3:end] : s.args[2:end]
@@ -259,16 +427,25 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
                     shadow[i] = opf(:div_float, Ti, num, opf(:mul_float, Ti, pb, pb))
                 else
                     # non-differentiable intrinsic (int arithmetic, comparisons, conversions):
-                    # primal computed, tangent is the structural zero of the primal result. When the
-                    # result type is a concrete Number the zero is a literal; else fall back to a
-                    # runtime `struct_zero` of the computed primal.
+                    # primal computed, tangent is the zero tangent of the primal result (see
+                    # `zero_shadow`: `NoTangent()` for `Int`/`Bool`, a literal `zero` for a concrete
+                    # Number, else a runtime `zero_tangent`).
                     primal[i] = opf(nm, Ti, (presolve(a) for a in actual)...)
-                    z = zero_of_type(Ti)
-                    shadow[i] = z === nothing ? emit!(Expr(:call, zerog, primal[i]), _zerotype_of(Ti)) : z
+                    shadow[i] = zero_shadow(Ti, primal[i])
                 end
             elseif f === Core.getfield
+                Pobj = _optype(pir, actual[1])
                 primal[i] = emit!(Expr(:call, getf, presolve(actual[1]), actual[2]), Ti)
-                shadow[i] = emit!(Expr(:call, getf, tresolve(actual[1]), actual[2]), Ti)
+                TT = tt(Ti)
+                if TT === NoTangent
+                    shadow[i] = NoTangent()
+                elseif Pobj <: Dual || Pobj <: Tuple || Pobj <: NamedTuple
+                    # Same-shape tangents: index/name the shadow aggregate directly.
+                    shadow[i] = emit!(Expr(:call, getf, tresolve(actual[1]), actual[2]), TT)
+                else
+                    # General struct: read the field's tangent out of the `Tangent`/`MutableTangent`.
+                    shadow[i] = emit!(Expr(:call, gettfield_g, tresolve(actual[1]), actual[2]), TT)
+                end
             elseif isa(f, Core.Builtin)
                 return nothing                              # other builtins: bail
             else
@@ -292,7 +469,58 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int)
                 end
             end
             primal[i] = emit!(Core.PhiNode(s.edges, pvals), Ti)
-            shadow[i] = emit!(Core.PhiNode(s.edges, tvals), Ti)
+            shadow[i] = emit!(Core.PhiNode(s.edges, tvals), tt(Ti))
+        elseif isa(s, Core.UpsilonNode)
+            # try/catch: a value live into a handler is captured by an `UpsilonNode` (at a def or
+            # right before the `:enter`) and collected by a `PhiCNode` at the handler top. Duplicate
+            # into a primal + shadow upsilon, exactly like a `PhiNode`. An unassigned `ϒ ()` slot
+            # (a live-but-undefined capture) is mirrored as an empty upsilon in both copies.
+            if isdefined(s, :val)
+                primal[i] = emit!(Core.UpsilonNode(presolve(s.val)), Ti)
+                shadow[i] = emit!(Core.UpsilonNode(tresolve(s.val)), tt(Ti))
+            else
+                primal[i] = emit!(Core.UpsilonNode(), Ti)
+                shadow[i] = emit!(Core.UpsilonNode(), tt(Ti))
+            end
+        elseif isa(s, Core.PhiCNode)
+            # Collects `UpsilonNode`s at a handler entry. Its operands are `SSAValue`s that must
+            # reference upsilons (`verify_ir`), so the primal-phic references the primal upsilons and
+            # the shadow-phic the shadow ones — reusing `primal[v.id]`/`shadow[v.id]`. The same
+            # `pending` forward-ref mechanism as `PhiNode` covers a capture defined later in linear
+            # order (a try/catch inside a loop).
+            k = length(s.values)
+            pvals = Vector{Any}(undef, k); tvals = Vector{Any}(undef, k)
+            for j in 1:k
+                isassigned(s.values, j) || continue
+                v = s.values[j]
+                if isa(v, Core.SSAValue) && !isassigned(primal, v.id)
+                    push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (pvals, j, true))
+                    push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (tvals, j, false))
+                else
+                    pvals[j] = presolve(v); tvals[j] = tresolve(v)
+                end
+            end
+            primal[i] = emit!(Core.PhiCNode(pvals), Ti)
+            shadow[i] = emit!(Core.PhiCNode(tvals), tt(Ti))
+        elseif isa(s, Core.EnterNode)
+            # Control marker beginning a protected region. `catch_dest` is a basic-block number
+            # (topology preserved 1:1) so it carries over unchanged; the token it defines is
+            # referenced by `:leave`/`:pop_exception` via its primal SSA. It terminates its block, so
+            # its type must be `Any` (verify_ir). `scope`, if present, is an ordinary value operand.
+            ent = isdefined(s, :scope) ?
+                    Core.EnterNode(s.catch_dest, presolve(s.scope)) : Core.EnterNode(s.catch_dest)
+            primal[i] = emit!(ent, Any); shadow[i] = primal[i]
+        elseif isa(s, Expr) && s.head === :leave
+            # Pops one or more `:enter` scopes, referencing the `EnterNode`(s) by `SSAValue` (or
+            # `nothing`); `presolve` remaps each to the enter's primal SSA. Pure control, no value.
+            push!(code, Expr(:leave, Any[presolve(a) for a in s.args]...)); push!(types, Any)
+        elseif isa(s, Expr) && s.head === :pop_exception
+            primal[i] = emit!(Expr(:pop_exception, presolve(s.args[1])), Ti); shadow[i] = primal[i]
+        elseif isa(s, Expr) && s.head === :the_exception
+            # The caught exception object has no meaningful tangent (non-differentiable): keep the
+            # primal, give it a zero tangent like other non-diff results.
+            primal[i] = emit!(Expr(:the_exception), Ti)
+            shadow[i] = zero_shadow(Ti, primal[i])
         elseif isa(s, GlobalRef) || !isa(s, Expr)
             primal[i] = presolve(s); shadow[i] = tresolve(s)
         else
@@ -339,7 +567,11 @@ end
 _valtype(@nospecialize x) = isa(x, GlobalRef) && isdefined(x.mod, x.name) ? typeof(getglobal(x.mod, x.name)) : Any
 _optype(pir, @nospecialize x) = isa(x, Core.SSAValue) ? pir.stmts[x.id][:type] :
                                 isa(x, Core.Argument) ? pir.argtypes[x.n] : typeof(x)
-_zerotype_of(@nospecialize T) = (T <: Number ? T : NoFData)
+# A field is a "non-differentiable singleton" (a function/constant, tangent = `NoTangent`) when it is
+# a non-`NoTangent` singleton type. Such a field's shadow can't hold a `NoTangent` value (its slot
+# type would reject it), so the primal value is carried through instead. Differentiable structs are
+# not singletons, so they still take their structural tangent.
+_nondiff_singleton(@nospecialize T) = T isa DataType && Base.issingletontype(T) && T !== NoTangent
 
 
 function frule_body(world::UInt, source, self, dual_argtypes)

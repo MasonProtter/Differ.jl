@@ -5,38 +5,54 @@
 # `IRCode` (`build_dual_ir`) followed by the IPO-safe passes (`run_ipo_passes!`). It does not go
 # through `typeinf_ircode`, which would recompute from the throwing stub and bypass the seam.
 
+# Nest a value's dual seed `order` levels deep, per the Mooncake tangent system: the leaf tangent
+# is `tangent_type(T)`, so order 1 → `Dual{T,tangent_type(T)}` (first derivative). Because a `Dual`
+# is its own tangent type (`tangent_type(Dual{P,T}) == Dual{P,T}`, see `dual.jl`), the recursive
+# step `Dual{S,tangent_type(S)}` collapses to `Dual{S,S}`, so order 2 → `Dual{Dual{T,U},Dual{T,U}}`
+# etc. — matching ADNext's Option-A higher-order nesting.
+#
+# This is uniform for the function and every value argument (the function nests like any other value
+# — see the peel in `build_dual_ir`). A plain function `f` has `tangent_type(typeof(f)) == NoTangent`
+# (so `Dual{typeof(f),NoTangent}`); a closure has a `Tangent{…}` tangent over its captures, read in
+# the body via the struct `getfield`→`get_tangent_field` path.
+_nest_dual(@nospecialize(T), order::Int) =
+    order <= 1 ? Dual{T,tangent_type(T)} : (S = _nest_dual(T, order - 1); Dual{S,tangent_type(S)})
+
 """
-    code_dual_ircode(f, argtypes::Tuple; world=Base.get_world_counter()) -> Pair{IRCode,Any}
+    code_dual_ircode(f, argtypes::Tuple; order=1, world=Base.get_world_counter()) -> Pair{IRCode,Any}
 
 Return `ir => rettype`, the optimized dualized `IRCode` for differentiating `f` at arguments of
 types `argtypes` (each primal type `T` is seeded with a `Dual{T,T}`; the function itself with
-`Dual{typeof(f),NoFData}`). Errors if dualization bails (e.g. exception handling — not yet supported).
+`Dual{typeof(f),NoTangent}`). `order` requests a higher derivative by nesting *all* seeds uniformly
+to that depth — `order=2` seeds each `T` with `Dual{Dual{T,T},Dual{T,T}}` and the function with
+`Dual{Dual{typeof(f),NoTangent},Dual{typeof(f),NoTangent}}` — which is useful for running
+`Core.Compiler.verify_ir` on the higher-order IR without a live call. Errors if dualization bails
+(e.g. array indexing — not yet supported).
 
 # Examples
 ```julia
 ir, rt = code_dual_ircode(x -> sin(x) + 1, (Float64,))
 code_dual_ircode(*, (ComplexF64, ComplexF64))
+code_dual_ircode(x -> x*x, (Float64,); order=2)   # second-derivative IR
 ```
 See also [`@code_dual_ircode`](@ref).
 """
 function code_dual_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
-                          world::UInt = Base.get_world_counter())
+                          order::Int = 1, world::UInt = Base.get_world_counter())
     interp = ADInterpreter{Forward}(; world)
-    dualtys = Any[Dual{typeof(f), NoFData}]
+    dualtys = Any[_nest_dual(typeof(f), order)]
     for T in argtypes
         (T isa Type) || throw(ArgumentError("argtypes must be a tuple of types, got $(repr(T))"))
-        push!(dualtys, Dual{T, T})
+        push!(dualtys, _nest_dual(T, order))
     end
     impl_tt = Tuple{typeof(dualized_impl), dualtys...}
     match, _ = CC.findsup(impl_tt, CC.method_table(interp))
     match === nothing && error("no primal method for $f with argument types $argtypes")
     impl_mi = specialize_method(match.method, match.spec_types, match.sparams)::MethodInstance
 
-    ir = build_dual_ir(interp, impl_mi)
+    ir = optimized_dual_ir(interp, impl_mi)
     ir === nothing && error("ADNext could not dualize $f$argtypes on optimized IRCode " *
-                            "(unsupported construct, e.g. exception handling — not yet handled).")
-    opt = CC.OptimizationState(impl_mi, CC.retrieve_code_info(impl_mi, world), interp)
-    ir = run_ipo_passes!(ir, opt)
+                            "(unsupported construct, e.g. array indexing — not yet handled).")
     return ir => CC.compute_ir_rettype(ir)
 end
 

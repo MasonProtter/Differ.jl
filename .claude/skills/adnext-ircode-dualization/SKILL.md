@@ -14,8 +14,8 @@ transform exists and jumps straight into *how* it works.
 
 For every primal SSA statement `i`, the engine computes **two** new values: `primal[i]` (the
 reconstructed primal computation) and `shadow[i]` (the parallel tangent computation). At a
-`ReturnNode`, the two are packed into one `Dual{R,R}` via `%new` (never a dynamic `Dual(...)`
-call — that's for allocation-free-compile reasons the test suite guards directly).
+`ReturnNode`, the two are packed into one `Dual{R, tangent_type(R)}` via `%new` (never a dynamic
+`Dual(...)` call — that's for allocation-free-compile reasons the test suite guards directly).
 
 Two small resolver closures do all the SSA-reference translation:
 - `presolve(x)` — the *new* primal value corresponding to an *old* operand `x` (an `SSAValue`
@@ -27,29 +27,33 @@ Two small resolver closures do all the SSA-reference translation:
 Function arguments are unpacked once up front into `parg`/`targ` (via `getfield` on the incoming
 `Dual`s), so `presolve`/`tresolve` can treat `Argument`s uniformly with `SSAValue`s.
 
-**Types are read directly off the primal IR, never guessed.** Every shadow statement shares its
-primal statement's declared type `Ti` (`pstmts[i][:type]`); `_optype`/`_valtype` pull types off
-SSA values/arguments/globals the same way. This is why the result is a fully-typed `IRCode` whose
-return type `finishinfer!` can read straight off via `compute_ir_rettype` — there's no
-re-inference step to get wrong.
+**Types are read directly off the primal IR, never guessed.** The primal statement keeps its
+declared type `Ti` (`pstmts[i][:type]`); the **shadow statement is typed `tangent_type(Ti)`** (the
+local helper `tt(T) = tangent_type(T)`). For scalars this is a no-op (`tangent_type(Float64) ==
+Float64`), so scalar shadows look exactly as they did under the old same-typed scheme; for a struct
+it's a `Tangent`/`MutableTangent`, for a tuple a per-field tangent tuple, and for a `Dual` carrier
+(higher order) the `Dual` itself. `_optype`/`_valtype` pull primal types off SSA values/arguments/
+globals the same way. The result is a fully-typed `IRCode` whose return type `finishinfer!` reads
+straight off via `compute_ir_rettype` — no re-inference step to get wrong.
 
 ## Per-construct handling (the big `if`/`elseif` chain)
 
 | Primal statement | What happens |
 |---|---|
-| `ReturnNode` | `dual!(R, R, presolve(val), tresolve(val))`, wrapped in a new `ReturnNode`. |
+| `ReturnNode` | `dual!(R, tangent_type(R), presolve(val), tresolve(val))`, wrapped in a new `ReturnNode`. |
 | `PiNode` | Pure alias: `primal[i] = presolve(val)`, no new instruction emitted. |
-| `Expr(:new, T, args...)` | Two `%new`s — one with presolved args, one with tresolved args. |
+| `Expr(:new, T, args...)` | Primal is a `%new(T, presolved…)`. Shadow **dispatches on `T`**: `T<:Dual` → same-typed `%new(T, …)` (a `Dual` is its own tangent; non-diff *singleton* fields carry the primal value); `T<:Tuple`/`NamedTuple` → `%new(tangent_type(T), …)` with `NoTangent()` in non-diff slots; a general struct → `build_tangent(T, tresolved…)` yielding a `Tangent`/`MutableTangent`. (If `tangent_type(T)==NoTangent`, the shadow is just `NoTangent()`.) |
 | intrinsic call (`add_float`/`sub_float`/`neg_float`/`mul_float`/`div_float`, `_fast` variants) | Hand-coded differentiation rule per intrinsic (product/quotient rule for `mul`/`div`). |
-| any other intrinsic (int arithmetic, comparisons, conversions) | Primal computed normally; tangent is the *structural zero* of the result — a literal `zero(T)` when `T` is a concrete `Number`, else a runtime `struct_zero` call. |
-| `Core.getfield` | `getfield` on both the primal and the shadow struct. |
-| any other `Core.Builtin` | **bail** (`return nothing`) — not yet supported. |
-| surviving `:call`/`:invoke` (e.g. `sin`, `cos`, or any composite function with no intrinsic-level path) | `frule_split!`: wrap the callee and each arg in a fresh `Dual` via `%new`, then emit a static `:invoke` to a *compiled `CodeInstance`* (via `frule_codeinstance`) when resolvable, else a dynamic `:call` to `frule`. |
+| any other intrinsic (int arithmetic, comparisons, conversions) | Primal computed normally; tangent is the *zero tangent* of the result via `zero_shadow(Ti, primal[i])` — `NoTangent()` when `tangent_type(Ti)==NoTangent` (e.g. `Int`/`Bool`), a literal `zero(Ti)` for a concrete `Number`, else a runtime `zero_tangent` on the primal. |
+| `Core.getfield` | Primal is `getfield`. Shadow dispatches on the object's primal type: `Dual`/`Tuple`/`NamedTuple` → `getfield` on the (same-shape) shadow; a general struct → `get_tangent_field` on the `Tangent`/`MutableTangent`. (`NoTangent()` if the field's `tangent_type` is `NoTangent`.) |
+| any other `Core.Builtin` | **bail** (`return nothing`) — e.g. array/`memoryref` indexing. |
+| surviving `:call`/`:invoke` (e.g. `sin`, `cos`, or any composite function with no intrinsic-level path) | `frule_split!`: wrap the callee (`Dual{ftype,NoTangent}`) and each arg (`Dual{P,tangent_type(P)}`) in a fresh `Dual` via `%new`, then emit a static `:invoke` to a *compiled `CodeInstance`* (via `frule_codeinstance`) when resolvable, else a dynamic `:call` to `frule`. Result is `Dual{R,tangent_type(R)}`. |
 | `GotoNode` / `GotoIfNot` | Passed through basically unchanged — see "Control flow" below. |
-| `PhiNode` | Duplicated into a primal-phi and a shadow-phi — see "Control flow" below. |
+| `PhiNode` | Duplicated into a primal-phi (typed `Ti`) and a shadow-phi (typed `tangent_type(Ti)`) — see "Control flow" below. |
+| `UpsilonNode` / `PhiCNode` (try/catch value capture) | Duplicated into primal + shadow copies, exactly like `PhiNode` (shadow typed `tangent_type(Ti)`), reusing the same `pending` forward-ref mechanism. |
+| `EnterNode` / `Expr(:leave` / `:pop_exception` / `:the_exception)` | Control markers: carried through unchanged (block-numbered `catch_dest`, `SSAValue` refs remapped); `:the_exception`'s shadow is a zero tangent. |
 | `GlobalRef` / any other non-`Expr` | Alias via `presolve`/`tresolve`, no new instruction. |
 | anything else | **bail**. |
-| `PhiCNode` / `UpsilonNode` / `EnterNode` (checked in a pre-scan before any of the above) | **bail** — exception handling isn't supported yet. |
 
 ## Control flow: preserve block topology 1:1
 
@@ -97,8 +101,10 @@ Three real bugs surfaced this way, none of them exotic — expect to hit variati
    partitioned GlobalRef not allowed in value position`, unless its module is `Core`/`Base` or its
    binding is proven constant across the IR's valid worlds. `GlobalRef(ADNext, :frule)` and a
    primal callee like `GlobalRef(Main, :sin)` both trip this. Fix: resolve to the actual (stable,
-   singleton) value first — `_calleeval(fpos)` for a primal callee, or just reference `struct_zero`
-   and `frule` directly as Julia values — and embed *that*, not the `GlobalRef`.
+   singleton) value first — `_calleeval(fpos)` for a primal callee, or reference the helper
+   functions directly as Julia values (the engine binds `fruleg = frule`, `zerotang_g =
+   zero_tangent`, `buildtang_g = build_tangent`, `gettfield_g = get_tangent_field` for exactly this
+   reason) — and embed *that*, not the `GlobalRef`.
 3. **Empty blocks corrupt the following block's range.** A block whose every original statement is
    a pure alias (`PiNode`, or a bare `nothing` placeholder statement — Julia leaves these between
    adjacent loops, e.g. in `sumk2`'s primal IR) emits zero new instructions. Left unhandled, this

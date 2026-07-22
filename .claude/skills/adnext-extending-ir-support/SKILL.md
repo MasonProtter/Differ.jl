@@ -1,6 +1,6 @@
 ---
 name: adnext-extending-ir-support
-description: Playbook for extending ADNext's dualization engine to support a new Julia IR construct — the methodology used to add control flow (branches/loops), and what's already known about the next milestone, exception handling (try/catch via EnterNode/PhiCNode/UpsilonNode). Use this when asked to make ADNext handle more Julia language features, when dualize_to_ircode bails on something new, or when planning/starting the try/catch follow-up work.
+description: Playbook for extending ADNext's dualization engine to support a new Julia IR construct — the methodology used to add control flow (branches/loops) and exception handling (try/catch), and what's known about the next gap, array / memoryref indexing. Use this when asked to make ADNext handle more Julia language features, when dualize_to_ircode bails on something new, or when planning array-indexing support.
 ---
 
 # Extending ADNext's dualization engine to a new IR construct
@@ -30,11 +30,14 @@ works; this skill is about the *process* of growing it further.
    forward references are legal and how dominance is checked for them. Design the transform to
    satisfy these checks from the start rather than discovering them by trial and error.
 
-3. **Narrow the bail list.** The pre-scan near the top of `dualize_to_ircode`
-   (`for i in 1:N ... if isa(s, ...) return nothing end end`) currently only bails on
-   `PhiCNode`/`UpsilonNode`/`EnterNode`. Remove exactly the construct(s) you're adding support for
-   — don't remove anything else, and don't broaden the removal further than the specific node
-   types you're prepared to handle in every branch below.
+3. **Narrow the bail list.** Bails are `return nothing` in the main `if`/`elseif` chain (which the
+   caller turns into a clear `ErrorException`). The live ones today are: any un-ruled `Core.Builtin`
+   (the `elseif isa(f, Core.Builtin)` arm — this is where array/`memoryref` indexing currently
+   lands), plus the `anything else` fallthrough. Add a dedicated branch for the construct you're
+   supporting *before* those catch-alls; don't broaden a catch-all to swallow more than the specific
+   node/builtin you're prepared to handle in every branch below. (Historical note: `PhiCNode`/
+   `UpsilonNode`/`EnterNode` used to be rejected by a pre-scan; that pre-scan is gone now that
+   try/catch is handled inline.)
 
 4. **Decide the duplication scheme.** Ask: does this construct carry a *value* that needs both a
    primal and a shadow copy (like `PhiNode` → primal-phi + shadow-phi), or is it a pure *control
@@ -64,7 +67,11 @@ works; this skill is about the *process* of growing it further.
    (b) a regression test that constructs still outside scope keep bailing with a clear
    `ErrorException` rather than silently miscompiling.
 
-## What's already known about exception handling (the current next milestone)
+## Exception handling (try/catch) — implemented; kept here as a worked reference
+
+`try`/`catch` is now **supported and tested** (it was the milestone this playbook was first written
+for). The IR-shape notes below are how it works today; they're a good concrete example of applying
+the methodology above. The *next* gap is array / `memoryref` indexing (see the final section).
 
 `try`/`catch`/`finally` lowers to `EnterNode` (marks the start of a protected region;
 `catch_dest` names the handler block, `0` meaning "no handler needed" once the optimizer proves
@@ -80,18 +87,29 @@ exactly the reason this is harder than branches/loops: a `PhiNode` operand's leg
 against *dominance from a specific predecessor edge*, but an exception can be thrown from *any*
 instruction inside the protected region — there's no single predecessor edge to hang a normal phi
 off of. Expect the "does this need a primal-copy + shadow-copy" question from step 4 above to
-apply to `UpsilonNode`/`PhiCNode` the same way it did to `PhiNode` (a shadow `UpsilonNode` at each
-capture point, feeding a shadow `PhiCNode` in the handler) — but verify this against real IR
-(step 1) before committing to it; this hasn't been implemented or tested yet, just researched.
+applies to `UpsilonNode`/`PhiCNode` the same way it did to `PhiNode`, and that's exactly how it was
+implemented: a shadow `UpsilonNode` at each capture point (typed `tangent_type(Ti)`), feeding a
+shadow `PhiCNode` in the handler, reusing the same `pending` forward-ref mechanism.
 
-The exception object itself (`Expr(:the_exception)`) has no meaningful tangent — treat it the same
-way non-differentiable intrinsic results are already treated elsewhere in the engine (`NoFData()`
-or a structural zero).
+The exception object itself (`Expr(:the_exception)`) has no meaningful tangent — its shadow is the
+zero tangent of its type (`zero_shadow`, i.e. `NoTangent()` / a literal `zero` / a runtime
+`zero_tangent`), the same treatment non-differentiable intrinsic results get.
 
 Also worth knowing: the optimizer already eliminates `try`/`catch` scopes it can prove unreachable
 (in `Compiler/src/optimize.jl`), so post-optimization IR handed to `dualize_to_ircode` may have
 simpler exception structure than the source suggests — don't assume every source-level `try` shows
 up as a live `EnterNode`.
+
+## The next gap: array / memoryref indexing
+
+`v[i]` (and mutating a container) currently **bails**: on Julia 1.13 it lowers to `memoryref` /
+`memoryrefget` / `memoryrefset!` builtins plus `Expr(:boundscheck)` on the live path, which hit the
+"un-ruled `Core.Builtin` → `return nothing`" arm. The tangent *type* system already covers arrays
+(`tangent_type(Array{Float64}) == Array{Float64}`, and `array_tangents.jl` has the value ops), so
+the work is in the engine: give those builtins dualization branches (an indexed read differentiates
+like a per-element `getfield`; a write propagates into the shadow array). Mooncake's own
+`src/rules/memory.jl` is the reference for how the `Memory`/`MemoryRef` layer behaves, though its
+approach is fused with the reverse-mode rule system rather than the split-shadow IR transform.
 
 ## Cross-references
 

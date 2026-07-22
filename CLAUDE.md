@@ -3,6 +3,12 @@ ADNext package is a small, experimental post-optimization IR-based automatic dif
 This is implemented with reference to julia v1.13, always run code using `julia +1.13` as your engine, 
 and use `../julia/Compiler` as your reference for anything related to the compiler.
 
+The tangent representation is a port of Mooncake.jl's tangent / fdata / rdata type system
+(`tangent_type`/`fdata_type`/`rdata_type` keyed on the *primal* type, `Tangent`/`MutableTangent`/
+`PossiblyUninitTangent`, `FData`/`RData`, `zero_tangent`/`increment!!`, and the Mooncake-shaped
+`Dual`/`CoDual` carriers). Forward mode is built on this `Dual`. `../Mooncake.jl` is the reference
+for anything tangent-system-related. Reverse-mode AD is not implemented yet (only the type system).
+
 ## ADNext skills
 
 `ADNext/.claude/skills/` has three skills describing the structure and meaning of ADNext's code in
