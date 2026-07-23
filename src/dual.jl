@@ -1,3 +1,14 @@
+macro outline(args...)
+    fargs = esc.(args[1:end-1])
+    body = args[end]
+    @gensym f
+    quote
+        $f($(fargs...),) = $body
+        @noinline $f($(fargs...),)
+    end
+end
+
+
 """
     Dual(primal::P, tangent::T)
 
@@ -10,6 +21,29 @@ Must satisfy `tangent_type(P) == T`.
 struct Dual{P,T}
     primal::P
     tangent::T
+    function Dual{P, T}(x, dx) where {P, T}
+        if !(tangent_type(P) == T)
+            @outline P T throw(ArgumentError(
+                "Invalid Dual{P,T} construction for primal type P=$P\n\tgot tangent type T=$T\n\tADNext requires that tangent_type(P) == T"
+            ))
+        end
+        new{P, T}(convert(P, x), convert(T, dx))
+    end
+    function Dual(x::P, dx::T) where {P, T}
+        Tproper = tangent_type(P)
+        if !(T <: Tproper)
+            tdx = as_tangent(dx)
+            if typeof(tdx) <: Tproper
+                return new{P, Tproper}(x, tdx)
+            else
+                @outline P T throw(ArgumentError(
+                    "Invalid Dual construction, Dual(::$(P), ::$(T)). The tangent type T=$T does not match tangent_type(P)=$(tangent_type(P))"
+                ))
+            end
+        else 
+            new{P, T}(x, dx)
+        end
+    end
 end
 
 primal(x::Dual) = x.primal
@@ -132,7 +166,22 @@ _dual_tangent_type(::Type{Dual{P,T}}) where {P,T} = T
 _carrier_zero(x::IEEEFloat) = zero(x)
 _carrier_zero(::NoTangent) = NoTangent()
 _carrier_zero(x::Dual) = zero_tangent_internal(x, NoCache())
-_carrier_zero(x::X) where {X} = Base.issingletontype(X) ? x : zero_tangent(x)
+# For any other carried field: a singleton (function/constant) carries through; a self-tangent type
+# (`tangent_type(X) === X`, e.g. `Vector{Float64}`) takes its ordinary `zero_tangent`. A non-self-
+# tangent type (`tangent_type(X) !== X`, e.g. a struct/closure with a `Float64` field, whose tangent
+# is a `Tangent`) *cannot* be represented in a `Dual`'s same-typed field, so a same-typed zero does
+# not exist. This is a fundamental limit of the self-tangent `Dual` scheme used for higher-order
+# forward mode — surface it as a clear error rather than the cryptic `%new` `TypeError` it would
+# otherwise become downstream. (Differentiating such a value at order ≥2 — e.g. a closure with
+# differentiable captures under a nested `D` — is what lands here.)
+_carrier_zero(x::X) where {X} =
+    Base.issingletontype(X) ? x :
+    tangent_type(X) === X    ? zero_tangent(x) :
+    error("ADNext: cannot build a higher-order zero tangent for a `Dual` carrying a value of type ",
+          X, " (whose tangent type ", tangent_type(X), " differs from itself). The self-tangent ",
+          "`Dual` scheme used for higher-order forward mode requires each carried type to be its own ",
+          "tangent type — true for scalars and arrays, but not for a struct/closure with ",
+          "differentiable fields — so differentiating such a value at order ≥2 is unsupported.")
 
 @generated function zero_tangent_internal(d::D, ::MaybeCache) where {D<:Dual}
     return Expr(:new, :D, (:(_carrier_zero(getfield(d, $i))) for i in 1:fieldcount(D))...)

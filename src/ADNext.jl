@@ -15,6 +15,9 @@ include("contextual.jl")
 include("forward_interp.jl")
 include("reflection.jl")
 
+# using PrecompileTools: @compile_workload
+# include("precomp.jl")
+
 # NOTE: `reverse_interp.jl` (a WIP barebones reverse-mode engine) is intentionally NOT included.
 # Its mutable `CoDual` is incompatible with the ported immutable `CoDual{Tx,Tdx}`, and reverse-mode
 # AD is out of scope for the tangent/fdata/rdata port. The file is retained on disk.
@@ -28,5 +31,6 @@ export tangent_type, fdata_type, rdata_type
 export Tangent, MutableTangent, PossiblyUninitTangent
 export NoFData, NoRData, FData, RData
 export fdata, rdata, zero_tangent
+export as_tangent, unit_tangent
 
 end # module ADNext

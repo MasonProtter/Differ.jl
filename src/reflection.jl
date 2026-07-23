@@ -50,9 +50,9 @@ function code_dual_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
     match === nothing && error("no primal method for $f with argument types $argtypes")
     impl_mi = specialize_method(match.method, match.spec_types, match.sparams)::MethodInstance
 
-    ir = optimized_dual_ir(interp, impl_mi)
-    ir === nothing && error("ADNext could not dualize $f$argtypes on optimized IRCode " *
-                            "(unsupported construct, e.g. array indexing — not yet handled).")
+    reason = Ref("no specific reason recorded")
+    ir = optimized_dual_ir(interp, impl_mi, reason)
+    ir === nothing && error("ADNext could not dualize $f$argtypes on optimized IRCode: $(reason[])")
     return ir => CC.compute_ir_rettype(ir)
 end
 

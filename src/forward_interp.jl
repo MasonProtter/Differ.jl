@@ -16,6 +16,19 @@ dualized_impl(dualargs::Dual...) =
           "(likely unsupported IR — e.g. array indexing / a builtin with no rule, or a vararg call).")
 
 
+# Runtime dispatcher for a *dynamic* (`apply_generic`) call that survived into the primal IR (its
+# callee or an argument was too abstractly typed to wrap statically). Rebuild concrete `Dual`s from
+# the runtime primal/tangent values — the `map` is the whole point: `Dual(1.0, 1.0)` infers the
+# concrete `Dual{Float64,Float64}`, so `frule`'s `@generated` dispatch (keyed on the `Dual` type
+# parameters) can name a concrete primal method. A statically-built `Dual{Any,Any}` could not. The
+# callee carries its *real* tangent `tf` (not a forced zero), so a dynamically-dispatched closure's
+# capture derivatives still propagate.
+function dynamic_frule(f, tf, primals::Tuple, tangents::Tuple)
+    duals = map(Dual, primals, tangents)
+    return frule(Dual(f, tf), duals...)
+end
+
+
 # ---------------------------------------------------------------------------
 # Forward-mode transform hook.
 #
@@ -28,21 +41,59 @@ dualized_impl(dualargs::Dual...) =
 
 function build_contextual_ir(interp::ADInterpreter{Forward}, mi::MethodInstance)
     is_dualized_impl(mi) || return nothing
-    return build_dual_ir(interp, mi)
+    reason = Ref("ADNext could not dualize the primal (no specific reason recorded).")
+    ir = build_dual_ir(interp, mi, reason)
+    ir === nothing && return error_ircode(mi, reason[])
+    return ir
 end
 
 is_dualized_impl(mi) = isa(mi.def, Method) && !isempty(mi.specTypes.parameters) &&
                        mi.specTypes.parameters[1] === typeof(dualized_impl)
 
-# Resolve the primal MethodInstance and dual arity for a `dualized_impl` specialization.
-function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance)
+# Build a minimal IRCode whose only effect is to `error(msg)` when invoked, installed via the same
+# `finishinfer!`/`optimize` seam as a real dualized body (see the hard project constraint: transform
+# IRCode only, never patch a rettype after the fact). Used when `build_dual_ir` bails, so calling the
+# carrier reports *why* (the specific unsupported construct) instead of `dualized_impl`'s generic
+# stub message.
+function error_ircode(impl_mi::MethodInstance, msg::String)
+    stream = CC.InstructionStream(2)
+    stream.stmt[1] = Expr(:call, error, msg); stream.type[1] = Union{}; stream.flag[1] = CC.IR_FLAG_NULL
+    stream.stmt[2] = Core.ReturnNode();       stream.type[2] = Union{}; stream.flag[2] = CC.IR_FLAG_NULL
+    cfg = CC.CFG(CC.BasicBlock[CC.BasicBlock(CC.StmtRange(1,2), Int[], Int[])], Int[3])
+    di = CC.DebugInfoStream(stream.line)
+    di.def = impl_mi
     dualparams = impl_mi.specTypes.parameters[2:end]
-    all(P -> P isa Type && P <: Dual, dualparams) || return nothing
+    argtypes = Any[impl_mi.specTypes.parameters[1], Tuple{dualparams...}]
+    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[])
+    CC.verify_ir(ir)
+    return ir
+end
+
+# Resolve the primal MethodInstance and dual arity for a `dualized_impl` specialization. `reason`
+# records why (a human-readable message) when this bails, for `build_contextual_ir`/`code_dual_ircode`
+# to surface to the user instead of a generic message.
+function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""))
+    dualparams = impl_mi.specTypes.parameters[2:end]
+    if !all(P -> P isa Type && P <: Dual, dualparams)
+        reason[] = "not every dual argument type is a `Dual` (a vararg call?)"
+        return nothing
+    end
     primal_tt = Base.to_tuple_type(Any[_dual_primal_type(P) for P in dualparams])
     pmatch, _ = CC.findsup(primal_tt, CC.method_table(interp))
-    pmatch === nothing && return nothing
-    isa(pmatch.method, Method) || return nothing
-    pmatch.method.isva && return nothing
+    if pmatch === nothing
+        reason[] = "no unique primal method resolves for argument types " *
+                   "$(Tuple(_dual_primal_type(P) for P in dualparams)) — likely an ambiguous " *
+                   "dynamic-dispatch call (abstractly-typed arguments) or a nonexistent method"
+        return nothing
+    end
+    if !isa(pmatch.method, Method)
+        reason[] = "the resolved primal match is not a concrete Method"
+        return nothing
+    end
+    if pmatch.method.isva
+        reason[] = "the primal method $(pmatch.method) is a vararg method (not yet supported)"
+        return nothing
+    end
     primal_mi = specialize_method(pmatch.method, pmatch.spec_types, pmatch.sparams)::MethodInstance
     return (primal_mi, length(dualparams))
 end
@@ -60,51 +111,86 @@ end
 #    resolving the inner `dualized_impl` carrier, and recursing through `optimized_dual_ir`; the
 #    result is then re-dualized. That inner dual IR is vararg-shaped (`dualized_impl(dualargs...)`),
 #    so `pir_is_vararg=true` selects the tuple-reconstruction prologue in `dualize_to_ircode`.
-function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance)
+function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""))
     dualparams = impl_mi.specTypes.parameters[2:end]
-    all(P -> P isa Type && P <: Dual, dualparams) || return nothing
+    if !all(P -> P isa Type && P <: Dual, dualparams)
+        reason[] = "not every dual argument type is a `Dual` (a vararg call?)"
+        return nothing
+    end
     n = length(dualparams)
-    # All arguments — the function included — are nested uniformly to the differentiation order (a
-    # constant/function nests too, carrying `NoTangent` at the leaf), so an order-≥2 request is one
-    # where *any* argument's primal is itself a `Dual`. The `frule` guard is the one exception:
-    # `frule` is the only Dual-consuming function in the system, so a Dual-valued arg *under `frule`*
-    # means "differentiate a hand rule once" (the base case — the rule is an ordinary method taking
-    # Duals), not "differentiate the derivative". That guard is what lets the recursion peel down to
-    # `frule` and hand off to `primal_of_impl`.
-    higher_order = n >= 1 && _dual_primal_type(dualparams[1]) !== typeof(frule) &&
-                   any(i -> _dual_primal_type(dualparams[i]) <: Dual, 1:n)
 
-    if higher_order
-        # Peel exactly one Dual level off every arg uniformly (the function like any other value):
-        # `Dual{Dual{f,NoTangent},…}` → `Dual{f,NoTangent}`, `Dual{Dual{F,F},Dual{F,F}}` → `Dual{F,F}`.
-        # That yields the order-(k-1) carrier signature.
-        inner_dualparams = Any[_dual_primal_type(P) for P in dualparams]
+    # Compose the transform (Option A): peel one `Dual` level off `dualparams[1+offset:end]` to form
+    # the order-(k-1) carrier signature, obtain that carrier's optimized dual IR, and re-dualize it.
+    #  * `offset=0` — uniform seeds where the function nests like every value arg, so the *whole* list
+    #    peels: `Dual{Dual{f,NoTangent},…}` → `Dual{f,NoTangent}`, `Dual{Dual{F,F},…}` → `Dual{F,F}`.
+    #  * `offset=1` — a re-dualized carrier invoke whose `dualparams[1]` is a non-nested function slot
+    #    (`dualized_impl`/`frule`) naming the function being re-differentiated: drop it, peel only the
+    #    trailing (nested) value args.
+    function compose(offset::Int)
+        inner_dualparams = Any[_dual_primal_type(P) for P in dualparams[1+offset:end]]
         inner_tt = Tuple{typeof(dualized_impl), inner_dualparams...}
         m, _ = CC.findsup(inner_tt, CC.method_table(interp))
-        m === nothing && return nothing
+        if m === nothing
+            reason[] = "could not find an inner carrier method to compose (higher-order re-dualization)"
+            return nothing
+        end
         inner_mi = specialize_method(m.method, m.spec_types, m.sparams)::MethodInstance
-        pir = optimized_dual_ir(interp, inner_mi)
+        pir = optimized_dual_ir(interp, inner_mi, reason)
         pir === nothing && return nothing
-        return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=true)
+        return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=true, pir_arg_offset=offset, reason)
     end
 
-    info = primal_of_impl(interp, impl_mi)
-    info === nothing && return nothing
+    f1 = n >= 1 ? _dual_primal_type(dualparams[1]) : Union{}
+
+    # Higher-order requests re-dualize an order-(k-1) carrier. Two shapes reach here:
+    #
+    #  * Uniform seeds (`code_dual_ircode` order≥2 / a `frule(fseed_k, seed_k)` call): every dual arg
+    #    — the function included — is nested one level, so an order-≥2 request is one where *any*
+    #    argument's primal is itself a `Dual`. The function nests as arg 1, so the whole list peels
+    #    (`offset=0`). A `frule` slot is excluded: `frule` is the only Dual-consuming function, so a
+    #    Dual-valued arg *under `frule`* means "differentiate a hand rule once" (the base case), not
+    #    "differentiate the derivative" — that's handled below.
+    #
+    #  * A re-dualized *surviving carrier invoke* (nested `frule`/`D` — "D-of-D"): when the outer pass
+    #    dualizes a function whose body called `frule`, that inner call survives in the primal IR as a
+    #    `dualized_impl` `:invoke` (inlined generated `frule`) or a `frule` `:invoke`. `frule_split!`
+    #    re-wrapped its callee as the non-nested function slot `Dual{typeof(dualized_impl),NoTangent}`
+    #    / `Dual{typeof(frule),NoTangent}` at position 1, naming the function being re-differentiated
+    #    rather than a value arg — so it is dropped (`offset=1`) and the trailing nested args peel.
+    if f1 === typeof(dualized_impl)
+        return compose(1)
+    elseif f1 !== typeof(frule) && any(i -> _dual_primal_type(dualparams[i]) <: Dual, 1:n)
+        return compose(0)
+    end
+
+    # Base case: an ordinary user method or a hand-written `frule`, dualized directly. The `frule`
+    # slot lands here — `primal_of_impl` peels its args to the concrete rule signature. If that
+    # resolves to the *generated* (vararg) `frule` rather than a hand rule, this is not a base case
+    # but a composed derivative (`D` applied to a surviving `frule` invoke, e.g. a 3rd+-order nested
+    # `D`); fall back to `compose(1)`, which drops the `frule` slot and re-dualizes the inner carrier.
+    info = primal_of_impl(interp, impl_mi, reason)
+    if info === nothing
+        f1 === typeof(frule) && return compose(1)
+        return nothing
+    end
     primal_mi, _ = info
     world = CC.get_inference_world(interp)
     # Optimized primal IR via the internal `typeinf_ircode`. A NativeInterpreter is used so that
     # `sin`/`cos` and other hand-ruled functions survive as `:invoke`s (routed through `frule`).
     pir, _ = CC.typeinf_ircode(CC.NativeInterpreter(world), primal_mi, nothing)
-    pir === nothing && return nothing
-    return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=false)
+    if pir === nothing
+        reason[] = "inference failed to produce optimized IR for the primal method $(primal_mi)"
+        return nothing
+    end
+    return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=false, reason)
 end
 
 # The optimized dual `IRCode` for a `dualized_impl` carrier: exactly what the `optimize` seam
 # installs (and what `code_dual_ircode` returns) — `build_dual_ir` followed by the IPO-safe passes.
 # Used both by the higher-order recursion above (to obtain the order-(k-1) dual IR as a primal) and
 # by the reflection entry point.
-function optimized_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance)
-    ir = build_dual_ir(interp, impl_mi)
+function optimized_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""))
+    ir = build_dual_ir(interp, impl_mi, reason)
     ir === nothing && return nothing
     world = CC.get_inference_world(interp)
     opt = CC.OptimizationState(impl_mi, CC.retrieve_code_info(impl_mi, world), interp)
@@ -154,9 +240,16 @@ end
 
 const _Intr = Core.Intrinsics
 
+# Resolve a callee-position AST node to its actual value when it's *statically* known (a `GlobalRef`
+# to a defined binding, or a `QuoteNode` literal). An `SSAValue`/`Argument` is a genuinely dynamic
+# value, not a name to look up: returning it as-is would let the raw *old*-numbered node leak
+# directly into the freshly built IR as an operand (referencing the wrong slot there). `nothing`
+# signals "not statically resolvable — resolve via `presolve`/`_optype` instead" to callers.
 _calleeval(@nospecialize(x)) =
     isa(x, GlobalRef) ? (isdefined(x.mod, x.name) ? getglobal(x.mod, x.name) : nothing) :
-    isa(x, QuoteNode) ? x.value : x
+    isa(x, QuoteNode) ? x.value :
+    isa(x, Core.SSAValue) || isa(x, Core.Argument) ? nothing :
+    x
 
 # Build the dualized IRCode for `impl_mi` (a `dualized_impl` specialization) from the primal's
 # optimized IRCode `pir`. `n` = number of dual arguments (= primal args incl. #self#).
@@ -164,14 +257,19 @@ _calleeval(@nospecialize(x)) =
 # positional args, first-order/base case), `true` when `pir` is itself an order-(k-1) dual IR (a
 # vararg `dualized_impl` taking one tuple of Duals — the higher-order case; see the prologue below).
 # Returns `ir::IRCode` or `nothing`.
-function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_vararg::Bool=false)
+function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
+                           pir_is_vararg::Bool=false, pir_arg_offset::Int=0,
+                           reason::Ref{String}=Ref(""))
     pstmts = pir.stmts
     N = length(pstmts)
     # Defensive: a leading PhiNode in block 1 (predecessor-free) would collide with the
     # unconditional arg-extraction prologue below, which must land before any real phi. Not
     # observed in practice (slot2ssa! always keeps block 1 phi-free), but bail rather than emit
     # invalid IR if it ever occurs.
-    isa(pstmts[1][:stmt], Core.PhiNode) && return nothing
+    if isa(pstmts[1][:stmt], Core.PhiNode)
+        reason[] = "primal IR has a leading PhiNode in block 1 (unsupported shape)"
+        return nothing
+    end
 
     # Embed the actual (stable, singleton) function objects as literals rather than `GlobalRef`s
     # to a non-Core/Base module: `Core.Compiler.verify_ir` rejects a bare `GlobalRef` used directly
@@ -182,7 +280,10 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
     buildtang_g  = build_tangent      # construct a struct's `Tangent`/`MutableTangent` shadow
     gettfield_g  = get_tangent_field  # read a field's tangent out of a `Tangent`/`MutableTangent`
     fruleg = frule
+    Dualg  = Dual                # the `Dual` constructor, for a runtime (dynamic) pack of a non-concrete result
+    dynfrule_g = dynamic_frule   # runtime dispatcher for a surviving dynamic (`apply_generic`) call
     getf   = GlobalRef(Core, :getfield)
+    ctuple = GlobalRef(Core, :tuple)
     intrg(name) = GlobalRef(Core.Intrinsics, name)
 
     # Tangent type of a primal type — drives every shadow SSA's declared type. For scalars
@@ -198,6 +299,22 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
     # allocation) rather than a dynamic `Dual(...)` call the inliner couldn't reach in synthetic IR.
     dual!(@nospecialize(P), @nospecialize(T), @nospecialize(p), @nospecialize(t)) =
         emit!(Expr(:new, Dual{P,T}, p, t), Dual{P,T})
+    # Whether a declared type is a specific leaf we can `%new` and freeze into an SSA's type.
+    _conc(@nospecialize T) = T isa DataType && isconcretetype(T)
+    # Pack a primal/tangent into a `Dual` for a *non-concrete* primal type `R` (e.g. `Any`, produced by
+    # a dynamic dispatch). A `%new(Dual{R,tt(R)}, …)` would freeze the over-wide declared type into the
+    # value — `dynbox(3.0)` would return a boxed `Dual{Any,Any}(9.0, 6.0)` instead of a genuine
+    # `Dual{Float64,Float64}`, and that couldn't flow back into `frule`. Instead call the `Dual`
+    # constructor *dynamically*: at run time it infers the concrete leaf type from the actual values
+    # (exactly as `dynamic_frule`'s `map(Dual, …)` does). The declared type is the abstract
+    # `dual_type(R)` — the UnionAll `Dual` for `R === Any`, or a `Union` of leaf `Dual`s for a `Union`
+    # `R` — of which every possible runtime leaf is a subtype (whereas the `%new`-built
+    # `Dual{Union{…},…}` is *not* a subtype of that union, so `%new` cannot be widened this way).
+    # Allocation-freedom is moot: a call whose result is non-concrete already dynamic-dispatched, so
+    # the `%new` fast path (kept for concrete `R`, asserted allocation-free by the test suite) is
+    # unaffected.
+    dyn_dual!(@nospecialize(R), @nospecialize(p), @nospecialize(t)) =
+        emit!(Expr(:call, Dualg, p, t), dual_type(R))
     # The tangent of a compile-time-constant primal is its zero tangent, computed now and embedded
     # as a literal so no call survives into the IR. `zero_tangent` handles singletons (-> the zero
     # tangent, e.g. `NoTangent()` for a function/`Int`), scalars (`0.0`), `Dual` carriers (a
@@ -231,21 +348,29 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
     else
         # Higher-order case: `pir` is a vararg `dualized_impl` whose only real argument is
         # `Argument(2)`, the tuple of order-(k-1) dual args (accessed as `getfield(Argument(2), i)`).
-        # Every arg is nested uniformly (the function included), so each `Di` has `primal_type(Di) <:
-        # Dual`. Peel one level off each: reconstruct a primal tuple (each element the order-(k-1) dual
-        # value) and a tangent tuple (its new, k-th tangent direction), so the existing getfield branch
-        # resolves `getfield(Argument(2), i)` with no changes. `pir` has exactly two arguments (#self#
-        # and the tuple), so `parg`/`targ` are length 2 regardless of `n`.
-        pelts = Vector{Any}(undef, n); telts = Vector{Any}(undef, n)
-        ptys  = Vector{Any}(undef, n); ttys  = Vector{Any}(undef, n)
-        for i in 1:n
+        # The `pir_arg_offset` leading dual args are non-value carrier function slots to skip (0 for a
+        # uniform seed where the function nests like every other value; 1 for a re-dualized
+        # `dualized_impl` invoke, whose `dualparams[1]` is the `Dual{typeof(dualized_impl),NoTangent}`
+        # function slot — see `build_dual_ir`). Each remaining `Di` is nested (`primal_type(Di) <:
+        # Dual`); peel one level off each: reconstruct a primal tuple (each element the order-(k-1) dual
+        # value) and a tangent tuple (its new, k-th tangent direction). The reconstructed tuple must
+        # match `pir`'s own vararg-tuple arg type, so the tuple index `i` is the *original* dualparam
+        # position (offset-shifted) while the tuple element position `j` is offset-free. `pir` has
+        # exactly two arguments (#self# and the tuple), so `parg`/`targ` are length 2 regardless of `n`.
+        nreal = n - pir_arg_offset
+        pelts = Vector{Any}(undef, nreal); telts = Vector{Any}(undef, nreal)
+        ptys  = Vector{Any}(undef, nreal); ttys  = Vector{Any}(undef, nreal)
+        for j in 1:nreal
+            i = j + pir_arg_offset
             Di = dualparams[i]
-            _dual_primal_type(Di) <: Dual || return nothing  # non-uniformly-nested seed at order ≥2 → bail
+            if !(_dual_primal_type(Di) <: Dual)  # non-uniformly-nested seed at order ≥2 → bail
+                reason[] = "argument #$i is not nested as a Dual at order ≥2 (a non-uniformly-nested higher-order seed)"
+                return nothing
+            end
             di = emit!(Expr(:call, getf, Core.Argument(2), i), Di)
-            pelts[i] = emit!(Expr(:call, getf, di, 1), _dual_primal_type(Di));  ptys[i] = _dual_primal_type(Di)
-            telts[i] = emit!(Expr(:call, getf, di, 2), _dual_tangent_type(Di)); ttys[i] = _dual_tangent_type(Di)
+            pelts[j] = emit!(Expr(:call, getf, di, 1), _dual_primal_type(Di));  ptys[j] = _dual_primal_type(Di)
+            telts[j] = emit!(Expr(:call, getf, di, 2), _dual_tangent_type(Di)); ttys[j] = _dual_tangent_type(Di)
         end
-        ctuple = GlobalRef(Core, :tuple)
         ptuple = emit!(Expr(:call, ctuple, pelts...), Tuple{ptys...})
         ttuple = emit!(Expr(:call, ctuple, telts...), Tuple{ttys...})
         @assert Tuple{ptys...} === pir.argtypes[2]     # reconstructed tuple == pir's own arg type
@@ -262,22 +387,70 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
     function frule_split!(fpos, actual, R)
         # Dual(callee, NoTangent()) and each Dual(arg_primal, arg_tangent), constructed via %new.
         # Embed the *resolved* callee value (e.g. the `sin` function object) rather than the raw
-        # callee-position AST node: a bare `GlobalRef` outside Core/Base used directly as a value
-        # is rejected by `Core.Compiler.verify_ir` unless its binding is proven constant across the
-        # IR's valid worlds, which a plain `GlobalRef(Main, :sin)` isn't. Falls back to the raw node
-        # (rare: a dynamic/unresolvable callee) when resolution fails, matching prior behavior.
+        # callee-position AST node when it's statically known: a bare `GlobalRef` outside Core/Base
+        # used directly as a value is rejected by `Core.Compiler.verify_ir` unless its binding is
+        # proven constant. When the callee is a genuinely dynamic value (an `SSAValue`/`Argument` —
+        # e.g. a `Function` read out of a container), resolve it like any other operand via
+        # `presolve`/`_optype` rather than embedding the raw (old-numbered) AST node.
         fval = _calleeval(fpos)
-        fcallee = fval === nothing ? fpos : fval
-        ftype = fval === nothing ? _valtype(fpos) : typeof(fval)
+        fcallee = fval === nothing ? presolve(fpos) : fval
+        ftype   = fval === nothing ? _optype(pir, fpos) : typeof(fval)
+        # The callee's own tangent: a statically-known function is a code constant (zero tangent —
+        # `NoTangent()` for a plain function); a genuinely dynamic callee (read out of a container)
+        # carries whatever tangent the shadow pass computed for it.
+        ftang   = fval === nothing ? tresolve(fpos) : zero_tangent(fval)
+        # A call is a genuine dynamic dispatch (`apply_generic`) when its callee or any argument has a
+        # non-concrete declared type — the method that runs depends on runtime types unknowable here
+        # (e.g. a value read out of an `Any`-typed global/field/container). We can't wrap such a call
+        # statically: a `%new` of a `Dual` would freeze the abstract type into the object, and
+        # `frule`'s `@generated` dispatch — keyed on exactly those `Dual` type parameters — could not
+        # resolve a concrete primal from `Dual{Any,…}`. Defer to the runtime `dynamic_frule` dispatcher
+        # (see its definition above): pass the callee's primal + tangent and a tuple of the argument
+        # *primals* and a tuple of their *tangents*, and let it rebuild concrete `Dual`s and dispatch
+        # `frule` at run time. Its result is typed `Any`; extract the primal (typed `R`) and tangent
+        # (typed `tt(R)`, which widens to `Any` when `R` is abstract). Note we do *not* branch on `R`:
+        # a call with concrete callee+args but an inference-widened abstract result (e.g. `_2 * _2 ::
+        # Any`, left after a `Ref{Any}` was SROA'd away) takes the static path below, which annotates
+        # its result with the *abstract* `dual_type(R)` — sound because `Dual` is invariant so the
+        # concrete `Dual{Rc,Tc}` the rule returns is `<: Dual` but not `<: Dual{Any,Any}`.
+        if !_conc(ftype) || !all(a -> _conc(_optype(pir, a)), actual)
+            # A statically-known operand (a `GlobalRef` to a defined binding, or a `QuoteNode` — e.g.
+            # the `^` passed as an argument to `Base.literal_pow`) must be embedded as its *resolved
+            # value*, not the raw node: a bare non-Core/Base `GlobalRef` in value position is rejected
+            # by `verify_ir` (and `tresolve` would take `zero_tangent` of the `GlobalRef` object
+            # itself rather than the value it names). Resolve each arg's primal, its declared type,
+            # and its (compile-time-zero) tangent together so the tuple's element types match.
+            pvals = Any[]; ptys = Any[]; tvals = Any[]; ttys = Any[]
+            for a in actual
+                v = _calleeval(a)
+                if v === nothing                       # genuinely dynamic operand (SSAValue/Argument)
+                    P = _optype(pir, a)
+                    push!(pvals, presolve(a)); push!(ptys, P)
+                    push!(tvals, tresolve(a)); push!(ttys, tt(P))
+                else                                   # statically-known: embed the value + its zero
+                    P = typeof(v)
+                    push!(pvals, v); push!(ptys, P)
+                    push!(tvals, zero_tangent(v)); push!(ttys, tt(P))
+                end
+            end
+            ptup = emit!(Expr(:call, ctuple, pvals...), Tuple{ptys...})
+            ttup = emit!(Expr(:call, ctuple, tvals...), Tuple{ttys...})
+            dd = emit!(Expr(:call, dynfrule_g, fcallee, ftang, ptup, ttup), Any)
+            return emit!(Expr(:call, getf, dd, 1), R),
+                   emit!(Expr(:call, getf, dd, 2), tt(R))
+        end
         fd = dual!(ftype, NoTangent, fcallee, NoTangent())
         # Each argument dual is `Dual{P, tangent_type(P)}` (the Mooncake invariant). For scalar
         # primals `tangent_type(P) == P`, so this matches the old `Dual{P,P}`.
         dualtys = Any[Dual{_optype(pir,a),tt(_optype(pir,a))} for a in actual]
         duals = Any[dual!(_optype(pir,a), tt(_optype(pir,a)), presolve(a), tresolve(a)) for a in actual]
-        # Emit the surviving high-level rule as a static `:invoke` to a compiled `CodeInstance`
-        # when we can resolve one (direct, unboxed call); otherwise a plain non-inlined `:call`.
+        # Emit the surviving high-level rule as a static `:invoke` to a compiled `CodeInstance` when we
+        # can resolve one (direct, unboxed call); otherwise a plain non-inlined `:call`. `dual_type(R)`
+        # is the declared result type: `Dual{R,tangent_type(R)}` for a concrete `R`, and the *abstract*
+        # `Dual` when `R` is non-concrete — the concrete `Dual` the rule actually returns is a subtype
+        # of the latter (whereas the invariant `Dual{Any,Any}` would be unsound and miscompile).
         ci = frule_codeinstance(interp, ftype, dualtys)
-        DR = Dual{R,tt(R)}
+        DR = dual_type(R)
         dd = ci === nothing ? emit!(Expr(:call, fruleg, fd, duals...), DR) :
                               emit!(Expr(:invoke, ci, fruleg, fd, duals...), DR)
         return emit!(Expr(:call, getf, dd, 1), R), emit!(Expr(:call, getf, dd, 2), tt(R))
@@ -318,7 +491,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
             # at all, which would leave it an empty `StmtRange`. Backfill a placeholder so every
             # block keeps at least one statement, matching the primal's own convention.
             if length(code) < block_start_new[bidx]
-                push!(code, nothing); push!(types, Nothing)
+                emit!(nothing, Nothing)
             end
             bidx += 1
             block_start_new[bidx] = length(code) + 1
@@ -329,12 +502,14 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
             # a never-consumed placeholder so `presolve`/`tresolve` on later error-path operands
             # still resolve, without emitting a bogus tangent computation.
             if isa(s, Core.ReturnNode)
-                push!(code, Core.ReturnNode()); push!(types, Union{})   # unreachable terminator
+                emit!(Core.ReturnNode(), Union{})   # unreachable terminator
             elseif isa(s, Expr) && s.head === :invoke
                 # Resolve the display-callee to its value: a bare non-Core/Base `GlobalRef` in the
                 # invoke's callee position is a value position `verify_ir` rejects (see frule_split!).
+                # A genuinely dynamic callee (SSAValue/Argument) isn't a name to look up — resolve it
+                # like any other operand via `presolve`.
                 fv = _calleeval(s.args[2])
-                ex = Expr(:invoke, s.args[1], fv === nothing ? s.args[2] : fv,
+                ex = Expr(:invoke, s.args[1], fv === nothing ? presolve(s.args[2]) : fv,
                           (presolve(a) for a in s.args[3:end])...)
                 primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
             elseif isa(s, Expr) && s.head === :call
@@ -342,7 +517,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
                 # bare non-Core/Base `GlobalRef` (e.g. `throw`) fails the const-binding check when
                 # re-embedded in this synthetic IR's world range.
                 fv = _calleeval(s.args[1])
-                ex = Expr(:call, fv === nothing ? s.args[1] : fv,
+                ex = Expr(:call, fv === nothing ? presolve(s.args[1]) : fv,
                           (presolve(a) for a in s.args[2:end])...)
                 primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
             elseif isa(s, Expr) && s.head === :new
@@ -350,19 +525,28 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
                 primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
             elseif isa(s, Core.PiNode)
                 primal[i] = presolve(s.val); shadow[i] = primal[i]
-            elseif isa(s, GlobalRef) || !isa(s, Expr)
+            elseif isa(s, GlobalRef)
+                # A bare GlobalRef statement is a global-variable load, not a pure alias — it must be
+                # emitted as a real instruction (see the main-loop GlobalRef case below for why).
+                primal[i] = emit!(s, Ti); shadow[i] = primal[i]
+            elseif !isa(s, Expr)
                 primal[i] = presolve(s); shadow[i] = primal[i]
             else
-                return nothing                                          # unexpected in an error block
+                reason[] = "unexpected statement kind $(typeof(s)) in an unreachable (throw-only) " *
+                           "block at %$i: `$(_stmt_str(s))`"
+                return nothing
             end
         elseif isa(s, Core.ReturnNode)
             if !isdefined(s, :val)
-                push!(code, Core.ReturnNode()); push!(types, Union{})   # unreachable terminator
+                emit!(Core.ReturnNode(), Union{})   # unreachable terminator
             else
                 p = presolve(s.val); t = tresolve(s.val)
                 R = _optype(pir, s.val)
-                res = dual!(R, tt(R), p, t)
-                push!(code, Core.ReturnNode(res)); push!(types, Any)
+                # Concrete `R`: pack with an allocation-free `%new` of the exact `Dual{R,tt(R)}`.
+                # Non-concrete `R` (a dynamic-dispatch result, e.g. `Any`): build the `Dual`
+                # dynamically so the runtime type is the concrete leaf, not a frozen `Dual{Any,Any}`.
+                res = _conc(R) ? dual!(R, tt(R), p, t) : dyn_dual!(R, p, t)
+                emit!(Core.ReturnNode(res), Any)
             end
         elseif isa(s, Core.PiNode)
             primal[i] = presolve(s.val); shadow[i] = tresolve(s.val)
@@ -447,14 +631,18 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
                     shadow[i] = emit!(Expr(:call, gettfield_g, tresolve(actual[1]), actual[2]), TT)
                 end
             elseif isa(f, Core.Builtin)
-                return nothing                              # other builtins: bail
+                reason[] = "no dualization rule for builtin `$f` (e.g. array/memoryref indexing) at " *
+                           "%$i: `$(_stmt_str(s))`"
+                return nothing                               # other builtins: bail
             else
-                primal[i], shadow[i] = frule_split!(fpos, actual, Ti)
+                res = frule_split!(fpos, actual, Ti)
+                res === nothing && return nothing            # dynamic dispatch: bail (see frule_split!)
+                primal[i], shadow[i] = res
             end
         elseif isa(s, Core.GotoNode)
-            push!(code, Core.GotoNode(s.label)); push!(types, Any)
+            emit!(Core.GotoNode(s.label), Any)
         elseif isa(s, Core.GotoIfNot)
-            push!(code, Core.GotoIfNot(presolve(s.cond), s.dest)); push!(types, Any)
+            emit!(Core.GotoIfNot(presolve(s.cond), s.dest), Any)
         elseif isa(s, Core.PhiNode)
             k = length(s.values)
             pvals = Vector{Any}(undef, k); tvals = Vector{Any}(undef, k)
@@ -513,7 +701,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
         elseif isa(s, Expr) && s.head === :leave
             # Pops one or more `:enter` scopes, referencing the `EnterNode`(s) by `SSAValue` (or
             # `nothing`); `presolve` remaps each to the enter's primal SSA. Pure control, no value.
-            push!(code, Expr(:leave, Any[presolve(a) for a in s.args]...)); push!(types, Any)
+            emit!(Expr(:leave, Any[presolve(a) for a in s.args]...), Any)
         elseif isa(s, Expr) && s.head === :pop_exception
             primal[i] = emit!(Expr(:pop_exception, presolve(s.args[1])), Ti); shadow[i] = primal[i]
         elseif isa(s, Expr) && s.head === :the_exception
@@ -521,9 +709,19 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
             # primal, give it a zero tangent like other non-diff results.
             primal[i] = emit!(Expr(:the_exception), Ti)
             shadow[i] = zero_shadow(Ti, primal[i])
-        elseif isa(s, GlobalRef) || !isa(s, Expr)
+        elseif isa(s, GlobalRef)
+            # A bare GlobalRef *statement* is a global-variable load (not a pure alias like a
+            # `PiNode`): it must be *emitted* as a real instruction. Aliasing it away would let the
+            # raw `GlobalRef` leak into a later operand position, which `Core.Compiler.verify_ir`
+            # rejects unless the binding is proven constant (a non-`const` global like a plain
+            # `Ref{Any}` isn't). The loaded value is external, non-differentiable state, so its
+            # shadow is the zero tangent (matching how other non-diff sources are treated).
+            primal[i] = emit!(s, Ti)
+            shadow[i] = zero_shadow(Ti, primal[i])
+        elseif !isa(s, Expr)
             primal[i] = presolve(s); shadow[i] = tresolve(s)
         else
+            reason[] = "unsupported statement kind $(typeof(s)) at %$i: `$(_stmt_str(s))`"
             return nothing
         end
         if haskey(pending, i)
@@ -534,9 +732,12 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
         end
     end
     if length(code) < block_start_new[nblocks]      # the final block emitted nothing; see above
-        push!(code, nothing); push!(types, Nothing)
+        emit!(nothing, Nothing)
     end
-    isempty(pending) || return nothing               # unreachable on well-formed IR; bail, don't emit invalid IR
+    if !isempty(pending)  # unreachable on well-formed IR; bail, don't emit invalid IR
+        reason[] = "internal error — an unresolved forward-reference remained (a bug in this transform, not unsupported input)"
+        return nothing
+    end
 
     len = length(code)
     stream = CC.InstructionStream(len)
@@ -562,11 +763,18 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int; pir_is_
     return ir
 end
 
-# Type helpers. Types are taken directly from the primal IR (`_optype`), so they are exact rather
-# than guessed; the fallbacks only cover genuine constants/globals.
-_valtype(@nospecialize x) = isa(x, GlobalRef) && isdefined(x.mod, x.name) ? typeof(getglobal(x.mod, x.name)) : Any
+# Type helper. Types are taken directly from the primal IR, so they are exact rather than guessed;
+# the fallback (`typeof(x)`) only covers genuine literal constants.
 _optype(pir, @nospecialize x) = isa(x, Core.SSAValue) ? pir.stmts[x.id][:type] :
                                 isa(x, Core.Argument) ? pir.argtypes[x.n] : typeof(x)
+# Compact, single-line rendering of a primal IR statement for a bail `reason` message, so the error
+# tells the user *what* IR construct was unsupported (e.g. the actual `Base.arrayref(...)` call)
+# rather than just its kind. Kept defensive: `show` on a stray node must never mask the real bail.
+function _stmt_str(@nospecialize s)
+    str = try sprint(show, s) catch; string(s) end
+    str = replace(str, r"\s+" => " ")
+    length(str) > 200 ? string(first(str, 197), "...") : str
+end
 # A field is a "non-differentiable singleton" (a function/constant, tangent = `NoTangent`) when it is
 # a non-`NoTangent` singleton type. Such a field's shadow can't hold a `NoTangent` value (its slot
 # type would reject it), so the primal value is carried through instead. Differentiable structs are

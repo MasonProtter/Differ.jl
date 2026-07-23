@@ -110,6 +110,17 @@ input `dualize_to_ircode` can't handle — flows through the ordinary, unmodifie
   plain function `Dual(Dual(f,NoTangent()),Dual(f,NoTangent()))` (these two shapes are unchanged
   from before). `code_dual_ircode(f, argtypes; order)` builds these seeds (leaf `Dual{T,
   tangent_type(T)}`) for inspection/`verify_ir`.
+- **Higher-order the natural way — composed differentiation (`D`-of-`D`)**: you can also write
+  `D(f,x) = frule(Dual(f,zero_tangent(f)), Dual(x,one(x))).dx` and *nest* it (e.g. `D(x -> D(g, x), y)`)
+  to get second and higher derivatives, instead of hand-building nested `Dual` seeds. This works
+  because when the outer pass dualizes a closure whose body calls `frule`, that inner call survives in
+  the primal IR as a `dualized_impl`/`frule` `:invoke`; `frule_split!` re-dualizes it, and
+  `build_dual_ir`'s `compose(offset)` drops the leading non-nested *function slot*
+  (`Dual{typeof(dualized_impl),NoTangent}` / `Dual{typeof(frule),NoTangent}`) and peels the remaining
+  nested value args to the inner carrier. It recurses, so `D∘D∘D…` works to arbitrary order. **Limit:**
+  a closure/struct with *differentiable fields* can't be differentiated at order ≥2 (the self-tangent
+  `Dual` scheme needs each carried type to equal its own tangent type — true for scalars/arrays, false
+  for such a struct whose tangent is a `Tangent`); it errors clearly rather than miscompiling.
 - Only `sin`/`cos` have hand-written `frule` methods in `frules.jl`. Deliberately **no** rules
   exist for `+`, `-`, `*`, `/`, or comparisons: those inline down to intrinsics
   (`add_float`/`mul_float`/`lt_float`/…), which the dualization engine differentiates directly at
@@ -136,8 +147,31 @@ error paths (a block ending in an unreachable `ReturnNode` is reconstructed prim
 exception handling (`try`/`catch` via `EnterNode`/`PhiCNode`/`UpsilonNode`/`:leave`/
 `:pop_exception`/`:the_exception`). Data-wise: scalars, immutable structs (→ `Tangent`), mutable
 structs (→ `MutableTangent`), tuples/namedtuples, and closures (differentiate w.r.t. captures).
+Higher-order works two ways: hand-nested `Dual` seeds (uniform nesting) and composed differentiation
+(`D`-of-`D`, i.e. nesting a `frule`-based derivative operator) to arbitrary order — see the
+higher-order bullets above. **Dynamic dispatch** (`apply_generic`) is also supported: a surviving
+call whose callee or an argument has a non-concrete declared type — e.g. a value read from a
+non-`const` global or an `Any`-typed field/`Ref`, which Julia infers as `Any` regardless of what it
+holds — is deferred at run time to the `dynamic_frule` dispatcher (in `forward_interp.jl`), which
+rebuilds concrete `Dual`s from the actual runtime values (that runtime `map(Dual, …)` is what recovers
+concrete type parameters for `frule`'s generator) and dispatches `frule` dynamically. A call with
+concrete callee+args but an inference-widened *abstract result* type stays on the ordinary static
+`:invoke` path — only its result annotation widens to the abstract `Dual` (via `dual_type(R)`, since
+`Dual` is invariant). See the "Dynamic dispatch" and "invariant-`Dual` typing rule" sections of the
+`adnext-ircode-dualization` skill.
 
 Not yet supported (bails gracefully with a clear `ErrorException` rather than miscompiling): array /
 `memoryref` indexing (arrayref/boundscheck builtins on the live path) and other `Core.Builtin`s with
-no rule, and vararg calls. See the `adnext-ircode-dualization` skill for how supported constructs are
-handled, and `adnext-extending-ir-support` before adding support for anything new.
+no rule, and vararg calls. Also unsupported: differentiating a closure/struct
+with *differentiable fields* at order ≥2 (a representational limit of the self-tangent `Dual`
+scheme — errors clearly). Every bail now records a specific, human-
+readable *reason* (threaded via a `reason::Ref{String}` through `dualize_to_ircode`/`build_dual_ir`/
+`primal_of_impl`) that names the offending IR construct — including a compact rendering of the actual
+statement (`_stmt_str`) and its `%i` index, so the user sees *what* showed up in the IR that couldn't
+be handled (e.g. the literal `:boundscheck` an array index emits) — surfaced by installing a small
+error-raising `IRCode` (`error_ircode`) through the
+same `finishinfer!`/`optimize` seam rather than falling through to the carrier stub's generic
+message — see `adnext-architecture`'s "hard project constraint" above; this keeps that constraint
+intact (still transform-IRCode-only, no post-hoc patching). See the `adnext-ircode-dualization` skill
+for how supported constructs are handled, and `adnext-extending-ir-support` before adding support for
+anything new.

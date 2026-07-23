@@ -117,6 +117,16 @@ poly32(x::Float32) = x*x + x
 mklin(a)  = x -> a*x         # a·x        : d/dx = a,   d/da = x
 mkquad(a) = x -> a*(x*x)     # a·x²       : d/dx = 2a·x, d²/dx² = 2a
 
+# Higher-order AD written the natural way — a differentiation operator composed with itself — rather
+# than by hand-nesting `Dual` seeds. `Dop(f, x)` is `f'(x)` via one `frule`; nesting `Dop` gives
+# `f''` etc. This works because the inner `frule` inlines into the differentiated closure's primal
+# IR as a surviving `dualized_impl` `:invoke`, which the outer pass re-dualizes (see the
+# `pir_arg_offset`/function-slot handling in `build_dual_ir`). `scplusx` is differentiated twice
+# below (d²/dx²(sin x + x) = -sin x); `mkquad`'s capture is differentiated at second order too.
+Dop(f, x)  = frule(Dual(f, zero_tangent(f)), Dual(x, unit_tangent(x))).dx
+scplusx(x) = sin(x) + x
+d1_scpx(x) = Dop(scplusx, x)   # closure-free first derivative: cos(x) + 1
+
 # Still out of scope (scalar only): array indexing needs `Expr(:boundscheck)` + memoryref builtins
 # on the live path. Should bail gracefully with an `ErrorException`, not miscompile.
 getidx(v, i) = v[i]
@@ -130,6 +140,27 @@ checkdom(x) = x < 0 ? throw(DomainError(x, "neg")) : x*x
 @noinline throwneg(x) = throw(DomainError(x, "neg"))
 checkdom_ni(x) = x < 0 ? throwneg(x) : x*x
 guarded(x) = x == 0.0 ? throw(ArgumentError("zero")) : 1/x
+
+# Dynamic dispatch (`apply_generic`): reading a non-`const` global always infers as `Any` (regardless
+# of the concrete type of the value it holds), so any call whose argument flows through it — here
+# `getindex` on the `Ref`, then `+` — is a genuine `apply_generic`-style dynamic dispatch. These are
+# handled by deferring the surviving call to the runtime `dynamic_frule` dispatcher, which rebuilds
+# concrete `Dual`s from the runtime values and dispatches `frule` dynamically. `dyncall` holds the
+# `Ref` constant, so d/dx (x + c) = 1. `dyn_g` is a dynamically-resolved *callee* read from a global.
+dyn_ref = Ref{Any}(1.0)
+dyncall(x) = x + dyn_ref[]
+dyn_g = sin
+dyncallee(x) = dyn_g(x)                       # callee itself is dynamic (read from a non-const global)
+# A dynamic value that *carries a tangent*: box `x` in a `Ref{Any}`, read it back, and use it — the
+# tangent must propagate, so d/dx (r[] * x) = 2x. SROA proves `r[] === x` and folds the read away,
+# leaving `*(x, x)` with concrete args but an already-widened `::Any` result; that stays on the static
+# `:invoke` path (result annotated `dual_type(R)` = abstract `Dual`), exercising the invariant-`Dual`
+# typing rule rather than the `dynamic_frule` trampoline.
+dynbox(x) = (r = Ref{Any}(x); r[] * x)
+# A `Union`-typed return (a single `ReturnNode` whose value is a `PhiNode` typed `Union{Float64,Int}`):
+# the packed `Dual` must be a concrete leaf (`Dual{Float64,Float64}` on this input), not the frozen
+# `Dual{Union{Float64,Int},…}` a `%new` would build — which is *not* `<: dual_type(Union{…})`.
+dynret(x) = (x > 0 ? x*x : 1)
 
 @testset "ADNext" begin
 
@@ -386,9 +417,40 @@ guarded(x) = x == 0.0 ? throw(ArgumentError("zero")) : 1/x
 
     @testset "graceful bail on unsupported IR" begin
         # array indexing (memoryref builtins / boundscheck on the live path) is out of scope
-        # (scalar only): should error, not miscompile.
-        @test_throws ErrorException frule(Dual(getidx, NoTangent()),
-                                          Dual([1.0, 2.0, 3.0], NoTangent()), Dual(2, NoTangent()))
+        # (scalar only): should error, not miscompile. The message names the offending builtin.
+        err = try
+            frule(Dual(getidx, NoTangent()),
+                  Dual([1.0, 2.0, 3.0], [1.0, 0.0, 0.0]), Dual(2, NoTangent()))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        # the message names the offending IR construct (here the `:boundscheck` an array index emits)
+        @test occursin("boundscheck", err.msg)
+        @test occursin("at %", err.msg)
+    end
+
+    @testset "dynamic dispatch (apply_generic)" begin
+        # A surviving dynamic call (callee/arg non-concrete — e.g. a value flowed through an
+        # `Any`-typed global/field/`Ref`) is deferred to the runtime `dynamic_frule` dispatcher; a
+        # concrete-args/abstract-result call (`dynbox`) stays static — see the primal defs above.
+        # d/dx (x + const) = 1 (the `Ref` is held constant).
+        @test frule(Dual(dyncall, NoTangent()), Dual(1.0, 1.0)).dx ≈ 1.0
+        # dynamically-resolved callee read from a global: d/dx sin(x) = cos(x).
+        @test frule(Dual(dyncallee, NoTangent()), Dual(0.5, 1.0)).dx ≈ cos(0.5)
+        # tangent must propagate *through* the dynamic (Any-typed) value: d/dx (r[]*x) = 2x.
+        @test frule(Dual(dynbox, NoTangent()), Dual(3.0, 1.0)).dx ≈ 6.0
+        # matches finite differences on a nonlinear composition through a dynamic value.
+        fdyn(x) = sin(x + dyn_ref[])
+        h = 1e-6
+        @test frule(Dual(fdyn, NoTangent()), Dual(0.7, 1.0)).dx ≈ (fdyn(0.7+h) - fdyn(0.7-h))/2h atol=1e-6
+
+        # A non-concrete return type must pack the result as a *concrete leaf* `Dual` (built via a
+        # runtime `Dual(p,t)` call), not a frozen `Dual{Any,Any}`/`Dual{Union,…}`, so the result stays
+        # a well-typed dual (composable back into `frule`). `dynbox` returns `Any`; `dynret` a `Union`.
+        @test frule(Dual(dynbox, NoTangent()), Dual(3.0, 1.0)) isa Dual{Float64,Float64}
+        @test frule(Dual(dynret, NoTangent()), Dual(3.0, 1.0)) isa Dual{Float64,Float64}
     end
 
     @testset "function tangents (closures)" begin
@@ -467,8 +529,50 @@ guarded(x) = x == 0.0 ? throw(ArgumentError("zero")) : 1/x
 
         # graceful bail still holds at higher order: array indexing is unsupported → ErrorException.
         @test_throws ErrorException frule(fseed2(getidx),
-            Dual(Dual([1.0,2.0], NoTangent()), Dual([0.0,0.0], NoTangent())),
+            Dual(Dual([1.0,2.0], [1.0,0.0]), Dual([0.0,0.0], [0.0,0.0])),
             Dual(Dual(2, NoTangent()), Dual(0, NoTangent())))
+    end
+
+    @testset "higher-order via composed differentiation (nested frule / D-of-D)" begin
+        # Differentiate a function that itself calls `frule`. The inner `frule` inlines into the
+        # outer closure's primal IR as a surviving `dualized_impl` `:invoke`; the outer dualization
+        # pass re-dualizes it (the function slot `Dual{typeof(dualized_impl),NoTangent}` is dropped
+        # and the remaining nested value args peel down to the inner order-1 carrier).
+
+        # The exact form from the design goal: D(f, x) with `do` blocks, second derivative of sin+x.
+        r = Dop(10.0) do x
+            Dop(x) do x
+                sin(x) + x
+            end
+        end
+        @test r ≈ -sin(10.0)                               # d²/dx²(sin x + x) = -sin x
+
+        # Named-function equivalents, checked against the analytic second derivative at several points.
+        for x in (0.4, 1.3, -0.7, 2.1)
+            @test Dop(scplusx, x) ≈ cos(x) + 1             # first derivative
+            @test Dop(d1_scpx, x) ≈ -sin(x)                # second derivative via composed D
+            @test Dop(x -> Dop(scplusx, x), x) ≈ -sin(x)   # same, as a closure literal
+        end
+
+        # Higher orders by composing D further: d³/dx³(sin x + x) = -cos x, d⁴/dx⁴ = sin x. The
+        # `frule`-slot compose path (re-dualizing a surviving `frule` invoke) recurses cleanly.
+        d2_scpx(x) = Dop(d1_scpx, x)
+        d3_scpx(x) = Dop(d2_scpx, x)
+        @test Dop(d2_scpx, 0.4) ≈ -cos(0.4)
+        @test Dop(d3_scpx, 0.4) ≈  sin(0.4)
+
+        # The re-dualized outer closure produces valid IR (verify_ir on the raw dualized IRCode).
+        Core.Compiler.verify_ir(code_dual_ircode(d1_scpx, (Float64,))[1])
+        @test true
+
+        # Limitation: a closure/struct with *differentiable fields* cannot be differentiated at order
+        # ≥2. The self-tangent `Dual` scheme (`tangent_type(Dual{P,T}) == Dual{P,T}`) requires each
+        # carried type to be its own tangent type, which fails for such a struct (its tangent is a
+        # `Tangent`, not itself). Surfaces as a clear ADNext error, not a miscompile. `mkquad(3.0)` is
+        # a closure with a `Float64` capture, so nesting D over it lands here (whereas nesting D over
+        # the plain-function `scplusx` above is fine). First-order differentiation of the same closure
+        # — including w.r.t. its capture — works and is covered by the closures testset above.
+        @test_throws ErrorException Dop(z -> Dop(mkquad(3.0), z), 1.7)
     end
 
     @testset "allocation-free (dualization is fully inlined)" begin

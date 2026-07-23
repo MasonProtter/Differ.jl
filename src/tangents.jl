@@ -523,6 +523,75 @@ function zero_tangent(x::Ptr)
 end
 
 """
+    as_tangent(x)::tangent_type(typeof(x))
+
+Returns a value matching a primal type `x` projected to the tangent space, following the rules of ``
+
+Examples:
+
+```julia-repl
+julia> as_tangent(1.0)
+1.0
+
+julia> as_tangent(1)
+NoTangent()
+
+julia> as_tangent(1.0 + im)
+Tangent{@NamedTuple{re::Float64, im::Float64}}((re = 1.0, im = 1.0))
+
+julia> as_tangent(1 + im)
+NoTangent()
+```
+"""
+as_tangent(x) = primal_to_tangent!!(zero_tangent(x), x)::tangent_type(typeof(x))
+
+
+"""
+    unit_tangent(x)::tangent_type(typeof(x))
+
+Equivalent to `as_tangent(oneunit(x))`, i.e. get the equivalent of `oneunit(x)` but
+converted to an appropriate tangent type (if such an object exists).
+
+```julia-repl
+julia> unit_tangent(10.0)
+1.0
+
+julia> unit_tangent(10.0 + im)
+Tangent{@NamedTuple{re::Float64, im::Float64}}((re = 1.0, im = 0.0))
+
+julia> unit_tangent(1)
+NoTangent()
+```
+
+Keep in mind, not every object (such as vectors) have a canonical `oneunit`, so these will error.
+```
+julia> unit_tangent([1.0])
+ERROR: MethodError: no method matching one(::Vector{Float64})
+The function `one` exists, but no method is defined for this combination of argument types.
+
+Closest candidates are:
+  one(::Type{Union{}}, Any...)
+   @ Base number.jl:401
+  one(::Type{Missing})
+   @ Base missing.jl:107
+  one(::BitMatrix)
+   @ Base bitarray.jl:418
+  ...
+
+Stacktrace:
+ [1] oneunit(x::Vector{Float64})
+   @ Base ./number.jl:424
+ [2] unit_tangent(x::Vector{Float64})
+   @ ADNext ~/Nextcloud/Julia/ADNextPlayground/ADNext/src/tangents.jl:555
+ [3] top-level scope
+   @ REPL[114]:1
+```
+ 
+"""
+unit_tangent(x) = primal_to_tangent!!(zero_tangent(x), oneunit(x))::tangent_type(typeof(x))
+
+
+"""
     zero_tangent_internal(x, d::MaybeCache)
 
 Implementation of [`zero_tangent`](@ref). Makes use of `d` in the same way that
@@ -1777,6 +1846,7 @@ function primal_to_tangent!!(tangent, primal::P) where {P}
         tangent, primal, isbitstype(P) ? NoCache() : IdDict()
     )::tangent_type(P)
 end
+
 
 """
     tangent_to_primal_internal!!(x, tx, c::MaybeCache)
