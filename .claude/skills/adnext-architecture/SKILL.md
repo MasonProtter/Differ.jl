@@ -123,28 +123,33 @@ input `dualize_to_ircode` can't handle — flows through the ordinary, unmodifie
   for such a struct whose tangent is a `Tangent`); it errors clearly rather than miscompiling.
 - Only `sin`/`cos` have hand-written `frule` methods in `frules.jl`. Deliberately **no** rules
   exist for `+`, `-`, `*`, `/`, or comparisons: those inline down to intrinsics
-  (`add_float`/`mul_float`/`lt_float`/…), which are handled by **dispatch** via `src/intrinsics.jl`.
-  Each supported intrinsic has a thin wrapper function + an `frule`; the engine rewrites each
-  intrinsic call to its wrapper and routes it through `frule_split!` like any surviving call.
-  Registration is **explicit** — `translate` (intrinsic value → wrapper) has *no* identity fallback,
-  so an unregistered intrinsic bails with a clear located error instead of silently miscompiling.
-  Two macros register:
-  - `@intrinsic name` + a hand-written `frule(::Dual{typeof(name)}, …)` for a **differentiable**
-    intrinsic. Registered: `add/sub/neg/mul/div_float`, `sqrt_llvm`, `abs_float`, `max/min_float`,
-    `fma_float`, `muladd_float`, `copysign_float`, `fpext`/`fptrunc` (float-width conversions), plus
-    `_fast` variants.
-  - `@inactive_intrinsic name` for a **non-differentiable** one — auto-generates a variadic `frule`
-    computing the primal with a zero tangent. Registered: int/float comparisons, integer arithmetic
-    (+ checked), bit/boolean ops, rounding (`floor/ceil/trunc/rint_llvm`), and int↔float / width
-    conversions (`sitofp`, `fptosi`, …) whose leading *type* argument is carried through as a
-    `Dual{DataType}`.
+  (`add_float`/`mul_float`/`lt_float`/…), which are handled by **dispatch** via `src/intrinsics.jl`
+  — but *directly emitted*, not routed through `frule`/`Dual`-boxing/`CodeInstance` resolution the
+  way a surviving high-level call (`frule_split!`, e.g. `sin`/`cos`) is. An earlier version wrapped
+  each intrinsic in a thin function and dispatched `frule` on it like any surviving call; that was
+  simple but a real perf regression, since *every* arithmetic op in a differentiated function is an
+  intrinsic (unlike the handful of calls that actually survive). Instead, `dualize_to_ircode` calls
+  `apply_intrinsic_frule!(Val(f), actual, Ti, ctx)` for an intrinsic call — `Val(f)` dispatch works
+  because an intrinsic *value* is a valid type parameter (`Val{Core.Intrinsics.add_float}` names one
+  specific intrinsic, even though every intrinsic shares the single type `Core.IntrinsicFunction`).
+  Each method emits the primal + shadow IR straight into the caller's instruction stream using the
+  same `opf`/`presolve`/`tresolve`/`zero_shadow` primitives as every other case in the main loop, and
+  returns `(primal_ssa, shadow_ssa)`. Registration is **explicit** — the fallback method returns
+  `nothing`, so an unregistered intrinsic bails with a clear located error instead of silently
+  miscompiling. Rules are hand-written directly for a **differentiable** intrinsic (`add/sub/neg/
+  mul/div_float`, `sqrt_llvm`, `abs_float`, `max/min_float`, `fma_float`, `muladd_float`,
+  `copysign_float`, `fpext`/`fptrunc`, plus `_fast` variants — `max`/`min` use a branchless
+  `Core.ifelse` select, itself directly dualizable, see the builtin case next to `getfield`), and via
+  `@inactive_intrinsic name` for a **non-differentiable** one (int/float comparisons, integer
+  arithmetic (+ checked), bit/boolean ops, rounding, and int↔float / width conversions whose leading
+  *type* argument just passes through `presolve` unchanged — no `Dual`-boxing means no need to
+  resolve it to a `DataType` value first).
 
   This means arithmetic works for *any* type (`Float32`, `Complex`, a user struct via
   `getfield`/`%new`) without a per-type rule — don't add arithmetic `frule`s. To support a new
-  intrinsic, add the appropriate line in `src/intrinsics.jl` (no engine change needed); a
-  differentiable `frule` body must call the *wrappers* so it re-dualizes at higher order. The goal is
-  for *every* intrinsic to be registered; the few still unregistered are exotic (pointer/atomic ops,
-  `llvmcall`, `cglobal`, `bitcast`) and error loudly if hit rather than miscompiling.
+  intrinsic, add a method in `src/intrinsics.jl` (no engine change needed). The goal is for *every*
+  intrinsic to be registered; the few still unregistered are exotic (pointer/atomic ops, `llvmcall`,
+  `cglobal`, `bitcast`) and error loudly if hit rather than miscompiling.
 - `frule(dualargs::Dual...)` itself is `@generated`: for a composite primal with no hand-written
   rule, the generator compiles a dualized version of the primal's body under
   `ADInterpreter{Forward}` and returns a trivial body that `invoke`s the resulting `CodeInstance`.

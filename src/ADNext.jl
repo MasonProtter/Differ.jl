@@ -10,7 +10,7 @@ include("dual.jl")
 include("codual.jl")
 
 # Forward-mode AD engine, rebuilt on the ported `Dual`.
-include("intrinsics.jl")   # intrinsic wrappers + `frule`s (dispatch-based intrinsic handling)
+include("intrinsics.jl")   # dispatch-based intrinsic handling (apply_intrinsic_frule!)
 include("frules.jl")
 include("contextual.jl")
 include("forward_interp.jl")

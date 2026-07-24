@@ -301,6 +301,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     dynfrule_g = dynamic_frule   # runtime dispatcher for a surviving dynamic (`apply_generic`) call
     getf   = GlobalRef(Core, :getfield)
     ctuple = GlobalRef(Core, :tuple)
+    ifelseg = GlobalRef(Core, :ifelse)
     intrg(name) = GlobalRef(Core.Intrinsics, name)
 
     # Tangent type of a primal type — drives every shadow SSA's declared type. For scalars
@@ -490,6 +491,11 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         return emit!(Expr(:call, getf, dd, 1), R), emit!(Expr(:call, getf, dd, 2), tt(R))
     end
 
+    # Bundle of closures `apply_intrinsic_frule!` (`src/intrinsics.jl`) needs to emit an intrinsic's
+    # primal + shadow IR directly, without going through `frule_split!`'s `Dual`-boxing/`CodeInstance`
+    # machinery — see that file for why intrinsics get this cheaper path.
+    intrinsic_ctx = (opf=opf, emit! =emit!, presolve=presolve, tresolve=tresolve, zero_shadow=zero_shadow)
+
     # Block topology (block count, order, preds/succs) is preserved 1:1 from the primal: this
     # transform only expands each original statement into more instructions, never splits, merges,
     # or reorders blocks. So `GotoNode.label`/`GotoIfNot.dest`/`PhiNode.edges` (already basic-block
@@ -622,23 +628,19 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             actual = s.head === :invoke ? s.args[3:end] : s.args[2:end]
             f = _calleeval(fpos, iworld)
             if isa(f, Core.IntrinsicFunction)
-                # Every intrinsic is handled by rewriting it to its wrapper function and routing
-                # through the wrapper's `frule` (`src/intrinsics.jl`), exactly like any other
-                # surviving high-level call — a differentiable intrinsic (`add_float`, …) gets its
-                # hand-written rule, a non-differentiable one (comparisons, integer/bit ops, …) the
-                # auto-generated primal-plus-zero-tangent rule. `translate` has no identity fallback,
-                # so an *unregistered* intrinsic throws; catch it and bail gracefully with a located
-                # reason (matching the other unsupported-IR bails) rather than crashing inference.
-                local wrapper
-                try
-                    wrapper = translate(Val(f))
-                catch
+                # Dispatch straight to a per-intrinsic rule (`apply_intrinsic_frule!` in
+                # `src/intrinsics.jl`), which emits the primal + shadow IR directly using the same
+                # `opf`/`presolve`/`tresolve`/`zero_shadow` primitives as every other case in this
+                # loop — no `Dual` boxing, `frule` dispatch, or `CodeInstance` resolution. Explicit,
+                # not implicit: the fallback method returns `nothing`, so an *unregistered* intrinsic
+                # bails gracefully with a located reason rather than crashing or silently miscompiling.
+                res = apply_intrinsic_frule!(Val(f), actual, Ti, intrinsic_ctx)
+                if res === nothing
                     reason[] = "unsupported intrinsic `$(nameof(f))` at %$i: `$(_stmt_str(s))` " *
-                               "(no wrapper/`frule` registered; add one in src/intrinsics.jl)"
+                               "(no rule registered; add one in src/intrinsics.jl via " *
+                               "`apply_intrinsic_frule!`)"
                     return nothing
                 end
-                res = frule_split!(wrapper, actual, Ti)
-                res === nothing && return nothing
                 primal[i], shadow[i] = res
             elseif f === Core.getfield
                 Pobj = _optype(pir, actual[1])
@@ -653,6 +655,16 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                     # General struct: read the field's tangent out of the `Tangent`/`MutableTangent`.
                     shadow[i] = emit!(Expr(:call, gettfield_g, tresolve(actual[1]), actual[2]), TT)
                 end
+            elseif f === Core.ifelse
+                # A branchless select: same-shape shadow, indexed by the (non-differentiable) primal
+                # condition. Lets a rule that needs a select (e.g. `max_float`/`min_float` in
+                # `src/intrinsics.jl`) stay a single flat instruction instead of splitting the block —
+                # and remain dualizable if this IR is itself re-dualized at a higher order.
+                cond, a, b = actual[1], actual[2], actual[3]
+                primal[i] = emit!(Expr(:call, ifelseg, presolve(cond), presolve(a), presolve(b)), Ti)
+                TT = tt(Ti)
+                shadow[i] = TT === NoTangent ? NoTangent() :
+                            emit!(Expr(:call, ifelseg, presolve(cond), tresolve(a), tresolve(b)), TT)
             elseif isa(f, Core.Builtin)
                 reason[] = "no dualization rule for builtin `$f` (e.g. array/memoryref indexing) at " *
                            "%$i: `$(_stmt_str(s))`"
