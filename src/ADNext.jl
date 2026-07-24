@@ -9,7 +9,7 @@ include("array_tangents.jl")
 include("dual.jl")
 include("codual.jl")
 
-# Forward-mode AD engine, rebuilt on the ported `Dual`.
+# Forward-mode AD engine, compiler-level Dual arithmetic
 include("intrinsics.jl")   # dispatch-based intrinsic handling (apply_intrinsic_frule!)
 include("frules.jl")
 include("contextual.jl")

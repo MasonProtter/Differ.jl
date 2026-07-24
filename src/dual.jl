@@ -100,7 +100,7 @@ _primal(x::Dual) = primal(x)
 
 Check that the type of `tangent(x)` is the tangent type of the type of `primal(x)`.
 """
-verify_dual_type(x::Dual) = tangent_type(typeof(primal(x))) == typeof(tangent(x))
+verify_dual_type(x::Dual) = tangent_type(_typeof(primal(x))) == typeof(tangent(x))
 
 function error_if_incorrect_dual_types(duals::Vararg{Dual,N}) where {N}
     correct_types = map(verify_dual_type, duals)
@@ -109,9 +109,9 @@ function error_if_incorrect_dual_types(duals::Vararg{Dual,N}) where {N}
         tangents = map(tangent, duals)
         throw(ArgumentError("""
         Tangent types do not match primal types:
-          - primal types:           $(map(typeof, primals))
+          - primal types:           $(map(_typeof, primals))
           - provided tangent types: $(map(typeof, tangents))
-          - required tangent types: $(map(tangent_type, map(typeof, primals)))
+          - required tangent types: $(map(tangent_type, map(_typeof, primals)))
         """))
     end
 end

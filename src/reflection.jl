@@ -40,7 +40,7 @@ See also [`@code_dual_ircode`](@ref).
 function code_dual_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
                           order::Int = 1, world::UInt = Base.get_world_counter())
     interp = ADInterpreter{Forward}(; world)
-    dualtys = Any[_nest_dual(typeof(f), order)]
+    dualtys = Any[_nest_dual(_typeof(f), order)]
     for T in argtypes
         (T isa Type) || throw(ArgumentError("argtypes must be a tuple of types, got $(repr(T))"))
         push!(dualtys, _nest_dual(T, order))
@@ -60,7 +60,7 @@ end
     @code_dual_ircode f(args...)
 
 Convenience macro: show the optimized dualized `IRCode` for the call `f(args...)`, using the
-runtime types of `args`. Equivalent to `code_dual_ircode(f, map(typeof, (args...,)))`.
+runtime types of `args`. Equivalent to `code_dual_ircode(f, map(_typeof, (args...,)))`.
 
 ```julia
 @code_dual_ircode sin(0.5)
@@ -71,5 +71,5 @@ macro code_dual_ircode(call::Expr)
     call.head === :call || throw(ArgumentError("@code_dual_ircode expects a function call, e.g. `@code_dual_ircode f(x)`"))
     f = esc(call.args[1])
     args = Expr(:tuple, (esc(a) for a in call.args[2:end])...)
-    return :(code_dual_ircode($f, map(typeof, $args)))
+    return :(code_dual_ircode($f, map(_typeof, $args)))
 end

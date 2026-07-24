@@ -318,6 +318,9 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     dual!(@nospecialize(P), @nospecialize(T), @nospecialize(p), @nospecialize(t)) =
         emit!(Expr(:new, Dual{P,T}, p, t), Dual{P,T})
     # Whether a declared type is a specific leaf we can `%new` and freeze into an SSA's type.
+    # Note: `isconcretetype(Type{P})` is always `false` (a documented Julia quirk), so a
+    # `Type{P}`-typed callee/operand always takes the dynamic (`dynamic_frule`) path below rather
+    # than a static `:invoke` — correct, just not the fast path.
     _conc(@nospecialize T) = T isa DataType && isconcretetype(T)
     # Pack a primal/tangent into a `Dual` for a *non-concrete* primal type `R` (e.g. `Any`, produced by
     # a dynamic dispatch). A `%new(Dual{R,tt(R)}, …)` would freeze the over-wide declared type into the
@@ -412,7 +415,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # `presolve`/`_optype` rather than embedding the raw (old-numbered) AST node.
         fval = _calleeval(fpos, iworld)
         fcallee = fval === nothing ? presolve(fpos) : fval
-        ftype   = fval === nothing ? _optype(pir, fpos) : typeof(fval)
+        ftype   = fval === nothing ? _optype(pir, fpos) : _typeof(fval)
         # The callee's own tangent: a statically-known function is a code constant (zero tangent —
         # `NoTangent()` for a plain function); a genuinely dynamic callee (read out of a container)
         # carries whatever tangent the shadow pass computed for it.
@@ -446,7 +449,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                     push!(pvals, presolve(a)); push!(ptys, P)
                     push!(tvals, tresolve(a)); push!(ttys, tt(P))
                 else                                   # statically-known: embed the value + its zero
-                    P = typeof(v)
+                    P = _typeof(v)
                     push!(pvals, v); push!(ptys, P)
                     push!(tvals, zero_tangent(v)); push!(ttys, tt(P))
                 end
@@ -461,11 +464,14 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # Each argument dual is `Dual{P, tangent_type(P)}` (the Mooncake invariant). For scalar
         # primals `tangent_type(P) == P`, so this matches the old `Dual{P,P}`. A statically-known
         # operand (a `GlobalRef` to a defined binding, or a `QuoteNode`) must be embedded as its
-        # *resolved value* with `P = typeof(value)`, not as the raw node: e.g. an intrinsic's leading
-        # *type* argument (`fpext(Base.Float64, …)`) is a `GlobalRef` whose value is a `DataType`, and
-        # wrapping the raw node as `Dual{GlobalRef,…}` would both mis-declare the field and TypeError
-        # at the `%new` when the ref loads as the type. Only genuinely dynamic operands
-        # (SSAValue/Argument) fall back to `presolve`/`_optype`/`tresolve`.
+        # *resolved value* with `P = _typeof(value)`, not as the raw node: e.g. an intrinsic's leading
+        # *type* argument (`fpext(Base.Float64, …)`) is a `GlobalRef` whose value is a `DataType`
+        # instance (`Float64`), and wrapping the raw node as `Dual{GlobalRef,…}` would both mis-declare
+        # the field and TypeError at the `%new` when the ref loads as the type. `_typeof`, not plain
+        # `typeof`, is required here: `typeof(Float64) === DataType` loses the value entirely, whereas
+        # `_typeof(Float64) === Type{Float64}` sharpens it — needed for `Dual{Type{Float64},…}`-keyed
+        # `frule` dispatch to resolve. Only genuinely dynamic operands (SSAValue/Argument) fall back to
+        # `presolve`/`_optype`/`tresolve`.
         dualtys = Any[]; duals = Any[]
         for a in actual
             v = _calleeval(a, iworld)
@@ -474,7 +480,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 push!(dualtys, Dual{P,tt(P)})
                 push!(duals, dual!(P, tt(P), presolve(a), tresolve(a)))
             else                                        # statically-known: embed value + its zero tangent
-                P = typeof(v)
+                P = _typeof(v)
                 push!(dualtys, Dual{P,tt(P)})
                 push!(duals, dual!(P, tt(P), v, zero_tangent(v)))
             end
