@@ -41,6 +41,12 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
     # MethodInstance being compiled. Safe because one interpreter instance serves both hooks of a
     # given frame.
     transformed_ir::IdDict{MethodInstance, IRCode}
+    # Backedges discovered while building `transformed_ir[mi]` (e.g. the primal method it was
+    # dualized from, and any `frule` method resolved for a surviving high-level call) — see the
+    # `build_contextual_ir`/`build_dual_ir` machinery in `forward_interp.jl`. `finishinfer!` folds
+    # these into `me.src.edges` so the ordinary `compute_edges!`/`store_backedges` path registers
+    # real Julia backedges, without ADNext calling any invalidation ccall itself.
+    transformed_edges::IdDict{MethodInstance, Vector{Any}}
     function ADInterpreter{M}(world::UInt,
                               ip::InferenceParams,
                               op::OptimizationParams) where {M<:ADMode}
@@ -52,6 +58,7 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
             op,
             IdDict{CodeInstance, CodeInfo}(),
             IdDict{MethodInstance, IRCode}(),
+            IdDict{MethodInstance, Vector{Any}}(),
         )
     end
 end
@@ -123,6 +130,24 @@ function CC.finishinfer!(me::CC.InferenceState, interp::ADInterpreter, cycleid::
     if ir !== nothing
         interp.transformed_ir[me.linfo] = ir
         me.bestguess = CC.compute_ir_rettype(ir)
+        # Fold in whatever backedges the mode's transform discovered (e.g. the primal method(s) a
+        # dualized body was built from, and any `frule` methods resolved for surviving high-level
+        # calls — see `build_contextual_ir`/`build_dual_ir` in `forward_interp.jl`). These must land
+        # on *this* CodeInstance (`me.linfo`'s own compile), not merely on some caller of it: a
+        # `finish!` on THIS `InferenceState` is what actually calls `store_backedges` against
+        # `me.linfo`'s CodeInstance below, and a `@generated` caller's own cached CodeInstance for a
+        # call to `me.linfo` is only re-examined for staleness by looking `me.linfo`'s cache up
+        # again — so if `me.linfo`'s CodeInstance were never itself invalidated, a caller
+        # regenerating around it would just find (and keep reusing) the same stale result. Setting
+        # `me.src.edges` here — *before* delegating to the generic `finishinfer!`, which internally
+        # calls `compute_edges!(me)` reading exactly this field — is the standard, documented way a
+        # generator-produced `CodeInfo` declares extra edges (`compute_edges!` in `typeinfer.jl`).
+        edges = get(interp.transformed_edges, me.linfo, nothing)
+        if edges !== nothing && !isempty(edges)
+            existing = me.src.edges
+            me.src.edges = (existing === nothing || existing === CC.empty_edges) ? edges :
+                           Any[existing..., edges...]
+        end
     end
     return @invoke CC.finishinfer!(me::CC.InferenceState, interp::CC.AbstractInterpreter,
                                    cycleid::Int, opt_cache::IdDict{MethodInstance, CodeInstance})

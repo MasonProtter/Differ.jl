@@ -42,7 +42,14 @@ end
 function build_contextual_ir(interp::ADInterpreter{Forward}, mi::MethodInstance)
     is_dualized_impl(mi) || return nothing
     reason = Ref("ADNext could not dualize the primal (no specific reason recorded).")
-    ir = build_dual_ir(interp, mi, reason)
+    edges = Any[]
+    ir = build_dual_ir(interp, mi, reason, edges)
+    # Stash whatever backedges were discovered even on a bail: if the missing piece (a primal
+    # method, a not-yet-written `frule`) later appears, the mt-backedges recorded below (see
+    # `primal_of_impl`/`frule_codeinstance`) invalidate this carrier so it gets a real chance to
+    # dualize instead of staying pinned to the error stub forever. `frule_body` reads this back to
+    # set the generated wrapper's `ci.edges`.
+    interp.transformed_edges[mi] = edges
     ir === nothing && return error_ircode(mi, reason[])
     return ir
 end
@@ -69,16 +76,90 @@ function error_ircode(impl_mi::MethodInstance, msg::String)
     return ir
 end
 
+# The `frule_tt` a *hypothetical* differentiation of `callee_mi` would resolve against — the same
+# shape `frule_codeinstance`/`primal_of_impl` build from a genuine surviving call, but derived
+# instead from `callee_mi.specTypes` (the exact concrete call signature Julia's own call-graph
+# discovery already found — see `register_implicit_frule_backedge!`/`src_inlining_policy` below).
+# Returns `nothing` for anything the shape doesn't apply to (varargs, `Type`-valued parameters,
+# …) rather than throwing: `callee_mi` may be an arbitrary callee Julia's compiler discovered, not
+# something ADNext validated.
+function implicit_frule_tt(callee_mi::MethodInstance)
+    isa(callee_mi.def, Method) || return nothing
+    params = callee_mi.specTypes.parameters
+    isempty(params) && return nothing
+    ftype = params[1]
+    (ftype isa Type) || return nothing
+    try
+        dualargs = Any[Dual{P,tangent_type(P)} for P in params[2:end]]
+        return Tuple{typeof(frule), Dual{ftype,NoTangent}, dualargs...}
+    catch
+        return nothing
+    end
+end
+
+# An mt-backedge on the `frule` resolution a *hypothetical* differentiation of `callee_mi` would
+# use, registered even though `callee_mi`'s call was (or may have been) inlined away and never
+# actually went through `frule_split!`/`frule_codeinstance` — see the call site in `build_dual_ir`'s
+# base case. So a user later hand-writing `frule(::Dual{typeof(callee_mi's function)}, ...)`
+# invalidates a derivative built before that rule existed, exactly like a surviving high-level call
+# would get via `frule_codeinstance`. Best-effort, same caveats as `implicit_frule_tt`: this is a
+# nice-to-have extra invalidation trigger, not core, so a `frule_tt` that can't be built is silently
+# skipped rather than aborting the whole dualization.
+function register_implicit_frule_backedge!(edges::Vector{Any}, callee_mi::MethodInstance)
+    frule_tt = implicit_frule_tt(callee_mi)
+    frule_tt === nothing || push!(edges, frule_tt, Core.methodtable)
+    return nothing
+end
+
+# The generated composite fallback (`frule_body`, installed by `refresh_frule`) is the *only* method
+# of `frule` with this exact vararg signature — every hand-written rule (`frule(::Dual{typeof(f)},
+# dualargs::Dual...)` for a concrete `f`) has a strictly narrower signature. So a `Method` matches the
+# fallback, rather than some hand rule, iff its signature is exactly this one.
+is_generated_frule_fallback(m::Method) = m.sig === Tuple{typeof(frule), Vararg{Dual}}
+
+# Does a *hand-written* `frule` (as opposed to the generated composite fallback, which always
+# matches) apply to a hypothetical differentiation of `callee_mi`? Used by `src_inlining_policy`
+# below to keep such a call from being inlined away before `dualize_to_ircode` ever gets a chance to
+# route it through that rule (see the "inlined `foo`, hand rule added, still gives the wrong
+# derivative" class of bug this defends against).
+function has_hand_frule(interp::ADInterpreter, callee_mi::MethodInstance)
+    frule_tt = implicit_frule_tt(callee_mi)
+    frule_tt === nothing && return false
+    m, _ = CC.findsup(frule_tt, CC.method_table(interp))
+    m === nothing && return false
+    return !is_generated_frule_fallback(m.method)
+end
+
+# Inlining policy: never inline a call whose callee has a hand-written `frule` — otherwise the call
+# vanishes into the caller's optimized IR (as plain arithmetic/whatever primitives it lowers to)
+# before `dualize_to_ircode` ever sees it, so the hand rule can never be consulted, regardless of how
+# small/inlinable the callee looks to Julia's ordinary cost-based heuristic (which has no concept of
+# `frule` at all). Falls back to the ordinary policy otherwise, so this only ever *restricts*
+# inlining relative to normal Julia behavior, never expands it.
+function CC.src_inlining_policy(interp::ADInterpreter{Forward}, mi::MethodInstance,
+                                @nospecialize(src), @nospecialize(info::CC.CallInfo), stmt_flag::UInt32)
+    has_hand_frule(interp, mi) && return false
+    return @invoke CC.src_inlining_policy(interp::CC.AbstractInterpreter, mi::MethodInstance,
+                                          src::Any, info::CC.CallInfo, stmt_flag::UInt32)
+end
+
 # Resolve the primal MethodInstance and dual arity for a `dualized_impl` specialization. `reason`
 # records why (a human-readable message) when this bails, for `build_contextual_ir`/`code_dual_ircode`
-# to surface to the user instead of a generic message.
-function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""))
+# to surface to the user instead of a generic message. `edges` collects the backedges this
+# resolution depends on (see `build_contextual_ir`/`frule_body`): an mt-backedge on `primal_tt` —
+# unconditional, since *any* new method that could apply to these argument types (more specific,
+# or previously nonexistent) must invalidate a derivative built against the old resolution — plus,
+# when a match is found, a direct edge to `primal_mi` itself (this dual IR is built directly from
+# its optimized IR, i.e. effectively inlines it, so redefining/invalidating it must invalidate us).
+function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""),
+                        edges::Vector{Any}=Any[])
     dualparams = impl_mi.specTypes.parameters[2:end]
     if !all(P -> P isa Type && P <: Dual, dualparams)
         reason[] = "not every dual argument type is a `Dual` (a vararg call?)"
         return nothing
     end
     primal_tt = Base.to_tuple_type(Any[_dual_primal_type(P) for P in dualparams])
+    push!(edges, primal_tt, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
     pmatch, _ = CC.findsup(primal_tt, CC.method_table(interp))
     if pmatch === nothing
         reason[] = "no unique primal method resolves for argument types " *
@@ -95,6 +176,7 @@ function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance, reason::
         return nothing
     end
     primal_mi = specialize_method(pmatch.method, pmatch.spec_types, pmatch.sparams)::MethodInstance
+    CC.add_inlining_edge!(edges, primal_mi)
     return (primal_mi, length(dualparams))
 end
 
@@ -111,7 +193,8 @@ end
 #    resolving the inner `dualized_impl` carrier, and recursing through `optimized_dual_ir`; the
 #    result is then re-dualized. That inner dual IR is vararg-shaped (`dualized_impl(dualargs...)`),
 #    so `pir_is_vararg=true` selects the tuple-reconstruction prologue in `dualize_to_ircode`.
-function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""))
+function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""),
+                       edges::Vector{Any}=Any[])
     dualparams = impl_mi.specTypes.parameters[2:end]
     if !all(P -> P isa Type && P <: Dual, dualparams)
         reason[] = "not every dual argument type is a `Dual` (a vararg call?)"
@@ -135,9 +218,15 @@ function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::R
             return nothing
         end
         inner_mi = specialize_method(m.method, m.spec_types, m.sparams)::MethodInstance
+        # This dual IR is built directly on top of the inner carrier's own optimized dual IR (its
+        # instructions are copied/re-dualized wholesale below), so redefining/invalidating
+        # `inner_mi` must invalidate this one too. `inner_mi`'s *own* dependencies (its primal
+        # method, any `frule`s it resolved) are tracked on its own edges list whenever it is
+        # itself compiled through this same seam — not duplicated into `edges` here.
+        CC.add_inlining_edge!(edges, inner_mi)
         pir = optimized_dual_ir(interp, inner_mi, reason)
         pir === nothing && return nothing
-        return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=true, pir_arg_offset=offset, reason)
+        return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=true, pir_arg_offset=offset, reason, edges)
     end
 
     f1 = n >= 1 ? _dual_primal_type(dualparams[1]) : Union{}
@@ -168,29 +257,57 @@ function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::R
     # resolves to the *generated* (vararg) `frule` rather than a hand rule, this is not a base case
     # but a composed derivative (`D` applied to a surviving `frule` invoke, e.g. a 3rd+-order nested
     # `D`); fall back to `compose(1)`, which drops the `frule` slot and re-dualizes the inner carrier.
-    info = primal_of_impl(interp, impl_mi, reason)
+    info = primal_of_impl(interp, impl_mi, reason, edges)
     if info === nothing
         f1 === typeof(frule) && return compose(1)
         return nothing
     end
     primal_mi, _ = info
-    world = CC.get_inference_world(interp)
-    # Optimized primal IR via the internal `typeinf_ircode`. A NativeInterpreter is used so that
-    # `sin`/`cos` and other hand-ruled functions survive as `:invoke`s (routed through `frule`).
-    pir, _ = CC.typeinf_ircode(CC.NativeInterpreter(world), primal_mi, nothing)
-    if pir === nothing
+    # Optimized primal IR, computed by hand (mirroring `Core.Compiler.typeinf_ircode`'s own body)
+    # rather than calling that function directly, so we can also read off `frame.edges` — see below.
+    # Compiled with `interp` itself (not a bare `NativeInterpreter`): this is what makes our
+    # `src_inlining_policy` override actually apply, so a callee with a hand-written `frule` isn't
+    # inlined away before `dualize_to_ircode` gets a chance to route it through that rule — the same
+    # reason `sin`/`cos` and other hand-ruled functions already survived as `:invoke`s even before
+    # that override existed (their bodies simply weren't cheap enough to inline by ordinary cost
+    # heuristics; the override now makes that hold *regardless* of cost for anything hand-ruled).
+    frame = CC.typeinf_frame(interp, primal_mi, false)
+    if frame === nothing
         reason[] = "inference failed to produce optimized IR for the primal method $(primal_mi)"
         return nothing
     end
-    return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=false, reason)
+    opt = CC.OptimizationState(frame, interp)
+    pir = CC.run_passes_ipo_safe(opt.src, opt, nothing)
+    # Pre-inlining call-graph edges: a plain `add_inlining_edge!(edges, primal_mi)` (added by
+    # `primal_of_impl` above) is *not* enough on its own — if the primal inlines a callee (the
+    # common case, e.g. `bar(x) = foo(x)` inlining `foo`), that callee's identity is gone from `pir`
+    # by the time we ever see it, so we could never discover it by walking `pir` ourselves. But
+    # `frame.edges` was already populated by ordinary inference (`compute_edges!`, called from
+    # `finishinfer!` as the frame completes) *before* the optimizer ran — from each call site's
+    # `CallInfo`, independent of what the later inlining pass does to the IR — and the inlining pass
+    # (`InliningState(frame, interp)` aliases `frame.edges` as `opt.inlining.edges`) appends to that
+    # very same array as it inlines. So `frame.edges` after `run_passes_ipo_safe` is exactly the
+    # primal's real dependency set, including everything it inlined away.
+    append!(edges, frame.edges)
+    # For every concrete callee discovered above (regardless of whether its call survived or was
+    # inlined away), also register the mt-backedge a hand-written `frule` for it would need — see
+    # `register_implicit_frule_backedge!`. `ForwardToBackedgeIterator` decodes the same variable-width
+    # edge encoding `store_backedges` itself understands, so this walks `frame.edges` correctly
+    # regardless of which entry shape (plain MI/CI, invoke pair, mt-backedge pair, multi-match
+    # record) each dependency happened to take.
+    for (_, item) in CC.ForwardToBackedgeIterator(Core.svec(frame.edges...))
+        isa(item, MethodInstance) && register_implicit_frule_backedge!(edges, item)
+    end
+    return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=false, reason, edges)
 end
 
 # The optimized dual `IRCode` for a `dualized_impl` carrier: exactly what the `optimize` seam
 # installs (and what `code_dual_ircode` returns) — `build_dual_ir` followed by the IPO-safe passes.
 # Used both by the higher-order recursion above (to obtain the order-(k-1) dual IR as a primal) and
 # by the reflection entry point.
-function optimized_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""))
-    ir = build_dual_ir(interp, impl_mi, reason)
+function optimized_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""),
+                           edges::Vector{Any}=Any[])
+    ir = build_dual_ir(interp, impl_mi, reason, edges)
     ir === nothing && return nothing
     world = CC.get_inference_world(interp)
     opt = CC.OptimizationState(impl_mi, CC.retrieve_code_info(impl_mi, world), interp)
@@ -204,14 +321,24 @@ end
 # `:invoke` (mirroring how the primal IR keeps `sin`/`cos` as `:invoke`s to a `CodeInstance`).
 # `:invoke` targets *must* be `CodeInstance`s: `collectinvokes!` only JITs those, so a bare
 # `MethodInstance` would fall back to a boxed dynamic call. Returns `nothing` if unresolved.
-function frule_codeinstance(interp::ADInterpreter, @nospecialize(ftype), dual_argtypes)
+#
+# `edges` collects the backedges this resolution depends on: an mt-backedge on `frule_tt` —
+# unconditional, so a *new* user `frule` method (one that didn't exist, or wasn't as specific, when
+# this was built — e.g. someone hand-writing a rule for a function that previously fell through to
+# the generated composite fallback) invalidates this dual IR — plus, when a rule is found, a direct
+# invoke edge to the resolved `CodeInstance` (this call is emitted as a static `:invoke` to it).
+function frule_codeinstance(interp::ADInterpreter, @nospecialize(ftype), dual_argtypes,
+                            edges::Vector{Any}=Any[])
     frule_tt = Tuple{typeof(frule), Dual{ftype,NoTangent}, dual_argtypes...}
+    push!(edges, frule_tt, Core.methodtable)   # mt-backedge: a new/more-specific frule must invalidate
     fm, _ = CC.findsup(frule_tt, CC.method_table(interp))
     fm === nothing && return nothing
     isa(fm.method, Method) || return nothing
     frule_mi = specialize_method(fm.method, fm.spec_types, fm.sparams)::MethodInstance
     world = CC.get_inference_world(interp)
-    return CC.typeinf_ext_toplevel(CC.NativeInterpreter(world), frule_mi, CC.SOURCE_MODE_ABI)::CodeInstance
+    ci = CC.typeinf_ext_toplevel(CC.NativeInterpreter(world), frule_mi, CC.SOURCE_MODE_ABI)::CodeInstance
+    CC.add_invoke_edge!(edges, frule_tt, ci)
+    return ci
 end
 
 
@@ -273,7 +400,7 @@ _calleeval(@nospecialize(x), world::UInt) =
 # Returns `ir::IRCode` or `nothing`.
 function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                            pir_is_vararg::Bool=false, pir_arg_offset::Int=0,
-                           reason::Ref{String}=Ref(""))
+                           reason::Ref{String}=Ref(""), edges::Vector{Any}=Any[])
     pstmts = pir.stmts
     N = length(pstmts)
     # Resolve `GlobalRef` callees/operands at the interpreter's *inference* world (see `_calleeval`):
@@ -490,7 +617,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # is the declared result type: `Dual{R,tangent_type(R)}` for a concrete `R`, and the *abstract*
         # `Dual` when `R` is non-concrete — the concrete `Dual` the rule actually returns is a subtype
         # of the latter (whereas the invariant `Dual{Any,Any}` would be unsound and miscompile).
-        ci = frule_codeinstance(interp, ftype, dualtys)
+        ci = frule_codeinstance(interp, ftype, dualtys, edges)
         DR = dual_type(R)
         dd = ci === nothing ? emit!(Expr(:call, fruleg, fd, duals...), DR) :
                               emit!(Expr(:invoke, ci, fruleg, fd, duals...), DR)
@@ -846,6 +973,9 @@ function frule_body(world::UInt, source, self, dual_argtypes)
     ci = expr_to_codeinfo(@__MODULE__(), argnames, [], (),
                           :(return invoke(dualized_impl, $cinst, dualargs...)), true)
 
+    # `impl_mi` is a real backedge: if its own CodeInstance is invalidated (see below — that's where
+    # the primal/`frule` dependencies actually get registered, via `finishinfer!` in `contextual.jl`),
+    # this wrapper must be invalidated and regenerated too, so it re-embeds a fresh `cinst`.
     ci.edges = Core.MethodInstance[impl_mi]
     return ci
 end

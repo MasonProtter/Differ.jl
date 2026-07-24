@@ -621,5 +621,6 @@ dynret(x) = (x > 0 ? x*x : 1)
     end
 
     include("test_intrinsic_dispatch.jl")      # dispatch-based intrinsic handling (add_float)
+    include("test_backedges.jl")               # derivative invalidation on primal redefinition
 
 end
