@@ -219,6 +219,38 @@ for a value whose type is fixed *elsewhere* and is already a concrete leaf `<:` 
 time from the actual values). That is exactly why the two non-concrete paths (`frule_split!`'s
 `:invoke`, the `ReturnNode`'s `dyn_dual!`) can carry the abstract `dual_type(R)` while a `%new` cannot.
 
+## World-age inside the generated `frule` body (resolve bindings at the *inference* world)
+
+Everything reached transitively from the `@generated frule` body — `frule_body` →
+`typeinf_ext_toplevel(interp, …)` → `build_contextual_ir` → the whole dualization engine — runs at a
+**stale generation world** that can *predate a user's (`Main`) function definition*. So **never resolve
+a global binding, do a method lookup, or build an interpreter using the *ambient* world**:
+`Base.get_world_counter()`, `Core.Compiler.tls_world_age()`, a bare `getglobal`/`isdefined`, or
+`invoke_in_world` for a binding (which reparameterizes *dispatch* but **not** global-binding lookup —
+its `UndefVarError` still reports the stale world). Always thread the interpreter's inference world
+`CC.get_inference_world(interp)` and use world-parameterized primitives:
+
+- `CC.method_table(interp)` for `findsup` (already the case in `primal_of_impl`/`compose`/`frule_codeinstance`);
+- `CC.NativeInterpreter(world)` / `retrieve_code_info(mi, world)` for sub-inference (already in `build_dual_ir`/`optimized_dual_ir`);
+- **`Base.getglobalref(gr, world)`** (`ccall :jl_eval_globalref`) to read a `GlobalRef`'s value — this
+  is what `_calleeval(x, world)` uses, and why its `world` argument is **mandatory (no default)**: a
+  silent `get_world_counter()` default is exactly the trap.
+
+`Base` functions accidentally survive a wrong (ambient) world because they were defined at an early
+world; **user** functions are the ones that expose the bug. The classic symptom is a `GlobalRef`
+leaking into the dual IR — e.g. a callee that couldn't be resolved degrades to a raw `GlobalRef`,
+producing `%new(Dual{GlobalRef,…}, foo, …)` and a runtime `TypeError(:new, …, GlobalRef, foo)` at
+order ≥2 (the misresolved callee is invisible at first order until re-processing/const-prop reaches
+it). This was the root cause of the "differentiate a user function with a hand-written `frule`" crash.
+
+**Known open issue (not yet fixed):** the carrier's installed `CodeInstance` does not record real
+backedges to the dependencies discovered while building the dual IR (the primal `MethodInstance` from
+`typeinf_ircode`, and `frule_codeinstance` `:invoke` targets) — `finishinfer!` derives edges from the
+`dualized_impl` *stub* body, and the raw `CC.findsup` lookups aren't edge-tracked. Redefining a primal
+or adding/changing a hand `frule` therefore does **not** invalidate an already-compiled dual (hence the
+manual `refresh_frule()` escape hatch). Systemic (reverse mode shares it). Fixing it means wiring those
+dependencies into `me.edges`/`opt.src.edges`.
+
 ## Where to go next
 
 - General orientation / why any of this exists: the `adnext-architecture` skill.

@@ -127,6 +127,20 @@ Dop(f, x)  = frule(Dual(f, zero_tangent(f)), Dual(x, unit_tangent(x))).dx
 scplusx(x) = sin(x) + x
 d1_scpx(x) = Dop(scplusx, x)   # closure-free first derivative: cos(x) + 1
 
+# A *user* function (defined here, not in Base) with a hand-written `frule`, reached through a
+# wrapper. Unlike `sin`/`cos`, a user callee is defined at a *late* world, so differentiating a
+# caller of it must resolve the callee at the interpreter's *inference* world (`_calleeval`'s `world`
+# argument, via `Base.getglobalref`) — resolving at the stale generation world the dualization runs
+# under would see the binding as undefined, leak a raw `GlobalRef` into the dual IR, and miscompile at
+# order ≥2 (a `Dual{GlobalRef,…}` → `%new` `TypeError`). `@noinline` keeps the callee a surviving
+# `:invoke`. This is the exact shape of the original bug report.
+@noinline hr_lin(x) = x + 1     # hand rule below; d/dx = 1,  higher derivatives = 0
+@noinline hr_sqr(x) = x*x       # hand rule below; d/dx = 2x, d²/dx² = 2, d³/dx³ = 0
+call_lin(x) = hr_lin(x)
+call_sqr(x) = hr_sqr(x)
+ADNext.frule(::Dual{typeof(hr_lin)}, d::Dual) = Dual(d.x + 1, d.dx * one(d.x))
+ADNext.frule(::Dual{typeof(hr_sqr)}, d::Dual) = Dual(d.x * d.x, d.dx * (2 * d.x))
+
 # Still out of scope (scalar only): array indexing needs `Expr(:boundscheck)` + memoryref builtins
 # on the live path. Should bail gracefully with an `ErrorException`, not miscompile.
 getidx(v, i) = v[i]
@@ -573,6 +587,27 @@ dynret(x) = (x > 0 ? x*x : 1)
         # the plain-function `scplusx` above is fine). First-order differentiation of the same closure
         # — including w.r.t. its capture — works and is covered by the closures testset above.
         @test_throws ErrorException Dop(z -> Dop(mkquad(3.0), z), 1.7)
+    end
+
+    @testset "user function with a hand-written frule (world-age callee resolution)" begin
+        # Differentiating a caller of a *user* function with a hand rule: the callee must be resolved
+        # at the interpreter's inference world, not the stale generation world (see `hr_lin`/`hr_sqr`).
+        # First order works even on a clean tree; the crash was at order ≥2 (a `Dual{GlobalRef,…}`).
+        @test Dop(call_lin, 1.0) == 1.0                          # d/dx (x+1) = 1
+
+        # The exact original bug report: D-of-D over the wrapper. Second/third derivatives of x+1 = 0.
+        @test (Dop(1.0) do x; Dop(call_lin, x) end) == 0.0
+        @test (Dop(1.0) do x; Dop(y -> Dop(call_lin, y), x) end) == 0.0
+
+        # Non-linear rule so the second derivative is non-trivial: d/dx(x²)=2x, d²/dx²(x²)=2.
+        for x in (0.4, 1.3, -0.7, 2.1)
+            @test Dop(call_sqr, x) ≈ 2x
+            @test (Dop(z -> Dop(call_sqr, z), x)) ≈ 2.0
+        end
+
+        # The dualized caller is valid IR (verify_ir on the raw dualized IRCode).
+        Core.Compiler.verify_ir(code_dual_ircode(call_sqr, (Float64,))[1])
+        @test true
     end
 
     @testset "allocation-free (dualization is fully inlined)" begin

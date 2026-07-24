@@ -245,8 +245,20 @@ const _Intr = Core.Intrinsics
 # value, not a name to look up: returning it as-is would let the raw *old*-numbered node leak
 # directly into the freshly built IR as an operand (referencing the wrong slot there). `nothing`
 # signals "not statically resolvable — resolve via `presolve`/`_optype` instead" to callers.
-_calleeval(@nospecialize(x)) =
-    isa(x, GlobalRef) ? (isdefined(x.mod, x.name) ? getglobal(x.mod, x.name) : nothing) :
+#
+# A `GlobalRef` is resolved *at `world`* — the interpreter's inference world — via `Base.getglobalref`
+# (`jl_eval_globalref`), NOT at the ambient task world. This is load-bearing: `dualize_to_ircode` runs
+# transitively inside the `@generated frule` body (`frule_body` -> `typeinf_ext_toplevel`), whose
+# generation world can *predate* a user's (`Main`) function definition. A bare `getglobal`/`isdefined`
+# (or `invoke_in_world`, which reparameterizes dispatch but *not* global-binding lookup) would there
+# see a genuinely-defined user function as undefined, returning `nothing` — the callee then degrades to
+# a raw `GlobalRef` and miscompiles at higher order (a `Dual{GlobalRef,…}` -> `%new` `TypeError`).
+# `Base` functions escape this only because they are defined at an early world. The `world` argument is
+# therefore *mandatory* (no default): every caller must thread the inference world in consciously — see
+# the "world-age inside the generated `frule` body" note in the `adnext-ircode-dualization` skill.
+# `try/catch -> nothing` keeps the "genuinely unresolvable ⇒ dynamic" contract for undefined bindings.
+_calleeval(@nospecialize(x), world::UInt) =
+    isa(x, GlobalRef) ? (try Base.getglobalref(x, world) catch; nothing end) :
     isa(x, QuoteNode) ? x.value :
     isa(x, Core.SSAValue) || isa(x, Core.Argument) ? nothing :
     x
@@ -262,6 +274,9 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                            reason::Ref{String}=Ref(""))
     pstmts = pir.stmts
     N = length(pstmts)
+    # Resolve `GlobalRef` callees/operands at the interpreter's *inference* world (see `_calleeval`):
+    # the ambient generation world we run under can predate a user function's definition.
+    iworld = CC.get_inference_world(interp)
     # Defensive: a leading PhiNode in block 1 (predecessor-free) would collide with the
     # unconditional arg-extraction prologue below, which must land before any real phi. Not
     # observed in practice (slot2ssa! always keeps block 1 phi-free), but bail rather than emit
@@ -392,7 +407,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # proven constant. When the callee is a genuinely dynamic value (an `SSAValue`/`Argument` —
         # e.g. a `Function` read out of a container), resolve it like any other operand via
         # `presolve`/`_optype` rather than embedding the raw (old-numbered) AST node.
-        fval = _calleeval(fpos)
+        fval = _calleeval(fpos, iworld)
         fcallee = fval === nothing ? presolve(fpos) : fval
         ftype   = fval === nothing ? _optype(pir, fpos) : typeof(fval)
         # The callee's own tangent: a statically-known function is a code constant (zero tangent —
@@ -422,7 +437,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             # and its (compile-time-zero) tangent together so the tuple's element types match.
             pvals = Any[]; ptys = Any[]; tvals = Any[]; ttys = Any[]
             for a in actual
-                v = _calleeval(a)
+                v = _calleeval(a, iworld)
                 if v === nothing                       # genuinely dynamic operand (SSAValue/Argument)
                     P = _optype(pir, a)
                     push!(pvals, presolve(a)); push!(ptys, P)
@@ -508,7 +523,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # invoke's callee position is a value position `verify_ir` rejects (see frule_split!).
                 # A genuinely dynamic callee (SSAValue/Argument) isn't a name to look up — resolve it
                 # like any other operand via `presolve`.
-                fv = _calleeval(s.args[2])
+                fv = _calleeval(s.args[2], iworld)
                 ex = Expr(:invoke, s.args[1], fv === nothing ? presolve(s.args[2]) : fv,
                           (presolve(a) for a in s.args[3:end])...)
                 primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
@@ -516,7 +531,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # Resolve the callee to its value too: `userefs` checks the callee operand, and a
                 # bare non-Core/Base `GlobalRef` (e.g. `throw`) fails the const-binding check when
                 # re-embedded in this synthetic IR's world range.
-                fv = _calleeval(s.args[1])
+                fv = _calleeval(s.args[1], iworld)
                 ex = Expr(:call, fv === nothing ? presolve(s.args[1]) : fv,
                           (presolve(a) for a in s.args[2:end])...)
                 primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
@@ -586,7 +601,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
             fpos = s.head === :invoke ? s.args[2] : s.args[1]
             actual = s.head === :invoke ? s.args[3:end] : s.args[2:end]
-            f = _calleeval(fpos)
+            f = _calleeval(fpos, iworld)
             if isa(f, Core.IntrinsicFunction)
                 nm = nameof(f)
                 if nm === :add_float || nm === :add_float_fast
