@@ -15,6 +15,15 @@ sqr(x)     = x*x
 mul3(x)    = (x*x)*x   # explicit 2-arg grouping; `x*x*x` would be a 3-arg (vararg) `*`, unsupported
 sincosp(x) = sin(x)*cos(x)
 
+# reverse-mode PoC (straight-line): scalar intrinsics only, and an immutable-struct case reusing
+# `V2` (defined below) to exercise `Expr(:new,...)`/`Core.getfield` via `RData`/`increment_field!!`.
+rprod(x, y) = x*y + x                             # ∂/∂x = y+1, ∂/∂y = x
+rquot(x, y) = (x*y + x) / y                        # mul/add/div composed
+function rstruct(a, b)                            # a*b + a, routed through a %new + two getfields
+    v = V2(a, b)
+    v.a*v.b + v.a
+end
+
 # control flow + local assignments
 relu(x)    = x > 0.0 ? x : -x                    # branch (== abs here)
 function p4(x)                                    # local reassignment: x^4
@@ -620,7 +629,76 @@ dynret(x) = (x > 0 ? x*x : 1)
         @test allocs(sincosp, 0.6) == 0        # surviving sin/cos rule :invokes
     end
 
+    @testset "reverse mode (branches, Mooncake-style tape — see Phase B of the control-flow plan)" begin
+        # Central finite differences, one argument at a time.
+        fd1(f, x, y, k; h=1e-6) = k == 1 ? (f(x+h, y) - f(x-h, y)) / 2h : (f(x, y+h) - f(x, y-h)) / 2h
+
+        # Tier 1: scalar float intrinsics only (add_float/mul_float/div_float), checked two ways:
+        # finite differences, and a cross-check against the already-trusted forward-mode `frule`
+        # (one seed direction per argument) — independent verification of the new reverse engine.
+        for f in (rprod, rquot)
+            x, y = 2.0, 3.0
+            _, dx, dy = gradient(f, x, y)
+            @test dx ≈ fd1(f, x, y, 1) rtol = 1e-5
+            @test dy ≈ fd1(f, x, y, 2) rtol = 1e-5
+            @test dx ≈ frule(Dual(f, NoTangent()), Dual(x, 1.0), Dual(y, 0.0)).dx
+            @test dy ≈ frule(Dual(f, NoTangent()), Dual(x, 0.0), Dual(y, 1.0)).dx
+        end
+
+        # Tier 2: immutable struct via `%new`/`getfield`, exercising `RData`/`increment_field!!`.
+        # rstruct(a,b) = a*b + a  =>  ∂/∂a = b+1, ∂/∂b = a
+        _, da, db = gradient(rstruct, 2.0, 3.0)
+        @test da ≈ 3.0 + 1.0
+        @test db ≈ 2.0
+
+        # Tier 3: branches. `relu` is the multiple-reachable-`return`s shape (the common shape
+        # Julia's optimizer actually produces for an `if/else` with a value in each arm — see
+        # `_exit_blocks`'s docstring); `branch3` merges all three arms into a single `return` via one
+        # `PhiNode` with three predecessors (exercises the `Switch`-with-more-than-two-targets path).
+        # Both are checked against finite differences AND the trusted forward-mode `frule` (already
+        # supports control flow) as an independent cross-check of the new tape/block-stack machinery.
+        for (f, x) in ((relu, 2.0), (relu, -2.0), (branch3, 3.0), (branch3, 1.0), (branch3, -1.0))
+            _, dx = gradient(f, x)
+            h = 1e-6
+            @test dx ≈ (f(x + h) - f(x - h)) / 2h rtol = 1e-5
+            @test dx ≈ frule(Dual(f, NoTangent()), Dual(x, 1.0)).dx
+        end
+
+        # A branch combined with `%new`/`getfield` (both new mechanisms exercised together, reusing
+        # `V2` — already defined above for `rstruct`).
+        function branch_struct(a, b)
+            v = V2(a, b)
+            return a > b ? v.a * v.b : v.a + v.b
+        end
+        for (a, b) in ((5.0, 2.0), (1.0, 4.0))
+            _, da, db = gradient(branch_struct, a, b)
+            h = 1e-6
+            @test da ≈ (branch_struct(a + h, b) - branch_struct(a - h, b)) / 2h rtol = 1e-5
+            @test db ≈ (branch_struct(a, b + h) - branch_struct(a, b - h)) / 2h rtol = 1e-5
+        end
+
+        # Graceful bail (not a miscompile): loops/back-edges (Phase C lifts this — `sumk` is the
+        # existing forward-mode while-loop fixture), and a surviving high-level call (`sin`).
+        @test_throws ErrorException gradient(sumk, 2.0, 3)
+        @test_throws ErrorException gradient(plus1, 1.0)
+
+        # `code_reverse_fwds_ircode`/`code_reverse_pullback_ircode` mirror `code_dual_ircode`:
+        # inspect each carrier's generated IR directly and confirm it passes `Core.Compiler.verify_ir`
+        # — the same debugging workflow forward mode uses.
+        function checkverify_rev(f, at)
+            Core.Compiler.verify_ir(code_reverse_fwds_ircode(f, at)[1])
+            Core.Compiler.verify_ir(code_reverse_pullback_ircode(f, at)[1])
+        end
+        checkverify_rev(rprod, (Float64, Float64))
+        checkverify_rev(rquot, (Float64, Float64))
+        checkverify_rev(rstruct, (Float64, Float64))
+        checkverify_rev(relu, (Float64,))
+        checkverify_rev(branch3, (Float64,))
+        checkverify_rev(branch_struct, (Float64, Float64))
+    end
+
     include("test_intrinsic_dispatch.jl")      # dispatch-based intrinsic handling (add_float)
     include("test_backedges.jl")               # derivative invalidation on primal redefinition
+    include("test_cfg_ir.jl")                  # CFGBlock/ID working-IR round-trip (Phase A, no AD)
 
 end

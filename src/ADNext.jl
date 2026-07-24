@@ -8,24 +8,32 @@ include("fwds_rvs_data.jl")
 include("array_tangents.jl")
 include("dual.jl")
 include("codual.jl")
+include("stack.jl")        # Stack/SingletonStack — reverse-mode control-flow replay tape
 
 # Forward-mode AD engine, compiler-level Dual arithmetic
 include("intrinsics.jl")   # dispatch-based intrinsic handling (apply_intrinsic_frule!)
 include("frules.jl")
 include("contextual.jl")
+include("cfg_ir.jl")       # ID/CFGBlock working-IR layer (reverse-mode control flow only)
 include("forward_interp.jl")
+
+# Reverse-mode AD engine (proof of concept, straight-line code only — see reverse_interp.jl header)
+include("intrinsics_reverse.jl")   # dispatch-based intrinsic vjp rules (apply_intrinsic_rrule!)
+include("reverse_interp.jl")
+
 include("reflection.jl")
 
 # using PrecompileTools: @compile_workload
 # include("precomp.jl")
 
-# NOTE: `reverse_interp.jl` (a WIP barebones reverse-mode engine) is intentionally NOT included.
-# Its mutable `CoDual` is incompatible with the ported immutable `CoDual{Tx,Tdx}`, and reverse-mode
-# AD is out of scope for the tangent/fdata/rdata port. The file is retained on disk.
-
 # Carriers and the forward-mode entry points.
 export Dual, CoDual, primal, tangent, NoTangent, frule
 export code_dual_ircode, @code_dual_ircode
+
+# Reverse-mode entry points (branches supported; loops are Phase C — see reverse_interp.jl header).
+export rrule, gradient
+export code_reverse_fwds_ircode, @code_reverse_fwds_ircode
+export code_reverse_pullback_ircode, @code_reverse_pullback_ircode
 
 # Tangent / fdata / rdata type system.
 export tangent_type, fdata_type, rdata_type

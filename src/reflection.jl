@@ -73,3 +73,97 @@ macro code_dual_ircode(call::Expr)
     args = Expr(:tuple, (esc(a) for a in call.args[2:end])...)
     return :(code_dual_ircode($f, map(_typeof, $args)))
 end
+
+"""
+    code_reverse_fwds_ircode(f, argtypes::Tuple; world=Base.get_world_counter()) -> Pair{IRCode,Any}
+
+Return `ir => rettype`, the optimized `IRCode` for the reverse-mode *forwards* carrier
+(`reverse_fwds_impl`) differentiating `f` at arguments of types `argtypes` (each primal type `T`,
+and `f` itself, wrapped in `fcodual_type`). `rettype` is `Tuple{CoDual, Tape}` — the primal result
+plus the tape `code_reverse_pullback_ircode` needs. Reproduces exactly what the `optimize` seam
+installs, without going through the throwing carrier stub. Errors if the reverse-mode transform
+bails (see the scope notes in `reverse_interp.jl`'s header).
+
+# Examples
+```julia
+ir, rt = code_reverse_fwds_ircode(x -> x*x + x, (Float64,))
+```
+See also [`@code_reverse_fwds_ircode`](@ref) and [`code_reverse_pullback_ircode`](@ref).
+"""
+function code_reverse_fwds_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
+                                  world::UInt=Base.get_world_counter())
+    interp = ADInterpreter{Reverse}(; world)
+    codualtys = Any[fcodual_type(_typeof(f))]
+    for T in argtypes
+        (T isa Type) || throw(ArgumentError("argtypes must be a tuple of types, got $(repr(T))"))
+        push!(codualtys, fcodual_type(T))
+    end
+    impl_tt = Tuple{typeof(reverse_fwds_impl), codualtys...}
+    match, _ = CC.findsup(impl_tt, CC.method_table(interp))
+    match === nothing && error("no primal method for $f with argument types $argtypes")
+    impl_mi = specialize_method(match.method, match.spec_types, match.sparams)::MethodInstance
+
+    reason = Ref("no specific reason recorded")
+    ir = optimized_reverse_fwds_ir(interp, impl_mi, reason)
+    ir === nothing &&
+        error("ADNext could not build the reverse forwards pass for $f$argtypes on optimized IRCode: $(reason[])")
+    return ir => CC.compute_ir_rettype(ir)
+end
+
+"""
+    @code_reverse_fwds_ircode f(args...)
+
+Convenience macro: show the optimized `IRCode` for the reverse-mode forwards carrier for the call
+`f(args...)`, using the runtime types of `args`.
+"""
+macro code_reverse_fwds_ircode(call::Expr)
+    call.head === :call || throw(ArgumentError("@code_reverse_fwds_ircode expects a function call, e.g. `@code_reverse_fwds_ircode f(x)`"))
+    f = esc(call.args[1])
+    args = Expr(:tuple, (esc(a) for a in call.args[2:end])...)
+    return :(code_reverse_fwds_ircode($f, map(_typeof, $args)))
+end
+
+"""
+    code_reverse_pullback_ircode(f, argtypes::Tuple; seedtype::Type=Float64, world=Base.get_world_counter()) -> Pair{IRCode,Any}
+
+Return `ir => rettype`, the optimized `IRCode` for the reverse-mode *pullback* carrier
+(`reverse_pullback_impl`) for `f` at arguments of types `argtypes`. `seedtype` is the type of the
+rdata seed for the primal's return value (default `Float64`, for scalar output). The `Tape` type is
+recovered from `code_reverse_fwds_ircode`'s own return type, so both carriers agree on it by
+construction (mirroring how they'd be produced by an actual `rrule` call).
+
+# Examples
+```julia
+ir, rt = code_reverse_pullback_ircode(x -> x*x + x, (Float64,))
+```
+See also [`@code_reverse_pullback_ircode`](@ref) and [`code_reverse_fwds_ircode`](@ref).
+"""
+function code_reverse_pullback_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
+                                      seedtype::Type=Float64, world::UInt=Base.get_world_counter())
+    interp = ADInterpreter{Reverse}(; world)
+    _, fwds_rt = code_reverse_fwds_ircode(f, argtypes; world)
+    TapeT = fwds_rt.parameters[2]
+    impl_tt = Tuple{typeof(reverse_pullback_impl), TapeT, seedtype}
+    match, _ = CC.findsup(impl_tt, CC.method_table(interp))
+    match === nothing && error("no primal method for $f with argument types $argtypes")
+    impl_mi = specialize_method(match.method, match.spec_types, match.sparams)::MethodInstance
+
+    reason = Ref("no specific reason recorded")
+    ir = optimized_reverse_pullback_ir(interp, impl_mi, reason)
+    ir === nothing &&
+        error("ADNext could not build the reverse pullback pass for $f$argtypes on optimized IRCode: $(reason[])")
+    return ir => CC.compute_ir_rettype(ir)
+end
+
+"""
+    @code_reverse_pullback_ircode f(args...)
+
+Convenience macro: show the optimized `IRCode` for the reverse-mode pullback carrier for the call
+`f(args...)`, using the runtime types of `args`.
+"""
+macro code_reverse_pullback_ircode(call::Expr)
+    call.head === :call || throw(ArgumentError("@code_reverse_pullback_ircode expects a function call, e.g. `@code_reverse_pullback_ircode f(x)`"))
+    f = esc(call.args[1])
+    args = Expr(:tuple, (esc(a) for a in call.args[2:end])...)
+    return :(code_reverse_pullback_ircode($f, map(_typeof, $args)))
+end
