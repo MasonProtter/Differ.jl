@@ -194,7 +194,9 @@ function optimized_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reaso
     ir === nothing && return nothing
     world = CC.get_inference_world(interp)
     opt = CC.OptimizationState(impl_mi, CC.retrieve_code_info(impl_mi, world), interp)
-    return run_ipo_passes!(ir, opt)
+    return begin
+        run_ipo_passes!(ir, opt)
+    end
 end
 
 # Resolve and compile the `frule(Dual{typeof(f),NoTangent}, dualargs...)` rule for a surviving
@@ -456,9 +458,26 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         end
         fd = dual!(ftype, NoTangent, fcallee, NoTangent())
         # Each argument dual is `Dual{P, tangent_type(P)}` (the Mooncake invariant). For scalar
-        # primals `tangent_type(P) == P`, so this matches the old `Dual{P,P}`.
-        dualtys = Any[Dual{_optype(pir,a),tt(_optype(pir,a))} for a in actual]
-        duals = Any[dual!(_optype(pir,a), tt(_optype(pir,a)), presolve(a), tresolve(a)) for a in actual]
+        # primals `tangent_type(P) == P`, so this matches the old `Dual{P,P}`. A statically-known
+        # operand (a `GlobalRef` to a defined binding, or a `QuoteNode`) must be embedded as its
+        # *resolved value* with `P = typeof(value)`, not as the raw node: e.g. an intrinsic's leading
+        # *type* argument (`fpext(Base.Float64, …)`) is a `GlobalRef` whose value is a `DataType`, and
+        # wrapping the raw node as `Dual{GlobalRef,…}` would both mis-declare the field and TypeError
+        # at the `%new` when the ref loads as the type. Only genuinely dynamic operands
+        # (SSAValue/Argument) fall back to `presolve`/`_optype`/`tresolve`.
+        dualtys = Any[]; duals = Any[]
+        for a in actual
+            v = _calleeval(a, iworld)
+            if v === nothing                            # genuinely dynamic operand
+                P = _optype(pir, a)
+                push!(dualtys, Dual{P,tt(P)})
+                push!(duals, dual!(P, tt(P), presolve(a), tresolve(a)))
+            else                                        # statically-known: embed value + its zero tangent
+                P = typeof(v)
+                push!(dualtys, Dual{P,tt(P)})
+                push!(duals, dual!(P, tt(P), v, zero_tangent(v)))
+            end
+        end
         # Emit the surviving high-level rule as a static `:invoke` to a compiled `CodeInstance` when we
         # can resolve one (direct, unboxed call); otherwise a plain non-inlined `:call`. `dual_type(R)`
         # is the declared result type: `Dual{R,tangent_type(R)}` for a concrete `R`, and the *abstract*
@@ -603,35 +622,24 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             actual = s.head === :invoke ? s.args[3:end] : s.args[2:end]
             f = _calleeval(fpos, iworld)
             if isa(f, Core.IntrinsicFunction)
-                nm = nameof(f)
-                if nm === :add_float || nm === :add_float_fast
-                    primal[i] = opf(:add_float, Ti, presolve(actual[1]), presolve(actual[2]))
-                    shadow[i] = opf(:add_float, Ti, tresolve(actual[1]), tresolve(actual[2]))
-                elseif nm === :sub_float || nm === :sub_float_fast
-                    primal[i] = opf(:sub_float, Ti, presolve(actual[1]), presolve(actual[2]))
-                    shadow[i] = opf(:sub_float, Ti, tresolve(actual[1]), tresolve(actual[2]))
-                elseif nm === :neg_float || nm === :neg_float_fast
-                    primal[i] = opf(:neg_float, Ti, presolve(actual[1]))
-                    shadow[i] = opf(:neg_float, Ti, tresolve(actual[1]))
-                elseif nm === :mul_float || nm === :mul_float_fast
-                    pa, pb = presolve(actual[1]), presolve(actual[2])
-                    ta, tb = tresolve(actual[1]), tresolve(actual[2])
-                    primal[i] = opf(:mul_float, Ti, pa, pb)
-                    shadow[i] = opf(:add_float, Ti, opf(:mul_float, Ti, pa, tb), opf(:mul_float, Ti, ta, pb))
-                elseif nm === :div_float || nm === :div_float_fast
-                    pa, pb = presolve(actual[1]), presolve(actual[2])
-                    ta, tb = tresolve(actual[1]), tresolve(actual[2])
-                    primal[i] = opf(:div_float, Ti, pa, pb)
-                    num = opf(:sub_float, Ti, opf(:mul_float, Ti, ta, pb), opf(:mul_float, Ti, pa, tb))
-                    shadow[i] = opf(:div_float, Ti, num, opf(:mul_float, Ti, pb, pb))
-                else
-                    # non-differentiable intrinsic (int arithmetic, comparisons, conversions):
-                    # primal computed, tangent is the zero tangent of the primal result (see
-                    # `zero_shadow`: `NoTangent()` for `Int`/`Bool`, a literal `zero` for a concrete
-                    # Number, else a runtime `zero_tangent`).
-                    primal[i] = opf(nm, Ti, (presolve(a) for a in actual)...)
-                    shadow[i] = zero_shadow(Ti, primal[i])
+                # Every intrinsic is handled by rewriting it to its wrapper function and routing
+                # through the wrapper's `frule` (`src/intrinsics.jl`), exactly like any other
+                # surviving high-level call — a differentiable intrinsic (`add_float`, …) gets its
+                # hand-written rule, a non-differentiable one (comparisons, integer/bit ops, …) the
+                # auto-generated primal-plus-zero-tangent rule. `translate` has no identity fallback,
+                # so an *unregistered* intrinsic throws; catch it and bail gracefully with a located
+                # reason (matching the other unsupported-IR bails) rather than crashing inference.
+                local wrapper
+                try
+                    wrapper = translate(Val(f))
+                catch
+                    reason[] = "unsupported intrinsic `$(nameof(f))` at %$i: `$(_stmt_str(s))` " *
+                               "(no wrapper/`frule` registered; add one in src/intrinsics.jl)"
+                    return nothing
                 end
+                res = frule_split!(wrapper, actual, Ti)
+                res === nothing && return nothing
+                primal[i], shadow[i] = res
             elseif f === Core.getfield
                 Pobj = _optype(pir, actual[1])
                 primal[i] = emit!(Expr(:call, getf, presolve(actual[1]), actual[2]), Ti)

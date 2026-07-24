@@ -620,4 +620,6 @@ dynret(x) = (x > 0 ? x*x : 1)
         @test allocs(sincosp, 0.6) == 0        # surviving sin/cos rule :invokes
     end
 
+    include("test_intrinsic_dispatch.jl")      # dispatch-based intrinsic handling (add_float)
+
 end

@@ -123,10 +123,28 @@ input `dualize_to_ircode` can't handle — flows through the ordinary, unmodifie
   for such a struct whose tangent is a `Tangent`); it errors clearly rather than miscompiling.
 - Only `sin`/`cos` have hand-written `frule` methods in `frules.jl`. Deliberately **no** rules
   exist for `+`, `-`, `*`, `/`, or comparisons: those inline down to intrinsics
-  (`add_float`/`mul_float`/`lt_float`/…), which the dualization engine differentiates directly at
-  the intrinsic level. This means arithmetic works generically for *any* type (`Float32`,
-  `Complex`, a user struct via `getfield`/`%new`) without a per-type rule — don't add arithmetic
-  `frule`s; add intrinsic cases in `dualize_to_ircode` instead if something's missing.
+  (`add_float`/`mul_float`/`lt_float`/…), which are handled by **dispatch** via `src/intrinsics.jl`.
+  Each supported intrinsic has a thin wrapper function + an `frule`; the engine rewrites each
+  intrinsic call to its wrapper and routes it through `frule_split!` like any surviving call.
+  Registration is **explicit** — `translate` (intrinsic value → wrapper) has *no* identity fallback,
+  so an unregistered intrinsic bails with a clear located error instead of silently miscompiling.
+  Two macros register:
+  - `@intrinsic name` + a hand-written `frule(::Dual{typeof(name)}, …)` for a **differentiable**
+    intrinsic. Registered: `add/sub/neg/mul/div_float`, `sqrt_llvm`, `abs_float`, `max/min_float`,
+    `fma_float`, `muladd_float`, `copysign_float`, `fpext`/`fptrunc` (float-width conversions), plus
+    `_fast` variants.
+  - `@inactive_intrinsic name` for a **non-differentiable** one — auto-generates a variadic `frule`
+    computing the primal with a zero tangent. Registered: int/float comparisons, integer arithmetic
+    (+ checked), bit/boolean ops, rounding (`floor/ceil/trunc/rint_llvm`), and int↔float / width
+    conversions (`sitofp`, `fptosi`, …) whose leading *type* argument is carried through as a
+    `Dual{DataType}`.
+
+  This means arithmetic works for *any* type (`Float32`, `Complex`, a user struct via
+  `getfield`/`%new`) without a per-type rule — don't add arithmetic `frule`s. To support a new
+  intrinsic, add the appropriate line in `src/intrinsics.jl` (no engine change needed); a
+  differentiable `frule` body must call the *wrappers* so it re-dualizes at higher order. The goal is
+  for *every* intrinsic to be registered; the few still unregistered are exotic (pointer/atomic ops,
+  `llvmcall`, `cglobal`, `bitcast`) and error loudly if hit rather than miscompiling.
 - `frule(dualargs::Dual...)` itself is `@generated`: for a composite primal with no hand-written
   rule, the generator compiles a dualized version of the primal's body under
   `ADInterpreter{Forward}` and returns a trivial body that `invoke`s the resulting `CodeInstance`.
