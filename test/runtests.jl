@@ -302,6 +302,22 @@ arr_via_mut(p::MPoint) = arr_inner_mut(p)
             t = zero_tangent(p)
             @test tangent(fdata(t), rdata(t)) == t
         end
+
+        # `_nondiff_field` decides whether a shadow-`Dual` field carries the primal through: true iff
+        # the field's tangent is `NoTangent` but its slot can't hold `NoTangent`. That is *any*
+        # non-differentiable field, not only singletons — including concrete non-singletons (`Int`,
+        # `Tuple{Int,Int}`) and `Type`-valued fields (which `Base.issingletontype` misreports as
+        # non-singleton, a documented Julia quirk). Anything else would drop `NoTangent()` into a
+        # slot that rejects it.
+        @test Differ._nondiff_field(typeof(sin))     # singleton function
+        @test Differ._nondiff_field(Type{Float64})   # regression: Type{P}, missed by issingletontype
+        @test Differ._nondiff_field(DataType)
+        @test Differ._nondiff_field(Int)             # concrete non-singleton, NoTangent tangent
+        @test Differ._nondiff_field(Tuple{Int,Int})  # concrete aggregate that collapses to NoTangent
+        @test !Differ._nondiff_field(Float64)        # differentiable, takes its tangent
+        @test !Differ._nondiff_field(Point)          # differentiable struct, takes its tangent
+        @test !Differ._nondiff_field(NoTangent)      # a NoTangent slot holds NoTangent fine
+        @test !Differ._nondiff_field(Integer)        # abstract slot: conservatively left on tangent path
     end
 
     @testset "zero_tangent / increment!!" begin
@@ -315,6 +331,17 @@ arr_via_mut(p::MPoint) = arr_inner_mut(p)
         # increment!! adds tangents; mutates array fdata in place
         @test increment!!(1.0, 2.0) === 3.0
         a = [1.0, 2.0]; @test increment!!(a, [3.0, 4.0]) === a && a == [4.0, 6.0]
+        # `increment!!` decides its aliasing cache via `require_tangent_cache` (keyed on the tangent
+        # type), the same authority `zero_tangent`/`set_to_zero!!` use — not a cruder `isbitstype`.
+        # A `Vector{<:IEEEFloat}` tangent is provably tree-like, so no `IdDict` is built: after warmup
+        # the only allocation is the result-copy path, never a cache. (Regression for the old
+        # `isbitstype(T) ? … : IdDict` heuristic that disagreed with `zero_tangent`.)
+        @test Differ.require_tangent_cache(Vector{Float64}) === Val{false}()
+        let a = [1.0, 2.0, 3.0], b = [10.0, 20.0, 30.0]
+            f(x, y) = increment!!(x, y)
+            f(copy(a), b)                                  # warmup
+            @test (@allocated f(copy(a), b)) == (@allocated copy(a))   # copy only, no IdDict
+        end
     end
 
     @testset "CoDual basics" begin
@@ -674,6 +701,13 @@ arr_via_mut(p::MPoint) = arr_inner_mut(p)
         # The re-dualized outer closure produces valid IR (verify_ir on the raw dualized IRCode).
         Core.Compiler.verify_ir(code_dual_ircode(d1_scpx, (Float64,))[1])
         @test true
+
+        # Regression: forward-mode dualization of a self-recursive `@noinline` primal must bail
+        # cleanly rather than stack-overflow. This exercises the `dualized_impl_in_progress` cycle
+        # guard, whose forward-mode twist is that the recursion crosses *fresh* `ADInterpreter`
+        # instances via the `frule!!` `@generated` boundary — so the guard is task-local (shared
+        # across those instances) rather than a per-`interp` field like reverse mode's `in_progress`.
+        @test_throws ErrorException frule!!(Dual(rec_self, NoTangent()), Dual(1.0, 1.0), Dual(3, NoTangent()))
 
         # Limitation: a closure/struct with *differentiable fields* cannot be differentiated at order
         # ≥2. The self-tangent `Dual` scheme (`tangent_type(Dual{P,T}) == Dual{P,T}`) requires each

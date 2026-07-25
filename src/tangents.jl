@@ -942,7 +942,7 @@ same tangent twice and producing incorrect results.
 
 """
 require_tangent_cache(::Type{P}) where {P} = Val{!isbitstype(P)}()
-require_tangent_cache(::Type{<:Array{P}}) where {P} = Val{!isbitstype(P)}()
+require_tangent_cache(::Type{<:Array{P}}) where {P} = Val{!isbitstype(P) && tangent_type(P) !== NoTangent}()
 
 const IncCache = Union{NoCache,IdDict{Any,Bool}}
 const SetToZeroCache = Union{NoCache,Vector{UInt}}
@@ -970,8 +970,16 @@ Add `x` to `y`. If `ismutabletype(T)`, then `increment!!(x, y) === x` must hold.
 That is, `increment!!` will mutate `x`.
 This must apply recursively if `T` is a composite type whose fields are mutable.
 """
+# Consult `require_tangent_cache` for the aliasing/circular-reference cache decision, exactly as
+# `zero_tangent` (`_tangent_cache`) and `set_to_zero!!` do — keyed on the tangent type `T` here, the
+# same way `set_to_zero!!(x) = set_to_zero!!(x, require_tangent_cache(typeof(x)))` keys on a tangent.
+# A bare `isbitstype(T)` is strictly cruder: it allocates an `IdDict` for every non-bits tangent,
+# including provably tree-like ones like `Vector{<:IEEEFloat}` (whose `require_tangent_cache` says
+# `NoCache`). This keeps `increment!!` and `zero_tangent` from disagreeing on when a cache is needed.
+@inline _inc_cache(::Val{true}) = IdDict{Any,Bool}()
+@inline _inc_cache(::Val{false}) = NoCache()
 function increment!!(x::T, y::T) where {T}
-    return increment_internal!!(isbitstype(T) ? NoCache() : IdDict{Any,Bool}(), x, y)
+    return increment_internal!!(_inc_cache(require_tangent_cache(T)), x, y)
 end
 
 """

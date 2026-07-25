@@ -181,7 +181,7 @@ function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance, reason::
 end
 
 # Recursion cycle guard for `build_dual_ir`, analogous to reverse mode's `interp.in_progress` field
-# (`contextual.jl`/`reverse_interp.jl`) but **global** rather than per-instance: a self- or
+# (`contextual.jl`/`reverse_interp.jl`) but **task-local** rather than per-instance: a self- or
 # mutually-recursive primal's nested resolution crosses the `frule!!` `@generated`-function boundary
 # (`frule_codeinstance` below compiles the generic `frule!!` fallback under a *fresh*
 # `CC.NativeInterpreter`, whose generator body `frule_body` — `refresh_frule`, bottom of this file —
@@ -191,7 +191,16 @@ end
 # empirically: a `@noinline` self-recursive function run through `frule!!` stack-overflows without
 # this (a hard crash before this fix, not a catchable error) — the identical failure mode reverse
 # mode's `in_progress` field exists to prevent, just reached by a different code path.
-const DUALIZED_IMPL_IN_PROGRESS = IdDict{MethodInstance,Nothing}()
+#
+# That whole recursion is synchronous and never leaves the compiling task, so task-local storage is
+# exactly the right scope: it is shared across those nested interpreter instances (so the cycle stays
+# observable) yet isolated between concurrently-compiling tasks/threads. A plain `const` global
+# `IdDict` was both — a shared bag that concurrent compilation on another thread could corrupt; keying
+# it to the task fixes that without narrowing the scope the guard actually needs.
+function dualized_impl_in_progress()
+    return get!(() -> IdDict{MethodInstance,Nothing}(), task_local_storage(),
+                :differ_dualized_impl_in_progress)::IdDict{MethodInstance,Nothing}
+end
 
 # Build the dualized `IRCode` for a `dualized_impl` specialization from the primal's optimized
 # `IRCode`. Returns the dual `IRCode` or `nothing` (unsupported IR → bail).
@@ -208,16 +217,17 @@ const DUALIZED_IMPL_IN_PROGRESS = IdDict{MethodInstance,Nothing}()
 #    so `pir_is_vararg=true` selects the tuple-reconstruction prologue in `dualize_to_ircode`.
 function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""),
                        edges::Vector{Any}=Any[])
-    if haskey(DUALIZED_IMPL_IN_PROGRESS, impl_mi)
+    in_progress = dualized_impl_in_progress()
+    if haskey(in_progress, impl_mi)
         reason[] = "recursive dualization of $(impl_mi) detected (a self- or mutually-recursive " *
                    "primal) — not yet supported; bailing instead of recursing forever"
         return nothing
     end
-    DUALIZED_IMPL_IN_PROGRESS[impl_mi] = nothing
+    in_progress[impl_mi] = nothing
     try
         return _build_dual_ir(interp, impl_mi, reason, edges)
     finally
-        delete!(DUALIZED_IMPL_IN_PROGRESS, impl_mi)
+        delete!(in_progress, impl_mi)
     end
 end
 
@@ -759,11 +769,11 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             TT = tt(Ti)
             if T <: Dual
                 # `Dual` is its own tangent type, so its shadow is a same-typed `Dual` built via
-                # `%new`. Each field is its `tresolve`d tangent, except a *non-differentiable
-                # singleton* field (a function/constant, whose tangent is `NoTangent` and can't fill
-                # e.g. a `typeof(sin)` slot) which carries the primal value through unchanged. This is
-                # what lets a `Dual{typeof(sin),NoTangent}` be re-dualized at higher order.
-                tf = Any[_nondiff_singleton(fieldtype(T, j)) ? presolve(args[j]) : tresolve(args[j])
+                # `%new`. Each field is its `tresolve`d tangent, except a *non-differentiable* field
+                # (whose tangent is `NoTangent` and can't fill e.g. a `typeof(sin)` or `Int` slot)
+                # which carries the primal value through unchanged. This is what lets a
+                # `Dual{typeof(sin),NoTangent}` be re-dualized at higher order.
+                tf = Any[_nondiff_field(fieldtype(T, j)) ? presolve(args[j]) : tresolve(args[j])
                          for j in eachindex(args)]
                 shadow[i] = emit!(Expr(:new, T, tf...), Ti)
             elseif TT === NoTangent
@@ -971,11 +981,23 @@ function _stmt_str(@nospecialize s)
     str = replace(str, r"\s+" => " ")
     length(str) > 200 ? string(first(str, 197), "...") : str
 end
-# A field is a "non-differentiable singleton" (a function/constant, tangent = `NoTangent`) when it is
-# a non-`NoTangent` singleton type. Such a field's shadow can't hold a `NoTangent` value (its slot
-# type would reject it), so the primal value is carried through instead. Differentiable structs are
-# not singletons, so they still take their structural tangent.
-_nondiff_singleton(@nospecialize T) = T isa DataType && Base.issingletontype(T) && T !== NoTangent
+# A field's shadow carries the *primal* value through (rather than its tangent) exactly when the
+# field's tangent is `NoTangent` but its slot type would reject a `NoTangent` value — i.e. the field
+# is non-differentiable yet its slot is not itself a `NoTangent` slot. `tangent_type(T) === NoTangent`
+# is the principled statement of that (it subsumes the old singleton-only test: every non-`NoTangent`
+# singleton, like a `typeof(sin)` slot, has `NoTangent` tangent, and so do `Int`, `Bool`, `Symbol`,
+# `Tuple{Int,Int}`, … — all of which would otherwise get a spurious `NoTangent()` dropped into their
+# slot). Two guards:
+#  * `isconcretetype(T)` — only concrete types have a total, non-throwing `tangent_type`; an abstract
+#    slot (`::Integer`, `::Any`) can't be classified statically (its runtime value may or may not be
+#    differentiable), so we conservatively leave it on the tangent path, unchanged from before.
+#  * `T <: Type` handled separately — `Type{Float64}`/`DataType` are `Type`-valued (tangent `NoTangent`)
+#    but *not* concrete (`isconcretetype(Type{Float64}) === false`) and `Base.issingletontype` reports
+#    them non-singleton (a documented Julia quirk), so the concrete clause misses them; every
+#    `T <: Type` has `NoTangent` tangent, so carrying the primal is always right there.
+# Differentiable structs/scalars have a non-`NoTangent` tangent, so they still take their tangent.
+_nondiff_field(@nospecialize T) = T isa DataType && T !== NoTangent &&
+    (T <: Type || (isconcretetype(T) && tangent_type(T) === NoTangent))
 
 
 function frule_body(world::UInt, source, self, dual_argtypes)

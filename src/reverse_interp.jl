@@ -341,7 +341,8 @@ end
 # still on the stack, since recursive resolution always reuses *this same* `interp` instance (see
 # `reverse_fwds_recursive_ci`/`reverse_pullback_recursive_ci`) rather than crossing through a fresh
 # interpreter the way forward mode's `frule!!` `@generated`-function boundary does (see
-# `DUALIZED_IMPL_IN_PROGRESS`, `forward_interp.jl`, for that cross-instance variant of this same guard).
+# `dualized_impl_in_progress`, `forward_interp.jl`, for that task-local cross-instance variant of this
+# same guard).
 function build_reverse_fwds_ir(interp::ADInterpreter, impl_mi::MethodInstance,
                                reason::Ref{String}=Ref(""), edges::Vector{Any}=Any[])
     if haskey(interp.in_progress, impl_mi)
