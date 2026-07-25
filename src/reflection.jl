@@ -9,7 +9,7 @@
 # is `tangent_type(T)`, so order 1 → `Dual{T,tangent_type(T)}` (first derivative). Because a `Dual`
 # is its own tangent type (`tangent_type(Dual{P,T}) == Dual{P,T}`, see `dual.jl`), the recursive
 # step `Dual{S,tangent_type(S)}` collapses to `Dual{S,S}`, so order 2 → `Dual{Dual{T,U},Dual{T,U}}`
-# etc. — matching ADNext's Option-A higher-order nesting.
+# etc. — matching Differ's Option-A higher-order nesting.
 #
 # This is uniform for the function and every value argument (the function nests like any other value
 # — see the peel in `build_dual_ir`). A plain function `f` has `tangent_type(typeof(f)) == NoTangent`
@@ -52,7 +52,7 @@ function code_dual_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
 
     reason = Ref("no specific reason recorded")
     ir = optimized_dual_ir(interp, impl_mi, reason)
-    ir === nothing && error("ADNext could not dualize $f$argtypes on optimized IRCode: $(reason[])")
+    ir === nothing && error("Differ could not dualize $f$argtypes on optimized IRCode: $(reason[])")
     return ir => CC.compute_ir_rettype(ir)
 end
 
@@ -98,7 +98,10 @@ function code_reverse_fwds_ircode(@nospecialize(f), @nospecialize(argtypes::Tupl
         (T isa Type) || throw(ArgumentError("argtypes must be a tuple of types, got $(repr(T))"))
         push!(codualtys, fcodual_type(T))
     end
-    impl_tt = Tuple{typeof(reverse_fwds_impl), codualtys...}
+    # Inspect the tape-allocating shape (`Ctx{Nothing}`) — the one `build_ctx(...; prealloc=false)`
+    # uses, and the shape a pre-allocated context differs from only in its prologue. Carrier layout is
+    # `reverse_fwds_impl(fcd, ctx, argcds...)`: fcd first, then the ctx, then the argument coduals.
+    impl_tt = Tuple{typeof(reverse_fwds_impl), codualtys[1], Ctx{Nothing}, codualtys[2:end]...}
     match, _ = CC.findsup(impl_tt, CC.method_table(interp))
     match === nothing && error("no primal method for $f with argument types $argtypes")
     impl_mi = specialize_method(match.method, match.spec_types, match.sparams)::MethodInstance
@@ -106,7 +109,7 @@ function code_reverse_fwds_ircode(@nospecialize(f), @nospecialize(argtypes::Tupl
     reason = Ref("no specific reason recorded")
     ir = optimized_reverse_fwds_ir(interp, impl_mi, reason)
     ir === nothing &&
-        error("ADNext could not build the reverse forwards pass for $f$argtypes on optimized IRCode: $(reason[])")
+        error("Differ could not build the reverse forwards pass for $f$argtypes on optimized IRCode: $(reason[])")
     return ir => CC.compute_ir_rettype(ir)
 end
 
@@ -151,7 +154,7 @@ function code_reverse_pullback_ircode(@nospecialize(f), @nospecialize(argtypes::
     reason = Ref("no specific reason recorded")
     ir = optimized_reverse_pullback_ir(interp, impl_mi, reason)
     ir === nothing &&
-        error("ADNext could not build the reverse pullback pass for $f$argtypes on optimized IRCode: $(reason[])")
+        error("Differ could not build the reverse pullback pass for $f$argtypes on optimized IRCode: $(reason[])")
     return ir => CC.compute_ir_rettype(ir)
 end
 

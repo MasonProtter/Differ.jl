@@ -9,13 +9,13 @@
 # `apply_intrinsic_frule!(Val(f), actual, Ti, ctx)` is called from the main statement loop in
 # `dualize_to_ircode` (`forward_interp.jl`) for every intrinsic call in the primal IR. It emits the
 # primal + shadow IR *directly* into the caller's instruction stream and returns
-# `(primal_ssa, shadow_ssa)` (or `nothing` if unregistered) — there is no `Dual` boxing, no `frule`
+# `(primal_ssa, shadow_ssa)` (or `nothing` if unregistered) — there is no `Dual` boxing, no `frule!!`
 # dispatch, and no `CodeInstance` resolution/compile the way a surviving high-level call
 # (`frule_split!`, e.g. `sin`/`cos`) needs. That machinery is fine for the handful of calls that
 # survive a function's body, but *every* arithmetic op in a differentiated function is an intrinsic
-# call — routing each one through a full `frule`/`CodeInstance` round trip (as an earlier version of
+# call — routing each one through a full `frule!!`/`CodeInstance` round trip (as an earlier version of
 # this file did: wrap each intrinsic in a thin wrapper function with its own singleton type, rewrite
-# the call to it, and dispatch `frule` on that) bloated both compile time and the generated code.
+# the call to it, and dispatch `frule!!` on that) bloated both compile time and the generated code.
 # Direct emission keeps intrinsics exactly as cheap as the primal computation itself, while still
 # reaching each rule via ordinary dispatch instead of a hand-rolled if-else chain.
 #

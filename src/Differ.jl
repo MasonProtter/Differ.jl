@@ -1,4 +1,4 @@
-module ADNext
+module Differ
 
 # Tangent / fdata / rdata type system (ported from Mooncake), plus the Mooncake-shaped
 # `Dual` / `CoDual` carriers that sit on top of it.
@@ -20,6 +20,7 @@ include("forward_interp.jl")
 # Reverse-mode AD engine (proof of concept, straight-line code only — see reverse_interp.jl header)
 include("intrinsics_reverse.jl")   # dispatch-based intrinsic vjp rules (apply_intrinsic_rrule!)
 include("reverse_interp.jl")
+include("rrules.jl")               # hand-written reverse-mode rules (mirrors frules.jl)
 
 include("reflection.jl")
 
@@ -27,11 +28,12 @@ include("reflection.jl")
 # include("precomp.jl")
 
 # Carriers and the forward-mode entry points.
-export Dual, CoDual, primal, tangent, NoTangent, frule
+export Dual, CoDual, primal, tangent, NoTangent, frule!!
 export code_dual_ircode, @code_dual_ircode
 
 # Reverse-mode entry points (branches supported; loops are Phase C — see reverse_interp.jl header).
-export rrule, gradient
+export rrule!!, AbstractCtx, Ctx, build_ctx
+export gradient, gradient!, value_and_gradient!, zero_fcodual
 export code_reverse_fwds_ircode, @code_reverse_fwds_ircode
 export code_reverse_pullback_ircode, @code_reverse_pullback_ircode
 
@@ -42,4 +44,4 @@ export NoFData, NoRData, FData, RData
 export fdata, rdata, zero_tangent
 export as_tangent, unit_tangent
 
-end # module ADNext
+end # module Differ

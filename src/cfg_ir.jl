@@ -11,7 +11,7 @@
 # lowers `Switch` dispatches into `GotoIfNot` chains — so block *identity* must survive insertion/
 # reordering, which position-based numbering cannot do. Hence the `ID` indirection here.
 #
-# Adapted for ADNext (Julia 1.13 only, no multi-version `@static if` branching) and for this
+# Adapted for Differ (Julia 1.13 only, no multi-version `@static if` branching) and for this
 # project's existing conventions (`Core.PhiNode`/`Core.GotoNode`/... qualified, `CC` alias for
 # `Core.Compiler` from `contextual.jl`, bare `copy` rather than `CC.copy`).
 # ===========================================================================

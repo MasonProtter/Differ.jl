@@ -10,7 +10,7 @@
 # `IRCode` directly — used here purely as test-harness plumbing, unrelated to the "no OpaqueClosure
 # in the AD engine itself" design constraint the plan follows for reverse mode).
 
-using ADNext: _ircode_to_cfg_blocks, lower_cfg_blocks_to_ir
+using Differ: _ircode_to_cfg_blocks, lower_cfg_blocks_to_ir
 
 cfg_branch(x) = x > 0.0 ? x * 2.0 : -x
 function cfg_loop(x, k)

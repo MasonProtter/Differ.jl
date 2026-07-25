@@ -8,7 +8,7 @@ const bitcast = Core.Intrinsics.bitcast
 using Core: svec, SimpleVector
 
 # Mooncake gets `@unstable`/`@stable` from DispatchDoctor; they are type-stability
-# *assertions* used when the whole module is wrapped in `@stable`. ADNext is not, so these
+# *assertions* used when the whole module is wrapped in `@stable`. Differ is not, so these
 # are safe no-op pass-throughs — they keep the ported source verbatim without a new dep.
 macro unstable(expr)
     return esc(expr)

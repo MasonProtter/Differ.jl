@@ -24,7 +24,7 @@ struct Dual{P,T}
     function Dual{P, T}(x, dx) where {P, T}
         if !(tangent_type(P) == T)
             @outline P T throw(ArgumentError(
-                "Invalid Dual{P,T} construction for primal type P=$P\n\tgot tangent type T=$T\n\tADNext requires that tangent_type(P) == T"
+                "Invalid Dual{P,T} construction for primal type P=$P\n\tgot tangent type T=$T\n\tDiffer requires that tangent_type(P) == T"
             ))
         end
         new{P, T}(convert(P, x), convert(T, dx))
@@ -124,10 +124,10 @@ function Dual(x::Type{P}, dx::NoTangent) where {P}
 end
 
 # ===========================================================================
-# ADNext-specific integration of `Dual` with the tangent system.
+# Differ-specific integration of `Dual` with the tangent system.
 # ===========================================================================
 
-# Property aliases used across ADNext's engine and tests. `x`/`y`/`z` alias the primal field
+# Property aliases used across Differ's engine and tests. `x`/`y`/`z` alias the primal field
 # (`primal`); `dx`/`dy`/`dz` alias the tangent field (`tangent`). Any other symbol (including the
 # real field names `:primal`/`:tangent`) falls through to `getfield`, so `primal(d)`/`tangent(d)`
 # keep working.
@@ -142,7 +142,7 @@ function Base.getproperty(d::Dual, s::Symbol)
 end
 Base.propertynames(::Dual) = (:primal, :tangent, :x, :y, :z, :dx, :dy, :dz)
 
-# A `Dual` is its own tangent type. This is the key to preserving ADNext's higher-order
+# A `Dual` is its own tangent type. This is the key to preserving Differ's higher-order
 # (Option A) nesting under the Mooncake tangent system: after the engine peels one `Dual` level
 # off a primal that is itself a `Dual`, the tangent it must produce is again a `Dual` — because we
 # define it to be. This reproduces every documented order-≥2 seed and satisfies Mooncake's
@@ -177,7 +177,7 @@ _carrier_zero(x::Dual) = zero_tangent_internal(x, NoCache())
 _carrier_zero(x::X) where {X} =
     Base.issingletontype(X) ? x :
     tangent_type(X) === X    ? zero_tangent(x) :
-    error("ADNext: cannot build a higher-order zero tangent for a `Dual` carrying a value of type ",
+    error("Differ: cannot build a higher-order zero tangent for a `Dual` carrying a value of type ",
           X, " (whose tangent type ", tangent_type(X), " differs from itself). The self-tangent ",
           "`Dual` scheme used for higher-order forward mode requires each carried type to be its own ",
           "tangent type — true for scalars and arrays, but not for a struct/closure with ",

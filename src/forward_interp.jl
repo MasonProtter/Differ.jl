@@ -1,7 +1,7 @@
-# Forward-mode AD: the `frule` entry point, the mode-specific glue that plugs into the
+# Forward-mode AD: the `frule!!` entry point, the mode-specific glue that plugs into the
 # `ADInterpreter` seams (`contextual.jl`), and the split-shadow dualization engine itself.
 #
-# `frule(dualargs::Dual...)` is a `@generated` fallback: for a composite primal `g` with no
+# `frule!!(dualargs::Dual...)` is a `@generated` fallback: for a composite primal `g` with no
 # hand-written rule, it compiles a *dualized* version of `g`'s body under
 # `ADInterpreter{Forward}` and invokes the resulting `CodeInstance`. The dualization is a
 # split-shadow transform on `g`'s post-optimization `IRCode`, spliced into the typeinf pipeline at
@@ -12,27 +12,27 @@
 # `ADInterpreter{Forward}` replaces its source with the dualized primal body, so this
 # body must never actually run.
 dualized_impl(dualargs::Dual...) =
-    error("ADNext.dualized_impl ran directly: ADInterpreter could not dualize the primal ",
+    error("Differ.dualized_impl ran directly: ADInterpreter could not dualize the primal ",
           "(likely unsupported IR — e.g. array indexing / a builtin with no rule, or a vararg call).")
 
 
 # Runtime dispatcher for a *dynamic* (`apply_generic`) call that survived into the primal IR (its
 # callee or an argument was too abstractly typed to wrap statically). Rebuild concrete `Dual`s from
 # the runtime primal/tangent values — the `map` is the whole point: `Dual(1.0, 1.0)` infers the
-# concrete `Dual{Float64,Float64}`, so `frule`'s `@generated` dispatch (keyed on the `Dual` type
+# concrete `Dual{Float64,Float64}`, so `frule!!`'s `@generated` dispatch (keyed on the `Dual` type
 # parameters) can name a concrete primal method. A statically-built `Dual{Any,Any}` could not. The
 # callee carries its *real* tangent `tf` (not a forced zero), so a dynamically-dispatched closure's
 # capture derivatives still propagate.
 function dynamic_frule(f, tf, primals::Tuple, tangents::Tuple)
     duals = map(Dual, primals, tangents)
-    return frule(Dual(f, tf), duals...)
+    return frule!!(Dual(f, tf), duals...)
 end
 
 
 # ---------------------------------------------------------------------------
 # Forward-mode transform hook.
 #
-# The generated `frule` fallback asks the interpreter to compile a `dualized_impl` MethodInstance
+# The generated `frule!!` fallback asks the interpreter to compile a `dualized_impl` MethodInstance
 # whose `specTypes` is the *dual* signature. We compile it by transforming the corresponding primal
 # method's post-optimization `IRCode` into a dualized `IRCode` (`build_dual_ir`). Non-`dualized_impl`
 # MethodInstances return `nothing` here and flow through the ordinary pipeline (see the seam
@@ -41,11 +41,11 @@ end
 
 function build_contextual_ir(interp::ADInterpreter{Forward}, mi::MethodInstance)
     is_dualized_impl(mi) || return nothing
-    reason = Ref("ADNext could not dualize the primal (no specific reason recorded).")
+    reason = Ref("Differ could not dualize the primal (no specific reason recorded).")
     edges = Any[]
     ir = build_dual_ir(interp, mi, reason, edges)
     # Stash whatever backedges were discovered even on a bail: if the missing piece (a primal
-    # method, a not-yet-written `frule`) later appears, the mt-backedges recorded below (see
+    # method, a not-yet-written `frule!!`) later appears, the mt-backedges recorded below (see
     # `primal_of_impl`/`frule_codeinstance`) invalidate this carrier so it gets a real chance to
     # dualize instead of staying pinned to the error stub forever. `frule_body` reads this back to
     # set the generated wrapper's `ci.edges`.
@@ -82,7 +82,7 @@ end
 # discovery already found — see `register_implicit_frule_backedge!`/`src_inlining_policy` below).
 # Returns `nothing` for anything the shape doesn't apply to (varargs, `Type`-valued parameters,
 # …) rather than throwing: `callee_mi` may be an arbitrary callee Julia's compiler discovered, not
-# something ADNext validated.
+# something Differ validated.
 function implicit_frule_tt(callee_mi::MethodInstance)
     isa(callee_mi.def, Method) || return nothing
     params = callee_mi.specTypes.parameters
@@ -91,16 +91,16 @@ function implicit_frule_tt(callee_mi::MethodInstance)
     (ftype isa Type) || return nothing
     try
         dualargs = Any[Dual{P,tangent_type(P)} for P in params[2:end]]
-        return Tuple{typeof(frule), Dual{ftype,NoTangent}, dualargs...}
+        return Tuple{typeof(frule!!), Dual{ftype,NoTangent}, dualargs...}
     catch
         return nothing
     end
 end
 
-# An mt-backedge on the `frule` resolution a *hypothetical* differentiation of `callee_mi` would
+# An mt-backedge on the `frule!!` resolution a *hypothetical* differentiation of `callee_mi` would
 # use, registered even though `callee_mi`'s call was (or may have been) inlined away and never
 # actually went through `frule_split!`/`frule_codeinstance` — see the call site in `build_dual_ir`'s
-# base case. So a user later hand-writing `frule(::Dual{typeof(callee_mi's function)}, ...)`
+# base case. So a user later hand-writing `frule!!(::Dual{typeof(callee_mi's function)}, ...)`
 # invalidates a derivative built before that rule existed, exactly like a surviving high-level call
 # would get via `frule_codeinstance`. Best-effort, same caveats as `implicit_frule_tt`: this is a
 # nice-to-have extra invalidation trigger, not core, so a `frule_tt` that can't be built is silently
@@ -112,12 +112,12 @@ function register_implicit_frule_backedge!(edges::Vector{Any}, callee_mi::Method
 end
 
 # The generated composite fallback (`frule_body`, installed by `refresh_frule`) is the *only* method
-# of `frule` with this exact vararg signature — every hand-written rule (`frule(::Dual{typeof(f)},
+# of `frule!!` with this exact vararg signature — every hand-written rule (`frule!!(::Dual{typeof(f)},
 # dualargs::Dual...)` for a concrete `f`) has a strictly narrower signature. So a `Method` matches the
 # fallback, rather than some hand rule, iff its signature is exactly this one.
-is_generated_frule_fallback(m::Method) = m.sig === Tuple{typeof(frule), Vararg{Dual}}
+is_generated_frule_fallback(m::Method) = m.sig === Tuple{typeof(frule!!), Vararg{Dual}}
 
-# Does a *hand-written* `frule` (as opposed to the generated composite fallback, which always
+# Does a *hand-written* `frule!!` (as opposed to the generated composite fallback, which always
 # matches) apply to a hypothetical differentiation of `callee_mi`? Used by `src_inlining_policy`
 # below to keep such a call from being inlined away before `dualize_to_ircode` ever gets a chance to
 # route it through that rule (see the "inlined `foo`, hand rule added, still gives the wrong
@@ -130,11 +130,11 @@ function has_hand_frule(interp::ADInterpreter, callee_mi::MethodInstance)
     return !is_generated_frule_fallback(m.method)
 end
 
-# Inlining policy: never inline a call whose callee has a hand-written `frule` — otherwise the call
+# Inlining policy: never inline a call whose callee has a hand-written `frule!!` — otherwise the call
 # vanishes into the caller's optimized IR (as plain arithmetic/whatever primitives it lowers to)
 # before `dualize_to_ircode` ever sees it, so the hand rule can never be consulted, regardless of how
 # small/inlinable the callee looks to Julia's ordinary cost-based heuristic (which has no concept of
-# `frule` at all). Falls back to the ordinary policy otherwise, so this only ever *restricts*
+# `frule!!` at all). Falls back to the ordinary policy otherwise, so this only ever *restricts*
 # inlining relative to normal Julia behavior, never expands it.
 function CC.src_inlining_policy(interp::ADInterpreter{Forward}, mi::MethodInstance,
                                 @nospecialize(src), @nospecialize(info::CC.CallInfo), stmt_flag::UInt32)
@@ -180,12 +180,25 @@ function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance, reason::
     return (primal_mi, length(dualparams))
 end
 
+# Recursion cycle guard for `build_dual_ir`, analogous to reverse mode's `interp.in_progress` field
+# (`contextual.jl`/`reverse_interp.jl`) but **global** rather than per-instance: a self- or
+# mutually-recursive primal's nested resolution crosses the `frule!!` `@generated`-function boundary
+# (`frule_codeinstance` below compiles the generic `frule!!` fallback under a *fresh*
+# `CC.NativeInterpreter`, whose generator body `frule_body` — `refresh_frule`, bottom of this file —
+# then spins up a *brand-new* `ADInterpreter{Forward}` instance to resolve the inner `dualized_impl`),
+# so a guard scoped to one interpreter instance can never observe the cycle: each recursive level
+# uses a different `interp` object even though it targets the exact same `impl_mi`. Confirmed
+# empirically: a `@noinline` self-recursive function run through `frule!!` stack-overflows without
+# this (a hard crash before this fix, not a catchable error) — the identical failure mode reverse
+# mode's `in_progress` field exists to prevent, just reached by a different code path.
+const DUALIZED_IMPL_IN_PROGRESS = IdDict{MethodInstance,Nothing}()
+
 # Build the dualized `IRCode` for a `dualized_impl` specialization from the primal's optimized
 # `IRCode`. Returns the dual `IRCode` or `nothing` (unsupported IR → bail).
 #
 # Two cases, distinguished by whether any *value* argument's primal is itself a `Dual`:
 #
-#  * First order (base case): the primal is an ordinary user method (or a hand-written `frule`),
+#  * First order (base case): the primal is an ordinary user method (or a hand-written `frule!!`),
 #    found via `primal_of_impl`, and dualized directly. `pir` has scalar positional arguments.
 #  * Higher order (Option A — compose the transform): a request whose value args are nested Duals
 #    (e.g. `Dual{Dual{F,F},Dual{F,F}}`) is differentiating the *order-(k-1) dualized function*. That
@@ -195,6 +208,21 @@ end
 #    so `pir_is_vararg=true` selects the tuple-reconstruction prologue in `dualize_to_ircode`.
 function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""),
                        edges::Vector{Any}=Any[])
+    if haskey(DUALIZED_IMPL_IN_PROGRESS, impl_mi)
+        reason[] = "recursive dualization of $(impl_mi) detected (a self- or mutually-recursive " *
+                   "primal) — not yet supported; bailing instead of recursing forever"
+        return nothing
+    end
+    DUALIZED_IMPL_IN_PROGRESS[impl_mi] = nothing
+    try
+        return _build_dual_ir(interp, impl_mi, reason, edges)
+    finally
+        delete!(DUALIZED_IMPL_IN_PROGRESS, impl_mi)
+    end
+end
+
+function _build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""),
+                        edges::Vector{Any}=Any[])
     dualparams = impl_mi.specTypes.parameters[2:end]
     if !all(P -> P isa Type && P <: Dual, dualparams)
         reason[] = "not every dual argument type is a `Dual` (a vararg call?)"
@@ -207,7 +235,7 @@ function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::R
     #  * `offset=0` — uniform seeds where the function nests like every value arg, so the *whole* list
     #    peels: `Dual{Dual{f,NoTangent},…}` → `Dual{f,NoTangent}`, `Dual{Dual{F,F},…}` → `Dual{F,F}`.
     #  * `offset=1` — a re-dualized carrier invoke whose `dualparams[1]` is a non-nested function slot
-    #    (`dualized_impl`/`frule`) naming the function being re-differentiated: drop it, peel only the
+    #    (`dualized_impl`/`frule!!`) naming the function being re-differentiated: drop it, peel only the
     #    trailing (nested) value args.
     function compose(offset::Int)
         inner_dualparams = Any[_dual_primal_type(P) for P in dualparams[1+offset:end]]
@@ -221,7 +249,7 @@ function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::R
         # This dual IR is built directly on top of the inner carrier's own optimized dual IR (its
         # instructions are copied/re-dualized wholesale below), so redefining/invalidating
         # `inner_mi` must invalidate this one too. `inner_mi`'s *own* dependencies (its primal
-        # method, any `frule`s it resolved) are tracked on its own edges list whenever it is
+        # method, any `frule!!`s it resolved) are tracked on its own edges list whenever it is
         # itself compiled through this same seam — not duplicated into `edges` here.
         CC.add_inlining_edge!(edges, inner_mi)
         pir = optimized_dual_ir(interp, inner_mi, reason)
@@ -233,40 +261,40 @@ function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::R
 
     # Higher-order requests re-dualize an order-(k-1) carrier. Two shapes reach here:
     #
-    #  * Uniform seeds (`code_dual_ircode` order≥2 / a `frule(fseed_k, seed_k)` call): every dual arg
+    #  * Uniform seeds (`code_dual_ircode` order≥2 / a `frule!!(fseed_k, seed_k)` call): every dual arg
     #    — the function included — is nested one level, so an order-≥2 request is one where *any*
     #    argument's primal is itself a `Dual`. The function nests as arg 1, so the whole list peels
-    #    (`offset=0`). A `frule` slot is excluded: `frule` is the only Dual-consuming function, so a
-    #    Dual-valued arg *under `frule`* means "differentiate a hand rule once" (the base case), not
+    #    (`offset=0`). A `frule!!` slot is excluded: `frule!!` is the only Dual-consuming function, so a
+    #    Dual-valued arg *under `frule!!`* means "differentiate a hand rule once" (the base case), not
     #    "differentiate the derivative" — that's handled below.
     #
-    #  * A re-dualized *surviving carrier invoke* (nested `frule`/`D` — "D-of-D"): when the outer pass
-    #    dualizes a function whose body called `frule`, that inner call survives in the primal IR as a
-    #    `dualized_impl` `:invoke` (inlined generated `frule`) or a `frule` `:invoke`. `frule_split!`
+    #  * A re-dualized *surviving carrier invoke* (nested `frule!!`/`D` — "D-of-D"): when the outer pass
+    #    dualizes a function whose body called `frule!!`, that inner call survives in the primal IR as a
+    #    `dualized_impl` `:invoke` (inlined generated `frule!!`) or a `frule!!` `:invoke`. `frule_split!`
     #    re-wrapped its callee as the non-nested function slot `Dual{typeof(dualized_impl),NoTangent}`
-    #    / `Dual{typeof(frule),NoTangent}` at position 1, naming the function being re-differentiated
+    #    / `Dual{typeof(frule!!),NoTangent}` at position 1, naming the function being re-differentiated
     #    rather than a value arg — so it is dropped (`offset=1`) and the trailing nested args peel.
     if f1 === typeof(dualized_impl)
         return compose(1)
-    elseif f1 !== typeof(frule) && any(i -> _dual_primal_type(dualparams[i]) <: Dual, 1:n)
+    elseif f1 !== typeof(frule!!) && any(i -> _dual_primal_type(dualparams[i]) <: Dual, 1:n)
         return compose(0)
     end
 
-    # Base case: an ordinary user method or a hand-written `frule`, dualized directly. The `frule`
+    # Base case: an ordinary user method or a hand-written `frule!!`, dualized directly. The `frule!!`
     # slot lands here — `primal_of_impl` peels its args to the concrete rule signature. If that
-    # resolves to the *generated* (vararg) `frule` rather than a hand rule, this is not a base case
-    # but a composed derivative (`D` applied to a surviving `frule` invoke, e.g. a 3rd+-order nested
-    # `D`); fall back to `compose(1)`, which drops the `frule` slot and re-dualizes the inner carrier.
+    # resolves to the *generated* (vararg) `frule!!` rather than a hand rule, this is not a base case
+    # but a composed derivative (`D` applied to a surviving `frule!!` invoke, e.g. a 3rd+-order nested
+    # `D`); fall back to `compose(1)`, which drops the `frule!!` slot and re-dualizes the inner carrier.
     info = primal_of_impl(interp, impl_mi, reason, edges)
     if info === nothing
-        f1 === typeof(frule) && return compose(1)
+        f1 === typeof(frule!!) && return compose(1)
         return nothing
     end
     primal_mi, _ = info
     # Optimized primal IR, computed by hand (mirroring `Core.Compiler.typeinf_ircode`'s own body)
     # rather than calling that function directly, so we can also read off `frame.edges` — see below.
     # Compiled with `interp` itself (not a bare `NativeInterpreter`): this is what makes our
-    # `src_inlining_policy` override actually apply, so a callee with a hand-written `frule` isn't
+    # `src_inlining_policy` override actually apply, so a callee with a hand-written `frule!!` isn't
     # inlined away before `dualize_to_ircode` gets a chance to route it through that rule — the same
     # reason `sin`/`cos` and other hand-ruled functions already survived as `:invoke`s even before
     # that override existed (their bodies simply weren't cheap enough to inline by ordinary cost
@@ -290,7 +318,7 @@ function build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::R
     # primal's real dependency set, including everything it inlined away.
     append!(edges, frame.edges)
     # For every concrete callee discovered above (regardless of whether its call survived or was
-    # inlined away), also register the mt-backedge a hand-written `frule` for it would need — see
+    # inlined away), also register the mt-backedge a hand-written `frule!!` for it would need — see
     # `register_implicit_frule_backedge!`. `ForwardToBackedgeIterator` decodes the same variable-width
     # edge encoding `store_backedges` itself understands, so this walks `frame.edges` correctly
     # regardless of which entry shape (plain MI/CI, invoke pair, mt-backedge pair, multi-match
@@ -316,21 +344,21 @@ function optimized_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reaso
     end
 end
 
-# Resolve and compile the `frule(Dual{typeof(f),NoTangent}, dualargs...)` rule for a surviving
+# Resolve and compile the `frule!!(Dual{typeof(f),NoTangent}, dualargs...)` rule for a surviving
 # high-level call to an *invoke-able `CodeInstance`*, so the dualized IR can emit a static
 # `:invoke` (mirroring how the primal IR keeps `sin`/`cos` as `:invoke`s to a `CodeInstance`).
 # `:invoke` targets *must* be `CodeInstance`s: `collectinvokes!` only JITs those, so a bare
 # `MethodInstance` would fall back to a boxed dynamic call. Returns `nothing` if unresolved.
 #
 # `edges` collects the backedges this resolution depends on: an mt-backedge on `frule_tt` —
-# unconditional, so a *new* user `frule` method (one that didn't exist, or wasn't as specific, when
+# unconditional, so a *new* user `frule!!` method (one that didn't exist, or wasn't as specific, when
 # this was built — e.g. someone hand-writing a rule for a function that previously fell through to
 # the generated composite fallback) invalidates this dual IR — plus, when a rule is found, a direct
 # invoke edge to the resolved `CodeInstance` (this call is emitted as a static `:invoke` to it).
 function frule_codeinstance(interp::ADInterpreter, @nospecialize(ftype), dual_argtypes,
                             edges::Vector{Any}=Any[])
-    frule_tt = Tuple{typeof(frule), Dual{ftype,NoTangent}, dual_argtypes...}
-    push!(edges, frule_tt, Core.methodtable)   # mt-backedge: a new/more-specific frule must invalidate
+    frule_tt = Tuple{typeof(frule!!), Dual{ftype,NoTangent}, dual_argtypes...}
+    push!(edges, frule_tt, Core.methodtable)   # mt-backedge: a new/more-specific frule!! must invalidate
     fm, _ = CC.findsup(frule_tt, CC.method_table(interp))
     fm === nothing && return nothing
     isa(fm.method, Method) || return nothing
@@ -350,11 +378,11 @@ end
 # computation is reconstructed and a parallel tangent computation is emitted beside it, then packed
 # into a `Dual`. Low-level rules describe how each intrinsic (`add_float`, `mul_float`, …), builtin
 # (`getfield`), and `%new` propagates tangents; surviving `:invoke`/`:call`s (e.g. `sin`/`cos`) go
-# through `frule` dispatch, which picks up hand-written rules.
+# through `frule!!` dispatch, which picks up hand-written rules.
 #
 # Types are derived directly and exactly from the primal IR, not guessed: every shadow (tangent)
 # statement shares its primal statement's type `Ti`; a `Dual{R,R}` wrapper uses `R = Ti`; a
-# surviving `frule` result is `Dual{R,R}` with `R` the primal call's result type. The result is
+# surviving `frule!!` result is `Dual{R,R}` with `R` the primal call's result type. The result is
 # therefore a fully typed `IRCode` that installs as the optimization result and whose return type
 # `finishinfer!` reads off via `compute_ir_rettype` — no re-inference. Branches and loops
 # (`GotoNode`/`GotoIfNot`/`PhiNode`) are supported: block topology is preserved 1:1 from the primal,
@@ -377,14 +405,14 @@ const _Intr = Core.Intrinsics
 #
 # A `GlobalRef` is resolved *at `world`* — the interpreter's inference world — via `Base.getglobalref`
 # (`jl_eval_globalref`), NOT at the ambient task world. This is load-bearing: `dualize_to_ircode` runs
-# transitively inside the `@generated frule` body (`frule_body` -> `typeinf_ext_toplevel`), whose
+# transitively inside the `@generated frule!!` body (`frule_body` -> `typeinf_ext_toplevel`), whose
 # generation world can *predate* a user's (`Main`) function definition. A bare `getglobal`/`isdefined`
 # (or `invoke_in_world`, which reparameterizes dispatch but *not* global-binding lookup) would there
 # see a genuinely-defined user function as undefined, returning `nothing` — the callee then degrades to
 # a raw `GlobalRef` and miscompiles at higher order (a `Dual{GlobalRef,…}` -> `%new` `TypeError`).
 # `Base` functions escape this only because they are defined at an early world. The `world` argument is
 # therefore *mandatory* (no default): every caller must thread the inference world in consciously — see
-# the "world-age inside the generated `frule` body" note in the `adnext-ircode-dualization` skill.
+# the "world-age inside the generated `frule!!` body" note in the `adnext-ircode-dualization` skill.
 # `try/catch -> nothing` keeps the "genuinely unresolvable ⇒ dynamic" contract for undefined bindings.
 _calleeval(@nospecialize(x), world::UInt) =
     isa(x, GlobalRef) ? (try Base.getglobalref(x, world) catch; nothing end) :
@@ -418,12 +446,12 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # Embed the actual (stable, singleton) function objects as literals rather than `GlobalRef`s
     # to a non-Core/Base module: `Core.Compiler.verify_ir` rejects a bare `GlobalRef` used directly
     # as a value unless its binding is proven constant across the IR's valid worlds, which these
-    # ADNext-module bindings aren't considered to be even though they never change identity.
+    # Differ-module bindings aren't considered to be even though they never change identity.
     # Embed the actual functions as literals (see comment above re: value-position GlobalRefs).
     zerotang_g   = zero_tangent       # runtime zero-tangent fallback for non-diff results
     buildtang_g  = build_tangent      # construct a struct's `Tangent`/`MutableTangent` shadow
     gettfield_g  = get_tangent_field  # read a field's tangent out of a `Tangent`/`MutableTangent`
-    fruleg = frule
+    fruleg = frule!!
     Dualg  = Dual                # the `Dual` constructor, for a runtime (dynamic) pack of a non-concrete result
     dynfrule_g = dynamic_frule   # runtime dispatcher for a surviving dynamic (`apply_generic`) call
     getf   = GlobalRef(Core, :getfield)
@@ -452,7 +480,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # Pack a primal/tangent into a `Dual` for a *non-concrete* primal type `R` (e.g. `Any`, produced by
     # a dynamic dispatch). A `%new(Dual{R,tt(R)}, …)` would freeze the over-wide declared type into the
     # value — `dynbox(3.0)` would return a boxed `Dual{Any,Any}(9.0, 6.0)` instead of a genuine
-    # `Dual{Float64,Float64}`, and that couldn't flow back into `frule`. Instead call the `Dual`
+    # `Dual{Float64,Float64}`, and that couldn't flow back into `frule!!`. Instead call the `Dual`
     # constructor *dynamically*: at run time it infers the concrete leaf type from the actual values
     # (exactly as `dynamic_frule`'s `map(Dual, …)` does). The declared type is the abstract
     # `dual_type(R)` — the UnionAll `Dual` for `R === Any`, or a `Union` of leaf `Dual`s for a `Union`
@@ -551,11 +579,11 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # non-concrete declared type — the method that runs depends on runtime types unknowable here
         # (e.g. a value read out of an `Any`-typed global/field/container). We can't wrap such a call
         # statically: a `%new` of a `Dual` would freeze the abstract type into the object, and
-        # `frule`'s `@generated` dispatch — keyed on exactly those `Dual` type parameters — could not
+        # `frule!!`'s `@generated` dispatch — keyed on exactly those `Dual` type parameters — could not
         # resolve a concrete primal from `Dual{Any,…}`. Defer to the runtime `dynamic_frule` dispatcher
         # (see its definition above): pass the callee's primal + tangent and a tuple of the argument
         # *primals* and a tuple of their *tangents*, and let it rebuild concrete `Dual`s and dispatch
-        # `frule` at run time. Its result is typed `Any`; extract the primal (typed `R`) and tangent
+        # `frule!!` at run time. Its result is typed `Any`; extract the primal (typed `R`) and tangent
         # (typed `tt(R)`, which widens to `Any` when `R` is abstract). Note we do *not* branch on `R`:
         # a call with concrete callee+args but an inference-widened abstract result (e.g. `_2 * _2 ::
         # Any`, left after a `Ref{Any}` was SROA'd away) takes the static path below, which annotates
@@ -597,7 +625,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # the field and TypeError at the `%new` when the ref loads as the type. `_typeof`, not plain
         # `typeof`, is required here: `typeof(Float64) === DataType` loses the value entirely, whereas
         # `_typeof(Float64) === Type{Float64}` sharpens it — needed for `Dual{Type{Float64},…}`-keyed
-        # `frule` dispatch to resolve. Only genuinely dynamic operands (SSAValue/Argument) fall back to
+        # `frule!!` dispatch to resolve. Only genuinely dynamic operands (SSAValue/Argument) fall back to
         # `presolve`/`_optype`/`tresolve`.
         dualtys = Any[]; duals = Any[]
         for a in actual
@@ -764,7 +792,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # Dispatch straight to a per-intrinsic rule (`apply_intrinsic_frule!` in
                 # `src/intrinsics.jl`), which emits the primal + shadow IR directly using the same
                 # `opf`/`presolve`/`tresolve`/`zero_shadow` primitives as every other case in this
-                # loop — no `Dual` boxing, `frule` dispatch, or `CodeInstance` resolution. Explicit,
+                # loop — no `Dual` boxing, `frule!!` dispatch, or `CodeInstance` resolution. Explicit,
                 # not implicit: the fallback method returns `nothing`, so an *unregistered* intrinsic
                 # bails gracefully with a located reason rather than crashing or silently miscompiling.
                 res = apply_intrinsic_frule!(Val(f), actual, Ti, intrinsic_ctx)
@@ -959,7 +987,7 @@ function frule_body(world::UInt, source, self, dual_argtypes)
     match, _ = Core.Compiler.findsup(impl_tt, Core.Compiler.method_table(interp))
     if match === nothing
         return expr_to_codeinfo(@__MODULE__(), argnames, [], (),
-                                :(error("ADNext: no dualized_impl match")), true)
+                                :(error("Differ: no dualized_impl match")), true)
     end
     impl_mi = specialize_method(match.method, match.spec_types, match.sparams)::MethodInstance
 
@@ -974,14 +1002,14 @@ function frule_body(world::UInt, source, self, dual_argtypes)
                           :(return invoke(dualized_impl, $cinst, dualargs...)), true)
 
     # `impl_mi` is a real backedge: if its own CodeInstance is invalidated (see below — that's where
-    # the primal/`frule` dependencies actually get registered, via `finishinfer!` in `contextual.jl`),
+    # the primal/`frule!!` dependencies actually get registered, via `finishinfer!` in `contextual.jl`),
     # this wrapper must be invalidated and regenerated too, so it re-embeds a fresh `cinst`.
     ci.edges = Core.MethodInstance[impl_mi]
     return ci
 end
 
 function refresh_frule()
-    @eval function frule(dualargs::Dual...)
+    @eval function frule!!(dualargs::Dual...)
         $(Expr(:meta, :generated_only))
         $(Expr(:meta, :generated, frule_body))
     end

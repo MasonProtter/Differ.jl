@@ -10,6 +10,12 @@ Base.copy(::NoFData) = NoFData()
 
 increment_internal!!(::IncCache, ::NoFData, ::NoFData) = NoFData()
 
+# Zeroing "no fdata" is a no-op, the same way zeroing `NoTangent` is (`set_to_zero_internal!!` in
+# `tangents.jl`). Needed by the pre-allocated `value_and_gradient!` entry point, which zeroes each
+# caller-supplied shadow uniformly — and an argument whose tangent is rdata-carried (any scalar) or
+# absent (a plain function) has `NoFData` as its shadow.
+set_to_zero_internal!!(::SetToZeroCache, ::NoFData) = NoFData()
+
 """
     FData(data::NamedTuple)
 

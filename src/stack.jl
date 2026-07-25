@@ -18,6 +18,14 @@ end
 
 _copy(::Stack{T}) where {T} = Stack{T}()
 
+# NOTE on the fully-qualified `Base.push!` in the grow branch (and likewise anywhere else in the
+# reverse-mode runtime helpers): these functions are *inlined into synthetic IR* built by
+# `reverse_interp.jl`, whose `:invoke`s are emitted against resolved `CodeInstance`s. A bare `push!`
+# here resolves against this file's enclosing module and inlines as `GlobalRef(Differ, :push!)` — an
+# implicit `using Base` binding, which `Core.Compiler.verify_ir` rejects as an "unbound or
+# partitioned GlobalRef ... in value position" once re-embedded in the carrier's own compiled unit
+# (see the same hazard documented in `reverse_interp.jl`, for hand rules). Naming `Base` explicitly
+# makes it a genuine bound cross-module reference that survives inlining.
 @inline function Base.push!(x::Stack{T}, val::T) where {T}
     position = x.position + 1
     memory = x.memory
@@ -25,7 +33,7 @@ _copy(::Stack{T}) where {T} = Stack{T}()
     if position <= length(memory)
         @inbounds memory[position] = val
     else
-        @noinline push!(memory, val)
+        @noinline Base.push!(memory, val)
     end
     return nothing
 end

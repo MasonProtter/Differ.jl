@@ -510,8 +510,17 @@ anything other than that which this function returns.
 """
 zero_tangent(x)
 function zero_tangent(x::P) where {P}
-    return zero_tangent_internal(x, isbitstype(P) ? NoCache() : IdDict())
+    # `require_tangent_cache`, not a bare `isbitstype(P)`: the cache exists only to handle circular
+    # references and aliasing, and `require_tangent_cache` is this system's declared authority on
+    # when a tangent can contain either (it is what `set_to_zero!!` already consults). The bare
+    # `isbitstype` test is strictly cruder — it allocates an `IdDict` for *every* `Array`, including
+    # `Array{<:IEEEFloat}`, whose tangent is provably tree-like. That `IdDict` (plus its backing
+    # `Vector{Any}`) was showing up on every `gradient` call, purely to build an argument's zero
+    # shadow.
+    return zero_tangent_internal(x, _tangent_cache(require_tangent_cache(P)))
 end
+@inline _tangent_cache(::Val{true}) = IdDict()
+@inline _tangent_cache(::Val{false}) = NoCache()
 function zero_tangent(x::Ptr)
     throw(
         ArgumentError(
@@ -582,7 +591,7 @@ Stacktrace:
  [1] oneunit(x::Vector{Float64})
    @ Base ./number.jl:424
  [2] unit_tangent(x::Vector{Float64})
-   @ ADNext ~/Nextcloud/Julia/ADNextPlayground/ADNext/src/tangents.jl:555
+   @ Differ ~/Nextcloud/Julia/DifferPlayground/Differ/src/tangents.jl:555
  [3] top-level scope
    @ REPL[114]:1
 ```
@@ -1562,7 +1571,7 @@ function friendly_tangent_cache_internal(x::P) where {P}
     return FriendlyTangentCache{AsRaw}(nothing)
 end
 
-# NOTE (ADNext port): the `AsPrimal` path — `friendly_tangent_cache(::AbstractDict)` and
+# NOTE (Differ port): the `AsPrimal` path — `friendly_tangent_cache(::AbstractDict)` and
 # `tangent_to_friendly!!(::FriendlyTangentCache{AsPrimal}, …)` — is omitted here. It depends on
 # `_copy_output` / `_copy_to_output!!`, which live in Mooncake's `interface.jl`/rules layer (out of
 # scope for the tangent/fdata/rdata port). Mutable-collection primals therefore fall through to the

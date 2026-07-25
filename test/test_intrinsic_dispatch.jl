@@ -1,4 +1,4 @@
-# Tests for ADNext's dispatch-based handling of `Core.Intrinsics` (see `src/intrinsics.jl`).
+# Tests for Differ's dispatch-based handling of `Core.Intrinsics` (see `src/intrinsics.jl`).
 #
 # The mechanism:
 #   1. Every `Core.Intrinsics` function is an instance of the single type `Core.IntrinsicFunction`,
@@ -6,7 +6,7 @@
 #      one specific intrinsic and ordinary multiple dispatch on `Val` works.
 #   2. `dualize_to_ircode` calls `apply_intrinsic_frule!(Val(f), actual, Ti, ctx)` for every
 #      intrinsic call in the primal IR. Each method emits the primal + shadow IR *directly* — no
-#      `Dual` boxing, no `frule` dispatch, no `CodeInstance` resolution.
+#      `Dual` boxing, no `frule!!` dispatch, no `CodeInstance` resolution.
 #
 # *Differentiable* float intrinsics get a hand-written rule (`add_float`, `sqrt_llvm`, `max_float`,
 # `fma_float`, `fpext`, …); *non-differentiable* ones (comparisons, integer/bit ops, rounding,
@@ -29,33 +29,33 @@
     end
 
     @testset "inactive (non-differentiable) intrinsics" begin
-        D(f, x) = frule(Dual(f, NoTangent()), Dual(x, 1.0)).dx
+        D(f, x) = frule!!(Dual(f, NoTangent()), Dual(x, 1.0)).dx
 
         # Integer arithmetic, comparisons, and bit ops all contribute a zero tangent.
         addi(x) = Int(x) + 1
-        @test frule(Dual(addi, NoTangent()), Dual(2.0, 1.0)) === Dual(3, NoTangent())
+        @test frule!!(Dual(addi, NoTangent()), Dual(2.0, 1.0)) === Dual(3, NoTangent())
 
         # A comparison: primal is the `Bool`, tangent is `NoTangent`.
         lt(x, y) = x < y
-        @test frule(Dual(lt, NoTangent()), Dual(1.0, 1.0), Dual(2.0, 5.0)) === Dual(true, NoTangent())
+        @test frule!!(Dual(lt, NoTangent()), Dual(1.0, 1.0), Dual(2.0, 5.0)) === Dual(true, NoTangent())
 
         # A branch driven by a comparison dualizes end-to-end (relu-style).
         relu(x) = x > 0.0 ? x : -x
         rr = Dual(relu, NoTangent())
-        @test frule(rr, Dual(3.0, 1.0)) === Dual(3.0, 1.0)
-        @test frule(rr, Dual(-3.0, 1.0)) === Dual(3.0, -1.0)
+        @test frule!!(rr, Dual(3.0, 1.0)) === Dual(3.0, 1.0)
+        @test frule!!(rr, Dual(-3.0, 1.0)) === Dual(3.0, -1.0)
 
         # inactive conversions / rounding: primal computed, tangent is zero
         @test D(x -> x + Float64(3), 2.0) == 1.0          # sitofp on a constant contributes 0
         @test D(floor, 2.7) == 0.0                        # floor_llvm
         @test D(round, 2.7) == 0.0                        # rint_llvm
-        @test frule(Dual(x -> Float64(trunc(Int, x)), NoTangent()), Dual(2.7, 1.0)) === Dual(2.0, 0.0)
+        @test frule!!(Dual(x -> Float64(trunc(Int, x)), NoTangent()), Dual(2.7, 1.0)) === Dual(2.0, 0.0)
     end
 
     @testset "differentiable float intrinsics (vs finite differences)" begin
-        D(f, x)     = frule(Dual(f, NoTangent()), Dual(x, 1.0)).dx           # d/dx f(x)
-        Dx(f, x, y) = frule(Dual(f, NoTangent()), Dual(x, 1.0), Dual(y, 0.0)).dx   # ∂/∂x f(x,y)
-        Dy(f, x, y) = frule(Dual(f, NoTangent()), Dual(x, 0.0), Dual(y, 1.0)).dx   # ∂/∂y f(x,y)
+        D(f, x)     = frule!!(Dual(f, NoTangent()), Dual(x, 1.0)).dx           # d/dx f(x)
+        Dx(f, x, y) = frule!!(Dual(f, NoTangent()), Dual(x, 1.0), Dual(y, 0.0)).dx   # ∂/∂x f(x,y)
+        Dy(f, x, y) = frule!!(Dual(f, NoTangent()), Dual(x, 0.0), Dual(y, 1.0)).dx   # ∂/∂y f(x,y)
         fd(f, x; h=1e-6) = (f(x + h) - f(x - h)) / 2h
 
         # add/sub/neg/mul/div_float
@@ -84,19 +84,19 @@
         @test Dy(copysign, 3.0, 5.0)  == 0.0
         # fpext / fptrunc (Float32 ↔ Float64 width conversion): linear, derivative 1
         @test D(x -> Float64(Float32(x)), 2.5) == 1.0
-        r32 = frule(Dual(x -> Float64(x), NoTangent()), Dual(2.5f0, 1.0f0))
+        r32 = frule!!(Dual(x -> Float64(x), NoTangent()), Dual(2.5f0, 1.0f0))
         @test r32 === Dual(2.5, 1.0)
     end
 
-    @testset "dualized IR emits intrinsics directly (no frule round trip)" begin
+    @testset "dualized IR emits intrinsics directly (no frule!! round trip)" begin
         # A primal `+` inlines to `add_float`, which now dualizes to a directly-emitted `add_float`
-        # op for both primal and shadow — no boxing into a `Dual` and no `invoke frule(...)`.
+        # op for both primal and shadow — no boxing into a `Dual` and no `invoke frule!!(...)`.
         myadd(x, y) = x + y
         ir, rt = code_dual_ircode(myadd, (Float64, Float64))
         @test rt === Dual{Float64, Float64}
         stmts = string.(ir.stmts.stmt)
         @test count(s -> occursin("add_float", s), stmts) == 2
-        @test !any(s -> occursin("frule", s), stmts)
+        @test !any(s -> occursin("frule!!", s), stmts)
     end
 
     @testset "end-to-end derivatives + allocation-free" begin
@@ -105,7 +105,7 @@
         f_mul(x, y) = x * y
         f_div(x, y) = x / y
         f_sub(x, y) = x - y
-        deriv(f, x, y) = frule(Dual(f, NoTangent()), Dual(x, 1.0), Dual(y, 0.0)).dx
+        deriv(f, x, y) = frule!!(Dual(f, NoTangent()), Dual(x, 1.0), Dual(y, 0.0)).dx
         @test deriv(f_add, 3.0, 5.0) === 1.0          # ∂/∂x (x+y) = 1
         @test deriv(f_sub, 3.0, 5.0) === 1.0          # ∂/∂x (x-y) = 1
         @test deriv(f_mul, 3.0, 5.0) === 5.0          # ∂/∂x (x*y) = y
@@ -113,7 +113,7 @@
 
         # Allocation-free after warmup — the direct-emission path never boxes a `Dual` per op.
         df = Dual(f_mul, NoTangent())
-        frule(df, Dual(3.0, 1.0), Dual(5.0, 0.0))
-        @test (@allocated frule(df, Dual(3.0, 1.0), Dual(5.0, 0.0))) == 0
+        frule!!(df, Dual(3.0, 1.0), Dual(5.0, 0.0))
+        @test (@allocated frule!!(df, Dual(3.0, 1.0), Dual(5.0, 0.0))) == 0
     end
 end

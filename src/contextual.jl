@@ -42,11 +42,16 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
     # given frame.
     transformed_ir::IdDict{MethodInstance, IRCode}
     # Backedges discovered while building `transformed_ir[mi]` (e.g. the primal method it was
-    # dualized from, and any `frule` method resolved for a surviving high-level call) — see the
+    # dualized from, and any `frule!!` method resolved for a surviving high-level call) — see the
     # `build_contextual_ir`/`build_dual_ir` machinery in `forward_interp.jl`. `finishinfer!` folds
     # these into `me.src.edges` so the ordinary `compute_edges!`/`store_backedges` path registers
-    # real Julia backedges, without ADNext calling any invalidation ccall itself.
+    # real Julia backedges, without Differ calling any invalidation ccall itself.
     transformed_edges::IdDict{MethodInstance, Vector{Any}}
+    # Reverse-mode recursion cycle guard: carrier MethodInstances currently being built by
+    # `build_reverse_fwds_ir`/`build_reverse_pullback_ir` (`reverse_interp.jl`), so a self- or
+    # mutually-recursive primal bails cleanly instead of recursing into the transform forever.
+    # Mode-agnostic field (harmless, always empty, for `Forward`).
+    in_progress::IdDict{MethodInstance, Nothing}
     function ADInterpreter{M}(world::UInt,
                               ip::InferenceParams,
                               op::OptimizationParams) where {M<:ADMode}
@@ -59,6 +64,7 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
             IdDict{CodeInstance, CodeInfo}(),
             IdDict{MethodInstance, IRCode}(),
             IdDict{MethodInstance, Vector{Any}}(),
+            IdDict{MethodInstance, Nothing}(),
         )
     end
 end
@@ -99,7 +105,7 @@ end
 # ---------------------------------------------------------------------------
 # The transform seam.
 #
-# A mode's entry point (e.g. the generated `frule` fallback in `forward_interp.jl`) asks this
+# A mode's entry point (e.g. the generated `frule!!` fallback in `forward_interp.jl`) asks this
 # interpreter to compile a *carrier* MethodInstance whose `specTypes` encodes the transformed
 # signature. We compile it by transforming the corresponding primal method's post-optimization
 # `IRCode` into a new `IRCode` and splicing that transform into the pipeline at two points:
@@ -131,7 +137,7 @@ function CC.finishinfer!(me::CC.InferenceState, interp::ADInterpreter, cycleid::
         interp.transformed_ir[me.linfo] = ir
         me.bestguess = CC.compute_ir_rettype(ir)
         # Fold in whatever backedges the mode's transform discovered (e.g. the primal method(s) a
-        # dualized body was built from, and any `frule` methods resolved for surviving high-level
+        # dualized body was built from, and any `frule!!` methods resolved for surviving high-level
         # calls — see `build_contextual_ir`/`build_dual_ir` in `forward_interp.jl`). These must land
         # on *this* CodeInstance (`me.linfo`'s own compile), not merely on some caller of it: a
         # `finish!` on THIS `InferenceState` is what actually calls `store_backedges` against

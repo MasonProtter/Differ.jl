@@ -3,7 +3,7 @@
 # `Array{tangent_type(P),N}` tangent element-wise and are aliasing/circular-reference aware via
 # the cache, matching the generic scalar/struct implementations in `tangents.jl`.
 #
-# NOTE (ADNext port): Mooncake's Julia-1.13 array path (`src/rules/memory.jl`) instead recurses
+# NOTE (Differ port): Mooncake's Julia-1.13 array path (`src/rules/memory.jl`) instead recurses
 # through `Memory`/`MemoryRef` tangent internals and is fused with the reverse-mode rule system
 # (`frule!!`/`rrule!!`/`@is_primitive`), which is out of scope here. The element-wise version below
 # is semantically identical for the tangent/fdata/rdata system: the tangent of an `Array{P,N}` is
