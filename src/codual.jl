@@ -21,7 +21,7 @@ _copy(x::P) where {P<:CoDual} = x
 """
     extract(x::CoDual)
 
-Helper function. Returns the 2-tuple `x.x, x.dx`.
+Returns the 2-tuple `x.x, x.dx`.
 """
 extract(x::CoDual) = primal(x), tangent(x)
 
@@ -75,7 +75,7 @@ end
 
 The type of the `CoDual` which contains instances of `P` and associated tangents.
 """
-@unstable function codual_type(::Type{P}) where {P}
+function codual_type(::Type{P}) where {P}
     # `@isdefined(P)` is false when the static parameter couldn't be bound at
     # dispatch — e.g. for `UnionAll(A, AbstractArray{T, A})` whose body has a
     # free `TypeVar` `T`. Without this check, touching `P` would throw
@@ -85,7 +85,7 @@ The type of the `CoDual` which contains instances of `P` and associated tangents
     return _codual_internal(P, codual_type, tangent_type)
 end
 
-@unstable function codual_type(p::Type{Type{P}}) where {P}
+function codual_type(p::Type{Type{P}}) where {P}
     return @isdefined(P) ? CoDual{Type{P},NoTangent} : CoDual{_typeof(p),NoTangent}
 end
 
@@ -94,12 +94,12 @@ end
 
 The type of the `CoDual` which contains instances of `P` and its fdata.
 """
-@unstable function fcodual_type(::Type{P}) where {P}
+function fcodual_type(::Type{P}) where {P}
     @isdefined(P) || return CoDual
     return _codual_internal(P, fcodual_type, P -> fdata_type(tangent_type(P)))
 end
 
-@unstable function fcodual_type(p::Type{Type{P}}) where {P}
+function fcodual_type(p::Type{Type{P}}) where {P}
     return @isdefined(P) ? CoDual{Type{P},NoFData} : CoDual{_typeof(p),NoFData}
 end
 
@@ -140,15 +140,12 @@ _copy(x::P) where {P<:NoPullback} = P(_copy(x.r))
 """
     NoPullback(args::CoDual...)
 
-Construct a `NoPullback` from the arguments passed to an `rrule!!`. For each argument,
-extracts the primal value, and constructs a `LazyZeroRData`. These are stored in a
-`NoPullback` which, in the reverse-pass of AD, instantiates these `LazyZeroRData`s and
-returns them in order to perform the reverse-pass of AD.
+Construct a `NoPullback` from the arguments passed to an `rrule!!`: extracts each argument's
+primal value and wraps it as a `LazyZeroRData`, which the reverse pass instantiates and returns
+as that argument's rdata.
 
-The advantage of this approach is that if it is possible to construct the zero rdata element
-for each of the arguments lazily, the `NoPullback` generated will be a singleton type. This
-means that AD can avoid generating a stack to store this pullback, which can result in
-significant performance improvements.
+If every argument's zero rdata can be constructed lazily, the resulting `NoPullback` is a
+singleton type, so AD can skip allocating a stack to store it.
 """
 function NoPullback(args::Vararg{CoDual,N}) where {N}
     return NoPullback(tuple_map(lazy_zero_rdata ∘ primal, args))

@@ -1,9 +1,10 @@
 # Reflection: view the optimized dualized `IRCode` for a call.
 #
-# `code_dual_ircode(f, argtypes)` reproduces exactly what the `optimize` seam installs for the
+# `code_dual_ircode(f, argtypes)` reproduces exactly what `CC.optimize` installs for the
 # `dualized_impl` compile of `f`: the split-shadow transform on `f`'s post-optimization primal
 # `IRCode` (`build_dual_ir`) followed by the IPO-safe passes (`run_ipo_passes!`). It does not go
-# through `typeinf_ircode`, which would recompute from the throwing stub and bypass the seam.
+# through `typeinf_ircode`, which would recompute from the throwing stub instead of calling
+# `CC.optimize`.
 
 # Nest a value's dual seed `order` levels deep, per the Mooncake tangent system: the leaf tangent
 # is `tangent_type(T)`, so order 1 → `Dual{T,tangent_type(T)}` (first derivative). Because a `Dual`
@@ -80,7 +81,7 @@ end
 Return `ir => rettype`, the optimized `IRCode` for the reverse-mode *forwards* carrier
 (`reverse_fwds_impl`) differentiating `f` at arguments of types `argtypes` (each primal type `T`,
 and `f` itself, wrapped in `fcodual_type`). `rettype` is `Tuple{CoDual, Tape}` — the primal result
-plus the tape `code_reverse_pullback_ircode` needs. Reproduces exactly what the `optimize` seam
+plus the tape `code_reverse_pullback_ircode` needs. Reproduces exactly what `CC.optimize`
 installs, without going through the throwing carrier stub. Errors if the reverse-mode transform
 bails (see the scope notes in `reverse_interp.jl`'s header).
 

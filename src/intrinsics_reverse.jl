@@ -17,9 +17,9 @@
 # `ctx.opf(name, ty, args...)` is the same tiny helper as forward mode's: emit
 # `Expr(:call, GlobalRef(Core.Intrinsics, name), args...)` typed `ty`, return its `SSAValue`.
 #
-# Explicit, not implicit: the fallback returns `nothing`, so an intrinsic with no registered
-# reverse rule bails (in `reverse_to_ircode`) with a clear, located reason instead of silently
-# dropping a gradient contribution.
+# The fallback returns `nothing`, so an intrinsic with no registered reverse rule bails (in
+# `reverse_to_ircode`) with a clear, located reason instead of silently dropping a gradient
+# contribution.
 # ===========================================================================
 
 apply_intrinsic_rrule!(::Val{F}, pvals, dz, Ti, ctx) where {F} = nothing

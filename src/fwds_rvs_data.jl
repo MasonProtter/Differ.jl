@@ -250,7 +250,7 @@ end
 Returns the type of to the nth field of the fdata type associated to `P`. Will be a
 `PossiblyUninitTangent` if said field can be undefined.
 """
-@unstable @inline function fdata_field_type(::Type{P}, n::Int) where {P}
+@inline function fdata_field_type(::Type{P}, n::Int) where {P}
     Tf = tangent_type(fieldtype(P, n))
     f = ismutabletype(P) ? Tf : fdata_type(Tf)
     return is_always_initialised(P, n) ? f : PossiblyUninitTangent{f}
@@ -383,10 +383,10 @@ function __verify_fdata_value(c::IdDict{Any,Nothing}, p::Array, f::Array)
 end
 
 # (mutable) structs, Tuples, and NamedTuples all have slightly different storage.
-@unstable @inline _get_fdata_field(f::NamedTuple, name) = getfield(f, name)
-@unstable @inline _get_fdata_field(f::Tuple, name) = getfield(f, name)
-@unstable @inline _get_fdata_field(f::FData, name) = val(getfield(f.data, name))
-@unstable @inline _get_fdata_field(f::MutableTangent, name) = fdata(
+@inline _get_fdata_field(f::NamedTuple, name) = getfield(f, name)
+@inline _get_fdata_field(f::Tuple, name) = getfield(f, name)
+@inline _get_fdata_field(f::FData, name) = val(getfield(f.data, name))
+@inline _get_fdata_field(f::MutableTangent, name) = fdata(
     val(getfield(f.fields, name))
 )
 

@@ -7,16 +7,6 @@ const IEEEFloat = Base.IEEEFloat
 const bitcast = Core.Intrinsics.bitcast
 using Core: svec, SimpleVector
 
-# Mooncake gets `@unstable`/`@stable` from DispatchDoctor; they are type-stability
-# *assertions* used when the whole module is wrapped in `@stable`. Differ is not, so these
-# are safe no-op pass-throughs — they keep the ported source verbatim without a new dep.
-macro unstable(expr)
-    return esc(expr)
-end
-macro stable(expr)
-    return esc(expr)
-end
-
 """
     @foldable def
 
@@ -26,14 +16,19 @@ macro foldable(expr)
     return esc(:(Base.@assume_effects :foldable $expr))
 end
 
+# ---------------------------------------------------------------------------
+# _typeof
+# ---------------------------------------------------------------------------
+
 """
     _typeof(x)
 
-Central definition of typeof, specific to the use required in this package.
+Like `Base.typeof`, but recurses into `Tuple` and `NamedTuple` elements so nested types are
+captured concretely rather than collapsing to `Tuple`/`NamedTuple` alone.
 """
-@unstable _typeof(x) = Base._stable_typeof(x)
-@unstable _typeof(x::Tuple) = Tuple{tuple_map(_typeof, x)...}
-@unstable _typeof(x::NamedTuple{names}) where {names} = NamedTuple{names,_typeof(Tuple(x))}
+_typeof(x) = Base._stable_typeof(x)
+_typeof(x::Tuple) = Tuple{tuple_map(_typeof, x)...}
+_typeof(x::NamedTuple{names}) where {names} = NamedTuple{names,_typeof(Tuple(x))}
 
 # ---------------------------------------------------------------------------
 # tuple_map / tuple_fill / _findall / stable_all
@@ -112,7 +107,7 @@ end
 
 Same as `map`, but requires all elements of `x` to have equal length.
 """
-@unstable @inline function _map(f::F, x::Vararg{Any,N}) where {F,N}
+@inline function _map(f::F, x::Vararg{Any,N}) where {F,N}
     @assert allequal(map(length, x))
     return map(f, x...)
 end

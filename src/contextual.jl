@@ -9,7 +9,8 @@ const CC = Core.Compiler
 # AD modes.
 #
 # `ADInterpreter` is parameterized by the AD mode it runs in, so one interpreter and one set
-# of pipeline seams serve every mode; only the mode-specific IR transform differs. Forward mode is
+# of `finishinfer!`/`optimize` overrides serve every mode; only the mode-specific IR transform
+# differs. Forward mode is
 # implemented (see `forward_interp.jl`); reverse mode is not yet implemented (the marker type exists
 # so the machinery is ready for it).
 # ---------------------------------------------------------------------------
@@ -103,7 +104,7 @@ end
 
 
 # ---------------------------------------------------------------------------
-# The transform seam.
+# Installing the transformed IR via `finishinfer!` and `optimize`.
 #
 # A mode's entry point (e.g. the generated `frule!!` fallback in `forward_interp.jl`) asks this
 # interpreter to compile a *carrier* MethodInstance whose `specTypes` encodes the transformed
@@ -128,8 +129,8 @@ end
 # leave `mi` to the ordinary pipeline. Overridden per mode (see `forward_interp.jl`).
 build_contextual_ir(::ADInterpreter, ::MethodInstance) = nothing
 
-# Return-type seam: build the transformed IR and set `me.bestguess` to its return type so the
-# generic `finishinfer!` freezes the correct type into the CodeInstance.
+# Builds the transformed IR and sets `me.bestguess` to its return type so the generic
+# `finishinfer!` freezes the correct type into the CodeInstance.
 function CC.finishinfer!(me::CC.InferenceState, interp::ADInterpreter, cycleid::Int,
                          opt_cache::IdDict{MethodInstance, CodeInstance})
     ir = build_contextual_ir(interp, me.linfo)
@@ -159,9 +160,9 @@ function CC.finishinfer!(me::CC.InferenceState, interp::ADInterpreter, cycleid::
                                    cycleid::Int, opt_cache::IdDict{MethodInstance, CodeInstance})
 end
 
-# Install seam: replace the optimization result with the transformed IR built in `finishinfer!`,
-# then run the ordinary IPO-safe optimization passes on it (inlining, SROA, ADCE, …) so the
-# synthetic construction / rule calls are inlined and immutable results scalar-replaced.
+# Replaces the optimization result with the transformed IR built in `finishinfer!`, then runs
+# the ordinary IPO-safe optimization passes on it (inlining, SROA, ADCE, …) so the synthetic
+# construction / rule calls are inlined and immutable results scalar-replaced.
 function CC.optimize(interp::ADInterpreter, opt::CC.OptimizationState,
                      caller::CC.InferenceResult)
     ir = get(interp.transformed_ir, caller.linfo, nothing)

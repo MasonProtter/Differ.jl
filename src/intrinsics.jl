@@ -25,9 +25,9 @@
 #   * `ctx.presolve(x)`/`ctx.tresolve(x)` — resolve an operand AST node to its primal/shadow SSA
 #   * `ctx.zero_shadow(Ti, primal_ssa)` — the zero tangent of a computed non-differentiable result
 #
-# Explicit, not implicit: the fallback method below returns `nothing`. An intrinsic with no
-# registered rule bails (in `dualize_to_ircode`) with a clear, located reason instead of silently
-# miscompiling — e.g. a missing derivative silently returning a wrong zero tangent. Register a
+# The fallback method below returns `nothing`, so an intrinsic with no registered rule bails (in
+# `dualize_to_ircode`) with a clear, located reason instead of silently miscompiling — e.g. a
+# missing derivative silently returning a wrong zero tangent. Register a
 # *differentiable* intrinsic by hand (see below); register a *non-differentiable* one (comparisons,
 # integer/bit ops, …) with `@inactive_intrinsic`, which emits the primal and its zero tangent.
 # ===========================================================================

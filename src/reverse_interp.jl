@@ -1,6 +1,6 @@
 # Reverse-mode AD: branches and loops, Mooncake style.
 #
-# Two separately-compiled carriers, wired through the same `build_contextual_ir` seam as forward
+# Two separately-compiled carriers, wired through the same `build_contextual_ir` override as forward
 # mode (`ADInterpreter{Reverse}`, `contextual.jl`, unchanged):
 #
 #   * `reverse_fwds_impl(codualargs::CoDual...) -> (result::CoDual, tape::Tape)` — forward-replays
@@ -138,11 +138,12 @@ end
 #
 #   * The *entry* is the public surface — the `@generated` fallback method of `rrule!!` and the
 #     `@generated` pullback callable `(t::Tape)(seed)`. Both compile the corresponding carrier under
-#     `ADInterpreter{Reverse}` (which is what runs the `build_contextual_ir` seam at all — ordinary
-#     code compiles under a `NativeInterpreter`, where the seam never fires) and emit a static
+#     `ADInterpreter{Reverse}` (which is what calls `build_contextual_ir` at all — ordinary
+#     code compiles under a `NativeInterpreter`, which never calls it) and emit a static
 #     `:invoke` to the result. The fwds entry is a straight pass-through: it invokes the carrier with
 #     exactly its own `(fcd, ctx, argcds...)`, because the carrier mirrors `rrule!!`'s signature.
-#   * The *carrier* is the hidden function whose specializations that seam actually transforms.
+#   * The *carrier* is the hidden function whose specializations `build_contextual_ir` actually
+#     transforms.
 #     Its body below is the stub that runs only if the transform bailed *and* the more specific
 #     `reverse_error_ircode` (which names the offending construct) was not installed.
 #
@@ -238,7 +239,7 @@ function CC.src_inlining_policy(interp::ADInterpreter{Reverse}, mi::MethodInstan
 end
 
 # Build a minimal IRCode whose only effect is to `error(msg)` when invoked, installed via the same
-# `finishinfer!`/`optimize` seam as a real reverse-mode body (mirrors `error_ircode`,
+# `finishinfer!`/`optimize` path as a real reverse-mode body (mirrors `error_ircode`,
 # `forward_interp.jl`). Works for either carrier's argument shape (`_impl_argtypes` below).
 function reverse_error_ircode(impl_mi::MethodInstance, msg::String)
     stream = CC.InstructionStream(2)
@@ -395,7 +396,7 @@ function build_reverse_pullback_ir(interp::ADInterpreter, impl_mi::MethodInstanc
     end
 end
 
-# The optimized IR for a carrier: exactly what the `optimize` seam installs. Used both by
+# The optimized IR for a carrier: exactly what `CC.optimize` installs. Used both by
 # `code_reverse_fwds_ircode`/`code_reverse_pullback_ircode` (reflection.jl) and available for
 # future higher-order composition.
 function optimized_reverse_fwds_ir(interp::ADInterpreter, impl_mi::MethodInstance,
@@ -653,7 +654,7 @@ end
 # `forward_interp.jl`, but — unlike that function, which resolves under a *fresh*
 # `CC.NativeInterpreter` because it targets the generic `frule!!` function whose own `@generated` body
 # separately spins up a nested `ADInterpreter{Forward}` — this must reuse the caller's own `interp`:
-# `reverse_fwds_impl` specializations only get transformed via the `build_contextual_ir` seam when
+# `reverse_fwds_impl` specializations only get transformed via `build_contextual_ir` when
 # compiled under an `ADInterpreter`, so a bare `NativeInterpreter` would just compile the
 # untransformed stub (`error("ran directly...")`) instead of a real recursive forwards pass. Reusing
 # `interp` is also what makes the `in_progress` cycle guard (`build_reverse_fwds_ir` above) actually
@@ -1765,7 +1766,7 @@ end
 
 # The `@generated` derived fallback for `rrule!!(fcd, ctx, argcds...)` — the least-specific method
 # (see the ambiguity note above the type definitions). Generated, because compiling the carrier is
-# what runs the `build_contextual_ir` seam (see the two-layer note near the carrier stubs). The
+# what calls `build_contextual_ir` (see the two-layer note near the carrier stubs). The
 # carrier mirrors this signature exactly, so the body is a straight pass-through invoke — no
 # reordering. `ctx` reaches the generated carrier as an ordinary argument, which is how a `Ctx`
 # carrying a pre-allocated tape hands its stacks in.

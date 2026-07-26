@@ -1,12 +1,12 @@
-# Forward-mode AD: the `frule!!` entry point, the mode-specific glue that plugs into the
-# `ADInterpreter` seams (`contextual.jl`), and the split-shadow dualization engine itself.
+# Forward-mode AD: the `frule!!` entry point, the mode-specific `build_contextual_ir` override that
+# `ADInterpreter` calls into (`contextual.jl`), and the split-shadow dualization engine itself.
 #
 # `frule!!(dualargs::Dual...)` is a `@generated` fallback: for a composite primal `g` with no
 # hand-written rule, it compiles a *dualized* version of `g`'s body under
 # `ADInterpreter{Forward}` and invokes the resulting `CodeInstance`. The dualization is a
-# split-shadow transform on `g`'s post-optimization `IRCode`, spliced into the typeinf pipeline at
-# the `finishinfer!` (return type) / `optimize` (install) seams via the `build_contextual_ir`
-# hook below.
+# split-shadow transform on `g`'s post-optimization `IRCode`, spliced into the typeinf pipeline via
+# the `build_contextual_ir` hook below, which `finishinfer!` calls for the return type and
+# `optimize` calls to install the result.
 
 # Carrier stub: gives a MethodInstance whose specTypes is the *dual* signature.
 # `ADInterpreter{Forward}` replaces its source with the dualized primal body, so this
@@ -36,8 +36,8 @@ end
 # The generated `frule!!` fallback asks the interpreter to compile a `dualized_impl` MethodInstance
 # whose `specTypes` is the *dual* signature. We compile it by transforming the corresponding primal
 # method's post-optimization `IRCode` into a dualized `IRCode` (`build_dual_ir`). Non-`dualized_impl`
-# MethodInstances return `nothing` here and flow through the ordinary pipeline (see the seam
-# in `contextual.jl`).
+# MethodInstances return `nothing` here and flow through the ordinary pipeline (see
+# `contextual.jl`).
 # ---------------------------------------------------------------------------
 
 function build_contextual_ir(interp::ADInterpreter{Forward}, mi::MethodInstance)
@@ -59,7 +59,7 @@ is_dualized_impl(mi) = isa(mi.def, Method) && !isempty(mi.specTypes.parameters) 
                        mi.specTypes.parameters[1] === typeof(dualized_impl)
 
 # Build a minimal IRCode whose only effect is to `error(msg)` when invoked, installed via the same
-# `finishinfer!`/`optimize` seam as a real dualized body (see the hard project constraint: transform
+# `finishinfer!`/`optimize` path as a real dualized body (see the hard project constraint: transform
 # IRCode only, never patch a rettype after the fact). Used when `build_dual_ir` bails, so calling the
 # carrier reports *why* (the specific unsupported construct) instead of `dualized_impl`'s generic
 # stub message.
@@ -261,7 +261,7 @@ function _build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::
         # instructions are copied/re-dualized wholesale below), so redefining/invalidating
         # `inner_mi` must invalidate this one too. `inner_mi`'s *own* dependencies (its primal
         # method, any `frule!!`s it resolved) are tracked on its own edges list whenever it is
-        # itself compiled through this same seam — not duplicated into `edges` here.
+        # itself compiled via `build_contextual_ir` — not duplicated into `edges` here.
         CC.add_inlining_edge!(edges, inner_mi)
         pir = optimized_dual_ir(interp, inner_mi, reason)
         pir === nothing && return nothing
@@ -340,7 +340,7 @@ function _build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::
     return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=false, reason, edges)
 end
 
-# The optimized dual `IRCode` for a `dualized_impl` carrier: exactly what the `optimize` seam
+# The optimized dual `IRCode` for a `dualized_impl` carrier: exactly what `CC.optimize`
 # installs (and what `code_dual_ircode` returns) — `build_dual_ir` followed by the IPO-safe passes.
 # Used both by the higher-order recursion above (to obtain the order-(k-1) dual IR as a primal) and
 # by the reflection entry point.
@@ -1174,7 +1174,7 @@ function frule_body(world::UInt, source, self, dual_argtypes)
     # Compile the dualized body under ADInterpreter -> an invoke-able CodeInstance.
     # Call typeinf_ext_toplevel directly (not CompilerPlugins.typeinf, which would recreate the
     # interpreter at tls_world_age() — stale inside a generator) so it uses `interp`'s generation
-    # world; the finishinfer!/optimize seams then build and install the dual IR (see contextual.jl).
+    # world; `finishinfer!`/`optimize` then build and install the dual IR (see contextual.jl).
     cinst = Compiler.typeinf_ext_toplevel(interp, impl_mi, Compiler.SOURCE_MODE_ABI)
 
     # Trivial generated body: return invoke(dualized_impl, cinst, dualargs...)

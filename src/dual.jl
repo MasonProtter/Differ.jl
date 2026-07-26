@@ -55,14 +55,14 @@ _copy(x::P) where {P<:Dual} = x
 """
     extract(x::Dual)
 
-Helper function. Returns the 2-tuple `x.x, x.dx`.
+Returns the 2-tuple `x.x, x.dx`.
 """
 extract(x::Dual) = primal(x), tangent(x)
 
 zero_dual(x) = Dual(x, zero_tangent(x))
 randn_dual(rng::AbstractRNG, x) = Dual(x, randn_tangent(rng, x))
 
-@unstable function dual_type(::Type{P}) where {P}
+function dual_type(::Type{P}) where {P}
     @isdefined(P) || return Dual
     P == Union{} && return Union{}
     P == DataType && return Dual
@@ -142,8 +142,8 @@ function Base.getproperty(d::Dual, s::Symbol)
 end
 Base.propertynames(::Dual) = (:primal, :tangent, :x, :y, :z, :dx, :dy, :dz)
 
-# A `Dual` is its own tangent type. This is the key to preserving Differ's higher-order
-# (Option A) nesting under the Mooncake tangent system: after the engine peels one `Dual` level
+# A `Dual` is its own tangent type, which preserves Differ's higher-order (Option A) nesting
+# under the Mooncake tangent system: after the engine peels one `Dual` level
 # off a primal that is itself a `Dual`, the tangent it must produce is again a `Dual` — because we
 # define it to be. This reproduces every documented order-≥2 seed and satisfies Mooncake's
 # invariant `Dual{P,T} ⟹ T == tangent_type(P)` (checked, e.g. `tangent_type(Dual{Float64,Float64})

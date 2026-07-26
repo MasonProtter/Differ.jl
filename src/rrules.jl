@@ -17,7 +17,8 @@
 # IR, where a bare name resolves against *this* module and re-embeds as `GlobalRef(Differ, :sin)` — an
 # implicit `using Base` binding that `Core.Compiler.verify_ir` rejects in value position. The emitted
 # pullback-recursion `:invoke` is additionally flagged `IR_FLAG_NOINLINE` for the same reason (see
-# `reverse_pullback_recursive_ci`); qualifying here is the belt to that braces.
+# `reverse_pullback_recursive_ci`); qualifying here is a second, redundant safeguard against the
+# same problem.
 
 # NOTE on the `::AbstractCtx` slot: a hand rule takes the differentiation context as its second
 # argument (right after `fcd`), matching the uniform `rrule!!(fcd, ctx, argcds...)` convention. A
