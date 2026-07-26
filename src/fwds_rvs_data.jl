@@ -211,6 +211,16 @@ end
 
 fdata_type(::Type{T}) where {T<:Ptr} = T
 
+# `MemoryRef`/`Memory` are reference/address-identified like `Ptr` (their `tangent_type` is
+# self-typed — `tangents.jl` — since a shadow `MemoryRef`/`Memory` is a real, distinct object holding
+# tangent data, not a value embedded in a larger structure), so like `Ptr` their fdata is themselves
+# and they carry no rdata. Without these, `fdata_type`'s generic struct-derivation falls over on
+# `MemoryRef`/`Memory` (both are primitive-ish compiler types, not derivable from their fields) — this
+# was a pre-existing gap, surfaced once `tangent_type(MemoryRef)`/`tangent_type(Memory)` started
+# returning themselves instead of a bogus generic-derivation type (see `tangents.jl`).
+fdata_type(::Type{T}) where {T<:MemoryRef} = T
+fdata_type(::Type{T}) where {T<:Memory} = T
+
 @generated function fdata_type(::Type{P}) where {P<:Tuple}
     isa(P, Union) && return :(Union{fdata_type($(P.a)),fdata_type($(P.b))})
     isempty(P.parameters) && return NoFData
@@ -497,6 +507,9 @@ end
 end
 
 rdata_type(::Type{<:Ptr}) = NoRData
+
+rdata_type(::Type{<:MemoryRef}) = NoRData
+rdata_type(::Type{<:Memory}) = NoRData
 
 @generated function rdata_type(::Type{P}) where {P<:Tuple}
     isa(P, Union) && return :(Union{rdata_type($(P.a)),rdata_type($(P.b))})

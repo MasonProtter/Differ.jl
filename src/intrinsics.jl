@@ -192,9 +192,12 @@ for name in (
     :have_fma,
     # rounding to an integral floating-point value (piecewise-constant → zero derivative)
     :floor_llvm, :ceil_llvm, :trunc_llvm, :rint_llvm,
-    # int↔float and integer-width conversions (first argument is a type). NB: `bitcast` is omitted
-    # — the name is already taken by `const bitcast` in tangent_utils.jl; it errors if ever hit.
-    :sitofp, :uitofp, :fptosi, :fptoui, :trunc_int, :sext_int, :zext_int,
+    # int↔float and integer-width conversions (first argument is a type), plus `bitcast` (a raw
+    # bit-level reinterpretation — e.g. `UInt`-casting an index/length for the unsigned bounds
+    # compare that array indexing lowers to). The macro fully qualifies everything via
+    # `Core.Intrinsics.$name`/`GlobalRef(Core.Intrinsics, name)`, so this doesn't collide with the
+    # unrelated `const bitcast = Core.Intrinsics.bitcast` alias in `tangent_utils.jl`.
+    :sitofp, :uitofp, :fptosi, :fptoui, :trunc_int, :sext_int, :zext_int, :bitcast,
 )
     @eval @inactive_intrinsic $name
 end

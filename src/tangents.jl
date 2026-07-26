@@ -352,6 +352,15 @@ tangent_type(::Type{String}) = NoTangent
 
 @unstable tangent_type(::Type{<:Array{P,N} where {P}}) where {N} = Array
 
+# A `MemoryRef`'s (and bare `Memory`'s) tangent is the same wrapper over the shadow `Memory`: the
+# array-indexing dualization in `forward_interp.jl` never builds these by hand, it always mirrors
+# the identical `memoryrefnew`/`getfield(:ref)` operation onto a genuine `Array{tangent_type(P),N}`
+# shadow array. Only matches the default `MemoryRef{P}`/`Memory{P}` (`:not_atomic`, CPU) aliases; a
+# `GenericMemoryRef` with a different `Kind`/`AddrSpace` (e.g. atomic memory) falls through to the
+# generic struct derivation below instead — a known, undocumented-elsewhere sharp edge.
+@unstable @foldable tangent_type(::Type{<:MemoryRef{P}}) where {P} = MemoryRef{tangent_type(P)}
+@unstable @foldable tangent_type(::Type{<:Memory{P}}) where {P} = Memory{tangent_type(P)}
+
 tangent_type(::Type{<:MersenneTwister}) = NoTangent
 
 tangent_type(::Type{Core.TypeName}) = NoTangent

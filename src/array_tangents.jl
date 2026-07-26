@@ -9,6 +9,11 @@
 # is semantically identical for the tangent/fdata/rdata system: the tangent of an `Array{P,N}` is
 # an `Array{tangent_type(P),N}`, its fdata is itself, and its rdata is `NoRData` (handled generically
 # in `fwds_rvs_data.jl`). Memory/MemoryRef primals themselves are not covered.
+#
+# One exception: `tangents.jl` (next to its `Array`/`Ptr` methods, not here) defines the single
+# type-level `tangent_type(MemoryRef{P})`/`tangent_type(Memory{P})` rule the forward-mode array
+# builtin arms (`forward_interp.jl`) need to type their shadow SSAs. That's pure type bookkeeping,
+# not a value-level operation, so it doesn't conflict with this file's scope as described above.
 
 @inline function zero_tangent_internal(x::Array{P,N}, dict::MaybeCache) where {P,N}
     haskey(dict, x) && return dict[x]::tangent_type(typeof(x))

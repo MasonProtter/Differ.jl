@@ -13,7 +13,8 @@
 # body must never actually run.
 dualized_impl(dualargs::Dual...) =
     error("Differ.dualized_impl ran directly: ADInterpreter could not dualize the primal ",
-          "(likely unsupported IR — e.g. array indexing / a builtin with no rule, or a vararg call).")
+          "(likely unsupported IR — e.g. a growable-array mutation like `push!`/`resize!`, a ",
+          "builtin with no rule, or a vararg call).")
 
 
 # Runtime dispatcher for a *dynamic* (`apply_generic`) call that survived into the primal IR (its
@@ -402,7 +403,11 @@ end
 # *handling* (`try`/`catch`) is supported as well: `UpsilonNode`/`PhiCNode` are duplicated into
 # primal + shadow copies and `EnterNode`/`:leave`/`:pop_exception` carry over as control markers.
 # Returns `nothing` to bail on still-unsupported constructs — e.g. a `Core.Builtin` with no rule
-# (array/memoryref indexing) or a vararg call — and the caller then bails gracefully.
+# (`Core.memoryrefoffset`, used by `push!`/`resize!`, or a non-bits/undef-checked element access) or
+# a vararg call — and the caller then bails gracefully. Array element read/write, array
+# *allocation* (`zeros`/`similar`/`Vector{T}(undef,n)`/comprehensions, via `memorynew`), and
+# mutable-struct field mutation (`setfield!`) *are* supported — see the `memorynew`/`memoryrefnew`/
+# `memoryrefget`/`memoryrefset!`/`setfield!` arms below.
 # ===========================================================================
 
 const _Intr = Core.Intrinsics
@@ -461,19 +466,31 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     zerotang_g   = zero_tangent       # runtime zero-tangent fallback for non-diff results
     buildtang_g  = build_tangent      # construct a struct's `Tangent`/`MutableTangent` shadow
     gettfield_g  = get_tangent_field  # read a field's tangent out of a `Tangent`/`MutableTangent`
+    settfield_g  = set_tangent_field! # mutate a field's tangent inside a MutableTangent shadow
     fruleg = frule!!
     Dualg  = Dual                # the `Dual` constructor, for a runtime (dynamic) pack of a non-concrete result
     dynfrule_g = dynamic_frule   # runtime dispatcher for a surviving dynamic (`apply_generic`) call
     getf   = GlobalRef(Core, :getfield)
     ctuple = GlobalRef(Core, :tuple)
     ifelseg = GlobalRef(Core, :ifelse)
+    setfieldg  = GlobalRef(Core, :setfield!)
+    memnewg    = GlobalRef(Core, :memorynew)
+    memrefnewg = GlobalRef(Core, :memoryrefnew)
+    memrefgetg = GlobalRef(Core, :memoryrefget)
+    memrefsetg = GlobalRef(Core, :memoryrefset!)
+    eqeqg      = GlobalRef(Core, :(===))
     intrg(name) = GlobalRef(Core.Intrinsics, name)
 
     # Tangent type of a primal type — drives every shadow SSA's declared type. For scalars
     # (`Float64`, `Float32`, `Complex`, …) `tt(T) == T`, so scalar shadows are unchanged from the
     # old same-typed scheme; for general structs it is a `Tangent`/`MutableTangent`, for tuples a
     # per-field tangent tuple, and for a `Dual` carrier the `Dual` itself (see `dual.jl`).
-    tt(@nospecialize T) = tangent_type(T)
+    # `T` is usually a plain `Type` (`pstmts[i][:type]`), but a statement whose result the primal's
+    # own const-prop narrowed (e.g. `Core.memorynew` with a literal length) can carry a
+    # `Core.PartialStruct`/`Const` lattice element instead — widen it first, since `tangent_type` is
+    # only ever defined on `Type`s and only the backing type (not the narrowed const value) matters
+    # for the tangent's own type.
+    tt(@nospecialize T) = tangent_type(T isa Type ? T : CC.widenconst(T))
 
     code = Any[]; types = Any[]
     emit!(ex, @nospecialize(ty)) = (push!(code, ex); push!(types, ty); Core.SSAValue(length(code)))
@@ -734,6 +751,9 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             elseif isa(s, Expr) && s.head === :new
                 ex = Expr(:new, s.args[1], (presolve(a) for a in s.args[2:end])...)
                 primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
+            elseif isa(s, Expr) && s.head === :boundscheck
+                primal[i] = emit!(Expr(:boundscheck, (presolve(a) for a in s.args)...), Ti)
+                shadow[i] = primal[i]
             elseif isa(s, Core.PiNode)
                 primal[i] = presolve(s.val); shadow[i] = primal[i]
             elseif isa(s, GlobalRef)
@@ -786,6 +806,22 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 tf = Any[tt(fieldtype(T, j)) === NoTangent ? NoTangent() : tresolve(args[j])
                          for j in eachindex(args)]
                 shadow[i] = emit!(Expr(:new, TT, tf...), TT)
+            elseif T <: Array
+                # Array construction — step 4 of 4 of the allocation sequence (see the
+                # `Core.memorynew` arm below for the other end): `Expr(:new, Vector{P}, ref, size)`.
+                # `tangent_type(Array{P,N}) === Array{tangent_type(P),N}` (tangents.jl), so `TT` is
+                # *directly* the concrete tangent type to `%new` here — no manual `eltype`/`ndims`
+                # unwrapping, unlike the generic-struct path below. Exactly 2 fields (`args[1]` =
+                # `:ref`, `args[2]` = `:size`):
+                #  * `:ref` is differentiable data (a `MemoryRef{P}` into the shadow memory allocated
+                #    by `Core.memorynew` above) -> `tresolve` it to the shadow `MemoryRef{tangent_type(P)}`
+                #    (mirrors the `Core.memoryrefnew` arm, whose own shadow is exactly this ref).
+                #  * `:size` is the array's *shape* — structural, non-differentiable (`Core.tuple(n)`'s
+                #    own shadow is deliberately `NoTangent()`) -> use the *primal*'s own size tuple
+                #    verbatim (`presolve`, not `tresolve`) rather than fabricate a bogus
+                #    all-`NoTangent()` shadow tuple. Matches Mooncake's reference `_new_` rule for
+                #    `Array{P,N}`: shadow ref, primal's own size.
+                shadow[i] = emit!(Expr(:new, TT, tresolve(args[1]), presolve(args[2])), TT)
             else
                 # General (im)mutable user struct → `Tangent`/`MutableTangent` via `build_tangent`,
                 # which wraps possibly-undef fields in `PossiblyUninitTangent` and fills the backing
@@ -794,6 +830,12 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 tf = Any[tresolve(args[j]) for j in eachindex(args)]
                 shadow[i] = emit!(Expr(:call, buildtang_g, T, tf...), TT)
             end
+        elseif isa(s, Expr) && s.head === :boundscheck
+            # Marks a compile-time-decided bounds-check mode, consulted downstream by a `GotoIfNot`/
+            # a 3-arg `getfield`/`memoryref*` boundscheck argument. Emitted through unchanged; its
+            # own result is a non-differentiable `Bool`.
+            primal[i] = emit!(Expr(:boundscheck, (presolve(a) for a in s.args)...), Ti)
+            shadow[i] = zero_shadow(Ti, primal[i])
         elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
             fpos = s.head === :invoke ? s.args[2] : s.args[1]
             actual = s.head === :invoke ? s.args[3:end] : s.args[2:end]
@@ -815,17 +857,132 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 primal[i], shadow[i] = res
             elseif f === Core.getfield
                 Pobj = _optype(pir, actual[1])
-                primal[i] = emit!(Expr(:call, getf, presolve(actual[1]), actual[2]), Ti)
+                # Trailing operands beyond (obj, name) — an atomic ordering and/or a boundscheck
+                # bool — are forwarded verbatim to the primal (faithful reconstruction) and to the
+                # same-shape shadow branches below (mirroring an array's `:ref` handle is safe
+                # regardless: no bounds are touched by `getfield` itself). The general-struct
+                # branch never receives them: a `Tangent`/`MutableTangent` field read has no
+                # atomicity/boundscheck concept.
+                primal[i] = emit!(Expr(:call, getf, presolve(actual[1]), actual[2],
+                                   (presolve(a) for a in actual[3:end])...), Ti)
                 TT = tt(Ti)
                 if TT === NoTangent
                     shadow[i] = NoTangent()
-                elseif Pobj <: Dual || Pobj <: Tuple || Pobj <: NamedTuple
-                    # Same-shape tangents: index/name the shadow aggregate directly.
-                    shadow[i] = emit!(Expr(:call, getf, tresolve(actual[1]), actual[2]), TT)
+                elseif Pobj <: Dual || Pobj <: Tuple || Pobj <: NamedTuple || Pobj <: Array
+                    # Same-shape tangents: index/name the shadow aggregate directly. An `Array`'s
+                    # shadow is a real same-shape `Array{tangent_type(P),N}`, so its own `:ref`
+                    # field mirrors the primal's directly (`:size` never actually reaches this
+                    # branch — a `Tuple{Int,...}`'s tangent_type is `NoTangent`, handled above).
+                    shadow[i] = emit!(Expr(:call, getf, tresolve(actual[1]), actual[2],
+                                       (presolve(a) for a in actual[3:end])...), TT)
                 else
                     # General struct: read the field's tangent out of the `Tangent`/`MutableTangent`.
                     shadow[i] = emit!(Expr(:call, gettfield_g, tresolve(actual[1]), actual[2]), TT)
                 end
+            elseif f === Core.setfield!
+                # setfield!(obj, name, value[, ordering]) mutates obj in place and returns value
+                # (Ti = the field's type). Only legal on a genuinely mutable primal, whose shadow
+                # is therefore always a `MutableTangent` — no Array/Tuple/Dual same-shape variant
+                # applies here (none of those are mutable in ordinary user code). A 4th
+                # (atomic-ordering) arg is forwarded to the primal call only, for faithful
+                # reconstruction; `set_tangent_field!` has no atomics concept, so the shadow
+                # mutation is always the plain (non-atomic) form — sound, since nothing in this
+                # codebase's `MutableTangent` gives any atomicity guarantee to begin with.
+                primal[i] = emit!(Expr(:call, setfieldg, presolve(actual[1]), actual[2],
+                                   presolve(actual[3]), (presolve(a) for a in actual[4:end])...), Ti)
+                TT = tt(Ti)
+                shadow[i] = TT === NoTangent ? NoTangent() :
+                            emit!(Expr(:call, settfield_g, tresolve(actual[1]), actual[2],
+                                  tresolve(actual[3])), TT)
+            elseif f === Core.memorynew
+                # Array allocation, step 1 of 4 (see the `Expr(:new, ::Array, …)` arm above for the
+                # other end of the sequence): `Core.memorynew(Memory{P}, n)` allocates a fresh,
+                # uninitialized `Memory{P}` of length `n`. Every observed allocation path (`zeros`,
+                # `similar`, `Vector{T}(undef,n)`, array comprehensions) lowers to the identical
+                # `memorynew -> memoryrefnew -> Core.tuple -> %new` shape — only the
+                # length-computation prologue differs.
+                #
+                # Mirrors Mooncake's reference rule (`Mooncake.jl/src/rules/memory.jl`): allocate a
+                # same-length shadow `Memory{tangent_type(P)}`, also uninitialized. Safe because
+                # every element the primal ever *reads* was necessarily *written* first (by a
+                # `memoryrefset!`, dualized below in lockstep) — an uninitialized shadow slot is
+                # never observed unread.
+                #
+                # The length is structural (how many elements exist, not a differentiable quantity),
+                # so it's `presolve`d, never `tresolve`d — same reasoning as the `:size` field in the
+                # `Expr(:new, ::Array, …)` arm above, and as `Core.tuple`'s own shadow
+                # (`tangent_type(Tuple{Int}) === NoTangent`).
+                primal[i] = emit!(Expr(:call, memnewg, presolve(actual[1]),
+                                   (presolve(a) for a in actual[2:end])...), Ti)
+                TT = tt(Ti)
+                shadow[i] = emit!(Expr(:call, memnewg, TT,
+                                   (presolve(a) for a in actual[2:end])...), TT)
+            elseif f === Core.memoryrefnew
+                # tangent_type(MemoryRef{P}) === MemoryRef{tangent_type(P)} (`tangents.jl`);
+                # mirroring the operation on the shadow ref/index yields the correctly-typed
+                # shadow handle directly. No `TT===NoTangent` shortcut: `MemoryRef{tangent_type(P)}`
+                # is never literally the `NoTangent` singleton type (e.g. for a `Vector{Int}`
+                # primal it's the real, if degenerate, type `MemoryRef{NoTangent}`).
+                #
+                # SAFETY: the trailing boundscheck flag (present in the 3-arg ref-offsetting form)
+                # is NOT mirrored from the primal. `Dual`'s constructor only checks
+                # `tangent_type(P) == T`, never that a user-supplied tangent array is the same
+                # length as its primal — so a caller can pass a too-short tangent and type-check
+                # fine. The primal's own bounds check (already run, upstream in this block)
+                # validated the index against the *primal's* size only. Always force the shadow
+                # ref's boundscheck to `true` so a mismatched-length tangent raises a catchable
+                # `BoundsError` instead of corrupting memory via an unchecked out-of-bounds
+                # `MemoryRef`.
+                nargs = length(actual)
+                primal[i] = emit!(Expr(:call, memrefnewg, presolve(actual[1]),
+                                   (presolve(a) for a in actual[2:end])...), Ti)
+                shadow[i] = if nargs >= 3
+                    emit!(Expr(:call, memrefnewg, tresolve(actual[1]),
+                          (presolve(a) for a in actual[2:end-1])..., true), tt(Ti))
+                else
+                    emit!(Expr(:call, memrefnewg, tresolve(actual[1]),
+                          (presolve(a) for a in actual[2:end])...), tt(Ti))
+                end
+            elseif f === Core.memoryrefget
+                # Reads one array element; the shadow array is a real same-shape
+                # `Array{tangent_type(P),N}`, so applying the same builtin to the shadow ref reads
+                # exactly the tangent at that position. The ref handed in was already forced
+                # bounds-checked by `memoryrefnew` above, so this call's own boundscheck flag can
+                # be mirrored from the primal unchanged.
+                primal[i] = emit!(Expr(:call, memrefgetg, presolve(actual[1]),
+                                   (presolve(a) for a in actual[2:end])...), Ti)
+                TT = tt(Ti)
+                shadow[i] = TT === NoTangent ? NoTangent() :
+                            emit!(Expr(:call, memrefgetg, tresolve(actual[1]),
+                                  (presolve(a) for a in actual[2:end])...), TT)
+            elseif f === Core.memoryrefset!
+                # Writes one array element, returns the written value. `val` (actual[2]) is the
+                # only differentiable operand; ref/ordering/boundscheck mirror the primal call
+                # unchanged (same already-bounds-checked-ref reasoning as `memoryrefget` above).
+                primal[i] = emit!(Expr(:call, memrefsetg, presolve(actual[1]), presolve(actual[2]),
+                                   (presolve(a) for a in actual[3:end])...), Ti)
+                TT = tt(Ti)
+                shadow[i] = TT === NoTangent ? NoTangent() :
+                            emit!(Expr(:call, memrefsetg, tresolve(actual[1]), tresolve(actual[2]),
+                                  (presolve(a) for a in actual[3:end])...), TT)
+            elseif f === Core.:(===)
+                # Identity/egal — pervasive in `eachindex`/iterate-protocol loops. Always `Bool`,
+                # never differentiable (`tangent_type(Bool) === NoTangent`).
+                primal[i] = emit!(Expr(:call, eqeqg, presolve(actual[1]), presolve(actual[2])), Ti)
+                shadow[i] = NoTangent()
+            elseif f === Core.tuple
+                # Needed on the live path for ≥2-D indexing: the `BoundsError` index tuple
+                # (`Core.tuple(i,j)`) is shared by two branches and hoisted into a *reachable*
+                # block rather than living only inside the unreachable throw block the way the
+                # 1-D case's index tuple does. Same-shape tangent tuple, built exactly like the
+                # `Expr(:new, ::Tuple, …)` branch above: a non-differentiable slot holds
+                # `NoTangent()`, a differentiable slot holds its resolved tangent.
+                primal[i] = emit!(Expr(:call, ctuple, (presolve(a) for a in actual)...), Ti)
+                TT = tt(Ti)
+                shadow[i] = TT === NoTangent ? NoTangent() :
+                    emit!(Expr(:call, ctuple,
+                          (tt(fieldtype(Ti, j)) === NoTangent ? NoTangent() : tresolve(actual[j])
+                           for j in eachindex(actual))...), TT)
             elseif f === Core.ifelse
                 # A branchless select: same-shape shadow, indexed by the (non-differentiable) primal
                 # condition. Lets a rule that needs a select (e.g. `max_float`/`min_float` in
@@ -837,8 +994,9 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 shadow[i] = TT === NoTangent ? NoTangent() :
                             emit!(Expr(:call, ifelseg, presolve(cond), tresolve(a), tresolve(b)), TT)
             elseif isa(f, Core.Builtin)
-                reason[] = "no dualization rule for builtin `$f` (e.g. array/memoryref indexing) at " *
-                           "%$i: `$(_stmt_str(s))`"
+                reason[] = "no dualization rule for builtin `$f` (e.g. `Core.memoryrefoffset` used " *
+                           "by `push!`/`resize!`, or a non-bits/undef-checked array element " *
+                           "access) at %$i: `$(_stmt_str(s))`"
                 return nothing                               # other builtins: bail
             else
                 res = frule_split!(fpos, actual, Ti)

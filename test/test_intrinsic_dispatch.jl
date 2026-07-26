@@ -15,17 +15,19 @@
 
 @testset "intrinsic dispatch" begin
     @testset "unregistered intrinsic bails with a located reason" begin
-        # `bitcast` is deliberately never registered (see `src/intrinsics.jl`); hitting it must bail
-        # gracefully with a message naming the intrinsic, not throw/miscompile.
-        f(x) = reinterpret(Int64, x)
+        # `pointerref` is deliberately never registered (see `src/intrinsics.jl` — pointer/atomic
+        # ops are exotic and out of scope); hitting it must bail gracefully with a message naming
+        # the intrinsic, not throw/miscompile. (`bitcast` itself is registered now — see the array
+        # indexing support, which needs it for the `UInt`-cast in bounds-check comparisons.)
+        f(x) = unsafe_load(x)
         err = try
-            code_dual_ircode(f, (Float64,))
+            code_dual_ircode(f, (Ptr{Float64},))
             nothing
         catch e
             e
         end
         @test err !== nothing
-        @test occursin("bitcast", sprint(showerror, err))
+        @test occursin("pointerref", sprint(showerror, err))
     end
 
     @testset "inactive (non-differentiable) intrinsics" begin
