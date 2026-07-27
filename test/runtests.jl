@@ -5,6 +5,9 @@ using Differ: tangent_type, fdata_type, rdata_type, fdata, rdata, tangent, zero_
 using Differ: Tangent, MutableTangent, PossiblyUninitTangent, NoFData, NoRData, FData, RData
 using Differ: build_tangent, primal, increment!!, get_tangent_field
 using Differ: _dual_primal_type, _dual_tangent_type
+using Differ: fcodual_type, codual_type, dual_type
+using Differ: zero_rdata_from_type, zero_like_rdata_from_type, CannotProduceZeroRDataFromType,
+              ZeroRData, SumMapPullback
 
 # Primal functions used by the forward-AD fallback. Defined at top level so the
 # generated `frule!!` fallback can resolve them via the method table.
@@ -64,6 +67,25 @@ function branch3(x)                               # if/elseif/else: 3-way merge 
     else
         -x
     end
+end
+
+# `Union`-typed phi (Phase 2 reverse-mode fix): one arm a `Float64`, the other an `Int` literal —
+# merges into a non-concrete `Union{Float64,Int}` SSA value that reverse mode's rdata `Ref`s must
+# accumulate via `ZeroRData` (see `zero_like_rdata_type`/`zero_like_rdata_from_type` in
+# fwds_rvs_data.jl, threaded through reverse_interp.jl's `Ref` prologue/`deref_and_zero!`/`route!`).
+unionphi_ternary(x)  = (x > 0 ? x : 1) * x          # d/dx = 2x for x>0
+unionphi_ternary2(x) = (x > 0 ? x*x : 1) * 1.0      # d/dx = 2x for x>0
+
+# Loop-carried phi that's `Union{Int,Float64}`: `s` starts as the `Int` literal `0`, then becomes
+# `Float64` on the first back-edge — the accumulator ref's declared type includes `ZeroRData`, and
+# `deref_and_zero!`/`route!` must re-zero/route it correctly across every one of the loop's repeated
+# visits, not just once.
+function unionphi_loop(x)
+    s = 0
+    for i in 1:3
+        s = s + x
+    end
+    return s
 end
 
 function multiret(x)                              # multiple returns from nested branches
@@ -200,6 +222,11 @@ function setdyn!(m::MP2, i::Int, v::Float64)
     Core.setfield!(m, i, v)
     return m.x + m.y
 end
+# Heterogeneous MUTABLE struct, dynamic `getfield` index: same "genuinely hard case" as `Het2`, but
+# through the mutable-struct branch of `builtin_rrule_comms(::Val{Core.getfield},...)`
+# (`src/builtins_reverse.jl`) rather than the immutable one — must bail cleanly there too.
+mutable struct MHet2; a::Float64; b::Int; end
+mhetdyn(m::MHet2, i::Int) = Core.getfield(m, i)
 # Homogeneous MUTABLE struct, dynamic `getfield` READ index (Part 2b — the tractable gap, reusing the
 # homogeneous mutable `MP2` above). Every field shares one tangent type, so a runtime index selects a
 # validly-typed field whichever one it lands on; the contribution routes through the object's own
@@ -260,6 +287,18 @@ dynbox(x) = (r = Ref{Any}(x); r[] * x)
 # the packed `Dual` must be a concrete leaf (`Dual{Float64,Float64}` on this input), not the frozen
 # `Dual{Union{Float64,Int},…}` a `%new` would build — which is *not* `<: dual_type(Union{…})`.
 dynret(x) = (x > 0 ? x*x : 1)
+
+# A `const` global `Ref`, unlike `dyn_ref` above, resolves to a concrete type at compile time, so
+# reading it (`Core.getfield` on a bare `GlobalRef` in value position) stays on the static
+# per-statement dualization path instead of falling to `dynamic_frule` — this used to crash with
+# `MethodError: get_tangent_field(::NoTangent, ::Symbol)`, because the tangent of the *value* the
+# global names was computed as the tangent of the `GlobalRef` struct itself (always `NoTangent`)
+# rather than the tangent of the `Ref`. Exercised for both a concrete-eltype and an `Any`-eltype
+# `Ref`, since the bug isn't a type-instability issue — both go through the identical code path.
+const constref_float = Ref(2.0)
+constref_float_use(x) = x * constref_float[]
+const constref_any = Ref{Any}(2.0)
+constref_any_use(x) = x * constref_any[]
 
 # Reverse mode Part 1 (recursive `rrule` calls): a genuinely separate, non-inlined callee — `rec_sq`
 # must actually survive as a surviving `:invoke` for this to exercise recursion, not just fold into
@@ -327,6 +366,17 @@ arr_alias(v::Vector{Float64}) = arr_inner(v) + arr_inner(v)
 # cycle guard).
 f_sumdo(v::Vector{Float64}) = sum(v) do vi
     vi^2 + 2vi + 1
+end
+
+# Two closures over distinct captured `Float64`s, each with real (non-`NoRData`) rdata, whose common
+# supertype is a non-concrete `Union` — the shape `SumMapPullback`'s own `G` type parameter binds to
+# when the derived recursion glue resolves the `sum(f,·)` hand rule via a static call-site type that
+# isn't concrete (`src/rrules.jl`, Phase 2). Built inside a function so `a`/`b` are genuine captured
+# closure fields, not global bindings accessed directly (which wouldn't produce a field at all).
+function make_sum_map_closures()
+    a = 1.0
+    b = 2.0
+    return (y -> y * a), (y -> y * b)
 end
 
 # `vs[1]` (an inner array read out of an array-of-arrays via ordinary indexing) used to be a
@@ -1159,6 +1209,14 @@ end
             @test db ≈ (branch_struct(a, b + h) - branch_struct(a, b - h)) / 2h rtol = 1e-5
         end
 
+        # `Union`-typed rdata (Phase 2): a phi merging two branches of different concrete type
+        # (`Float64` vs. an `Int` literal) makes reverse mode's rdata accumulator for that SSA value
+        # non-concrete. Before the `ZeroRData`-aware `Ref`/`deref_and_zero!`/`route!` machinery, this
+        # crashed with `TypeError: in new, expected Union{NoRData, Float64}, got a value of type
+        # Differ.CannotProduceZeroRDataFromType`.
+        @test Differ.gradient(unionphi_ternary, 1.5) == (NoTangent(), 3.0)
+        @test Differ.gradient(unionphi_ternary2, 1.5) == (NoTangent(), 3.0)
+
         # loops: A loop body may execute an unknown number of times, so this is
         # the first place the block stack and per-block comms `Stack`s are actually needed
         # (not just degenerate 0-or-1-entry stacks, as in the branch-only cases above) — and the
@@ -1176,6 +1234,13 @@ end
         # A zero-iteration loop (the loop-carried accumulator never updates) is a good edge case.
         _, dx_zero = gradient(sumk, 3.0, 0)
         @test dx_zero == 0.0
+
+        # `Union`-typed rdata across a loop *back-edge* (Phase 2): `unionphi_loop`'s loop-carried `s`
+        # is `Union{Int,Float64}` (starts as the `Int` literal `0`, becomes `Float64` after the first
+        # iteration), so its accumulator `Ref`'s `deref_and_zero!`/`route!` treatment is exercised
+        # repeatedly (once per iteration), not just once — this is the case the plain 3-call-site fix
+        # alone wouldn't cover (see the phi-routing fix in `reverse_pullback_to_ircode`).
+        @test Differ.gradient(unionphi_loop, 1.5) == (NoTangent(), 3.0)
 
         # A surviving high-level call now differentiates via Part 1's recursive `rrule` support
         # (`sin` specifically resolves to the hand-written rule in `src/rrules.jl`, not raw recursion
@@ -1220,6 +1285,10 @@ end
         checkverify_rev(sumk_multi, (Float64, Float64, Int))
         checkverify_rev(plus1, (Float64,))   # recursion into a hand-written reverse-mode rule (sin)
         checkverify_rev(nest, (Float64,))    # composed hand rules: sin(cos(x))
+        # `Union`-typed rdata (Phase 2: `ZeroRData`-aware `Ref`/`deref_and_zero!`/`route!`).
+        checkverify_rev(unionphi_ternary, (Float64,))
+        checkverify_rev(unionphi_ternary2, (Float64,))
+        checkverify_rev(unionphi_loop, (Float64,))
 
         # Reverse-mode conversion intrinsics. `sitofp` (Int->Float promotion) is the INACTIVE bucket:
         # its result carries a real tangent but its operands don't, so its pullback consumes the seed
@@ -1275,6 +1344,30 @@ end
         # regression: a dynamic getfield index into a HETEROGENEOUS struct is the genuinely hard case
         # — must bail with a located error, never crash or silently return a wrong/zero gradient.
         @test_throws "dynamic (non-literal) field index" gradient(hetdyn, Het2(1.0, 2), 1)
+        # Same check, but asserting the exception type explicitly (not just message content) — must be
+        # a located `ErrorException` naming the construct, never a bare `MethodError`/crash.
+        err_het = try
+            gradient(hetdyn, Het2(1.0, 2), 1)
+            nothing
+        catch e
+            e
+        end
+        @test err_het isa ErrorException
+        @test !(err_het isa MethodError)
+        @test occursin("dynamic (non-literal) field index", err_het.msg)
+
+        # regression: the same HETEROGENEOUS case through the mutable-struct branch of `getfield`'s
+        # comms rule (`builtin_rrule_comms(::Val{Core.getfield},...)`, `src/builtins_reverse.jl`) —
+        # a separate code path from the immutable case above, must bail identically.
+        err_mhet = try
+            gradient(mhetdyn, MHet2(1.0, 2), 1)
+            nothing
+        catch e
+            e
+        end
+        @test err_mhet isa ErrorException
+        @test !(err_mhet isa MethodError)
+        @test occursin("dynamic (non-literal) field index", err_mhet.msg)
 
         # regression: a dynamic setfield! index — Phase A only, always bails.
         @test_throws "dynamic (non-literal) field index" gradient(setdyn!, MP2(1.0, 2.0), 1, 5.0)
@@ -1337,6 +1430,19 @@ end
         # Regression: a dynamic-dispatch callee (read from a non-`const` global, reusing the existing
         # forward-mode `dyncallee` fixture) is not statically recursible — must still bail.
         @test_throws ErrorException gradient(dyncallee, 1.0)
+        # Same check, but asserting the exception is a located `ErrorException` naming the construct
+        # (`_static_recursible_call`'s "dynamic (non-statically-resolvable) callee" message,
+        # `src/reverse_interp.jl`), not just any `ErrorException` — and explicitly not a `MethodError`
+        # or other crash, which a bare `@test_throws ErrorException` would not distinguish from.
+        err_dyncall = try
+            gradient(dyncallee, 1.0)
+            nothing
+        catch e
+            e
+        end
+        @test err_dyncall isa ErrorException
+        @test !(err_dyncall isa MethodError)
+        @test occursin("dynamic (non-statically-resolvable) callee", err_dyncall.msg)
 
         checkverify_rev(rec_call, (Float64,))
         checkverify_rev(rec_branch, (Float64,))
@@ -1673,6 +1779,140 @@ end
         check_stack_balance(newmut_local, 3.0)
         check_stack_balance(newmut, 5.0)
         check_stack_balance(newmut_recursive_mutate, 2.0)
+    end
+
+    @testset "boxed captured variable (reassigned closure variable)" begin
+        # Reassigning a captured variable inside a closure forces Julia to box it (`Core.Box`, with
+        # an `Any`-typed `.contents` field), which lowers each read behind a `Core.isdefined` guard
+        # and a `throw_undef_if_not` marker. This used to crash reverse mode with a `MethodError`
+        # from deep inside `set_to_zero_internal!!` (no method for `FData`/`RData`); it now bails
+        # cleanly with a located `ErrorException` instead (reverse mode's own, separate limitation on
+        # `setfield!` of a field whose tangent carries fdata — Phase 2 territory, out of scope here).
+        err = try
+            let y = 1.0
+                gradient(1.0) do x
+                    y += x
+                    x * y
+                end
+            end
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test !(err isa MethodError)
+        @test occursin("setfield!", err.msg)
+        @test occursin("at %", err.msg)
+
+        # Forward mode fully supports this case (Phase 1): `Core.isdefined` is a registered builtin
+        # frule, and `throw_undef_if_not` is a pure control marker dualized on both the live-path and
+        # throw-only-block code paths. y0=1.0, x=1.0: primal = x*(y0+x) = 1*2 = 2;
+        # tangent = d/dx (x*(y0+x)) = y0 + 2x = 1 + 2 = 3.
+        let y = 1.0
+            f = x -> (y += x; x * y)
+            d = frule!!(Dual(f, zero_tangent(f)), Dual(1.0, 1.0))
+            @test primal(d) ≈ 2.0
+            @test tangent(d) ≈ 3.0
+        end
+
+        # A second, independent call must not observe state left over from the first (each call
+        # starts from `y = 1.0` again via a fresh `let`) — not a load-bearing aliasing check, just
+        # confirming the boxed capture itself is per-closure-instance.
+        let y = 10.0
+            f = x -> (y += x; x * y)
+            d = frule!!(Dual(f, zero_tangent(f)), Dual(2.0, 1.0))
+            @test primal(d) ≈ 24.0          # (10+2)*2
+            @test tangent(d) ≈ 14.0         # y0 + 2x = 10 + 4
+        end
+    end
+
+    @testset "GlobalRef operand in value position (const global Ref)" begin
+        # `x -> x * G[]` for a `const` global `Ref` used to crash forward mode with
+        # `MethodError: get_tangent_field(::NoTangent, ::Symbol)` for both `Ref{Float64}` and
+        # `Ref{Any}` globals (see `constref_float`/`constref_any` above) — the tangent of the
+        # `GlobalRef` struct (always `NoTangent`) was used in place of the tangent of the value it
+        # names. d/dx (x*c) = c.
+        d1 = frule!!(Dual(constref_float_use, zero_tangent(constref_float_use)), Dual(3.0, 1.0))
+        @test primal(d1) ≈ 3.0 * constref_float[]
+        @test tangent(d1) ≈ constref_float[]
+
+        d2 = frule!!(Dual(constref_any_use, zero_tangent(constref_any_use)), Dual(3.0, 1.0))
+        @test primal(d2) ≈ 3.0 * constref_any[]
+        @test tangent(d2) ≈ constref_any[]
+
+        # Two calls with different primal inputs must not observe a stale/aliased tangent object
+        # frozen from an earlier call (the fix emits a runtime `zero_tangent` call rather than
+        # splicing a constructed tangent as a compile-time literal specifically to avoid this).
+        d3 = frule!!(Dual(constref_float_use, zero_tangent(constref_float_use)), Dual(5.0, 1.0))
+        @test primal(d3) ≈ 5.0 * constref_float[]
+        @test tangent(d3) ≈ constref_float[]
+    end
+
+    @testset "SumMapPullback with a non-concrete (Union) closure type `G`" begin
+        # `sum(f, x)`'s hand rule (`src/rrules.jl`, `SumMapPullback`) normally binds its own `G` type
+        # parameter to the closure's concrete runtime type, but the derived recursion glue can resolve
+        # the hand rule via a static call-site type that isn't concrete (`g` reached through an
+        # abstractly-typed field/container) — that binds `G` to a non-concrete type here too. This used
+        # to call `zero_rdata_from_type(G)`, which for a non-concrete `G` with real (non-`NoRData`)
+        # rdata returns the `CannotProduceZeroRDataFromType()` sentinel — and `increment!!` has no
+        # method for that, so the pullback crashed with a raw `MethodError`. The fix
+        # (`zero_like_rdata_from_type(G)`) returns `ZeroRData()` instead, which `increment!!` handles.
+        #
+        # `make_sum_map_closures` (defined above) returns two closures over distinct captured
+        # `Float64`s — real rdata each — whose common supertype `G2` below is a non-concrete `Union`,
+        # exactly the shape `SumMapPullback`'s `G` can bind to.
+        h1, h2 = make_sum_map_closures()
+        G2 = Union{typeof(h1),typeof(h2)}
+        @test !isconcretetype(G2)
+        @test rdata_type(tangent_type(G2)) != NoRData
+
+        # The old call path: confirm it really does produce the sentinel (documenting the bug this
+        # guards against, not just the fix) and that `increment!!` chokes on it.
+        old_grdata = zero_rdata_from_type(G2)
+        @test old_grdata isa CannotProduceZeroRDataFromType
+        @test_throws MethodError increment!!(old_grdata, 1.0)
+
+        # The fixed call path.
+        new_grdata = zero_like_rdata_from_type(G2)
+        @test new_grdata isa ZeroRData
+        @test increment!!(new_grdata, 1.0) == 1.0
+
+        # `SumMapPullback` itself, constructed directly with `G` bound to `G2` and an empty `pbs`/`dx`
+        # (isolating exactly the line Phase 2 touched — `grdata = zero_like_rdata_from_type(G)` — from
+        # the unrelated, separately-scoped question of *calling* a `Union`-typed closure per element,
+        # which needs reverse-mode dynamic dispatch, not yet implemented; see `ISSUES.md`). With no
+        # elements to accumulate, the returned `grdata` is exactly `zero_like_rdata_from_type(G2)`.
+        dx_empty = Float64[]
+        pb = SumMapPullback{G2,Any,typeof(dx_empty)}(Any[], dx_empty)
+        result = pb(1.0)
+        @test result == (NoRData(), ZeroRData(), NoRData())
+    end
+
+    @testset "fcodual_type/codual_type on abstract P" begin
+        # `fcodual_type`/`codual_type` (`src/codual.jl`) special-case a `UnionAll` with a free type
+        # variable to the abstract fallback `CoDual`, but a plain abstract, fully-defined `P` (e.g.
+        # `Real`, `Any`) isn't a `UnionAll` at all — it falls through to `_codual_internal`'s final
+        # `isconcretetype(P) ? CoDual{P,extractor(P)} : CoDual` ternary instead. This confirms that
+        # fallback already produces the correct (if loose) abstract `CoDual` for such a `P`, rather
+        # than crashing or silently returning something too specific to be a valid supertype.
+        for P in (Real, Any, AbstractFloat, Integer, Number)
+            @test fcodual_type(P) === CoDual
+            @test codual_type(P) === CoDual
+        end
+        # A real, concrete `CoDual` instance must be a subtype of the abstract fallback these return.
+        inst = CoDual(1.0, NoFData())
+        @test inst isa fcodual_type(Real)
+        @test inst isa codual_type(Real)
+
+        # The specific pathological case the `@isdefined(P)` guard documents — a `UnionAll` whose body
+        # references a `TypeVar` that isn't its own bound variable (constructed directly, since this
+        # isn't reachable via ordinary type syntax) — must not crash either.
+        Tvar = TypeVar(:T)
+        Avar = TypeVar(:A)
+        pathological = UnionAll(Avar, AbstractArray{Tvar,Avar})
+        @test fcodual_type(pathological) === CoDual
+        @test codual_type(pathological) === CoDual
+        @test dual_type(pathological) === Dual
     end
 
     include("test_intrinsic_dispatch.jl")      # dispatch-based intrinsic handling (add_float)

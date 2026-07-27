@@ -61,6 +61,7 @@ const _memrefnewg = GlobalRef(Core, :memoryrefnew)
 const _memrefgetg = GlobalRef(Core, :memoryrefget)
 const _memrefsetg = GlobalRef(Core, :memoryrefset!)
 const _eqeqg      = GlobalRef(Core, :(===))
+const _isdefinedg = GlobalRef(Core, :isdefined)
 const _ctupleg    = GlobalRef(Core, :tuple)
 const _ifelseg    = GlobalRef(Core, :ifelse)
 
@@ -199,6 +200,13 @@ end
 # Identity/egal — always Bool, never differentiable.
 function apply_builtin_frule!(::Val{Core.:(===)}, actual, Ti, ctx)
     p = ctx.emit!(Expr(:call, _eqeqg, ctx.presolve(actual[1]), ctx.presolve(actual[2])), Ti)
+    p, NoTangent()
+end
+
+# Field-definedness check — always Bool, never differentiable. Shows up in boxed-capture IR (the
+# `throw_undef_if_not` guard around a `Core.Box`'s `.contents` field) and any `isdefined(x, :f)` call.
+function apply_builtin_frule!(::Val{Core.isdefined}, actual, Ti, ctx)
+    p = ctx.emit!(Expr(:call, _isdefinedg, (ctx.presolve(a) for a in actual)...), Ti)
     p, NoTangent()
 end
 

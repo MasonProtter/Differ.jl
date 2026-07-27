@@ -33,6 +33,12 @@ _copy(x::P) where {P<:FData} = P(_copy(x.data))
 
 fields_type(::Type{FData{T}}) where {T<:NamedTuple} = T
 
+# Recurse into the wrapped NamedTuple of fields (bottoms out on the NamedTuple/
+# PossiblyUninitTangent/MutableTangent methods in tangents.jl). Needed so
+# `set_to_zero_internal!!` can zero a struct field whose tangent carries fdata (e.g. a
+# `Core.Box`-boxed captured variable) instead of only ever seeing `NoFData` there.
+set_to_zero_internal!!(c::SetToZeroCache, x::F) where {F<:FData} = F(set_to_zero_internal!!(c, x.data))
+
 function increment_internal!!(c::IncCache, x::F, y::F) where {F<:FData}
     return F(tuple_map((a, b) -> increment_internal!!(c, a, b), x.data, y.data))
 end
@@ -441,6 +447,9 @@ end
 _copy(x::P) where {P<:RData} = P(_copy(x.data))
 
 fields_type(::Type{RData{T}}) where {T<:NamedTuple} = T
+
+# See the matching FData method above for why this is needed.
+set_to_zero_internal!!(c::SetToZeroCache, x::R) where {R<:RData} = R(set_to_zero_internal!!(c, x.data))
 
 @inline function increment_internal!!(c::IncCache, x::RData{T}, y::RData{T}) where {T}
     return RData(increment_internal!!(c, x.data, y.data))

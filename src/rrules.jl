@@ -92,7 +92,16 @@ end
 function (pb::SumMapPullback{G})(seed) where {G}
     pbs = pb.pbs
     dx = pb.dx
-    grdata = zero_rdata_from_type(G)
+    # `zero_like_rdata_from_type`, not `zero_rdata_from_type`: `G` is normally concrete (an ordinary
+    # dynamic dispatch to this hand rule always binds `G` to the closure's actual runtime type), but
+    # the derived recursion glue (`reverse_fwds_recursive_ci` in `reverse_interp.jl`) can resolve a
+    # hand rule via a *static* call-site type that isn't concrete (e.g. `g` reached through an
+    # abstractly-typed field/container) — that binds `G` to that same non-concrete type here, and
+    # `zero_rdata_from_type` would return the `CannotProduceZeroRDataFromType` sentinel instead of
+    # throwing outright, which `increment!!` below would then choke on. `grdata` only ever flows into
+    # `increment!!` (already `ZeroRData`-aware) or straight back out in the returned tuple (routed by
+    # the caller, also `ZeroRData`-aware), so no further instantiation is needed here.
+    grdata = zero_like_rdata_from_type(G)
     for i in length(pbs):-1:1
         gi_r, xi_r = pbs[i](seed)
         grdata = increment!!(grdata, gi_r)

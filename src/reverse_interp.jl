@@ -1182,6 +1182,11 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 primal_map[i] = emit!(Expr(:new, s.args[1], (presolve(a) for a in s.args[2:end])...), Ti)
             elseif isa(s, Expr) && s.head === :boundscheck
                 primal_map[i] = emit!(Expr(:boundscheck, s.args...), Ti)
+            elseif isa(s, Expr) && s.head === :throw_undef_if_not
+                # Pure control marker (undef-var/boxed-capture guard) — see the matching arm in the
+                # main (reachable-block) loop below for the full rationale. `args[1]` (name) is copied
+                # verbatim; `args[2]` (condition) is resolved like any other operand.
+                primal_map[i] = emit!(Expr(:throw_undef_if_not, s.args[1], presolve(s.args[2])), Ti)
             elseif isa(s, Core.PiNode)
                 primal_map[i] = presolve(s.val)
             elseif isa(s, GlobalRef)
@@ -1273,6 +1278,14 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             end
         elseif isa(s, Expr) && s.head === :boundscheck
             primal_map[i] = emit!(Expr(:boundscheck, s.args...), Ti)
+        elseif isa(s, Expr) && s.head === :throw_undef_if_not
+            # Pure control marker: raises `UndefVarError`/`UndefRefError` for an unassigned slot or
+            # boxed-capture field (the guard around a captured, reassigned variable's read). `args[1]`
+            # is a bare Symbol/GlobalRef name, never a value to resolve; `args[2]` is the Bool
+            # condition, which is a genuine operand here (a literal in a throw-only block — handled
+            # in the unreachable-block arm above — or an SSA reference on a live path). No fdata: its
+            # result is never consumed.
+            primal_map[i] = emit!(Expr(:throw_undef_if_not, s.args[1], presolve(s.args[2])), Ti)
         elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
             fpos, actual = _call_parts(s)
             f = _calleeval(fpos, iworld)
@@ -1413,6 +1426,17 @@ end
 # exactly what naming them explicitly buys).
 @inline __switch_case(id::Int32, prev::Int32) = Base.:!(Core.:(===)(id, prev))
 
+# Materializes a real zero rdata from `acc` when it's the `ZeroRData` placeholder. Needed wherever a
+# `deref_and_zero!`-derived accumulator must be treated as an actual `RDataT` value (e.g. its own
+# `NamedTuple` wrapper decomposed field-by-field for an immutable `%new`) rather than merely
+# `increment!!`-ed into (which already handles `ZeroRData` generically, needing no instantiation).
+# `@noinline`: this gets threaded through `icall` into hand-built carrier IR; without it,
+# `CC.ssa_inlining_pass!` would inline the tiny `@inline`-marked body straight in, and that body
+# contains a bare call that would resolve as `GlobalRef(Differ, ...)` in value position, which
+# `verify_ir` rejects (same reasoning as the `_rr_*` helper convention in `src/builtins_reverse.jl`).
+@noinline _rr_realize_rdata(acc, ::Type{RDataT}) where {RDataT} =
+    (acc isa ZeroRData ? zero_rdata_from_type(RDataT) : acc)::RDataT
+
 function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                                     reason::Ref{String}=Ref(""), edges::Vector{Any}=Any[])
     pstmts = pir.stmts
@@ -1512,8 +1536,14 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     arg_ref_id = Vector{Any}(undef, n)
     for k in 1:n
         Pk = _codual_primal_type(codualparams[k])
-        RT = rdtype(Pk)
-        arg_ref_id[k] = eemit!(Expr(:new, Base.RefValue{RT}, zero_rdata_from_type(Pk)), Base.RefValue{RT})
+        # `zero_like_rdata_type`/`zero_like_rdata_from_type`, not `rdtype`/`zero_rdata_from_type`:
+        # when `Pk` isn't concrete enough to produce a real zero rdata from its type alone (e.g. an
+        # abstractly-typed argument slot), the ref's element type must include `ZeroRData` and the
+        # zero literal must be `ZeroRData()` instead of crashing (`zero_rdata_from_type` returns the
+        # `CannotProduceZeroRDataFromType` sentinel in that case, which `:new`'s field-type check
+        # below rejects). Both collapse to the old behavior exactly when `Pk` is concrete.
+        RT = zero_like_rdata_type(Pk)
+        arg_ref_id[k] = eemit!(Expr(:new, Base.RefValue{RT}, zero_like_rdata_from_type(Pk)), Base.RefValue{RT})
     end
 
     ssa_ref_id = Vector{Any}(undef, N)
@@ -1523,8 +1553,9 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         # a bare `Type` — e.g. a `Core.memorynew` call with a literal length — and
         # `zero_rdata_from_type` (like `tangent_type`) is only ever defined on `Type`s.
         Ti = _widen(pstmts[i][:type])
-        RT = rdtype(Ti)
-        ssa_ref_id[i] = eemit!(Expr(:new, Base.RefValue{RT}, zero_rdata_from_type(Ti)), Base.RefValue{RT})
+        # See the `arg_ref_id` prologue above for why `zero_like_rdata_type`/`zero_like_rdata_from_type`.
+        RT = zero_like_rdata_type(Ti)
+        ssa_ref_id[i] = eemit!(Expr(:new, Base.RefValue{RT}, zero_like_rdata_from_type(Ti)), Base.RefValue{RT})
     end
 
     ref_for(@nospecialize node) =
@@ -1545,7 +1576,11 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         end
         target = ref_for(exit_ret_node[b])
         if target !== nothing
-            RT = rdtype(_optype(pir, exit_ret_node[b]))
+            # `zero_like_rdata_type`, not `rdtype`: `target`'s actual declared element type (set in
+            # the `arg_ref_id`/`ssa_ref_id` prologue above) may be `Union{R,ZeroRData}`, and `cur`'s
+            # declared type here must agree with that or the `icall` below could resolve to (and
+            # statically `:invoke`) a method compiled for the too-narrow `R` alone.
+            RT = zero_like_rdata_type(_optype(pir, exit_ret_node[b]))
             cur = remit!(Expr(:call, getf, target, 1), RT)
             new = remit!(icall(increment_g, (RT, PullbackSeedT), cur, seed_id), RT)
             remit!(Expr(:call, setf, target, 1, new), Any)
@@ -1579,16 +1614,28 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         # (see the `ssa_ref_id` prologue above) — `zero_rdata_from_type` only accepts a bare `Type`.
         deref_and_zero!(ref, @nospecialize(Pi)) = begin
             Pi = _widen(Pi)
-            RT = rdtype(Pi)
+            # `zero_like_rdata_type`/`zero_like_rdata_from_type` — see the `arg_ref_id`/`ssa_ref_id`
+            # prologue above; `ref`'s actual declared element type is whichever of the two this
+            # produces, so reading it back out (and re-zeroing it) must agree exactly.
+            RT = zero_like_rdata_type(Pi)
             cur = emit!(Expr(:call, getf, ref, 1), RT)
-            emit!(Expr(:call, setf, ref, 1, zero_rdata_from_type(Pi)), Any)
+            emit!(Expr(:call, setf, ref, 1, zero_like_rdata_from_type(Pi)), Any)
             cur
         end
         route!(@nospecialize(node), contrib, @nospecialize(ty)) = begin
             target = ref_for(node)
             if target !== nothing
-                cur = emit!(Expr(:call, getf, target, 1), ty)
-                new = emit!(icall(increment_g, (ty, ty), cur, contrib), ty)
+                # `target`'s actual declared element type is `zero_like_rdata_type` of `node`'s own
+                # primal type (set in the `arg_ref_id`/`ssa_ref_id` prologue above) — not necessarily
+                # the caller-supplied `ty` (which describes `contrib`, computed from whatever type
+                # the *contribution* happens to come from, e.g. a field type rather than `node`'s
+                # own type). Deriving `cur`'s type independently here, rather than trusting `ty`,
+                # keeps this correct regardless of what each call site passes for `ty` — a too-narrow
+                # declared type here would let `icall` resolve to (and statically `:invoke`) a method
+                # compiled for a type narrower than what the ref can actually hold.
+                rty = zero_like_rdata_type(_widen(_optype(pir, node)))
+                cur = emit!(Expr(:call, getf, target, 1), rty)
+                new = emit!(icall(increment_g, (rty, ty), cur, contrib), rty)
                 emit!(Expr(:call, setf, target, 1, new), Any)
             end
             nothing
@@ -1627,9 +1674,11 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                 continue
             elseif isa(s, Expr) && s.head === :boundscheck
                 continue   # pure control marker, always `NoRData` — nothing to route
+            elseif isa(s, Expr) && s.head === :throw_undef_if_not
+                continue   # pure control marker, always `NoRData` — nothing to route
             elseif isa(s, Core.PiNode)
                 acc = deref_and_zero!(ssa_ref_id[i], Ti)
-                route!(s.val, acc, rdtype(_optype(pir, s.val)))
+                route!(s.val, acc, zero_like_rdata_type(_widen(_optype(pir, s.val))))
             elseif isa(s, Expr) && s.head === :new
                 T = _calleeval(s.args[1], iworld)
                 args = @view s.args[2:end]
@@ -1666,8 +1715,20 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     acc = deref_and_zero!(ssa_ref_id[i], Ti)
                     RDataT = rdtype(T)
                     if RDataT !== NoRData
+                        # `acc`'s own declared type can include `ZeroRData` when `Ti` (this SSA's own
+                        # inferred type, which can be broader than `T` -- e.g. this `%new` sits behind
+                        # a later `Union` merge) isn't concrete enough on its own to produce a real
+                        # zero. `T` itself is always concrete here (required by `:new`), so a real
+                        # zero of type `RDataT` is always compile-time constructible regardless --
+                        # materialize it before treating `acc` as the real `RDataT` `NamedTuple`
+                        # wrapper below (a raw `getfield` on the literal `ZeroRData()` singleton,
+                        # which has no fields, would otherwise throw).
+                        real_acc = emit!(
+                            icall(_rr_realize_rdata, (zero_like_rdata_type(_widen(Ti)), Type{RDataT}),
+                                  acc, RDataT),
+                            RDataT)
                         NT = fields_type(RDataT)
-                        data_id = emit!(Expr(:call, getf, acc, 1), NT)
+                        data_id = emit!(Expr(:call, getf, real_acc, 1), NT)
                         for j in eachindex(args)
                             Fty = rdtype(fieldtype(T, j))
                             Fty === NoRData && continue
@@ -1719,7 +1780,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                             return nothing
                         end
                         for (a, c) in zip(actual, contribs)
-                            route!(a, c, rdtype(_optype(pir, a)))
+                            route!(a, c, zero_like_rdata_type(_widen(_optype(pir, a))))
                         end
                     end
                 elseif isa(f, Core.Builtin)
@@ -1730,7 +1791,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     if contribs !== nothing
                         for (a, c) in zip(actual, contribs)
                             c === nothing && continue
-                            route!(a, c, rdtype(_optype(pir, a)))
+                            route!(a, c, zero_like_rdata_type(_widen(_optype(pir, a))))
                         end
                     elseif tangent_type(_widen(Ti)) === NoTangent
                         # Mirrors the fwds pass's own treatment: a non-differentiable builtin result
@@ -1749,7 +1810,11 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     subtape_key = (:subtape, Core.SSAValue(i))
                     inner_tape = comms_val_id[subtape_key]
                     InnerTapeT = comms_type_id[subtape_key]
-                    SeedT = rdtype(Ti)
+                    # `zero_like_rdata_type`, not `rdtype`: `acc`'s actual type (see `deref_and_zero!`
+                    # above) may include `ZeroRData` when `Ti` isn't concrete enough on its own, so the
+                    # inner pullback must be resolved to accept exactly that (possibly wider) seed type
+                    # — its own exit-route `increment!!` already tolerates `ZeroRData` generically.
+                    SeedT = zero_like_rdata_type(_widen(Ti))
                     pb_resolved = reverse_pullback_recursive_ci(interp, InnerTapeT, SeedT, edges, reason)
                     pb_resolved === nothing && return nothing
                     pb_ci, pb_derived = pb_resolved
@@ -1769,7 +1834,10 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     # `_static_recursible_call`'s callee guard, discarded exactly like `ref_for`
                     # already discards any literal operand's contribution — so routing starts at 2.
                     for (j, a) in enumerate(actual)
-                        Fty = rdtype(argtypes[j])
+                        # `zero_like_rdata_type`: the callee's own `argtypes[j]`-th argument rdata
+                        # (this same function, recursively, for the callee) can likewise be
+                        # `ZeroRData` when that argument's type isn't concrete enough.
+                        Fty = zero_like_rdata_type(_widen(argtypes[j]))
                         Fty === NoRData && continue
                         contrib = emit!(Expr(:call, getf, inner_rdatas, j + 1), Fty)
                         route!(a, contrib, Fty)
@@ -1792,9 +1860,10 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             result_ids = Vector{Any}(undef, n)
             for k in 1:n
                 Pk = _codual_primal_type(codualparams[k])
-                result_ids[k] = emit!(Expr(:call, getf, arg_ref_id[k], 1), rdtype(Pk))
+                result_ids[k] = emit!(Expr(:call, getf, arg_ref_id[k], 1), zero_like_rdata_type(Pk))
             end
-            res = emit!(Expr(:call, ctuple, result_ids...), Tuple{(rdtype(_codual_primal_type(c)) for c in codualparams)...})
+            res = emit!(Expr(:call, ctuple, result_ids...),
+                       Tuple{(zero_like_rdata_type(_codual_primal_type(c)) for c in codualparams)...})
             emit!(Core.ReturnNode(res), Any)
         elseif phi_end < lo
             # No PhiNodes at the top of this block: switch straight to each predecessor's own block.
@@ -1820,9 +1889,17 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     tgt = ref_for(v)
                     tgt === nothing && continue
                     Ti = pstmts[i][:type]
-                    RT = rdtype(Ti)
-                    cur = remit!(Expr(:call, getf, tgt, 1), RT)
-                    new = remit!(icall(increment_g, (RT, RT), cur, phi_acc[j]), RT)
+                    # `tgt`'s actual declared element type is `zero_like_rdata_type` of `v`'s own
+                    # primal type (the edge value) — generally *not* the same as the phi node's own
+                    # (merged, typically wider) type `Ti`. `phi_acc[j]` is `zero_like_rdata_type` of
+                    # `Ti` instead, since that's what `deref_and_zero!` actually produced for the phi
+                    # itself. Deriving these independently (rather than a single `RT` from `Ti` used
+                    # for both, as before `ZeroRData` support) is what makes this correct on a loop
+                    # back-edge, where the phi's accumulator is genuinely re-zeroed every visit.
+                    RTcur = zero_like_rdata_type(_widen(_optype(pir, v)))
+                    RTacc = zero_like_rdata_type(_widen(Ti))
+                    cur = remit!(Expr(:call, getf, tgt, 1), RTcur)
+                    new = remit!(icall(increment_g, (RTcur, RTacc), cur, phi_acc[j]), RTcur)
                     remit!(Expr(:call, setf, tgt, 1, new), Any)
                 end
                 rid = ID()
@@ -2091,7 +2168,12 @@ function value_and_gradient!(ctx::AbstractCtx, fcd::CoDual, argcds::CoDual...)
     map(cd -> set_to_zero!!(tangent(cd)), argcds)
     result_cd, pb = rrule!!(fcd, ctx, argcds...)
     y = primal(result_cd)
-    rdatas = pb(one(y))
+    all_cds = (fcd, argcds...)
+    # A derived pullback can hand back `ZeroRData` for an argument whose concrete type has an
+    # abstractly-typed field (or is itself non-concrete) — see the `zero_like_rdata_type` machinery
+    # in `reverse_pullback_to_ircode`. This is the one place `gradient`/`gradient!` funnel through,
+    # so instantiate a real zero here rather than ever handing a `ZeroRData` back to the user.
+    rdatas = map((cd, r) -> r isa ZeroRData ? zero_rdata(primal(cd)) : r, all_cds, pb(one(y)))
     fdatas = (tangent(fcd), map(tangent, argcds)...)
     return y, map(tangent, fdatas, rdatas)
 end

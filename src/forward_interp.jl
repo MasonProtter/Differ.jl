@@ -513,7 +513,23 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # as a literal so no call survives into the IR. `zero_tangent` handles singletons (-> the zero
     # tangent, e.g. `NoTangent()` for a function/`Int`), scalars (`0.0`), `Dual` carriers (a
     # same-typed zero), and composite constants (a `Tangent`/tuple of zeros).
-    const_tangent(@nospecialize x) = zero_tangent(isa(x, QuoteNode) ? x.value : x)
+    #
+    # A bare `GlobalRef` operand is not itself a constant value — it *names* one. Splicing
+    # `zero_tangent(globalref)` here would compute the tangent of the `GlobalRef` struct (a
+    # `Module`+`Symbol` pair, always `NoTangent`), not of the value the binding holds. Resolve the
+    # binding (same lookup `_calleeval` uses for callees) to learn the tangent type, then emit a
+    # genuine runtime `zero_tangent` call on the (re-embedded, raw) `GlobalRef` operand — never
+    # splice a *constructed* tangent object as a compile-time literal: a mutable tangent (e.g. a
+    # `MutableTangent`) would then be one frozen object shared/aliased across every invocation of
+    # this compiled carrier, corrupted by the first call that mutates it.
+    function const_tangent(@nospecialize x)
+        isa(x, QuoteNode) && return zero_tangent(x.value)
+        if isa(x, GlobalRef)
+            gv = _calleeval(x, iworld)
+            gv !== nothing && return emit!(Expr(:call, zerotang_g, x), tangent_type(Core.Typeof(gv)))
+        end
+        return zero_tangent(x)
+    end
     # Zero tangent for a *computed* primal value of type `Ti` (the tangent of a non-differentiable
     # operation's result). `NoTangent()` when the tangent type is trivial (`Int`, `Bool`, …), a
     # literal `zero(Ti)` for a concrete `Number`, otherwise a runtime `zero_tangent` on the primal.
@@ -751,6 +767,15 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             elseif isa(s, Expr) && s.head === :boundscheck
                 primal[i] = emit!(Expr(:boundscheck, (presolve(a) for a in s.args)...), Ti)
                 shadow[i] = primal[i]
+            elseif isa(s, Expr) && s.head === :throw_undef_if_not
+                # Pure control marker (undef-var/boxed-capture guard): `args[1]` is a bare
+                # Symbol/GlobalRef name, copied through verbatim (never a value to dualize/resolve);
+                # `args[2]` is the non-differentiable Bool condition, which does need this pass's own
+                # resolution (it's a literal in a throw-only block, but resolve it uniformly with the
+                # live-path arm below regardless). No shadow value: it never feeds a `PhiNode` or is
+                # otherwise consumed.
+                primal[i] = emit!(Expr(:throw_undef_if_not, s.args[1], presolve(s.args[2])), Ti)
+                shadow[i] = primal[i]
             elseif isa(s, Core.PiNode)
                 primal[i] = presolve(s.val); shadow[i] = primal[i]
             elseif isa(s, GlobalRef)
@@ -832,6 +857,16 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             # a 3-arg `getfield`/`memoryref*` boundscheck argument. Emitted through unchanged; its
             # own result is a non-differentiable `Bool`.
             primal[i] = emit!(Expr(:boundscheck, (presolve(a) for a in s.args)...), Ti)
+            shadow[i] = zero_shadow(Ti, primal[i])
+        elseif isa(s, Expr) && s.head === :throw_undef_if_not
+            # Pure control marker: raises `UndefVarError`/`UndefRefError` for an unassigned slot or
+            # boxed-capture field (the guard Julia inserts around a captured variable's read once
+            # reassignment has forced it into a `Core.Box`). `args[1]` is a bare Symbol/GlobalRef name
+            # — copied through verbatim, never presolved/dualized. `args[2]` is the Bool condition
+            # (a literal in a throw-only block, or a genuine SSA operand on a live path) and does need
+            # resolving. Its own result is never consumed (no shadow-bearing value), so give it the
+            # zero tangent of its (non-differentiable) type like `:boundscheck` above.
+            primal[i] = emit!(Expr(:throw_undef_if_not, s.args[1], presolve(s.args[2])), Ti)
             shadow[i] = zero_shadow(Ti, primal[i])
         elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
             fpos = s.head === :invoke ? s.args[2] : s.args[1]

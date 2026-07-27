@@ -198,16 +198,20 @@ function apply_builtin_rrule!(::Val{Core.getfield}, actual, Ti, ctx)
     else
         idxty, idxval = Int, ctx.pb_presolve(actual[2])
     end
+    # `acc`'s actual type is `zero_like_rdata_type(Ti)`, not `rdtype(Ti)` (see `deref_and_zero!` in
+    # `reverse_interp.jl`) — may include `ZeroRData` when `Ti` isn't concrete enough (e.g. reading an
+    # abstractly-typed field). Likewise `target`'s (`ctx.ref_for(obj)`) actual declared element type
+    # is `zero_like_rdata_type(P)`, not `rdtype(P)`, whenever `obj`'s own primal type isn't concrete.
     if ismutabletype(P)
         mt = ctx.comms[(:fshadow, obj)]
-        ctx.emit!(ctx.icall(_rr_increment_field_rdata!, (fdtype(P), rdtype(Ti), idxty),
+        ctx.emit!(ctx.icall(_rr_increment_field_rdata!, (fdtype(P), zero_like_rdata_type(_widen(Ti)), idxty),
                             mt, acc, idxval), fdtype(P))
     else
         target = ctx.ref_for(obj)
         if target !== nothing
-            RT = rdtype(P)
+            RT = zero_like_rdata_type(_widen(P))
             cur = ctx.emit!(Expr(:call, _getfieldg, target, 1), RT)
-            new = ctx.emit!(ctx.icall(increment_field!!, (RT, rdtype(Ti), idxty), cur, acc, idxval), RT)
+            new = ctx.emit!(ctx.icall(increment_field!!, (RT, zero_like_rdata_type(_widen(Ti)), idxty), cur, acc, idxval), RT)
             ctx.emit!(Expr(:call, _setfieldg, target, 1, new), Any)
         end
     end
@@ -314,9 +318,13 @@ function apply_builtin_rrule!(::Val{Base.memoryrefget}, actual, Ti, ctx)
     rdtype(Ti) === NoRData && return nores
     acc = ctx.deref_and_zero!(Ti)
     shadow_ref = ctx.comms[(:shadow_ref, actual[1])]
-    cur = ctx.emit!(Expr(:call, Base.memoryrefget, shadow_ref, QuoteNode(:not_atomic), false), Ti)
-    new = ctx.emit!(ctx.icall(increment!!, (Ti, Ti), cur, acc), Ti)
-    ctx.emit!(Expr(:call, Base.memoryrefset!, shadow_ref, new, QuoteNode(:not_atomic), false), Ti)
+    # This rule only ever reaches a "bits" (rdata-carrying-directly) element, so ordinarily
+    # `rdtype(Ti) == Ti` -- but an array with an abstract eltype (e.g. `Vector{Real}`) makes `Ti`
+    # non-concrete, in which case `acc`'s actual type is `zero_like_rdata_type(Ti)`, not bare `Ti`.
+    RT = zero_like_rdata_type(_widen(Ti))
+    cur = ctx.emit!(Expr(:call, Base.memoryrefget, shadow_ref, QuoteNode(:not_atomic), false), RT)
+    new = ctx.emit!(ctx.icall(increment!!, (RT, RT), cur, acc), RT)
+    ctx.emit!(Expr(:call, Base.memoryrefset!, shadow_ref, new, QuoteNode(:not_atomic), false), RT)
     return nores
 end
 
@@ -423,7 +431,11 @@ function apply_builtin_rrule!(::Val{Core.setfield!}, actual, Ti, ctx)
     fname = _bi_fieldname(name_node)
     fieldidx = fname isa Symbol ? findfirst(==(fname), fieldnames(P)) : fname
     TF = tangent_type(_widen(Ti))
-    RT = rdtype(Ti)   # == rdata_type(TF), since TF === tangent_type(Ti) by construction
+    # `zero_like_rdata_type`, not `rdtype`: `acc` (below) may be `ZeroRData` when `Ti` (the field's
+    # own type) isn't concrete enough (e.g. an abstractly-typed field). `cur_rdata` is always a real
+    # value regardless (`_rr_rdata` on a genuine tangent), so declaring it at the same (possibly
+    # wider) `RT` is harmless.
+    RT = zero_like_rdata_type(_widen(Ti))
     acc = ctx.deref_and_zero!(Ti)
     cur_tangent = ctx.emit!(ctx.icall(_rr_get_tangent_field, (fdtype(P), Int), mt, fieldidx), TF)
     cur_rdata = ctx.emit!(ctx.icall(_rr_rdata, (TF,), cur_tangent), RT)
@@ -505,7 +517,10 @@ function apply_builtin_rrule!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     old_primal = ctx.comms[(:old_primal, ctx.ssa)]
     old_tangent = ctx.comms[(:old_tangent, ctx.ssa)]
     TT = tangent_type(_widen(Ti))
-    RT = rdtype(Ti)   # == rdata_type(TT), since TT === tangent_type(Ti) by construction
+    # `zero_like_rdata_type`, not `rdtype`: `acc` (below) may be `ZeroRData` when `Ti` (the element's
+    # own type) isn't concrete enough (e.g. an array with an abstract eltype). `cur_rdata` is always
+    # a real value regardless, so declaring it at the same (possibly wider) `RT` is harmless.
+    RT = zero_like_rdata_type(_widen(Ti))
     acc = ctx.deref_and_zero!(Ti)
     cur_tangent = ctx.emit!(Expr(:call, Base.memoryrefget, sref, QuoteNode(:not_atomic), false), TT)
     cur_rdata = ctx.emit!(ctx.icall(_rr_rdata, (TT,), cur_tangent), RT)
