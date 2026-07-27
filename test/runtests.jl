@@ -120,6 +120,16 @@ struct V2; a::Float64; b::Float64; end
 vprod(v::V2) = v.a * v.b
 poly32(x::Float32) = x*x + x
 
+# `sitofp` (Int→Float promotion): `x*i` promotes the loop counter `i::Int` via `sitofp` before the
+# multiply. The RESULT (`Float64`) carries a real tangent, but `sitofp`'s own operands (the Int value
+# and the leading type argument) are non-differentiable — the *inactive* bucket, not the linear one.
+# d/dx = 1+2+3 = 6.
+sitofp_ctl(x::Float64) = (s = 0.0; for i in 1:3; s += x*i; end; s)
+# `fpext`/`fptrunc` (`Float64`<->`Float32` width conversion): genuinely LINEAR, unlike `sitofp` above
+# — misclassifying either bucket either drops a real gradient or corrupts a zero one.
+# d/dx (Float64(Float32(x)*Float32(2.0)) + x) = 2 + 1 = 3.
+mix32_ctl(x::Float64) = Float64(Float32(x) * Float32(2.0)) + x
+
 # Closures capturing differentiable data: the *function* carries a tangent (its captured field), so
 # one can differentiate w.r.t. the capture as well as the argument. The capture is read via
 # `getfield(#self#, :a)` in the primal IR, whose tangent flows from the function-dual's tangent.
@@ -163,6 +173,46 @@ function mysum(v::Vector{Float64})   # eachindex reduction: 3-arg getfield + `==
     return s
 end
 tupfirst(t::Tuple{Float64,Float64}) = t[1]   # boundschecked tuple getfield (3-arg getfield forwarding)
+# Dynamic (non-literal) `getfield` index: `for i in 1:2` does not unroll, so this lowers to
+# `getfield(t, i)` with `i` a genuine SSAValue, not a literal — the homogeneous-tuple/NamedTuple
+# same-shape case (Phase B). d/dt_1 = d/dt_2 = 1.
+function tupsum_dyn(t::Tuple{Float64,Float64})
+    s = 0.0
+    for i in 1:2
+        s += t[i]
+    end
+    return s
+end
+function ntupsum_dyn(t::@NamedTuple{a::Float64,b::Float64})
+    s = 0.0
+    for i in 1:2
+        s += t[i]
+    end
+    return s
+end
+# Heterogeneous struct, dynamic `getfield` index: the genuinely hard case (per-field tangent types
+# differ) that must always bail, never miscompile.
+struct Het2; a::Float64; b::Int; end
+hetdyn(h::Het2, i::Int) = Core.getfield(h, i)
+# Dynamic `setfield!` index — Phase A only (no same-shape support for writes).
+mutable struct MP2; x::Float64; y::Float64; end
+function setdyn!(m::MP2, i::Int, v::Float64)
+    Core.setfield!(m, i, v)
+    return m.x + m.y
+end
+# Homogeneous MUTABLE struct, dynamic `getfield` READ index (Part 2b — the tractable gap, reusing the
+# homogeneous mutable `MP2` above). Every field shares one tangent type, so a runtime index selects a
+# validly-typed field whichever one it lands on; the contribution routes through the object's own
+# `MutableTangent` via the runtime-`Int` `increment_field_rdata!`. The index is a genuine
+# `Argument`/`SSAValue` (confirmed via `Base.code_ircode`), NOT const-folded to a literal.
+mp2get(m::MP2, i::Int) = Core.getfield(m, i)     # index is a genuine `Argument` (`_3`)
+function mp2sum_dyn(m::MP2)                       # loop index is a genuine `SSAValue` (a phi)
+    s = 0.0
+    for i in 1:2
+        s += Core.getfield(m, i)
+    end
+    return s
+end
 # Array allocation inside the differentiated function (`Core.memorynew`, backing `zeros`/`similar`/
 # `Vector{T}(undef,...)`/comprehensions) is supported — see "array allocation (forward mode)" below.
 allocarr(n) = (v = zeros(n); v[1] = 1.0; v[1])
@@ -237,7 +287,7 @@ end
 # Reverse mode Part 2 (read-only array indexing): fixed-index read, index chosen by a branch, and a
 # minimal hand-written summation loop (avoiding `sum`/iterator-protocol machinery beyond the
 # `Base.iterate`-state `===` check every `for` loop already needs — see the array shadow-chain notes
-# in `reverse_interp.jl`). `arr_mutate!` is the mutation regression: must still bail.
+# in `reverse_interp.jl`).
 function arr_idx3(x::Vector{Float64})                # a fixed-index read
     return x[3]
 end
@@ -251,7 +301,7 @@ function arr_sum(x::Vector{Float64})                  # hand-written summation l
     end
     return s
 end
-function arr_mutate!(x::Vector{Float64})              # regression: mutation must still bail
+function arr_mutate!(x::Vector{Float64})              # array mutation (memoryrefset!, Part 3 below)
     x[1] = 2.0 * x[1]
     return x[1]
 end
@@ -279,24 +329,163 @@ f_sumdo(v::Vector{Float64}) = sum(v) do vi
     vi^2 + 2vi + 1
 end
 
-# Regression: an array argument whose identity is *not* traceable to a function argument must still
-# bail cleanly rather than silently drop its gradient contribution. `vs[1]` (an inner array read out
-# of an array-of-arrays via ordinary indexing) is a genuine, non-eliminable heap read that
-# `_array_shadow_tracked` never marks tracked (its `Core.getfield`/`memoryrefnew` branches recognize
-# only the `.ref`-`MemoryRef` chain a *scalar* index produces, not a `memoryrefget` whose own result
-# is itself an array) — the cleanest way to construct "a real array Julia's optimizer can't fold
-# away, whose provenance this analysis still can't trace" without accidentally tripping the
-# unrelated non-trivial-fdata-*result* guard (Part 3 scope note, guard #3) instead.
+# `vs[1]` (an inner array read out of an array-of-arrays via ordinary indexing) used to be a
+# genuine provenance dead end (`_fdata_tracked`'s `Core.getfield`/`memoryrefnew` branches only
+# recognized the `.ref`-`MemoryRef` chain a *scalar* index produces, not a `memoryrefget` whose own
+# result is itself an array). Now that a `memoryrefget` off a tracked ref is itself a tracked root
+# when its result carries fdata (Piece 2, see `_fdata_tracked`, `reverse_interp.jl`), `w`'s identity
+# threads straight through into the recursive call below and differentiates correctly.
 @noinline arr_inner_box(v::Vector{Float64}) = v[1] + v[2]
 function arr_via_box(vs::Vector{Vector{Float64}})
     w = vs[1]
     return arr_inner_box(w)
 end
 
-# Regression: a mutable-struct argument (reusing `MPoint`, defined above) is unaffected by this
-# milestone — still fully unsupported, must still bail cleanly (only the `Array` case was lifted).
+# Recursive call with a mutable-struct *argument* (reusing `MPoint`, defined above): `p` is a genuine
+# function argument, tracked via `_arg_fdata_tracked`, so `_static_recursible_call`'s guard lets it
+# through into the recursive `:invoke`'s `CoDual` — the inner call's rule accumulates straight into
+# the caller's own shared `MutableTangent` in place, no rdata needed back from the call at all.
 @noinline arr_inner_mut(p::MPoint) = p.x + p.y
 arr_via_mut(p::MPoint) = arr_inner_mut(p)
+
+# Reverse mode Part 3 (mutable-struct `getfield`/`setfield!` and array mutation): `mpoint_read`/
+# `mpoint_setx!` (defined above, already exercised in forward mode) are reused here for reverse mode.
+
+# Array mutation combined with a full-array read, so both the mutated element and an untouched one
+# are exercised in the same gradient: d(sum)/dx[1] = 2, d(sum)/dx[2] = 1.
+function arr_mutate_sum!(x::Vector{Float64})
+    x[1] *= 2.0
+    return sum(x)
+end
+
+# Repeated mutation in a loop — the case the save/restore machinery (`:old_primal`/`:old_tangent`)
+# exists for; a version without restore passes the straight-line cases above and fails only here.
+function refprod_loop!(r::Base.RefValue{Float64}, ys::Vector{Float64})
+    for y in ys
+        r[] *= y
+    end
+    return r[]
+end
+
+# The originally-reported bug: a closure over a `Ref`, read via two separate `getfield` calls (once
+# before the mutation, once after) that must resolve to the *same* underlying `MutableTangent`. An
+# aliasing bug here (two independently-zeroed copies instead of one shared object) would silently
+# give the wrong gradient rather than erroring, so `refmul_closure`'s own correctness check below (not
+# just "it doesn't throw") is what actually exercises this.
+function make_refmul_closure()
+    r = Ref(1.0)
+    g(y) = (r[] *= y; nothing)
+    return g, r
+end
+
+# `setfield!` of an array-valued field: the field's shadow is aliased to the argument's real shadow
+# (rather than a fresh `zero_tangent`), so in-place accumulation into that shared shadow after the
+# assignment flows back to `w`. `setbox!` itself returns `nothing` with no downstream read of `b.v`,
+# so its own gradient is trivially zero (not a real exercise of the aliasing) — `setbox_sum!` reads
+# `b.v` back out through the return value and is the real test.
+mutable struct MBox; v::Vector{Float64}; end
+setbox!(b::MBox, w::Vector{Float64}) = (b.v = w; nothing)
+setbox_sum!(b::MBox, w::Vector{Float64}) = (b.v = w; sum(b.v))
+
+# Array allocation (Case 2 final step, reverse mode): `x[1] = [9.0, 9.0]` allocates a fresh
+# `Vector{Float64}` locally (`Core.memorynew` -> `Core.memoryrefnew` -> `%new(Vector,...)`) and
+# writes it into the argument array — the allocation escapes, so it survives SROA. Returns `nothing`,
+# so `gradient`'s `one(y)` seeding doesn't apply here (see the `rrule!!`-with-explicit-`NoRData()`
+# pattern `setbox!` uses above) — differentiated directly via `rrule!!` below instead.
+function mutate_nested!(x::Vector{Vector{Float64}})
+    x[1] = [9.0, 9.0]
+    return nothing
+end
+
+# Scalar-returning allocation tests (so `gradient` applies directly): `zeros`/explicit index writes,
+# not a `[a,b]` literal — a literal array with 2+ elements lowers through `Base.vect`'s `X::Tuple`
+# capture, and when an element is itself differentiable (e.g. `[x, 2x]`) that tuple is a genuine
+# differentiable `Core.tuple` result, the one explicitly out-of-scope gap (see the skill doc); `zeros`
+# + explicit writes avoids it entirely.
+#
+# `alloc_and_sum`: allocate, write both elements from `x`, read both back locally — d/dx = 3.
+alloc_and_sum(x::Float64) = (v = zeros(2); v[1] = x; v[2] = 2 * x; v[1] + v[2])
+# `alloc_store_read!`: allocate, write from `a`, store into the *argument* array `x[1]` (2b aliasing),
+# then read back through `x` — exercises allocation and argument-array aliasing together. `x`'s
+# original `x[1]` is overwritten before ever being read, so its own gradient is zero. d/da = 3.
+function alloc_store_read!(x::Vector{Vector{Float64}}, a::Float64)
+    v = zeros(2)
+    v[1] = a
+    v[2] = 2 * a
+    x[1] = v
+    return x[1][1] + x[1][2]
+end
+
+# Piece 2 (`memoryrefget` provenance for a nested-array result) / Piece 3 (`memoryrefset!` fdata
+# aliasing) — no array allocation involved, so fully in scope for both (unlike `mutate_nested!` above).
+#
+# `x[1]`'s own `memoryrefget` result is a tracked provenance root (its shadow is the corresponding
+# element of `x`'s own shadow array), so summing it differentiates directly.
+nested_read(x::Vector{Vector{Float64}}) = sum(x[1])
+
+# `x[1] = w` aliases the shadow slot to `w`'s own shadow (rather than a fresh zero), so reading
+# `x[1]` back out afterward resolves to `w`'s real shadow array, and later accumulation into it lands
+# in `w`'s gradient rather than a detached copy.
+function nested_write_existing(x::Vector{Vector{Float64}}, w::Vector{Float64})
+    x[1] = w
+    return sum(x[1])
+end
+
+# Adversarial: read the aliased array back through *both* names — the gradient must sum both
+# contributions, not just whichever one a broken (fresh-zero) shadow happened to see.
+function nested_write_read_both(x::Vector{Vector{Float64}}, w::Vector{Float64})
+    x[1] = w
+    return sum(x[1]) + sum(w)
+end
+
+# Adversarial: mutate a scalar element *through* the alias (`x[1][1] = ...`). Real Julia array
+# aliasing means this also mutates `w` itself in the primal; the gradient must track that mutation
+# back to `w`'s original value, not vanish or double-count it.
+function nested_write_mutate_through(x::Vector{Vector{Float64}}, w::Vector{Float64})
+    x[1] = w
+    x[1][1] = 3.0 * x[1][1]
+    return w[1] + w[2]
+end
+
+# `%new` of a mutable struct combined with recursion into a callee that takes it (3a+3b together): a
+# freshly-created local `MPoint` is now a tracked provenance root (`_fdata_tracked`'s `Expr(:new,...)`
+# case), and passing it into a recursive call is exactly `arr_via_mut`'s mutable-struct-argument case
+# above, just with a locally-created object instead of a function argument. `mpoint_xy` is `@noinline`
+# so `p` crosses a genuine call boundary Julia's SROA can't see through — otherwise `p` never escapes
+# and the optimizer elides the `%new` entirely before reverse mode ever sees it.
+@noinline mpoint_xy(p::MPoint) = p.x + p.y
+newmut(x::Float64) = (p = MPoint(x, 1.0); mpoint_xy(p))
+
+# Standalone 3a (no cross-call boundary at all): a mutable struct created and mutated purely locally.
+# Plain local create+mutate+read gets scalar-replaced away entirely by SROA before reverse mode ever
+# sees a `%new` (confirmed via `Base.code_ircode`) — nesting the fresh `MPoint` inside a second,
+# also-freshly-created mutable wrapper forces the `MPoint`'s own `%new` to survive (the wrapper itself
+# gets scalarized away by the optimizer, so the IR reverse mode actually sees is just
+# `%new(MPoint,...)` + getfield/setfield!/getfield/getfield/add, no trace of the wrapper at all).
+mutable struct MPointBox; p::MPoint; end
+function newmut_local(x::Float64)
+    p = MPoint(x, 1.0)
+    p.x = p.x + 2.0
+    box = MPointBox(p)
+    return box.p.x + box.p.y
+end
+
+# 3a + 3b + mutation inside the callee: `p` is created locally, then handed to a `@noinline` callee
+# that mutates it in place — the callee's `setfield!` accumulates into the very same shadow
+# `MutableTangent` the caller's local `%new` built.
+@noinline mpoint_mutate!(p::MPoint) = (p.x = p.x + 5.0; p.x + p.y)
+newmut_recursive_mutate(x::Float64) = mpoint_mutate!(MPoint(x, 1.0))
+
+# `vs[1]`'s provenance is now tracked (Piece 2, see `arr_via_box` above), so aliasing it into
+# `MArrBox`'s `.v` field is safe and this differentiates correctly too — exercises the
+# `%new`-field-provenance guard (`reverse_fwds_to_ircode`'s mutable-`%new` case) on a genuinely
+# tracked nested array.
+mutable struct MArrBox; v::Vector{Float64}; end
+@noinline arrbox_inner(m::MArrBox) = m.v[1] + m.v[2]
+function arrbox_untraced(vs::Vector{Vector{Float64}})
+    m = MArrBox(vs[1])
+    return arrbox_inner(m)
+end
 
 @testset "Differ" begin
 
@@ -464,6 +653,18 @@ arr_via_mut(p::MPoint) = arr_inner_mut(p)
         dv = frule!!(Dual(vprod, NoTangent()), Dual(V2(2.0, 3.0), build_tangent(V2, 1.0, 0.0)))
         @test dv.x  == 6.0
         @test dv.dx == 1.0*3.0 + 2.0*0.0              # = b*da + a*db
+
+        # `sitofp` (Int->Float promotion, `x*i` with `i::Int`): the INACTIVE bucket — the result
+        # carries a real tangent but the operands (Int value + type) don't. d/dx (x·(1+2+3)) = 6.
+        dsi = frule!!(Dual(sitofp_ctl, NoTangent()), Dual(2.0, 1.0))
+        @test dsi.x == 12.0 && dsi.dx == 6.0
+        # `fpext`/`fptrunc` (Float32<->Float64 width conversion): the LINEAR bucket — genuinely
+        # differentiable. d/dx (Float64(Float32(x)·Float32(2)) + x) = 2 + 1 = 3.
+        dmx = frule!!(Dual(mix32_ctl, NoTangent()), Dual(1.0, 1.0))
+        @test dmx.x == 3.0 && dmx.dx == 3.0
+        fd(f, x; h=1e-5) = (f(x+h) - f(x-h)) / 2h
+        @test dsi.dx ≈ fd(sitofp_ctl, 2.0) rtol=1e-5
+        @test dmx.dx ≈ fd(mix32_ctl, 1.0) rtol=1e-2   # loose: FD through Float32 quantization is noisy
     end
 
     @testset "local reassignment (straight-line after optimization)" begin
@@ -597,6 +798,50 @@ arr_via_mut(p::MPoint) = arr_inner_mut(p)
                      Dual((1.0, 2.0), build_tangent(Tuple{Float64,Float64}, 5.0, 6.0)))
         @test rt.x == 1.0 && rt.dx == 5.0
         checkverify(tupfirst, (Tuple{Float64,Float64},))
+
+        # dynamic (non-literal) getfield index (Phase B, forward): `for i in 1:2` does not unroll,
+        # so `t[i]` reaches `dualize_to_ircode` as a genuine dynamic index. Raw (unresolved) before
+        # the fix, this crashed with a TypeError — the primal index referenced the primal IR's own
+        # (stale) SSA numbering once shadow instructions were interleaved.
+        for seed in ((1.0, 0.0), (0.0, 1.0))
+            d = frule!!(Dual(tupsum_dyn, NoTangent()), Dual((3.0, 4.0), seed))
+            @test d.x == 7.0 && d.dx == 1.0   # d(t1+t2)/dt_i = 1 for either seed direction
+        end
+        checkverify(tupsum_dyn, (Tuple{Float64,Float64},))
+
+        # same, over a homogeneous NamedTuple.
+        dn = frule!!(Dual(ntupsum_dyn, NoTangent()),
+                     Dual((a=3.0, b=4.0), build_tangent(@NamedTuple{a::Float64,b::Float64}, 1.0, 0.0)))
+        @test dn.x == 7.0 && dn.dx == 1.0
+        checkverify(ntupsum_dyn, (@NamedTuple{a::Float64,b::Float64},))
+
+        # regression: a dynamic getfield index into a HETEROGENEOUS struct (fields with different
+        # tangent types) is the genuinely hard case — must bail with a located error, never crash or
+        # silently return a wrong/zero derivative.
+        @test_throws "no dualization rule for builtin `getfield`" frule!!(
+            Dual(hetdyn, NoTangent()),
+            Dual(Het2(1.0, 2), build_tangent(Het2, 1.0, NoTangent())), Dual(1, NoTangent()))
+
+        # regression: a dynamic setfield! index — Phase A only, always bails (no same-shape support
+        # for writes).
+        @test_throws ErrorException frule!!(
+            Dual(setdyn!, NoTangent()),
+            Dual(MP2(1.0, 2.0), MutableTangent((x=1.0, y=1.0))),
+            Dual(1, NoTangent()), Dual(5.0, 1.0))
+
+        # dynamic getfield index into a homogeneous MUTABLE struct (Part 2b): the runtime index is a
+        # genuine `Argument` (`_3`), not a const-folded literal — assert that, then differentiate. The
+        # one-hot tangent seed (dx=1, dy=0) picks out exactly the selected field's derivative.
+        @test !(Base.code_ircode(mp2get, (MP2, Int))[1][1].stmts.stmt[1].args[3] isa Union{Int,Symbol,QuoteNode})
+        dmp1 = frule!!(Dual(mp2get, NoTangent()), Dual(MP2(3.0, 4.0), build_tangent(MP2, 1.0, 0.0)), Dual(1, NoTangent()))
+        @test dmp1.x == 3.0 && dmp1.dx == 1.0
+        dmp2 = frule!!(Dual(mp2get, NoTangent()), Dual(MP2(3.0, 4.0), build_tangent(MP2, 1.0, 0.0)), Dual(2, NoTangent()))
+        @test dmp2.x == 4.0 && dmp2.dx == 0.0
+        # same via a genuinely-dynamic loop index (a phi `SSAValue`): d/dm_i = 1 for each field.
+        dms = frule!!(Dual(mp2sum_dyn, NoTangent()), Dual(MP2(3.0, 4.0), build_tangent(MP2, 1.0, 0.0)))
+        @test dms.x == 7.0 && dms.dx == 1.0
+        checkverify(mp2get, (MP2, Int))
+        checkverify(mp2sum_dyn, (MP2,))
 
         # element write: mutates the caller's own primal and tangent arrays in place at the written
         # index only (each aliased to the caller's array, not to each other).
@@ -888,7 +1133,7 @@ arr_via_mut(p::MPoint) = arr_inner_mut(p)
         @test da ≈ 3.0 + 1.0
         @test db ≈ 2.0
 
-        # Tier 3: branches. `relu` is the multiple-reachable-`return`s shape (the common shape
+        # branches: `relu` is the multiple-reachable-`return`s shape (the common shape
         # Julia's optimizer actually produces for an `if/else` with a value in each arm — see
         # `_exit_blocks`'s docstring); `branch3` merges all three arms into a single `return` via one
         # `PhiNode` with three predecessors (exercises the `Switch`-with-more-than-two-targets path).
@@ -914,8 +1159,8 @@ arr_via_mut(p::MPoint) = arr_inner_mut(p)
             @test db ≈ (branch_struct(a, b + h) - branch_struct(a, b - h)) / 2h rtol = 1e-5
         end
 
-        # Tier 4: loops (back-edges). A loop body may execute an unknown number of times, so this is
-        # the first place the block stack and per-block comms `Stack`s are genuinely load-bearing
+        # loops: A loop body may execute an unknown number of times, so this is
+        # the first place the block stack and per-block comms `Stack`s are actually needed
         # (not just degenerate 0-or-1-entry stacks, as in the branch-only cases above) — and the
         # first place rdata `Ref`s must correctly reset/accumulate across repeated visits in exact
         # LIFO order. `sumk`/`sumk2`/`sumk_multi` are the existing forward-mode loop fixtures (a
@@ -975,6 +1220,64 @@ arr_via_mut(p::MPoint) = arr_inner_mut(p)
         checkverify_rev(sumk_multi, (Float64, Float64, Int))
         checkverify_rev(plus1, (Float64,))   # recursion into a hand-written reverse-mode rule (sin)
         checkverify_rev(nest, (Float64,))    # composed hand rules: sin(cos(x))
+
+        # Reverse-mode conversion intrinsics. `sitofp` (Int->Float promotion) is the INACTIVE bucket:
+        # its result carries a real tangent but its operands don't, so its pullback consumes the seed
+        # and contributes `NoRData` — d/dx (x·(1+2+3)) = 6. `fpext`/`fptrunc` (Float32<->Float64) is
+        # the LINEAR bucket: genuinely differentiable, d/dx (Float64(Float32(x)·2) + x) = 3. Before
+        # these rules existed, either bailed with "no reverse rule for intrinsic `sitofp`/`fptrunc`".
+        # Cross-checked against forward mode and finite differences.
+        _, dx_si = gradient(sitofp_ctl, 2.0)
+        @test dx_si == 6.0
+        @test dx_si == frule!!(Dual(sitofp_ctl, NoTangent()), Dual(2.0, 1.0)).dx
+        _, dx_mx = gradient(mix32_ctl, 1.0)
+        @test dx_mx == 3.0
+        @test dx_mx == frule!!(Dual(mix32_ctl, NoTangent()), Dual(1.0, 1.0)).dx
+        hh = 1e-5
+        @test dx_si ≈ (sitofp_ctl(2.0 + hh) - sitofp_ctl(2.0 - hh)) / 2hh rtol = 1e-5
+        @test dx_mx ≈ (mix32_ctl(1.0 + hh) - mix32_ctl(1.0 - hh)) / 2hh rtol = 1e-2  # Float32 FD is noisy
+        checkverify_rev(sitofp_ctl, (Float64,))
+        checkverify_rev(mix32_ctl, (Float64,))
+
+        # Dynamic (non-literal) `getfield` index (Phase B): `for i in 1:2` does not unroll, so `t[i]`
+        # reaches the pullback as a genuine dynamic index. Before the fix, the pullback resolved the
+        # field to a raw, unresolved `SSAValue` instead of its runtime value, silently degenerating
+        # `increment_field!!`'s `Val`-based dispatch into a no-op — the gradient came back `(0.0,0.0)`
+        # instead of `(1.0,1.0)`, with no error at all. `d/dt_1 = d/dt_2 = 1`.
+        _, dt_dyn = gradient(tupsum_dyn, (3.0, 4.0))
+        @test dt_dyn == (1.0, 1.0)
+        @test dt_dyn[1] == frule!!(Dual(tupsum_dyn, NoTangent()), Dual((3.0, 4.0), (1.0, 0.0))).dx
+        @test dt_dyn[2] == frule!!(Dual(tupsum_dyn, NoTangent()), Dual((3.0, 4.0), (0.0, 1.0))).dx
+        h = 1e-6
+        @test dt_dyn[1] ≈ (tupsum_dyn((3.0 + h, 4.0)) - tupsum_dyn((3.0 - h, 4.0))) / 2h rtol = 1e-5
+        @test dt_dyn[2] ≈ (tupsum_dyn((3.0, 4.0 + h)) - tupsum_dyn((3.0, 4.0 - h))) / 2h rtol = 1e-5
+        checkverify_rev(tupsum_dyn, (Tuple{Float64,Float64},))
+
+        # same, over a homogeneous NamedTuple.
+        _, dnt_dyn = gradient(ntupsum_dyn, (a=3.0, b=4.0))
+        @test dnt_dyn == (a=1.0, b=1.0)
+        checkverify_rev(ntupsum_dyn, (@NamedTuple{a::Float64,b::Float64},))
+
+        # dynamic getfield index into a homogeneous MUTABLE struct (Part 2b): the field's rdata
+        # contribution routes into the object's own `MutableTangent` via the runtime-`Int`
+        # `increment_field_rdata!` (not an object-level `RData`, as a mutable struct has none). The
+        # gradient w.r.t. the struct is a one-hot `MutableTangent` for a single selected field, and
+        # all-ones when summed over both. Index is a genuine `Argument`/`SSAValue`, not const-folded.
+        _, dmp2_r, _ = gradient(mp2get, MP2(3.0, 4.0), 2)
+        @test get_tangent_field(dmp2_r, :x) == 0.0 && get_tangent_field(dmp2_r, :y) == 1.0
+        _, dmp1_r, _ = gradient(mp2get, MP2(3.0, 4.0), 1)
+        @test get_tangent_field(dmp1_r, :x) == 1.0 && get_tangent_field(dmp1_r, :y) == 0.0
+        _, dms_r = gradient(mp2sum_dyn, MP2(3.0, 4.0))
+        @test get_tangent_field(dms_r, :x) == 1.0 && get_tangent_field(dms_r, :y) == 1.0
+        checkverify_rev(mp2get, (MP2, Int))
+        checkverify_rev(mp2sum_dyn, (MP2,))
+
+        # regression: a dynamic getfield index into a HETEROGENEOUS struct is the genuinely hard case
+        # — must bail with a located error, never crash or silently return a wrong/zero gradient.
+        @test_throws "dynamic (non-literal) field index" gradient(hetdyn, Het2(1.0, 2), 1)
+
+        # regression: a dynamic setfield! index — Phase A only, always bails.
+        @test_throws "dynamic (non-literal) field index" gradient(setdyn!, MP2(1.0, 2.0), 1, 5.0)
 
         # Phase D (unique-predecessor optimization): every push must still be matched by exactly one
         # pop across a full rule+pullback round trip — the class of bug ("accidentally
@@ -1061,8 +1364,13 @@ arr_via_mut(p::MPoint) = arr_inner_mut(p)
             @test dx_sum[k] ≈ (arr_sum(xp) - arr_sum(xm)) / 2e-6 rtol = 1e-5
         end
 
-        # Regression: in-place mutation is not supported (no assignment-tape) — must bail cleanly.
-        @test_throws ErrorException gradient(arr_mutate!, [1.0, 2.0])
+        # Array mutation (Part 3, `memoryrefset!`): `arr_mutate!(x) = (x[1] = 2*x[1]; x[1])` — the
+        # returned value only ever sees the *overwritten* x[1], so d/dx = [2.0, 0.0].
+        _, dx_mut = gradient(arr_mutate!, [1.0, 2.0])
+        @test dx_mut == [2.0, 0.0]
+        h = 1e-6
+        xp = [1.0 + h, 2.0]; xm = [1.0 - h, 2.0]
+        @test dx_mut[1] ≈ (arr_mutate!(xp) - arr_mutate!(xm)) / 2h rtol = 1e-5
 
         checkverify_rev(arr_idx3, (Vector{Float64},))
         checkverify_rev(arr_idx_branch, (Vector{Float64}, Bool))
@@ -1101,20 +1409,270 @@ arr_via_mut(p::MPoint) = arr_inner_mut(p)
         _, dx_plainsum = gradient(sum, x7)
         @test dx_plainsum == ones(4)
 
-        # Regressions: an array argument not traceable to a function argument (read out of a
-        # container struct), and a mutable-struct argument (unaffected by this milestone) must both
-        # still bail cleanly.
-        @test_throws ErrorException gradient(arr_via_box, [[1.0, 2.0]])
-        @test_throws ErrorException gradient(arr_via_mut, MPoint(1.0, 2.0))
+        # Piece 2: `vs[1]`'s identity is now tracked through the recursive call (see the comment on
+        # `arr_via_box` above): d/dv[1] = 1, d/dv[2] = 1.
+        _, dvs_avb = gradient(arr_via_box, [[1.0, 2.0]])
+        @test dvs_avb == [[1.0, 1.0]]
+        checkverify_rev(arr_via_box, (Vector{Vector{Float64}},))
+        check_stack_balance(arr_via_box, [[1.0, 2.0]])
+
+        # 3b: recursive call with a mutable-struct *argument* — the inner call's rule accumulates
+        # straight into the caller's own shared `MutableTangent`, so both fields' gradients come back.
+        _, dp_avm = gradient(arr_via_mut, MPoint(1.0, 2.0))
+        @test dp_avm == MutableTangent{@NamedTuple{x::Float64,y::Float64}}((x=1.0, y=1.0))
 
         checkverify_rev(arr_outer, (Vector{Float64},))
         checkverify_rev(arr_nest, (Vector{Float64},))
         checkverify_rev(arr_alias, (Vector{Float64},))
         checkverify_rev(f_sumdo, (Vector{Float64},))
+        checkverify_rev(arr_via_mut, (MPoint,))
 
         check_stack_balance(arr_outer, [3.0, 4.0])
         check_stack_balance(arr_alias, [3.0, 4.0])
         check_stack_balance(f_sumdo, [1.0, 2.0])
+        check_stack_balance(arr_via_mut, MPoint(1.0, 2.0))
+
+        # Tier 8: Part 3 — mutable-struct `getfield`/`setfield!` and array mutation (`memoryrefset!`).
+        p0 = MPoint(2.0, 3.0)
+        _, dp_read = gradient(mpoint_read, p0)
+        @test dp_read == MutableTangent{@NamedTuple{x::Float64,y::Float64}}((x=1.0, y=1.0))
+
+        p1 = MPoint(2.0, 3.0)
+        _, dp_setx, dv_setx = gradient(mpoint_setx!, p1, 10.0)
+        # p.x is overwritten before use, so its own gradient contribution is 0; p.y and v both flow
+        # straight through to the `+`.
+        @test dp_setx == MutableTangent{@NamedTuple{x::Float64,y::Float64}}((x=0.0, y=1.0))
+        @test dv_setx == 1.0
+        # Cross-check against the already-trusted forward-mode `frule!!` result for the same primal.
+        p2 = MPoint(2.0, 3.0)
+        fwd_setx = frule!!(Dual(mpoint_setx!, NoTangent()), Dual(p2, zero_tangent(p2)), Dual(10.0, 1.0))
+        @test dv_setx ≈ fwd_setx.dx
+        h = 1e-6
+        fd_v = (mpoint_setx!(MPoint(2.0, 3.0), 10.0 + h) - mpoint_setx!(MPoint(2.0, 3.0), 10.0 - h)) / 2h
+        @test dv_setx ≈ fd_v rtol = 1e-5
+
+        # Array mutation: the mutated element and an untouched one are both exercised via `sum`.
+        x8 = [3.0, 4.0]
+        _, dx_mutsum = gradient(arr_mutate_sum!, x8)
+        @test dx_mutsum == [2.0, 1.0]
+        for k in eachindex(x8)
+            xp = copy(x8); xp[k] += 1e-6
+            xm = copy(x8); xm[k] -= 1e-6
+            @test dx_mutsum[k] ≈ (arr_mutate_sum!(xp) - arr_mutate_sum!(xm)) / 2e-6 rtol = 1e-5
+        end
+
+        # Repeated mutation in a loop — the case the save/restore (`:old_primal`/`:old_tangent`)
+        # machinery exists for; also the strongest available proof that the *same* `MutableTangent`
+        # is shared across every iteration's separate `getfield` access (a broken-aliasing bug here
+        # would give a numerically wrong answer, not an error): d(result)/dr = ys[1]*ys[2] = 12,
+        # d(result)/dys[1] = r*ys[2] = 8, d(result)/dys[2] = r*ys[1] = 6.
+        r0 = Ref(2.0)
+        ys0 = [3.0, 4.0]
+        _, dr_loop, dys_loop = gradient(refprod_loop!, r0, ys0)
+        @test get_tangent_field(dr_loop, 1) ≈ 12.0
+        @test dys_loop == [8.0, 6.0]
+        @test r0[] == 2.0   # forward-replay mutates r0; the pullback's restore leaves it as found
+
+        # A closure over a `Ref`, read via two separate `getfield` calls
+        # (once before the mutation, once after) — must simply run without erroring, must leave `r`
+        # restored after a full forward+pullback round trip, and (since the primal returns `nothing`)
+        # contributes no gradient to `y` through the return value.
+        g, r = make_refmul_closure()
+        gcd, pb = rrule!!(zero_fcodual(g), Ctx(), CoDual(3.0, NoFData()))
+        @test primal(gcd) === nothing
+        _, dy_closure = pb(NoRData())
+        @test dy_closure == 0.0
+        @test r[] == 1.0
+
+        # `setfield!` of an array-valued field (fdata-carrying): the field's shadow is aliased to
+        # `w`'s own shadow, so `sum(b.v)`'s in-place accumulation into that shared array is `w`'s
+        # actual gradient, not a fresh zero. `b`'s own gradient is zero — its original `.v` is
+        # overwritten before ever being read, mirroring `mpoint_setx!` above.
+        b1 = MBox([1.0, 2.0])
+        w1 = [3.0, 4.0]
+        _, db_setbox, dw_setbox = gradient(setbox_sum!, b1, w1)
+        @test db_setbox == MutableTangent{@NamedTuple{v::Vector{Float64}}}((v=[0.0, 0.0],))
+        @test dw_setbox == [1.0, 1.0]
+        h2 = 1e-6
+        for k in eachindex(w1)
+            wp = copy(w1); wp[k] += h2
+            wm = copy(w1); wm[k] -= h2
+            fd = (setbox_sum!(MBox([1.0, 2.0]), wp) - setbox_sum!(MBox([1.0, 2.0]), wm)) / 2h2
+            @test dw_setbox[k] ≈ fd rtol = 1e-5
+            # Cross-check against forward mode: the reverse-mode gradient's k-th entry is exactly the
+            # forward-mode directional derivative along the k-th basis vector.
+            ek = zeros(length(w1)); ek[k] = 1.0
+            fwd_setbox = frule!!(Dual(setbox_sum!, NoTangent()),
+                                 Dual(MBox([1.0, 2.0]), zero_tangent(MBox([1.0, 2.0]))),
+                                 Dual(w1, ek))
+            @test dw_setbox[k] ≈ fwd_setbox.dx
+        end
+        # `setbox!` (returns `nothing`, `b.v` never read back downstream) now runs to completion
+        # instead of bailing — the aliasing mechanism handles it fine, there is just nothing
+        # downstream to carry a gradient to `w`. `gradient`/`gradient!` both seed the pullback with
+        # `one(y)`, which has no method for `y === nothing` (a pre-existing, unrelated restriction of
+        # that convenience API to scalar-output primals) — so exercise `rrule!!` directly with an
+        # explicit `NoRData()` seed, exactly as `make_refmul_closure` above does for the same reason.
+        b0 = MBox([1.0, 2.0])
+        bshadow0 = MutableTangent{@NamedTuple{v::Vector{Float64}}}((v=zeros(2),))
+        w0 = [3.0, 4.0]
+        wshadow0 = zeros(2)
+        ycd0, pb0 = rrule!!(zero_fcodual(setbox!), Ctx(), CoDual(b0, bshadow0), CoDual(w0, wshadow0))
+        @test primal(ycd0) === nothing
+        pb0(NoRData())
+        @test bshadow0 == MutableTangent{@NamedTuple{v::Vector{Float64}}}((v=[0.0, 0.0],))
+        @test wshadow0 == [0.0, 0.0]
+
+        # Array allocation (Case 2 final step): `mutate_nested!` returns `nothing`, so `gradient`'s
+        # `one(y)` seeding doesn't apply — exercise `rrule!!` directly with an explicit `NoRData()`
+        # seed, exactly as `setbox!` above. The freshly-allocated `[9.0, 9.0]` has no dependency on
+        # `x`, so its aliased shadow is zero; the pullback's restore leaves `x`/its shadow as found.
+        xm0 = [[1.0, 2.0], [3.0, 4.0]]
+        xmshadow0 = [[0.0, 0.0], [0.0, 0.0]]
+        ycdm, pbm = rrule!!(zero_fcodual(mutate_nested!), Ctx(), CoDual(xm0, xmshadow0))
+        @test primal(ycdm) === nothing
+        @test xm0 == [[9.0, 9.0], [3.0, 4.0]]        # forward replay mutated x[1] in place
+        @test xmshadow0 == [[0.0, 0.0], [0.0, 0.0]]  # aliased shadow of the fresh array is zero
+        @test pbm(NoRData()) == (NoRData(), NoRData())
+        @test xm0 == [[1.0, 2.0], [3.0, 4.0]]        # pullback restored the overwritten slot
+        @test xmshadow0 == [[0.0, 0.0], [0.0, 0.0]]
+        checkverify_rev(mutate_nested!, (Vector{Vector{Float64}},))
+
+        # Scalar-returning allocation tests (see the function definitions above for why `zeros` +
+        # explicit writes, not a `[a,b]` literal): finite-difference-checked, `gradient`-based.
+        _, dx_aas = gradient(alloc_and_sum, 3.0)
+        @test dx_aas ≈ 3.0
+        h = 1e-6
+        @test dx_aas ≈ (alloc_and_sum(3.0 + h) - alloc_and_sum(3.0 - h)) / 2h rtol = 1e-5
+        checkverify_rev(alloc_and_sum, (Float64,))
+        check_stack_balance(alloc_and_sum, 3.0)
+
+        # Allocation + 2b argument-array aliasing together: the freshly-allocated array is stored into
+        # `x[1]` and read back *through `x`*, so the gradient w.r.t. `a` must flow through both the
+        # allocation's own shadow chain and the argument-array aliasing machinery; `x`'s own gradient
+        # is zero (its original `x[1]` is overwritten before ever being read).
+        _, dx_asr, da_asr = gradient(alloc_store_read!, [[1.0, 2.0], [3.0, 4.0]], 5.0)
+        @test dx_asr == [[0.0, 0.0], [0.0, 0.0]]
+        @test da_asr ≈ 3.0
+        @test da_asr ≈ (alloc_store_read!([[1.0, 2.0], [3.0, 4.0]], 5.0 + h) -
+                        alloc_store_read!([[1.0, 2.0], [3.0, 4.0]], 5.0 - h)) / 2h rtol = 1e-5
+        checkverify_rev(alloc_store_read!, (Vector{Vector{Float64}}, Float64))
+        check_stack_balance(alloc_store_read!, [[1.0, 2.0], [3.0, 4.0]], 5.0)
+
+        # Adversarial: reverse mode's shadow `memoryrefnew` now forces its own boundscheck flag `true`
+        # (mirroring forward mode's identical safety note — `Dual`/`CoDual`'s constructor never checks
+        # a caller-supplied tangent array's *length* against its primal's), so a too-short shadow
+        # raises a catchable `BoundsError` instead of corrupting memory via an unchecked out-of-bounds
+        # `MemoryRef`. Not allocation-specific (the checked ref is the *argument* array's own), but the
+        # same `Base.memoryrefnew` rule allocation itself now depends on.
+        @test_throws BoundsError rrule!!(zero_fcodual(arr_idx3), Ctx(),
+                                         CoDual([1.0, 2.0, 3.0, 4.0], [1.0]))
+
+        # Regression: still out of scope, must bail cleanly (a located reason, not a crash) — growing
+        # an existing array (`push!`/`resize!`) routes through `Core.memoryrefoffset`, a distinct,
+        # still-unhandled builtin (unrelated to allocation, which is now fully supported).
+        @test_throws ErrorException gradient(growvec!, [1.0, 2.0], 3.0)
+
+        # Piece 2 (`memoryrefget` provenance) / Piece 3 (`memoryrefset!` fdata-aliasing): nested-array
+        # read and write-then-read, no allocation involved.
+        _, dx_nr = gradient(nested_read, [[1.0, 2.0], [3.0, 4.0]])
+        @test dx_nr == [[1.0, 1.0], [0.0, 0.0]]
+        h = 1e-6
+        for k in 1:2
+            xp = [[1.0, 2.0], [3.0, 4.0]]; xp[1][k] += h
+            xm = [[1.0, 2.0], [3.0, 4.0]]; xm[1][k] -= h
+            @test dx_nr[1][k] ≈ (nested_read(xp) - nested_read(xm)) / 2h rtol = 1e-5
+        end
+
+        _, dx_nwe, dw_nwe = gradient(nested_write_existing, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
+        @test dx_nwe == [[0.0, 0.0], [0.0, 0.0]]   # x[1] overwritten before use — zero, not aliased
+        @test dw_nwe == [1.0, 1.0]
+        for k in 1:2
+            wp = [5.0, 6.0]; wp[k] += h
+            wm = [5.0, 6.0]; wm[k] -= h
+            fd = (nested_write_existing([[1.0, 2.0], [3.0, 4.0]], wp) -
+                  nested_write_existing([[1.0, 2.0], [3.0, 4.0]], wm)) / 2h
+            @test dw_nwe[k] ≈ fd rtol = 1e-5
+        end
+
+        # Adversarial: both aliases read back — the gradient must sum both contributions (a broken,
+        # fresh-zero shadow would only ever show one of them).
+        _, dx_rb, dw_rb = gradient(nested_write_read_both, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
+        @test dx_rb == [[0.0, 0.0], [0.0, 0.0]]
+        @test dw_rb == [2.0, 2.0]
+
+        # Adversarial: mutate a scalar element through the alias — real array aliasing means this
+        # also mutates `w` in the primal, and the gradient must track that: d/dw[1] = 3, d/dw[2] = 1.
+        _, dx_mt, dw_mt = gradient(nested_write_mutate_through, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
+        @test dx_mt == [[0.0, 0.0], [0.0, 0.0]]
+        @test dw_mt == [3.0, 1.0]
+
+        # Adversarial: a pre-seeded non-zero incoming shadow on `w` must accumulate, not overwrite —
+        # exercise `rrule!!` directly with explicit shadows, mirroring `make_refmul_closure` above.
+        x0 = [[1.0, 2.0], [3.0, 4.0]]
+        xshadow0 = [[0.0, 0.0], [0.0, 0.0]]
+        w0 = [5.0, 6.0]
+        wshadow0 = [10.0, 20.0]
+        ycd_nwe, pb_nwe = rrule!!(zero_fcodual(nested_write_existing), Ctx(),
+                                  CoDual(x0, xshadow0), CoDual(w0, wshadow0))
+        pb_nwe(1.0)
+        @test wshadow0 == [11.0, 21.0]                 # accumulated onto the pre-seeded [10.0, 20.0]
+        @test xshadow0 == [[0.0, 0.0], [0.0, 0.0]]      # restore leaves x's own slot untouched
+
+        checkverify_rev(nested_read, (Vector{Vector{Float64}},))
+        checkverify_rev(nested_write_existing, (Vector{Vector{Float64}}, Vector{Float64}))
+        checkverify_rev(nested_write_read_both, (Vector{Vector{Float64}}, Vector{Float64}))
+        checkverify_rev(nested_write_mutate_through, (Vector{Vector{Float64}}, Vector{Float64}))
+
+        check_stack_balance(nested_read, [[1.0, 2.0], [3.0, 4.0]])
+        check_stack_balance(nested_write_existing, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
+        check_stack_balance(nested_write_read_both, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
+        check_stack_balance(nested_write_mutate_through, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
+
+        # Piece 2: `vs[1]`'s provenance is tracked, so aliasing it into `MArrBox.v` is safe too:
+        # d/dvs[1] = [1.0, 1.0], d/dvs[2] = [0.0, 0.0] (untouched).
+        _, dvs_abu = gradient(arrbox_untraced, [[1.0, 2.0], [3.0, 4.0]])
+        @test dvs_abu == [[1.0, 1.0], [0.0, 0.0]]
+        checkverify_rev(arrbox_untraced, (Vector{Vector{Float64}},))
+        check_stack_balance(arrbox_untraced, [[1.0, 2.0], [3.0, 4.0]])
+
+        # 3a: `%new` of a mutable struct, purely locally (no cross-call boundary) — checked against
+        # finite differences.
+        _, dx_nml = gradient(newmut_local, 3.0)
+        @test dx_nml ≈ 1.0
+        h = 1e-6
+        @test dx_nml ≈ (newmut_local(3.0 + h) - newmut_local(3.0 - h)) / 2h rtol = 1e-5
+
+        # 3a + 3b together (the original target case): `%new` of a mutable struct crossing a genuine
+        # `@noinline` recursive-call boundary.
+        _, dx_nm = gradient(newmut, 5.0)
+        @test dx_nm ≈ 1.0
+        @test dx_nm ≈ (newmut(5.0 + h) - newmut(5.0 - h)) / 2h rtol = 1e-5
+
+        # 3a + 3b + mutation inside the callee: a locally-created mutable struct passed to a
+        # recursive callee that mutates it in place before the caller ever reads it back.
+        _, dx_nmr = gradient(newmut_recursive_mutate, 2.0)
+        @test dx_nmr ≈ 1.0
+        @test dx_nmr ≈ (newmut_recursive_mutate(2.0 + h) - newmut_recursive_mutate(2.0 - h)) / 2h rtol = 1e-5
+
+        checkverify_rev(mpoint_read, (MPoint,))
+        checkverify_rev(mpoint_setx!, (MPoint, Float64))
+        checkverify_rev(arr_mutate!, (Vector{Float64},))
+        checkverify_rev(arr_mutate_sum!, (Vector{Float64},))
+        checkverify_rev(refprod_loop!, (Base.RefValue{Float64}, Vector{Float64}))
+        checkverify_rev(setbox_sum!, (MBox, Vector{Float64}))
+        checkverify_rev(newmut_local, (Float64,))
+        checkverify_rev(newmut, (Float64,))
+        checkverify_rev(newmut_recursive_mutate, (Float64,))
+
+        check_stack_balance(mpoint_setx!, MPoint(2.0, 3.0), 10.0)
+        check_stack_balance(arr_mutate!, [1.0, 2.0])
+        check_stack_balance(arr_mutate_sum!, [3.0, 4.0])
+        check_stack_balance(refprod_loop!, Ref(2.0), [3.0, 4.0])
+        check_stack_balance(setbox_sum!, MBox([1.0, 2.0]), [3.0, 4.0])
+        check_stack_balance(newmut_local, 3.0)
+        check_stack_balance(newmut, 5.0)
+        check_stack_balance(newmut_recursive_mutate, 2.0)
     end
 
     include("test_intrinsic_dispatch.jl")      # dispatch-based intrinsic handling (add_float)

@@ -24,6 +24,36 @@
 
 apply_builtin_frule!(::Val{F}, actual, Ti, ctx) where {F} = nothing
 
+# True for a `getfield`/`setfield!` name/index operand that's already a compile-time literal
+# (`QuoteNode(sym)`, a bare `Symbol`, or a bare `Int`) — needs no resolution. Anything else
+# (`SSAValue`/`Argument`) is a dynamic, runtime-computed index (e.g. `t[i]` inside a loop).
+_bi_literal_index(@nospecialize(x)) = isa(x, QuoteNode) || isa(x, Symbol) || isa(x, Int)
+
+# The common tangent type shared by every field of concrete type `P`, or `nothing` if `P` isn't
+# concrete or its fields don't all share one tangent type. A dynamic (runtime-computed) field index
+# only has a single well-defined tangent type when this holds — used both to allow a dynamic index
+# into a homogeneous same-shape aggregate (Tuple/NamedTuple/Array/Dual, or a homogeneous mutable
+# struct — both `builtins.jl` and reverse mode's `builtins_reverse.jl` share this one helper rather
+# than duplicating the check) and to recognize an object that's entirely non-differentiable (every
+# field's tangent type is `NoTangent`) regardless of which field a dynamic index happens to hit.
+#
+# A HETEROGENEOUS object (differing per-field tangent types) always fails this check and so always
+# bails on a dynamic index — a deliberate scope limit, not an unfinished TODO: it mirrors Mooncake's
+# own restriction of dynamic `getfield` to homogeneous immutable structures (see
+# `is_homogeneous_and_immutable`, `Mooncake.jl/src/rules/builtins.jl:1069`). A generated-unrolling
+# path that dispatched per-field for the heterogeneous case would be fragile and type-unstable, and
+# is out of scope even in the mature reference implementation.
+function _bi_homog_tangent_type(P)
+    (P isa DataType && isconcretetype(P)) || return nothing
+    nf = fieldcount(P)
+    nf == 0 && return nothing
+    tt1 = tangent_type(fieldtype(P, 1))
+    for j in 2:nf
+        tangent_type(fieldtype(P, j)) === tt1 || return nothing
+    end
+    return tt1
+end
+
 const _getfieldg  = GlobalRef(Core, :getfield)
 const _setfieldg  = GlobalRef(Core, :setfield!)
 const _memnewg    = GlobalRef(Core, :memorynew)
@@ -38,20 +68,44 @@ const _ifelseg    = GlobalRef(Core, :ifelse)
 # verbatim (faithful primal reconstruction; harmless on the same-shape shadow branches too, since no
 # bounds are touched by `getfield` itself). The general-struct branch never receives them: a
 # `Tangent`/`MutableTangent` field read has no atomicity/boundscheck concept.
+#
+# `actual[2]` (the field name/index) is usually a literal `Symbol`/`Int`/`QuoteNode`, for which
+# `presolve` is a no-op — but a dynamic index (`t[i]` inside a loop, lowered to
+# `getfield(t, i)` with `i` a genuine `SSAValue`/`Argument`) must be resolved to this pass's own
+# numbering like any other operand, not embedded as a dangling reference into the primal's numbering
+# (embedding it raw crashed with a `TypeError`, since the two numberings diverge once shadow
+# instructions are interleaved).
 function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
     Pobj = ctx.optype(actual[1])
-    p = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(actual[1]), actual[2],
-                       (ctx.presolve(a) for a in actual[3:end])...), Ti)
+    idx = ctx.presolve(actual[2])
     TT = ctx.tt(Ti)
+    if !_bi_literal_index(actual[2]) && TT !== NoTangent
+        # Dynamic index into a differentiable field: only safe when every field of the object shares
+        # one tangent type (a homogeneous Tuple/NamedTuple/Array/Dual, or a homogeneous mutable
+        # struct — the common tuple-iteration pattern plus its mutable-struct analogue), so the
+        # runtime index always selects a validly-typed shadow value regardless of which field it
+        # lands on. A heterogeneous struct has no such guarantee (different fields could need
+        # different tangent types); bail rather than guess.
+        if !(Pobj <: Dual || Pobj <: Tuple || Pobj <: NamedTuple || Pobj <: Array ||
+             (Pobj isa DataType && ismutabletype(Pobj))) ||
+           _bi_homog_tangent_type(Pobj) !== TT
+            return nothing
+        end
+    end
+    p = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(actual[1]), idx,
+                       (ctx.presolve(a) for a in actual[3:end])...), Ti)
     t = if TT === NoTangent
         NoTangent()
     elseif Pobj <: Dual || Pobj <: Tuple || Pobj <: NamedTuple || Pobj <: Array
         # Same-shape tangent (Dual/Tuple/NamedTuple/Array): index/name the shadow aggregate directly.
-        ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), actual[2],
+        ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), idx,
                        (ctx.presolve(a) for a in actual[3:end])...), TT)
     else
-        # General struct: read the field's tangent out of the Tangent/MutableTangent.
-        ctx.emit!(Expr(:call, get_tangent_field, ctx.tresolve(actual[1]), actual[2]), TT)
+        # General struct (including a homogeneous mutable struct admitted by the dynamic-index gate
+        # above): read the field's tangent out of the Tangent/MutableTangent. `get_tangent_field` is
+        # generic over both and has a runtime-`Int` method, so a dynamic index here is type-stable
+        # exactly when the gate proved the object homogeneous.
+        ctx.emit!(Expr(:call, get_tangent_field, ctx.tresolve(actual[1]), idx), TT)
     end
     p, t
 end
@@ -59,12 +113,24 @@ end
 # setfield!(obj, name, value[, ordering]) mutates obj in place and returns value. Only legal on a
 # genuinely mutable primal, whose shadow is therefore always a MutableTangent. A 4th (atomic-ordering)
 # arg is forwarded to the primal call only; `set_tangent_field!` has no atomics concept.
+#
+# `actual[2]` gets the same always-resolve treatment as `getfield` above. Unlike `getfield`, a
+# dynamic *write* index gets no same-shape support (Phase B): `set_tangent_field!` needs a
+# statically-known field to place the new value into the right `NamedTuple` slot type, and a
+# same-shape aggregate is never itself mutable, so there's no tractable common case to support. Bail
+# unless the object is entirely non-differentiable (every field's tangent type is `NoTangent`), in
+# which case no field a dynamic index could hit carries a tangent anyway.
 function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
-    p = ctx.emit!(Expr(:call, _setfieldg, ctx.presolve(actual[1]), actual[2], ctx.presolve(actual[3]),
+    idx = ctx.presolve(actual[2])
+    Pobj = ctx.optype(actual[1])
+    if !_bi_literal_index(actual[2]) && !(Pobj isa DataType && _bi_homog_tangent_type(Pobj) === NoTangent)
+        return nothing
+    end
+    p = ctx.emit!(Expr(:call, _setfieldg, ctx.presolve(actual[1]), idx, ctx.presolve(actual[3]),
                        (ctx.presolve(a) for a in actual[4:end])...), Ti)
     TT = ctx.tt(Ti)
     t = TT === NoTangent ? NoTangent() :
-        ctx.emit!(Expr(:call, set_tangent_field!, ctx.tresolve(actual[1]), actual[2],
+        ctx.emit!(Expr(:call, set_tangent_field!, ctx.tresolve(actual[1]), idx,
                        ctx.tresolve(actual[3])), TT)
     p, t
 end

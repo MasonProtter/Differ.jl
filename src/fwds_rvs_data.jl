@@ -1097,6 +1097,34 @@ function increment_rdata!!(t::T, r) where {T}
 end
 
 """
+    increment_field_rdata!(dx::MutableTangent, dy_rdata, f) -> dx
+
+Increment field `f` of a mutable struct's tangent by an rdata contribution `dy_rdata`, in place.
+Ported from Mooncake's `increment_field_rdata!` (`src/rules/misc.jl`) — the mutable-struct analogue of
+`increment_field!!` (`tangents.jl`): a mutable struct has no rdata of its own (its whole tangent lives
+in fdata), so a field access routes its contribution here instead of into an object-level `RData`
+accumulator.
+"""
+increment_field_rdata!(dx::MutableTangent, ::NoRData, ::Val) = dx
+increment_field_rdata!(dx::NoFData, ::NoRData, ::Val) = dx
+function increment_field_rdata!(dx::T, dy_rdata, ::Val{f}) where {T<:MutableTangent,f}
+    set_tangent_field!(dx, f, increment_rdata!!(get_tangent_field(dx, f), dy_rdata))
+    return dx
+end
+
+# Runtime-`Int` field index, for a dynamic (non-literal) `getfield` into a *homogeneous* mutable
+# struct (every field shares one tangent type, so field `i` is well-typed regardless of which one a
+# runtime index lands on — `_bi_homog_tangent_type`, `builtins.jl`). Body identical to the `Val`
+# method above with `f` -> `i`; used by reverse mode's `Core.getfield` rule (`builtins_reverse.jl`)
+# once its comms scan has proven the object homogeneous.
+increment_field_rdata!(dx::MutableTangent, ::NoRData, ::Int) = dx
+increment_field_rdata!(dx::NoFData, ::NoRData, ::Int) = dx
+function increment_field_rdata!(dx::T, dy_rdata, i::Int) where {T<:MutableTangent}
+    set_tangent_field!(dx, i, increment_rdata!!(get_tangent_field(dx, i), dy_rdata))
+    return dx
+end
+
+"""
     zero_tangent(primal, fdata)
 
 Equivalent to `tangent(fdata, zero_rdata(primal))`.

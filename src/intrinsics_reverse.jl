@@ -16,6 +16,9 @@
 #
 # `ctx.opf(name, ty, args...)` is the same tiny helper as forward mode's: emit
 # `Expr(:call, GlobalRef(Core.Intrinsics, name), args...)` typed `ty`, return its `SSAValue`.
+# `ctx.optype(k)` reads operand `k`'s own *declared* primal type straight from the primal IR — needed
+# by a rule whose backward conversion depends on an operand's type rather than the statement's own
+# result type `Ti` (`fpext`/`fptrunc` below).
 #
 # The fallback returns `nothing`, so an intrinsic with no registered reverse rule bails (in
 # `reverse_to_ircode`) with a clear, located reason instead of silently dropping a gradient
@@ -97,5 +100,34 @@ for (div, neg, mul) in ((:div_float, :neg_float, :mul_float), (:div_float_fast, 
         db = ctx.opf($(QuoteNode(neg)), Ti,
                      ctx.opf($(QuoteNode(div)), Ti, num, ctx.opf($(QuoteNode(mul)), Ti, b, b)))
         return da, db
+    end
+end
+
+# `sitofp`/`uitofp` (Int→Float conversion): the RESULT carries rdata (its primal type is a float),
+# but both operands — the integer value and the leading type argument — are non-differentiable (an
+# integer's tangent is `NoTangent`, a type's is `NoTangent` too). This is the *inactive* bucket,
+# mirroring `@inactive_intrinsic` on the forward side (`intrinsics.jl`): the pullback consumes the
+# seed and contributes `NoRData()` to every operand. Do not confuse with the linear bucket below —
+# these have a differentiable *result* but non-differentiable *operands*, the opposite shape from a
+# typical inactive intrinsic (whose result is also non-differentiable), which is why they need their
+# own rule at all rather than being skipped by the `rdtype(Ti) === NoRData` check in the caller.
+for op in (:sitofp, :uitofp)
+    @eval intrinsic_rrule_operands(::Val{Core.Intrinsics.$op}) = ()
+    @eval function apply_intrinsic_rrule!(::Val{Core.Intrinsics.$op}, pvals, dz, Ti, ctx)
+        return ntuple(_ -> NoRData(), length(pvals))
+    end
+end
+
+# `fpext`/`fptrunc` (`Float32`<->`Float64` width conversion): genuinely differentiable, unlike the
+# int/float conversions above — `d(convert(T,a))/da = convert(T,da)`, mirroring forward mode's linear
+# rule (`intrinsics.jl:148-154`). The operand's contribution is `dz` converted back to the operand's
+# own (narrower/wider) type via the *opposite* conversion. The operand's own primal type isn't
+# derivable from `pvals` (a resolved value, not a type) or `Ti` (the statement's own result type) —
+# `ctx.optype(2)` reads it straight from the primal IR.
+for (op, invop) in ((:fpext, :fptrunc), (:fptrunc, :fpext))
+    @eval intrinsic_rrule_operands(::Val{Core.Intrinsics.$op}) = ()
+    @eval function apply_intrinsic_rrule!(::Val{Core.Intrinsics.$op}, pvals, dz, Ti, ctx)
+        Pa = ctx.optype(2)
+        return NoRData(), ctx.opf($(QuoteNode(invop)), Pa, Pa, dz)
     end
 end

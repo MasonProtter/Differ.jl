@@ -35,7 +35,7 @@
 # recursive calls into another primal (concrete callee + concrete, trivial-fdata args only — see
 # `_static_recursible_call`; a hand-written rule, `src/rrules.jl`, always takes priority over raw
 # recursion via ordinary method-table dispatch, mirroring `frules.jl`), and read-only array indexing
-# via a provenance chain traceable to a function argument (see `_array_shadow_tracked`). Still out of
+# via a provenance chain traceable to a function argument (see `_fdata_tracked`). Still out of
 # scope, bails cleanly: mutable structs, array mutation, dynamic-dispatch recursion, try/catch (see
 # the control-flow plan's Phase E).
 
@@ -494,20 +494,32 @@ function _unique_predecessor_info(pir, exit_blocks::Vector{Int})
     return is_unique_pred, pred_is_unique_pred
 end
 
-# Part 2 (read-only array indexing) static provenance analysis: which SSA statements' values are a
-# `MemoryRef` traceable, through *exactly* the chain Julia 1.13 lowers `x[i]` to, back to a function
-# argument whose fdata is non-trivial (i.e. an `Array` argument — confirmed by direct inspection of
-# `Base.code_ircode` on `x[1]`/a hand-written summation loop, per the `adnext-extending-ir-support`
-# methodology: `Base.getfield(x, :ref)::MemoryRef{T}` then `Base.memoryrefnew(ref, i, false)`, with an
-# optional `PiNode` alias in between). Bounds the feature precisely: an array reachable any other way
-# (nested in a struct field, returned from a call, locally `Vector{T}(undef,...)`-allocated) is
-# untracked — and untracked-but-differentiable is a real bail at the point of use (`_scan_block_comms`
-# /the fwds-pass builtin dispatch below), never silently mishandled.
+# Part 2 (read-only array indexing) static provenance analysis, extended by Part 3 (`src/CLAUDE.md`
+# mutable-struct/array-mutation milestone) to general struct fields: which SSA statements' values have
+# a statically-known *fdata* (shadow), traceable back to a function argument whose own fdata is
+# non-trivial. Two chains:
 #
-# Which top-level (fwds-carrier) arguments carry non-trivial fdata (an `Array`, today — mutable
-# structs are handled separately since this engine doesn't support them at all yet). Factored out of
-# `_array_shadow_tracked` so `_static_recursible_call`'s Part 3 array-argument-recursion guard can
-# check a bare `Core.Argument` operand directly without recomputing this.
+#  * The array-index chain (original Part 2): *exactly* the shape Julia 1.13 lowers `x[i]` to, back to
+#    an `Array` argument — confirmed by direct inspection of `Base.code_ircode` on `x[1]`/a
+#    hand-written summation loop, per the `adnext-extending-ir-support` methodology:
+#    `Base.getfield(x, :ref)::MemoryRef{T}` then `Base.memoryrefnew(ref, i, false)`, with an optional
+#    `PiNode` alias in between.
+#  * The general-struct chain (Part 3): `Core.getfield(x, fld)` off a tracked, non-`Array` object,
+#    whenever the result itself has non-trivial fdata (a nested array or mutable-struct field) —
+#    `_get_fdata_field` (`fwds_rvs_data.jl`) covers `FData`/`MutableTangent`/`Tuple`/`NamedTuple`
+#    uniformly, so an immutable closure holding a mutable ref and a mutable struct holding another
+#    mutable struct both work with the same emission path (`apply_builtin_rrule_fwds!`,
+#    `builtins_reverse.jl`).
+#
+# Bounds the feature precisely: an array/struct reachable any other way (nested inside a returned
+# value, freshly allocated, read out of a container via ordinary indexing) is untracked — and
+# untracked-but-differentiable is a real bail at the point of use (`_scan_block_comms`/the builtin
+# dispatch layer), never silently mishandled.
+#
+# Which top-level (fwds-carrier) arguments carry non-trivial fdata (an `Array`, a mutable struct, an
+# immutable struct/closure with a mutable-struct or array field, ...). Factored out of
+# `_fdata_tracked` so `_static_recursible_call`'s Part 3 array-argument-recursion guard can check a
+# bare `Core.Argument` operand directly without recomputing this.
 function _arg_fdata_tracked(n::Int, codualparams::Vector{Any})
     arg_tracked = falses(n)
     for k in 1:n
@@ -518,13 +530,13 @@ end
 
 # Returns a `BitVector` of length `length(pir.stmts)`, indexed by SSA id (`tracked[i]`). Argument
 # provenance (`Core.Argument(k)`) is checked inline via `arg_tracked` rather than returned, since
-# every caller that needs it (`_scan_block_comms`'s `memoryrefget` case, the fwds-pass builtin
-# dispatch) only ever looks the chain up starting from an `SSAValue` (the `memoryrefnew`/`PiNode`
-# result the `MemoryRef` handle actually flows through), never a bare `Argument` directly. Part 3
+# every caller that needs it (`_scan_block_comms`'s `memoryrefget` case, the builtin dispatch layer)
+# only ever looks the chain up starting from an `SSAValue` (the `memoryrefnew`/`PiNode`/general-struct
+# `getfield` result the shadow handle actually flows through), never a bare `Argument` directly. Part 3
 # (array-argument recursion, `_static_recursible_call`) additionally needs `arg_tracked` itself, for
 # a call whose argument is a bare `Core.Argument`, so it's exposed via `_arg_fdata_tracked` above
 # rather than recomputed.
-function _array_shadow_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
+function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
     N = length(pir.stmts)
     tracked = falses(N)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
@@ -535,25 +547,64 @@ function _array_shadow_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
         s = pir.stmts[i][:stmt]
         if isa(s, Core.PiNode)
             tracked[i] = provenance_tracked(s.val)
+        elseif isa(s, Expr) && s.head === :new
+            # A locally-created mutable struct is a fresh provenance root: the fwds pass always
+            # builds it a real `MutableTangent` shadow (see the `:new` case in
+            # `reverse_fwds_to_ircode`), so downstream `getfield`/`setfield!` on it can resolve a
+            # shadow with no function-argument ancestor at all. Only when `T` actually has
+            # differentiable content (`fdtype(T) !== NoFData`) -- otherwise `tangent_type(T) ===
+            # NoTangent` and there is no `MutableTangent` type to build a shadow of. `_calleeval`
+            # resolves a `GlobalRef` type argument (the common shape after optimization -- confirmed
+            # by inspecting real IR, `%new(Main.MPoint, ...)`, not a literal `DataType`) at the
+            # inference world.
+            T = _calleeval(s.args[1], iworld)
+            tracked[i] = T isa DataType && ismutabletype(T) && fdtype(T) !== NoFData
         elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
             fpos, actual = _call_parts(s)
             f = _calleeval(fpos, iworld)
             if f === Core.getfield && length(actual) >= 2 && provenance_tracked(actual[1])
                 fk = actual[2]
                 fname = isa(fk, QuoteNode) ? fk.value : fk
-                if fname === :ref && (pir.stmts[i][:type] <: MemoryRef)
+                Ti = pir.stmts[i][:type]
+                Pobj = _optype(pir, actual[1])
+                if fname === :ref && _widen(Ti) <: MemoryRef
+                    tracked[i] = true
+                elseif fdtype(Ti) !== NoFData && !(Pobj isa DataType && Pobj <: Array)
+                    # Part 3: a general struct field whose own value has non-trivial fdata (a nested
+                    # array or mutable-struct field) — kept off the `Array` case above, whose shadow is
+                    # a raw `.ref`-chain `MemoryRef`, not something `_get_fdata_field` handles.
                     tracked[i] = true
                 end
+            elseif f === Core.memorynew && !isempty(actual)
+                # Array allocation step 1: a fresh `Memory{P}` is itself a provenance root (no
+                # ancestor to check), exactly like a locally-`%new`'d mutable struct above — its
+                # shadow `Memory` backs the `memoryrefnew`/`%new(Vector,...)` that follow in the
+                # same 4-statement allocation sequence.
+                MT = _widen(pir.stmts[i][:type])
+                tracked[i] = MT isa DataType && MT <: Memory && fdtype(MT) !== NoFData
             elseif f === Base.memoryrefnew && !isempty(actual) && provenance_tracked(actual[1])
                 tracked[i] = true
+            elseif f === Base.memoryrefget && !isempty(actual) && provenance_tracked(actual[1])
+                # A read off a tracked ref whose own *result* is itself array/mutable-struct-valued
+                # (a nested array) is a provenance root in turn — its shadow is the corresponding
+                # element of the shadow array (mirrored onto the shadow ref in the fwds emission,
+                # `apply_builtin_rrule_fwds!(::Val{Base.memoryrefget}, ...)`, `builtins_reverse.jl`).
+                # A scalar (bits) result carries no fdata of its own, so is deliberately left
+                # untracked here — its gradient flows via rdata routing, not shadow aliasing.
+                fdtype(pir.stmts[i][:type]) !== NoFData && (tracked[i] = true)
             end
         end
     end
     return tracked
 end
 
-rdtype(@nospecialize P) = rdata_type(tangent_type(P))
-fdtype(@nospecialize P) = fdata_type(tangent_type(P))
+# `P` is usually a plain `Type` (`pir.stmts[i][:type]`), but a statement whose result the primal's
+# own const-prop narrowed (e.g. a `Core.memorynew` call with a literal length) can carry a
+# `Core.PartialStruct`/`Const` lattice element instead — widen it first, since `tangent_type` is only
+# ever defined on `Type`s. Mirrors `tt` in `forward_interp.jl` (`dualize_to_ircode`).
+_widen(@nospecialize T) = T isa Type ? T : CC.widenconst(T)
+rdtype(@nospecialize P) = rdata_type(tangent_type(_widen(P)))
+fdtype(@nospecialize P) = fdata_type(tangent_type(_widen(P)))
 
 # Extract the callee-position node and actual-argument nodes from a `:call`/`:invoke` statement —
 # the same split used at every other call-statement site in this file (`_scan_block_comms`,
@@ -574,18 +625,18 @@ _call_parts(s::Expr) = s.head === :invoke ? (s.args[2], @view s.args[3:end]) : (
 #     invoke pass `CoDual{ftype,NoFData}` for the callee slot with no fdata to thread through.
 #  2. Every argument type must be concrete, and its fdata must either be trivial (`NoFData`) or a
 #     real `Array` whose *identity* is traceable back to a function argument of the current fwds
-#     carrier (`arg_tracked`/`array_tracked`, Part 3). This is the load-bearing correctness guard,
+#     carrier (`arg_tracked`/`fdata_tracked`, Part 3). This is the load-bearing correctness guard,
 #     not just a missing-feature guard: passing a recursive call's argument a freshly-zeroed fdata
 #     with no link to the real shadow would be silently wrong, not just unsupported — so any
 #     non-trivial fdata that isn't a *real, traceable* array shadow must still bail (a mutable
 #     struct's fdata, or an array reachable any other way — nested in a struct field, returned from
 #     a call, freshly allocated — is untracked and stays unsupported, mirroring
-#     `_array_shadow_tracked`'s own read-indexing scope).
+#     `_fdata_tracked`'s own read-indexing scope).
 #  3. The call's own result type must likewise carry trivial fdata — array-*valued results* from a
 #     recursive call are a separate, not-yet-supported feature (the fwds pass has nowhere to route a
 #     result shadow today).
 function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{String},
-                                 arg_tracked::BitVector, array_tracked::BitVector)
+                                 arg_tracked::BitVector, fdata_tracked::BitVector)
     fpos, actual = _call_parts(s)
     fval = _calleeval(fpos, iworld)
     if fval === nothing
@@ -619,23 +670,26 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
             return nothing
         end
         if fdtype(P) !== NoFData
-            # Part 3: an array argument is allowed through — but only if its *identity* is
-            # statically traceable back to a tracked function argument, mirroring
-            # `_array_shadow_tracked`'s own provenance scope, so the emission side (below) always has
-            # a real shadow value (`sresolve`) to thread through the recursive `:invoke` rather than
-            # a detached `NoFData()`.
-            if !(fdata_type(tangent_type(P)) <: Array)
-                reason[] = "recursive call with a mutable-struct argument ($(P)) is not supported " *
-                           "yet at %$i: `$(_stmt_str(s))`"
+            # An array or mutable-struct argument is allowed through — but only if its *identity*
+            # is statically traceable back to a tracked function argument (or a tracked local
+            # `%new`, see `_fdata_tracked`), so the emission side (below) always has a real shadow
+            # value (`sresolve`) to thread through the recursive `:invoke` rather than a detached
+            # `NoFData()`. A mutable-struct argument needs no rdata back from the inner call at
+            # all: the inner call's rule accumulates into the *same*, shared `MutableTangent` in
+            # place (fdata semantics), so the gradient is already there once the call returns.
+            if !(fdata_type(tangent_type(P)) <: Array || ismutabletype(P))
+                reason[] = "recursive call with a non-array, non-mutable-struct argument ($(P)) " *
+                           "whose tangent carries fdata is not supported yet at %$i: " *
+                           "`$(_stmt_str(s))`"
                 return nothing
             end
             a = actual[j]
             tracked_here = isa(a, Core.Argument) ? (a.n <= length(arg_tracked) && arg_tracked[a.n]) :
-                           isa(a, Core.SSAValue) ? array_tracked[a.id] : false
+                           isa(a, Core.SSAValue) ? fdata_tracked[a.id] : false
             if !tracked_here
-                reason[] = "recursive call with an array argument ($(P)) whose provenance is not " *
-                           "traceable to a function argument is not supported yet at %$i: " *
-                           "`$(_stmt_str(s))`"
+                reason[] = "recursive call with an array/mutable-struct argument ($(P)) whose " *
+                           "provenance is not traceable to a function argument is not supported " *
+                           "yet at %$i: `$(_stmt_str(s))`"
                 return nothing
             end
         end
@@ -819,7 +873,7 @@ function _scan_block_comms(interp, pir, iworld, unreachable, codualparams::Vecto
     nodes = [Any[] for _ in 1:nblocks]
     types = [Any[] for _ in 1:nblocks]
     n = length(codualparams)
-    array_tracked = _array_shadow_tracked(pir, iworld, n, codualparams)
+    fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
     bidx = 1
     for i in 1:length(pir.stmts)
@@ -828,6 +882,23 @@ function _scan_block_comms(interp, pir, iworld, unreachable, codualparams::Vecto
         end
         unreachable[bidx] && continue
         s = pir.stmts[i][:stmt]
+        if isa(s, Expr) && s.head === :new
+            # A tracked mutable `%new` (see `_fdata_tracked`) needs its fresh shadow communicated
+            # forward to the pullback, exactly like any other object's `(:fshadow, obj)` item
+            # (`getfield`/`setfield!`) — except here the object *is* this statement's own result,
+            # so it's keyed by its own `SSAValue` rather than an existing operand.
+            T = _calleeval(s.args[1], iworld)
+            # `T <: Array` excluded: an array's shadow is a plain `Array`, never referenced via a
+            # `(:fshadow, obj)` comms item (that's only ever produced by `getfield`/`setfield!` on a
+            # genuinely mutable struct — `.ref`/`.size` reads on an array always have `NoRData`, so
+            # `Core.getfield`'s own comms rule never fires for them). Declaring one here would just be
+            # dead weight on every block that allocates an array.
+            if T isa DataType && !(T <: Array) && ismutabletype(T) && fdtype(T) !== NoFData
+                push!(nodes[bidx], (:fshadow, Core.SSAValue(i)))
+                push!(types[bidx], fdtype(T))
+            end
+            continue
+        end
         (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || continue
         fpos, actual = _call_parts(s)
         f = _calleeval(fpos, iworld)
@@ -852,33 +923,29 @@ function _scan_block_comms(interp, pir, iworld, unreachable, codualparams::Vecto
                 push!(nodes[bidx], (:primal, a))
                 push!(types[bidx], _optype(pir, a))
             end
-        elseif f === Core.getfield
-            continue   # routes by static type + node identity only — no runtime value needed
-        elseif f === Base.memoryrefget
-            # A read whose result actually carries a gradient needs its shadow `MemoryRef` handle
-            # communicated forward — but only if that handle has provenance traceable all the way
-            # back to a tracked argument (see `_array_shadow_tracked`); otherwise this is a real bail
-            # (silently dropping the contribution would be wrong, not just unsupported).
-            Ti = pir.stmts[i][:type]
-            if rdtype(Ti) !== NoRData
-                ref_node = actual[1]
-                if !(isa(ref_node, Core.SSAValue) && array_tracked[ref_node.id])
-                    reason[] = "array read has no differentiable provenance traceable to a function " *
-                               "argument at %$i: `$(_stmt_str(s))`"
-                    return nothing
-                end
-                any(nd -> nd == (:shadow_ref, ref_node), nodes[bidx]) && continue
-                push!(nodes[bidx], (:shadow_ref, ref_node))
-                push!(types[bidx], _optype(pir, ref_node))
-            end
         elseif isa(f, Core.Builtin)
-            continue   # `memoryrefnew` needs no comms entry; any other builtin bails at point-of-use
+            # The dispatch layer (`builtins_reverse.jl`) decides everything: whether this call needs
+            # comms items, and whether this specific case is even in scope (types + static provenance
+            # — a registered rule that declines sets `reason[]` and returns `false`; `nothing` means
+            # "unregistered", which needs no comms and never bails here — any bail for an arbitrary
+            # differentiable builtin with no rule happens at point-of-use, in the emission loops).
+            ctx = (optype=(@nospecialize x) -> _optype(pir, x), ssa=Core.SSAValue(i),
+                  tracked=fdata_tracked, arg_tracked=arg_tracked, reason=reason)
+            result = builtin_rrule_comms(Val(f), actual, pir.stmts[i][:type], ctx)
+            result === false && return nothing
+            if result !== nothing
+                for (item, ty) in result
+                    any(nd -> nd == item, nodes[bidx]) && continue
+                    push!(nodes[bidx], item)
+                    push!(types[bidx], ty)
+                end
+            end
         else
             # A surviving high-level call: attempt Part 1's static recursion. Not qualifying is *not*
             # an error at scan time (mirrors how an unregistered intrinsic isn't flagged here either
             # — only the main per-statement loop, reaching it for real, turns that into a bail); only
             # a genuine attempted-and-failed resolution propagates as a real bail here.
-            info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, array_tracked)
+            info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, fdata_tracked)
             info === nothing && continue
             _, ftype, argtypes = info
             resolved = reverse_fwds_recursive_ci(interp, ftype, argtypes, edges, reason)
@@ -927,7 +994,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     scan = _scan_block_comms(interp, pir, iworld, unreachable_block, codualparams, reason, edges)
     scan === nothing && return nothing
     block_comms_nodes, block_comms_types = scan
-    array_tracked = _array_shadow_tracked(pir, iworld, n, codualparams)
+    fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
 
     getf = GlobalRef(Core, :getfield)
@@ -1018,15 +1085,26 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
 
     primal_map = Vector{Any}(undef, N)
     shadow_map = Vector{Any}(undef, N)   # Part 2: array shadow (MemoryRef) chain, sparse — only
-                                          # `array_tracked[i]` entries are ever assigned or read.
+                                          # `fdata_tracked[i]` entries are ever assigned or read.
+    # A bare `GlobalRef` operand (e.g. a `ReturnNode`'s `.val` for a function ending `return nothing`)
+    # must be resolved to its actual value here, not passed through: an unresolved `GlobalRef` outside
+    # `Core`/`Base` (a `Main` binding, say) is illegal in value position (`verify_ir`) — exactly the
+    # hazard `_calleeval` already exists to handle for callees (`forward_interp.jl`).
     presolve(@nospecialize x) =
-        isa(x, Core.SSAValue) ? primal_map[x.id] : isa(x, Core.Argument) ? parg[x.n] : x
+        isa(x, Core.SSAValue) ? primal_map[x.id] : isa(x, Core.Argument) ? parg[x.n] :
+        isa(x, GlobalRef) ? _calleeval(x, iworld) : x
     sresolve(@nospecialize x) =
         isa(x, Core.SSAValue) ? shadow_map[x.id] : isa(x, Core.Argument) ? farg[x.n] : x
 
     # Part 1: which block's own recursive-call `:subtape` comms item already has its inner `Tape`
     # SSA value computed, so `emit_epilogue!` can find it (sparse, parallel to `primal_map`).
     inner_tape_map = Dict{Int,Any}()
+
+    # Part 3: `:old_primal`/`:old_tangent` comms items (`builtins_reverse.jl`) are computed by a
+    # rule's own fwds emission rather than resolved from an existing node — each such rule returns a
+    # `saved::Dict{Any,Any}` mapping its declared item to the SSA value holding it, merged in here per
+    # block for `emit_epilogue!` to look up.
+    block_saved = [Dict{Any,Any}() for _ in 1:nblocks]
 
     # Forward-reference patches for a `PhiNode` operand not yet resolved when the phi is processed
     # (a loop back-edge: the operand is defined later in linear statement order). Keyed by the
@@ -1046,7 +1124,13 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # matching `pop!` for exactly this case.)
         if !isempty(nodes)
             vals = (nd[1] === :primal ? presolve(nd[2]) :
-                    nd[1] === :subtape ? inner_tape_map[nd[2].id] : sresolve(nd[2]) for nd in nodes)
+                    nd[1] === :subtape ? inner_tape_map[nd[2].id] :
+                    (nd[1] === :old_primal || nd[1] === :old_tangent) ?
+                        get(() -> error("Differ internal error: comms item $(nd) was declared but " *
+                                        "never saved by its rule's fwds emission (builtin_rrule_comms/" *
+                                        "apply_builtin_rrule_fwds! disagree)"),
+                            block_saved[b], nd) :
+                    sresolve(nd[2]) for nd in nodes)
             CommsT = Tuple{block_comms_types[b]...}
             tup = emit!(Expr(:call, ctuple, vals...), CommsT)
             icall!(push_g, Any, (comms_stack_ty[b], CommsT), comms_stack_ssa[b], tup)
@@ -1115,7 +1199,10 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 return nothing
             end
             ret_val = presolve(s.val)
-            R = _optype(pir, s.val)
+            # `_optype` has no world to resolve a bare `GlobalRef` with (unlike `presolve` above), so
+            # a `GlobalRef`-valued return (`return nothing` at `Main` scope, say) needs its type read
+            # off the already-resolved `ret_val` instead of the unresolved node.
+            R = isa(s.val, GlobalRef) ? Core.Typeof(ret_val) : _optype(pir, s.val)
             result_cd = icall!(zerofcodual_g, fcodual_type(R), (R,), ret_val)
             # Pre-allocated mode returns the caller's own tape object; otherwise `%new` one around
             # the stacks the prologue just built.
@@ -1128,16 +1215,62 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             emit!(Core.ReturnNode(final), Any)
         elseif isa(s, Core.PiNode)
             primal_map[i] = presolve(s.val)
-            array_tracked[i] && (shadow_map[i] = sresolve(s.val))
+            fdata_tracked[i] && (shadow_map[i] = sresolve(s.val))
         elseif isa(s, Expr) && s.head === :new
-            T = s.args[1]
-            if !(T isa DataType) || ismutabletype(T) || !is_always_fully_initialised(T)
-                reason[] = "reverse mode does not support mutable structs or structs with " *
-                           "possibly-undef fields ($(T)) at %$i: `$(_stmt_str(s))`"
+            # `_calleeval` resolves a `GlobalRef` type argument (the common post-optimization shape,
+            # e.g. `%new(Main.MPoint, ...)`) at the inference world; a literal `DataType` passes
+            # through unchanged.
+            T = _calleeval(s.args[1], iworld)
+            if !(T isa DataType) || !is_always_fully_initialised(T)
+                reason[] = "reverse mode does not support structs with possibly-undef fields " *
+                           "($(T)) at %$i: `$(_stmt_str(s))`"
                 return nothing
             end
             args = @view s.args[2:end]
             primal_map[i] = emit!(Expr(:new, T, (presolve(a) for a in args)...), Ti)
+            if T <: Array
+                # Array allocation step 4 of 4 (`%new(Vector{P}, ref, size)`): the shadow is a real
+                # same-shape `Array{tangent_type(P),N}`, never a `MutableTangent` — this must run
+                # BEFORE the generic mutable-struct branch below, which would otherwise wrongly claim
+                # this `%new` too (`ismutabletype(Vector) === true`). Exactly 2 fields: `:ref`
+                # (differentiable — `sresolve` to the shadow `MemoryRef` already built by the
+                # `Core.memorynew`/`Base.memoryrefnew` steps above) and `:size` (structural, not
+                # differentiable — the primal's own size tuple, `presolve`d not `sresolve`d). Mirrors
+                # forward mode's identical `T <: Array` branch (`forward_interp.jl`).
+                TT = tangent_type(T)
+                shadow_map[i] = emit!(Expr(:new, TT, sresolve(args[1]), presolve(args[2])), TT)
+            elseif ismutabletype(T) && fdtype(T) !== NoFData
+                # Fresh shadow `MutableTangent`, mirroring Mooncake's `_new_` rrule
+                # (`ismutabletype(P)` branch): each field's initial tangent is
+                # `zero_tangent(field_primal, field_fdata)`, which *aliases* the assigned value's
+                # own shadow when that field carries fdata (array/mutable-struct field) instead of
+                # fabricating a detached zero — the same aliasing `Core.setfield!`'s rule relies on
+                # (`builtins_reverse.jl`). This SSA is a tracked provenance root (`_fdata_tracked`
+                # marks it), so downstream `getfield`/`setfield!` on it resolve to this shadow
+                # exactly like a tracked function argument.
+                field_tangents = Any[]
+                for (j, a) in enumerate(args)
+                    Fty = fieldtype(T, j)
+                    FTj = fdtype(Fty)
+                    if FTj !== NoFData
+                        tracked_here = isa(a, Core.SSAValue) ? (a.id <= length(fdata_tracked) && fdata_tracked[a.id]) :
+                                       isa(a, Core.Argument) ? (a.n <= length(arg_tracked) && arg_tracked[a.n]) : false
+                        if !tracked_here
+                            reason[] = "reverse mode `%new` of a mutable struct with a field " *
+                                       "($(Fty)) whose assigned value's fdata is not traceable " *
+                                       "to a function argument is not supported at %$i: " *
+                                       "`$(_stmt_str(s))`"
+                            return nothing
+                        end
+                        fdata_val = sresolve(a)
+                    else
+                        fdata_val = NoFData()
+                    end
+                    push!(field_tangents, icall!(_rr_zero_tangent2, tangent_type(Fty), (Fty, FTj), presolve(a), fdata_val))
+                end
+                argtys = (Type{T}, Tuple(tangent_type(fieldtype(T, j)) for j in eachindex(args))...)
+                shadow_map[i] = icall!(_rr_build_tangent, tangent_type(T), argtys, T, field_tangents...)
+            end
         elseif isa(s, Expr) && s.head === :boundscheck
             primal_map[i] = emit!(Expr(:boundscheck, s.args...), Ti)
         elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
@@ -1145,43 +1278,28 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             f = _calleeval(fpos, iworld)
             if isa(f, Core.IntrinsicFunction)
                 primal_map[i] = emit!(Expr(:call, f, (presolve(a) for a in actual)...), Ti)
-            elseif f === Core.getfield
-                primal_map[i] = emit!(Expr(:call, getf, presolve(actual[1]), actual[2]), Ti)
-                # Part 2: the shadow `.ref`/element-of-tracked-chain mirrors the primal access
-                # exactly (see `_array_shadow_tracked`) — only ever true for a `MemoryRef`-producing
-                # `getfield(x, :ref)` off an already-tracked `x`.
-                array_tracked[i] && (shadow_map[i] = emit!(Expr(:call, getf, sresolve(actual[1]), actual[2]), Ti))
-            elseif f === Base.memoryrefnew
-                primal_map[i] = emit!(Expr(:call, f, (presolve(a) for a in actual)...), Ti)
-                if array_tracked[i]
-                    shadow_args = Any[sresolve(actual[1])]
-                    for a in actual[2:end]
-                        push!(shadow_args, presolve(a))
-                    end
-                    shadow_map[i] = emit!(Expr(:call, f, shadow_args...), Ti)
-                end
-            elseif f === Base.memoryrefget
-                # Primal replay only: the shadow *value* is never read on the fwds pass, only the
-                # shadow `MemoryRef` *handle* (a mutable/pointer-like object) is communicated forward
-                # for the pullback to mutate later — registered in `_scan_block_comms`, not here.
-                primal_map[i] = emit!(Expr(:call, f, (presolve(a) for a in actual)...), Ti)
-            elseif f === Base.memoryrefset!
-                reason[] = "reverse mode does not support array mutation (`memoryrefset!`) at " *
-                           "%$i: `$(_stmt_str(s))`"
-                return nothing
-            elseif isa(f, Core.Builtin) && rdtype(Ti) === NoRData
-                # A non-differentiable builtin result (`===`, `isa`, comparisons, ... — e.g. the
-                # `Base.iterate`-state check a `for i in 1:length(x)` loop's own lowering embeds) has
-                # no gradient to route, so no rule/comms is needed — just replay it primally, the same
-                # treatment `GlobalRef`/literal statements already get. Distinct from
-                # `memoryrefget`/`memoryrefnew` above only in that there is no shadow chain to extend.
-                primal_map[i] = emit!(Expr(:call, f, (presolve(a) for a in actual)...), Ti)
             elseif isa(f, Core.Builtin)
-                reason[] = "reverse mode does not support builtin `$(f)` with a differentiable " *
-                           "result ($(Ti)) and no reverse rule at %$i: `$(_stmt_str(s))`"
-                return nothing
+                bctx = (; emit!, icall!, presolve, sresolve,
+                       optype=(@nospecialize x) -> _optype(pir, x), tracked=fdata_tracked, ssa=Core.SSAValue(i))
+                result = apply_builtin_rrule_fwds!(Val(f), actual, Ti, bctx)
+                if result !== nothing
+                    p, shadow, saved = result
+                    primal_map[i] = p
+                    shadow !== nothing && (shadow_map[i] = shadow)
+                    isempty(saved) || merge!(block_saved[bidx], saved)
+                elseif tangent_type(_widen(Ti)) === NoTangent
+                    # A non-differentiable builtin result (`===`, `isa`, comparisons, ... — e.g. the
+                    # `Base.iterate`-state check a `for i in 1:length(x)` loop's own lowering embeds)
+                    # has no gradient to route, so no rule/comms is needed — just replay it primally,
+                    # the same treatment `GlobalRef`/literal statements already get.
+                    primal_map[i] = emit!(Expr(:call, f, (presolve(a) for a in actual)...), Ti)
+                else
+                    reason[] = "reverse mode does not support builtin `$(f)` with a differentiable " *
+                               "result ($(Ti)) and no reverse rule at %$i: `$(_stmt_str(s))`"
+                    return nothing
+                end
             else
-                info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, array_tracked)
+                info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked)
                 info === nothing && return nothing
                 fval, ftype, argtypes = info
                 resolved = reverse_fwds_recursive_ci(interp, ftype, argtypes, edges, reason)
@@ -1322,7 +1440,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     scan = _scan_block_comms(interp, pir, iworld, unreachable_block, codualparams, reason, edges)
     scan === nothing && return nothing
     block_comms_nodes, block_comms_types = scan
-    array_tracked = _array_shadow_tracked(pir, iworld, n, codualparams)
+    fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
 
     getf = GlobalRef(Core, :getfield)
@@ -1330,7 +1448,6 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     ctuple = GlobalRef(Core, :tuple)
     pop_g = Base.pop!
     increment_g = increment!!
-    incfield_g = increment_field!!
 
     # Build the statement for a call to a runtime helper: a static `:invoke` when the callee
     # resolves, else a plain `:call` (see `helper_ci` for why the difference is the whole ballgame
@@ -1402,7 +1519,10 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     ssa_ref_id = Vector{Any}(undef, N)
     for i in 1:N
         needs_ref(i) || continue
-        Ti = pstmts[i][:type]
+        # `_widen`: a statement's inferred type can be a lattice element (`Core.PartialStruct`), not
+        # a bare `Type` — e.g. a `Core.memorynew` call with a literal length — and
+        # `zero_rdata_from_type` (like `tangent_type`) is only ever defined on `Type`s.
+        Ti = _widen(pstmts[i][:type])
         RT = rdtype(Ti)
         ssa_ref_id[i] = eemit!(Expr(:new, Base.RefValue{RT}, zero_rdata_from_type(Ti)), Base.RefValue{RT})
     end
@@ -1455,7 +1575,10 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         end
         # `Pi` is the *primal* type of the statement whose rdata `ref` accumulates — needed (not just
         # its rdata type) because the zero-reset literal is computed via `zero_rdata_from_type(Pi)`.
+        # `_widen` first: callers pass `pstmts[i][:type]` directly, which can be a lattice element
+        # (see the `ssa_ref_id` prologue above) — `zero_rdata_from_type` only accepts a bare `Type`.
         deref_and_zero!(ref, @nospecialize(Pi)) = begin
+            Pi = _widen(Pi)
             RT = rdtype(Pi)
             cur = emit!(Expr(:call, getf, ref, 1), RT)
             emit!(Expr(:call, setf, ref, 1, zero_rdata_from_type(Pi)), Any)
@@ -1508,18 +1631,49 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                 acc = deref_and_zero!(ssa_ref_id[i], Ti)
                 route!(s.val, acc, rdtype(_optype(pir, s.val)))
             elseif isa(s, Expr) && s.head === :new
-                acc = deref_and_zero!(ssa_ref_id[i], Ti)
-                T = s.args[1]
+                T = _calleeval(s.args[1], iworld)
                 args = @view s.args[2:end]
-                RDataT = rdtype(T)
-                if RDataT !== NoRData
-                    NT = fields_type(RDataT)
-                    data_id = emit!(Expr(:call, getf, acc, 1), NT)
-                    for j in eachindex(args)
-                        Fty = rdtype(fieldtype(T, j))
-                        Fty === NoRData && continue
-                        contrib = emit!(Expr(:call, getf, data_id, j), Fty)
-                        route!(args[j], contrib, Fty)
+                if T <: Array
+                    # Nothing to route: both fields (`:ref` — a `MemoryRef`, `:size` — a structural
+                    # tuple) always have `NoRData`, and no `(:fshadow, ...)` comms item exists for an
+                    # array's own `%new` (see `_scan_block_comms`) — everything accumulated during the
+                    # reverse walk already landed directly in the shadow `Array` the fwds pass built.
+                    # Must be checked before `ismutabletype(T)` below, which is also true for `Array`
+                    # but assumes a `MutableTangent` shadow that doesn't exist here.
+                elseif ismutabletype(T)
+                    # A mutable struct carries no rdata of its own (`rdtype(T) === NoRData`
+                    # always) -- everything accumulated during the reverse walk landed directly in
+                    # the shadow `MutableTangent` built by the fwds pass (via `getfield`/
+                    # `setfield!`'s own rules, `increment_field_rdata!`). By now (the pullback
+                    # walks statements in reverse, so this `%new`'s own turn runs *last*, after
+                    # every use of the object) that accumulation is complete, so each field's
+                    # gradient is handed back as this `%new` argument's own rdata -- mirroring
+                    # Mooncake's `_mutable_new_pullback!!`.
+                    FT = fdtype(T)
+                    if FT !== NoFData
+                        shadow = comms_val_id[(:fshadow, Core.SSAValue(i))]
+                        for j in eachindex(args)
+                            Fty = fieldtype(T, j)
+                            RFty = rdtype(Fty)
+                            RFty === NoRData && continue
+                            TFty = tangent_type(Fty)
+                            field_tangent = emit!(icall(_rr_get_tangent_field, (FT, Int), shadow, j), TFty)
+                            contrib = emit!(icall(_rr_rdata, (TFty,), field_tangent), RFty)
+                            route!(args[j], contrib, RFty)
+                        end
+                    end
+                else
+                    acc = deref_and_zero!(ssa_ref_id[i], Ti)
+                    RDataT = rdtype(T)
+                    if RDataT !== NoRData
+                        NT = fields_type(RDataT)
+                        data_id = emit!(Expr(:call, getf, acc, 1), NT)
+                        for j in eachindex(args)
+                            Fty = rdtype(fieldtype(T, j))
+                            Fty === NoRData && continue
+                            contrib = emit!(Expr(:call, getf, data_id, j), Fty)
+                            route!(args[j], contrib, Fty)
+                        end
                     end
                 end
             elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
@@ -1550,7 +1704,13 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                                              "that declaration in src/intrinsics_reverse.jl.")
                                    end
                                    emit!(Expr(:call, GlobalRef(Core.Intrinsics, name), args...), ty)
-                               end,)
+                               end,
+                              # An operand's own *declared* primal type, read straight from the primal
+                              # IR — not derivable from `pvals` (a resolved value, not a type) or `Ti`
+                              # (the statement's own result type, not an operand's). Needed by
+                              # `fpext`/`fptrunc`'s reverse rule, which converts `dz` back to the
+                              # operand's own float width.
+                              optype=(k::Int) -> _widen(_optype(pir, actual[k])),)
                         contribs = apply_intrinsic_rrule!(Val(f), pvals, acc, Ti, ctx)
                         if contribs === nothing
                             reason[] = "no reverse rule for intrinsic `$(nameof(f))` at %$i: " *
@@ -1562,64 +1722,27 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                             route!(a, c, rdtype(_optype(pir, a)))
                         end
                     end
-                elseif f === Core.getfield
-                    # Check triviality *first* (the key simplification over the naive version): this
-                    # automatically covers `getfield(x,:ref)`/`getfield(x,:size)`/`getfield(sizetuple,
-                    # j)` on an `Array` — all confirmed `NoRData` — with no array-specific code needed
-                    # here at all. Only a genuinely differentiable field access falls through to the
-                    # existing mutable-struct-bail + `increment_field!!` logic below.
-                    if rdtype(Ti) !== NoRData
-                        acc = deref_and_zero!(ssa_ref_id[i], Ti)
-                        obj = actual[1]
-                        StructP = _optype(pir, obj)
-                        if !(StructP isa DataType) || ismutabletype(StructP)
-                            reason[] = "reverse mode does not support `getfield` on a mutable struct " *
-                                       "($(StructP)) at %$i: `$(_stmt_str(s))` (needs fdata-based " *
-                                       "in-place accumulation, not implemented)"
-                            return nothing
-                        end
-                        target = ref_for(obj)
-                        if target !== nothing
-                            fk = actual[2]
-                            fieldidx = isa(fk, QuoteNode) ? findfirst(==(fk.value), fieldnames(StructP)) : fk
-                            RT = rdtype(StructP)
-                            cur = emit!(Expr(:call, getf, target, 1), RT)
-                            new = emit!(icall(incfield_g, (RT, rdtype(Ti), Val{fieldidx}),
-                                              cur, acc, Val(fieldidx)), RT)
-                            emit!(Expr(:call, setf, target, 1, new), Any)
-                        end
-                    end
-                elseif f === Base.memoryrefget
-                    if rdtype(Ti) !== NoRData
-                        acc = deref_and_zero!(ssa_ref_id[i], Ti)
-                        shadow_ref = comms_val_id[(:shadow_ref, actual[1])]
-                        RT = rdtype(Ti)
-                        # `MemoryRef`s are mutable/pointer-like: no `Ref`/`ssa_ref_id` accumulator is
-                        # needed for the array itself — its whole tangent lives in fdata, read-
-                        # incremented-written in place directly through the shadow handle threaded
-                        # forward via the `:shadow_ref` comms item, exactly the way an `Array`'s
-                        # tangent is a plain `Array` incremented in place, never routed through rdata.
-                        cur = emit!(Expr(:call, Base.memoryrefget, shadow_ref, QuoteNode(:not_atomic), false), RT)
-                        new = emit!(icall(increment_g, (RT, RT), cur, acc), RT)
-                        emit!(Expr(:call, Base.memoryrefset!, shadow_ref, new, QuoteNode(:not_atomic), false), RT)
-                    end
-                elseif f === Base.memoryrefnew
-                    # Its own rdata is always `NoRData` (a `MemoryRef` handle, not a differentiable
-                    # value) — nothing to route.
-                elseif f === Base.memoryrefset!
-                    reason[] = "reverse mode does not support array mutation (`memoryrefset!`) at " *
-                               "%$i: `$(_stmt_str(s))`"
-                    return nothing
-                elseif isa(f, Core.Builtin) && rdtype(Ti) === NoRData
-                    # Mirrors the fwds pass's own treatment: a non-differentiable builtin result has
-                    # nothing to route backward, so this is a genuine no-op here (unlike the fwds
-                    # pass, the pullback never needs to *replay* the statement at all).
                 elseif isa(f, Core.Builtin)
-                    reason[] = "reverse mode does not support builtin `$(f)` with a differentiable " *
-                               "result ($(Ti)) and no reverse rule at %$i: `$(_stmt_str(s))`"
-                    return nothing
+                    cctx = (; emit!, icall, comms=comms_val_id, pb_presolve,
+                           deref_and_zero! = (@nospecialize Pi) -> deref_and_zero!(ssa_ref_id[i], Pi),
+                           optype=(@nospecialize x) -> _optype(pir, x), ssa=Core.SSAValue(i), ref_for)
+                    contribs = apply_builtin_rrule!(Val(f), actual, Ti, cctx)
+                    if contribs !== nothing
+                        for (a, c) in zip(actual, contribs)
+                            c === nothing && continue
+                            route!(a, c, rdtype(_optype(pir, a)))
+                        end
+                    elseif tangent_type(_widen(Ti)) === NoTangent
+                        # Mirrors the fwds pass's own treatment: a non-differentiable builtin result
+                        # has nothing to route backward, so this is a genuine no-op here (unlike the
+                        # fwds pass, the pullback never needs to *replay* the statement at all).
+                    else
+                        reason[] = "reverse mode does not support builtin `$(f)` with a differentiable " *
+                                   "result ($(Ti)) and no reverse rule at %$i: `$(_stmt_str(s))`"
+                        return nothing
+                    end
                 else
-                    info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, array_tracked)
+                    info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked)
                     info === nothing && return nothing
                     _, ftype, argtypes = info
                     acc = deref_and_zero!(ssa_ref_id[i], Ti)   # this call's own seed for the inner pullback

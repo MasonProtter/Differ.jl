@@ -20,6 +20,7 @@ include("forward_interp.jl")
 
 # Reverse-mode AD engine (proof of concept, straight-line code only — see reverse_interp.jl header)
 include("intrinsics_reverse.jl")   # dispatch-based intrinsic vjp rules (apply_intrinsic_rrule!)
+include("builtins_reverse.jl")     # dispatch-based Core.Builtin vjp rules (apply_builtin_rrule!/etc.)
 include("reverse_interp.jl")
 include("rrules.jl")               # hand-written reverse-mode rules (mirrors frules.jl)
 
