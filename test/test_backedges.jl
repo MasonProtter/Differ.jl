@@ -1,3 +1,7 @@
+using Test
+using Differ
+using Differ: Dual, NoTangent, frule!!
+
 # Tests that Differ attaches real Julia backedges to a compiled derivative, so redefining a primal
 # method (or filling in a `frule!!` for something that previously errored) invalidates and recompiles
 # it — instead of silently keeping a stale `dualized_impl`/`frule!!` `CodeInstance` around forever.

@@ -1,3 +1,7 @@
+using Test
+using Differ
+using Differ: Dual, NoTangent, frule!!, code_dual_ircode
+
 # Tests for Differ's dispatch-based handling of `Core.Intrinsics` (see `src/intrinsics.jl`).
 #
 # The mechanism:
