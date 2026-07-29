@@ -5,6 +5,7 @@ using Test
 using Differ
 using Differ: code_dual_ircode, code_reverse_fwds_ircode, code_reverse_pullback_ircode
 using Differ: build_ctx, rrule!!, gradient, gradient!, zero_fcodual
+using Differ: tape_type, comms_element_types
 
 # Central finite difference, one argument.
 central_diff(f, x; h=1e-6) = (f(x + h) - f(x - h)) / 2h
@@ -68,4 +69,19 @@ function check_stack_balance(f, args...)
     @test pctx.tape.block_stack.position == 0
     @test all(s -> !(s isa Differ.Stack) || s.position == 0, pctx.tape.comms)
     return nothing
+end
+
+# Tape size. Asserts on properties of the *whole* set of comms element types (their total size, and
+# whether they are all `isbits` — i.e. whether the comms stacks are flat buffers or GC-tracked ones
+# needing a write barrier per push), never on a particular block's index: block numbering shifts
+# with any unrelated change to Julia's optimizer, but "how many bytes per loop iteration, and does
+# pushing them touch the GC" is exactly what these optimizations are about.
+#
+# `bytes` is the sum over comms stacks. Pass `isbits=true` to additionally require every stack to be
+# pointer-free.
+function check_tape_size(f, at; bytes::Union{Int,Nothing}=nothing, isbits::Union{Bool,Nothing}=nothing)
+    ts = comms_element_types(tape_type(f, at))
+    isbits === nothing || @test all(isbitstype, ts) == isbits
+    bytes === nothing || @test sum(sizeof, ts; init=0) == bytes
+    return ts
 end

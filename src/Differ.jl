@@ -38,6 +38,7 @@ export rrule!!, AbstractCtx, Ctx, build_ctx
 export gradient, gradient!, value_and_gradient!, zero_fcodual
 export code_reverse_fwds_ircode, @code_reverse_fwds_ircode
 export code_reverse_pullback_ircode, @code_reverse_pullback_ircode
+export tape_type, comms_element_types
 
 # Tangent / fdata / rdata type system.
 export tangent_type, fdata_type, rdata_type

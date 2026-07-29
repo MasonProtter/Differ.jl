@@ -128,9 +128,31 @@ Ctx() = Ctx(nothing)
 # (`Stack{T}` for a block with something to communicate, `SingletonStack{Tuple{}}` for one with
 # nothing — mirroring Mooncake's `SharedDataPairs`/singleton-type optimization).
 # ===========================================================================
-struct Tape{ArgsTT<:Tuple,CS<:Tuple}
-    block_stack::Stack{Int32}
-    comms::CS
+mutable struct Tape{ArgsTT<:Tuple,CS<:Tuple}
+    const block_stack::Stack{Int32}
+    const comms::CS
+    # The primal's `(fcd, argcds...)` coduals, stored by the forwards pass so the pullback can reach
+    # argument values at all: `reverse_pullback_impl`'s own signature is `(tape, seed)`, so an
+    # `Argument(k)` of the primal is otherwise simply unavailable to it, and everything derived from
+    # one has to be pushed per-execution instead of read once.
+    #
+    # Non-`const` because `build_ctx` allocates the tape knowing only the argument *types*
+    # (`_fresh_tape_expr`) — the values arrive later, on each call. The other two stay `const`: the
+    # pullback reads them once and hoists, which a mutable field would inhibit. Assigning an inline
+    # tuple field like this allocates nothing, just a write barrier.
+    # Reusable buffers for bulk primal save/restore, one slot per bulk-saved argument
+    # (`_bulk_save_args`). `const`: the `Vector` object is fixed for the tape's life, only its
+    # contents change — which is what lets a pre-allocated context reuse the buffers instead of
+    # allocating a copy per call. `_NO_BULK_BUFS` (a shared empty) when this primal saves nothing.
+    #
+    # Declared before `args` so the 3-argument constructor can leave *only* `args` undef: `bufs` is
+    # read unconditionally by the pullback and must always be assigned.
+    const bufs::Vector{Any}
+    args::ArgsTT
+    Tape{ArgsTT,CS}(block_stack, comms, bufs=_NO_BULK_BUFS) where {ArgsTT<:Tuple,CS<:Tuple} =
+        new{ArgsTT,CS}(block_stack, comms, bufs)    # `args` deliberately left undef
+    Tape{ArgsTT,CS}(block_stack, comms, bufs, args) where {ArgsTT<:Tuple,CS<:Tuple} =
+        new{ArgsTT,CS}(block_stack, comms, bufs, args)
 end
 
 # ===========================================================================
@@ -448,6 +470,111 @@ function _exit_blocks(pir, unreachable)
         isa(term, Core.ReturnNode) && isdefined(term, :val) && push!(exits, b)
     end
     return exits
+end
+
+# ===========================================================================
+# Bulk save/restore analysis: which arguments have their primal contents saved once per call, rather
+# than one overwritten element at a time.
+#
+# A `memoryrefset!`'s pullback restores the element it overwrote, so that the primal is left exactly
+# as the call found it. Doing that per element costs, *per store executed*, two tape slots (the old
+# value and the primal `MemoryRef` to put it back through), one load on the forwards pass and one
+# store on the pullback. In a loop that is O(iterations).
+#
+# It can instead be done once: no pullback rule anywhere ever *reads* primal memory (only this
+# restore ever writes it — see `src/rrules.jl`'s header, where that is stated as a rule for hand
+# rules to honour), so nothing observes the primal between the start of the pullback and its end.
+# Only the net effect at the boundary is visible, and one `copyto!` in and one out reproduces it.
+#
+# Restricted to arguments whose element type is `isbits`: the root has to be reachable from the
+# pullback (arguments are, via `Tape.args`; a locally-allocated `Memory` would need a comms item of
+# its own), and a non-bits element is a reference whose own contents the copy would not capture.
+# ===========================================================================
+
+# Blocks that can execute more than once per call: the union of the natural loops of every back edge
+# (an edge `b -> s` whose target dominates its source). Over-approximating this is harmless — it only
+# ever moves a store from the per-element scheme to the bulk one, which is a cost decision, not a
+# correctness one.
+function _loop_blocks(pir)
+    cfg = pir.cfg
+    nb = length(cfg.blocks)
+    inloop = falses(nb)
+    dt = CC.construct_domtree(cfg.blocks)
+    for b in 1:nb, s in cfg.blocks[b].succs
+        (1 <= s <= nb) || continue
+        CC.dominates(dt, s, b) || continue        # `b -> s` is a back edge
+        # Natural loop body: the header `s`, plus everything that reaches `b` without going through
+        # `s`. Walk predecessors from `b`, stopping at the header.
+        inloop[s] = true
+        seen = falses(nb)
+        seen[s] = true
+        worklist = Int[b]
+        while !isempty(worklist)
+            x = pop!(worklist)
+            (1 <= x <= nb) || continue
+            seen[x] && continue
+            seen[x] = true
+            inloop[x] = true
+            append!(worklist, cfg.blocks[x].preds)
+        end
+    end
+    return inloop
+end
+
+# Walk a `MemoryRef` chain back to the object it indexes into, through exactly the shapes Julia 1.13
+# lowers array indexing to (and that `_fdata_tracked` already tracks): `PiNode` aliases,
+# `memoryrefnew` (both the 1-arg `Memory` form and the 3-arg offsetting form), and an `Array`'s
+# `.ref` field. Returns the terminal node, or `nothing` if the chain runs into anything else.
+function _provenance_root(pir, iworld, @nospecialize(node))
+    for _ in 1:length(pir.stmts)      # bounded: each step moves strictly up the chain
+        isa(node, Core.Argument) && return node
+        isa(node, Core.SSAValue) || return nothing
+        s = pir.stmts[node.id][:stmt]
+        if isa(s, Core.PiNode)
+            node = s.val
+        elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
+            fpos, actual = _call_parts(s)
+            f = _calleeval(fpos, iworld)
+            isempty(actual) && return nothing
+            if f === Base.memoryrefnew
+                node = actual[1]
+            elseif f === Core.getfield && length(actual) >= 2 && _bi_fieldname(actual[2]) === :ref
+                node = actual[1]
+            else
+                return node        # a root in its own right (`memorynew`, a call, ...)
+            end
+        else
+            return node            # `%new`, a phi, ...
+        end
+    end
+    return nothing
+end
+
+# Which argument positions are bulk-saved. `arg_primal_types[k]` is argument `k`'s primal type.
+function _bulk_save_args(pir, iworld, arg_primal_types::Vector{Any})
+    inloop = _loop_blocks(pir)
+    bulk = Set{Int}()
+    nb = length(pir.cfg.blocks)
+    bidx = 1
+    for i in 1:length(pir.stmts)
+        while bidx < nb && i > pir.cfg.blocks[bidx].stmts.stop
+            bidx += 1
+        end
+        inloop[bidx] || continue          # a store executed once per call is not worth a whole copy
+        s = pir.stmts[i][:stmt]
+        (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || continue
+        fpos, actual = _call_parts(s)
+        _calleeval(fpos, iworld) === Base.memoryrefset! || continue
+        isempty(actual) && continue
+        root = _provenance_root(pir, iworld, actual[1])
+        isa(root, Core.Argument) || continue
+        k = root.n                        # primal `Argument(j)` is `codualparams[j]` (`#self#` is 1)
+        (1 <= k <= length(arg_primal_types)) || continue
+        P = _widen(arg_primal_types[k])
+        (P isa DataType && (P <: Memory || P <: Array) && isbitstype(eltype(P))) || continue
+        push!(bulk, k)
+    end
+    return bulk
 end
 
 # ===========================================================================
@@ -875,6 +1002,15 @@ function _scan_block_comms(interp, pir, iworld, unreachable, codualparams::Vecto
     n = length(codualparams)
     fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
+    # Bulk-saved arguments, decided before any item is declared: a store into one of them needs
+    # neither its old value nor the primal `MemoryRef` to put it back through, so this changes what
+    # `builtin_rrule_comms` declares (via `ctx.bulk_saved` below).
+    arg_primal_types = Any[_codual_primal_type(c) for c in codualparams]
+    bulk_args = _bulk_save_args(pir, iworld, arg_primal_types)
+    bulk_saved(@nospecialize ref_node) = begin
+        root = _provenance_root(pir, iworld, ref_node)
+        isa(root, Core.Argument) && root.n in bulk_args
+    end
     bidx = 1
     for i in 1:length(pir.stmts)
         while bidx < nblocks && i > pir.cfg.blocks[bidx].stmts.stop
@@ -930,7 +1066,8 @@ function _scan_block_comms(interp, pir, iworld, unreachable, codualparams::Vecto
             # "unregistered", which needs no comms and never bails here — any bail for an arbitrary
             # differentiable builtin with no rule happens at point-of-use, in the emission loops).
             ctx = (optype=(@nospecialize x) -> _optype(pir, x), ssa=Core.SSAValue(i),
-                  tracked=fdata_tracked, arg_tracked=arg_tracked, reason=reason)
+                  tracked=fdata_tracked, arg_tracked=arg_tracked, reason=reason,
+                  bulk_saved=bulk_saved)
             result = builtin_rrule_comms(Val(f), actual, pir.stmts[i][:type], ctx)
             result === false && return nothing
             if result !== nothing
@@ -955,7 +1092,7 @@ function _scan_block_comms(interp, pir, iworld, unreachable, codualparams::Vecto
             push!(types[bidx], InnerTapeT)
         end
     end
-    return nodes, types
+    return nodes, types, bulk_args
 end
 
 # ===========================================================================
@@ -993,7 +1130,17 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
 
     scan = _scan_block_comms(interp, pir, iworld, unreachable_block, codualparams, reason, edges)
     scan === nothing && return nothing
-    block_comms_nodes, block_comms_types = scan
+    # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
+    # than per overwritten element. Derived inside the scan so both builders get it identically —
+    # they must agree exactly, since it decides which comms items exist.
+    block_comms_nodes, block_comms_types, bulk_args = scan
+    bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
+    # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
+    # emission sides agree with the declaration side by construction.
+    pb_bulk_saved(@nospecialize ref_node) = begin
+        root = _provenance_root(pir, iworld, ref_node)
+        isa(root, Core.Argument) && root.n in bulk_args
+    end
     fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
 
@@ -1024,6 +1171,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # generically here for any argument type it happens to apply to. ---
     parg = Vector{Any}(undef, n)
     farg = Vector{Any}(undef, n)
+    carg = Vector{Any}(undef, n)   # the coduals themselves — stored on the tape for the pullback
     for i in 1:n
         Ci = codualparams[i]
         Pi = _codual_primal_type(Ci)
@@ -1031,9 +1179,14 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # codual 1 is `fcd` — `Argument(2)` directly; coduals 2..n are the argument coduals, packed
         # in the vararg tuple `Argument(4)` at position `i-1`. `Argument(3)` is the `ctx`.
         ci = i == 1 ? Core.Argument(2) : emit!(Expr(:call, getf, Core.Argument(4), i - 1), Ci)
+        carg[i] = ci
         parg[i] = emit!(Expr(:call, getf, ci, 1), Pi)
         Fi !== NoFData && (farg[i] = emit!(Expr(:call, getf, ci, 2), Fi))
     end
+    # Packed once here rather than at each use: both tape shapes below need it, and the
+    # pre-allocated shape stores it in the prologue (not at the return) so an early bail can't sink
+    # the store past a point where the tape is already visible to the caller.
+    args_tup_ssa = emit!(Expr(:call, ctuple, carg...), ArgsTT)
 
     # --- Tape prologue. Two shapes, chosen by the `ctx` type in `Argument(3)`. ---
     comms_stack_ty = Vector{Any}(undef, nblocks)
@@ -1081,6 +1234,29 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             comms_stack_ty[b] <: SingletonStack && continue   # no fields, nothing to reset
             emit!(Expr(:call, setf, comms_stack_ssa[b], 2, 0), Any)
         end
+        # This call's coduals replace the previous call's. A re-used context therefore keeps the
+        # *previous* call's arguments (and their shadows) alive until the next call overwrites them
+        # — noted in `build_ctx`'s docstring; the field is concretely typed, so there is nothing to
+        # null it to in between.
+        emit!(Expr(:call, setf, tape_ssa, 4, args_tup_ssa), Any)
+    end
+
+    # --- Bulk primal save. Still in the prologue — before any primal statement has run — so it
+    # captures the arguments exactly as the call found them. The buffers live on the tape, so a
+    # pre-allocated context reuses them across calls and a steady-state call allocates nothing; a
+    # `Ctx()` call allocates each buffer once, on its tape's first (and only) use. ---
+    bufs_ssa = if isempty(bulk_args)
+        # Shared empty sentinel: nothing will ever index it, and this way a primal that bulk-saves
+        # nothing pays no allocation for the field.
+        emit!(GlobalRef(@__MODULE__(), :_NO_BULK_BUFS), Vector{Any})
+    elseif tape_ssa === nothing
+        icall!(Vector{Any}, Vector{Any}, ())
+    else
+        emit!(Expr(:call, getf, tape_ssa, 3), Vector{Any})
+    end
+    for k in sort!(collect(bulk_args))
+        Pk = _widen(_codual_primal_type(codualparams[k]))
+        icall!(_bulk_save!, Nothing, (Vector{Any}, Int, Pk), bufs_ssa, bulk_slot[k], parg[k])
     end
 
     primal_map = Vector{Any}(undef, N)
@@ -1214,7 +1390,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             tape = tape_ssa
             if tape === nothing
                 comms_tuple = emit!(Expr(:call, ctuple, comms_stack_ssa...), Tuple{comms_stack_ty...})
-                tape = emit!(Expr(:new, TapeT, block_stack_ssa, comms_tuple), TapeT)
+                tape = emit!(Expr(:new, TapeT, block_stack_ssa, comms_tuple, bufs_ssa, args_tup_ssa), TapeT)
             end
             final = emit!(Expr(:call, ctuple, result_cd, tape), Tuple{fcodual_type(R),TapeT})
             emit!(Core.ReturnNode(final), Any)
@@ -1293,7 +1469,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 primal_map[i] = emit!(Expr(:call, f, (presolve(a) for a in actual)...), Ti)
             elseif isa(f, Core.Builtin)
                 bctx = (; emit!, icall!, presolve, sresolve,
-                       optype=(@nospecialize x) -> _optype(pir, x), tracked=fdata_tracked, ssa=Core.SSAValue(i))
+                       optype=(@nospecialize x) -> _optype(pir, x), tracked=fdata_tracked,
+                       ssa=Core.SSAValue(i), bulk_saved=pb_bulk_saved)
                 result = apply_builtin_rrule_fwds!(Val(f), actual, Ti, bctx)
                 if result !== nothing
                     p, shadow, saved = result
@@ -1463,7 +1640,17 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
 
     scan = _scan_block_comms(interp, pir, iworld, unreachable_block, codualparams, reason, edges)
     scan === nothing && return nothing
-    block_comms_nodes, block_comms_types = scan
+    # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
+    # than per overwritten element. Derived inside the scan so both builders get it identically —
+    # they must agree exactly, since it decides which comms items exist.
+    block_comms_nodes, block_comms_types, bulk_args = scan
+    bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
+    # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
+    # emission sides agree with the declaration side by construction.
+    pb_bulk_saved(@nospecialize ref_node) = begin
+        root = _provenance_root(pir, iworld, ref_node)
+        isa(root, Core.Argument) && root.n in bulk_args
+    end
     fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
 
@@ -1531,6 +1718,26 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     for b in 1:nblocks
         isempty(block_comms_types[b]) && continue
         comms_obj_id[b] = eemit!(Expr(:call, getf, comms_tuple_id, b), comms_stack_ty[b])
+    end
+
+    # --- The primal's own coduals, stored on the tape by the forwards pass (`Tape.args`). This is
+    # the pullback's only route to an `Argument(k)` of the primal: its own signature is
+    # `(tape, seed)`. Everything is unpacked eagerly, and unused entries are DCE'd by
+    # `run_ipo_passes!` — emitting lazily is not an option, because the entry block's *terminator*
+    # is emitted into this same `entry_stmts` vector by `_emit_switch!` below, and `CFGBlock` copies
+    # the vector, so anything appended after that point would either land past a terminator or be
+    # silently dropped. ---
+    parg_pb = Vector{Any}(undef, n)
+    farg_pb = Vector{Any}(undef, n)
+    let args_tup_id = eemit!(Expr(:call, getf, tape_id, 4), ArgsTT)
+        for k in 1:n
+            Ck = codualparams[k]
+            Pk = _codual_primal_type(Ck)
+            Fk = _codual_fdata_type(Ck)
+            cd = eemit!(Expr(:call, getf, args_tup_id, k), Ck)
+            parg_pb[k] = eemit!(Expr(:call, getf, cd, 1), Pk)
+            Fk !== NoFData && (farg_pb[k] = eemit!(Expr(:call, getf, cd, 2), Fk))
+        end
     end
 
     arg_ref_id = Vector{Any}(undef, n)
@@ -1656,10 +1863,42 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                 comms_type_id[nd] = block_comms_types[b][j]
             end
         end
-        # `pb_presolve` only ever looks up `:primal` comms items (intrinsic operands) — `:subtape`/
-        # `:shadow_ref` items are looked up directly by their own tag where needed, below.
-        pb_presolve(@nospecialize a) =
-            haskey(comms_val_id, (:primal, a)) ? comms_val_id[(:primal, a)] : _calleeval(a, iworld)
+        # --- Comms resolvers. Every pullback-side read of a forwards-recorded value goes through
+        # one of these three, rather than indexing `comms_val_id` directly. They are the single
+        # place that knows *how* a value can be obtained, which is what lets that set be extended
+        # (rematerialization, argument values off the tape) without touching a single rule.
+        #
+        # `fetch_shadow` accepts either spelling of "this node's fdata handle": `:shadow_ref` (what
+        # `memoryrefget`/`memoryrefset!` declare for a `MemoryRef`) and `:fshadow` (what
+        # `getfield`/`setfield!`/a tracked `%new` declare for a struct object). They mean the same
+        # thing and are resolved identically by `emit_epilogue!`; the two node populations are
+        # disjoint, so trying both here is unambiguous and saves renaming ten declaration sites.
+        pb_fetch_shadow(@nospecialize a) =
+            haskey(comms_val_id, (:shadow_ref, a)) ? comms_val_id[(:shadow_ref, a)] :
+            haskey(comms_val_id, (:fshadow, a)) ? comms_val_id[(:fshadow, a)] :
+            error("Differ internal error: no shadow comms item for $(a) in block $(b) — its rule's " *
+                  "`builtin_rrule_comms` and its pullback disagree about what was recorded")
+
+        # A literal/`GlobalRef` operand needs no comms item at all (`_calleeval` resolves it); an
+        # `SSAValue`/`Argument` does, and `_calleeval` returns `nothing` for those. Erroring on that
+        # `nothing` is the point: before, an operand a rule read but the scan never recorded would
+        # emit `nothing` into the IR and fail far away with no indication of where.
+        pb_presolve(@nospecialize a) = begin
+            haskey(comms_val_id, (:primal, a)) && return comms_val_id[(:primal, a)]
+            isa(a, Core.Argument) && return parg_pb[a.n]
+            v = _calleeval(a, iworld)
+            (v === nothing && (isa(a, Core.SSAValue) || isa(a, Core.Argument))) &&
+                error("Differ internal error: no primal comms item for $(a) in block $(b) — a rule " *
+                      "reads it, but the forwards pass never recorded it")
+            return v
+        end
+
+        # Values a rule's own fwds emission stashed (`(:old_primal, ssa)`, `(:old_tangent, ssa)`),
+        # keyed by the full tagged item rather than by node.
+        pb_fetch_saved(@nospecialize item) =
+            haskey(comms_val_id, item) ? comms_val_id[item] :
+            error("Differ internal error: comms item $(item) was declared but never saved by its " *
+                  "rule's fwds emission (builtin_rrule_comms/apply_builtin_rrule_fwds! disagree)")
 
         # (b) This block's own (non-phi) statements, in reverse order.
         lo, hi = pir.cfg.blocks[b].stmts.start, pir.cfg.blocks[b].stmts.stop
@@ -1700,7 +1939,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     # Mooncake's `_mutable_new_pullback!!`.
                     FT = fdtype(T)
                     if FT !== NoFData
-                        shadow = comms_val_id[(:fshadow, Core.SSAValue(i))]
+                        shadow = pb_fetch_shadow(Core.SSAValue(i))
                         for j in eachindex(args)
                             Fty = fieldtype(T, j)
                             RFty = rdtype(Fty)
@@ -1784,7 +2023,9 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                         end
                     end
                 elseif isa(f, Core.Builtin)
-                    cctx = (; emit!, icall, comms=comms_val_id, pb_presolve,
+                    cctx = (; emit!, icall, pb_presolve, bulk_saved=pb_bulk_saved,
+                           fetch_shadow=pb_fetch_shadow, fetch_primal=pb_presolve,
+                           fetch_saved=pb_fetch_saved,
                            deref_and_zero! = (@nospecialize Pi) -> deref_and_zero!(ssa_ref_id[i], Pi),
                            optype=(@nospecialize x) -> _optype(pir, x), ssa=Core.SSAValue(i), ref_for)
                     contribs = apply_builtin_rrule!(Val(f), actual, Ti, cctx)
@@ -1855,8 +2096,19 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         end
 
         if b == 1
-            # No predecessors: this is the pullback's own final block. Read out every argument's
-            # accumulated rdata and return them as a tuple.
+            # No predecessors: this is the pullback's own final block — the last thing that runs.
+            # Restore every bulk-saved argument's primal contents here, which is what makes the
+            # whole scheme equivalent to restoring each overwritten element as the sweep passes it:
+            # nothing reads primal memory in between, so only the state at this boundary is visible.
+            if !isempty(bulk_args)
+                bufs_id = emit!(Expr(:call, getf, Core.Argument(2), 3), Vector{Any})
+                for k in sort!(collect(bulk_args))
+                    Pk = _widen(_codual_primal_type(codualparams[k]))
+                    emit!(icall(_bulk_restore!, (Vector{Any}, Int, Pk),
+                                bufs_id, bulk_slot[k], parg_pb[k]), Nothing)
+                end
+            end
+            # Read out every argument's accumulated rdata and return them as a tuple.
             result_ids = Vector{Any}(undef, n)
             for k in 1:n
                 Pk = _codual_primal_type(codualparams[k])
@@ -2039,6 +2291,10 @@ every call — the whole point of holding onto a context rather than differentia
 the context **single-use at a time**: it is not reentrant and not thread-safe, so give each task its
 own. `prealloc=false` returns `Ctx()` — a context that allocates a fresh tape per call instead.
 
+A reused tape also holds onto the *previous* call's argument coduals (the pullback reaches primal
+argument values through them) — and so keeps their shadows alive — until the next call overwrites
+them. Drop the context to release them.
+
 ```julia
 ctx = build_ctx(f, (Vector{Float64},))
 y, pb = rrule!!(zero_fcodual(f), ctx, CoDual(x, dx))
@@ -2098,7 +2354,7 @@ end
 function _fresh_tape_expr(@nospecialize(TapeT))
     CS = TapeT.parameters[2]
     slots = Any[:($S()) for S in CS.parameters]
-    return :($TapeT($(Stack{Int32})(), ($(slots...),)))
+    return :($TapeT($(Stack{Int32})(), ($(slots...),), $(Vector{Any})()))
 end
 
 function refresh_build_tape()

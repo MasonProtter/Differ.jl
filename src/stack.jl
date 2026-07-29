@@ -45,6 +45,34 @@ end
     return val
 end
 
+# Reusable buffers for bulk primal save/restore (`_bulk_save_args`, `reverse_interp.jl`), held in a
+# `Tape`'s `bufs` field. Indexed by slot — one slot per bulk-saved argument, assigned statically by
+# the transform. `Any` element type because the slots have unrelated types; that costs one dynamic
+# check per *call*, never per element.
+#
+# `Base.copyto!`/`Base.similar` fully qualified for the same reason as `Base.push!` above: these are
+# inlined into synthetic carrier IR, where a bare name resolves as `GlobalRef(Differ, :copyto!)` and
+# trips `verify_ir`'s unbound-GlobalRef check.
+const _NO_BULK_BUFS = Any[]
+
+@noinline function _bulk_save!(bufs::Vector{Any}, slot::Int, src::M) where {M}
+    length(bufs) < slot && Base.resize!(bufs, slot)
+    b = Base.isassigned(bufs, slot) ? bufs[slot] : nothing
+    # Reallocate only when the buffer can't be reused — a pre-allocated context calling repeatedly
+    # with same-shaped arguments allocates here exactly once, ever.
+    if !isa(b, M) || Base.length(b::M) != Base.length(src)
+        b = Base.similar(src)
+        bufs[slot] = b
+    end
+    Base.copyto!(b::M, src)
+    return nothing
+end
+
+@noinline function _bulk_restore!(bufs::Vector{Any}, slot::Int, dst::M) where {M}
+    Base.copyto!(dst, bufs[slot]::M)
+    return nothing
+end
+
 # A stack for a singleton element type: nothing is ever actually stored (there's only one possible
 # value), so push!/pop! are no-ops that just materialise `T.instance`. Used for a block whose comms
 # tuple type is empty/singleton (nothing to communicate) so the tape carries no real storage for it.

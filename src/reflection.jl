@@ -160,6 +160,36 @@ function code_reverse_pullback_ircode(@nospecialize(f), @nospecialize(argtypes::
 end
 
 """
+    tape_type(f, argtypes::Tuple; world=Base.get_world_counter()) -> Type{<:Tape}
+
+The concrete `Tape` type the reverse-mode forwards carrier for `f` at `argtypes` returns — i.e. the
+tape a real `rrule!!` call would build. Recovered from `code_reverse_fwds_ircode`'s return type,
+exactly as `code_reverse_pullback_ircode` does it, so this reports the tape both carriers agree on.
+
+Chiefly useful with [`comms_element_types`](@ref) for asserting on tape layout in tests.
+"""
+function tape_type(@nospecialize(f), @nospecialize(argtypes::Tuple);
+                   world::UInt=Base.get_world_counter())
+    return code_reverse_fwds_ircode(f, argtypes; world)[2].parameters[2]
+end
+
+"""
+    comms_element_types(TapeT::Type{<:Tape}) -> Vector{Any}
+
+The element type of every per-block comms stack in `TapeT` that actually stores something, in block
+order. `SingletonStack` slots (blocks with nothing to communicate) are skipped — they carry no
+storage, so they say nothing about tape size.
+
+Each element is the `Tuple` type that block pushes once per execution. Assert on properties of the
+whole collection (`all(isbitstype, …)`, `sum(sizeof, …)`) rather than on a particular block's index:
+block numbering shifts with any unrelated change to Julia's optimizer.
+"""
+function comms_element_types(@nospecialize(TapeT::Type))
+    (TapeT <: Tape) || throw(ArgumentError("expected a `Tape` type, got $(TapeT)"))
+    return Any[S.parameters[1] for S in TapeT.parameters[2].parameters if S <: Stack]
+end
+
+"""
     @code_reverse_pullback_ircode f(args...)
 
 Convenience macro: show the optimized `IRCode` for the reverse-mode pullback carrier for the call

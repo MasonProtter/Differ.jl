@@ -375,3 +375,116 @@ end
     checkverify_rev(newmut_recursive_mutate, (Float64,))
     check_stack_balance(newmut_recursive_mutate, 2.0)
 end
+
+# ---------------------------------------------------------------------------
+# Bulk primal save/restore (`_bulk_save_args`, `reverse_interp.jl`).
+#
+# A store's pullback restores the element it overwrote so the primal is left as the call found it.
+# For an argument array written in a *loop* that is done once for the whole array, in the forwards
+# prologue and at the very end of the pullback, instead of per element — which is sound only because
+# no pullback rule anywhere reads primal memory, so nothing observes the primal in between.
+#
+# The tests that matter here are the negative ones: bulk mode must not fire where it isn't sound,
+# and must not disturb the shadow (which, unlike the primal, genuinely *is* live during the reverse
+# sweep and is still restored one element at a time).
+# ---------------------------------------------------------------------------
+@testset "reverse mode: bulk primal save/restore" begin
+    h = 1e-6
+
+    # A loop writing an argument array, then reading it back. `d/da` = sum over i of i = 6.
+    function bulk_write_read(v::Vector{Float64}, a::Float64)
+        for i in 1:length(v)
+            @inbounds v[i] = a * i
+        end
+        s = 0.0
+        for i in 1:length(v)
+            @inbounds s += v[i]
+        end
+        return s
+    end
+    v = [7.0, 8.0, 9.0]
+    _, _, da = gradient(bulk_write_read, v, 3.0)
+    @test da ≈ 6.0
+    @test da ≈ central_diff(a -> bulk_write_read(copy(v), a), 3.0) rtol = 1e-5
+    @test v == [7.0, 8.0, 9.0]          # primal restored by the bulk copy-back
+    checkverify_rev(bulk_write_read, (Vector{Float64}, Float64))
+    check_stack_balance(bulk_write_read, v, 3.0)
+    @test v == [7.0, 8.0, 9.0]
+
+    # The `Memory` form of the same shape — `foo!`'s exact IR: the ref chain is rooted at a
+    # `Core.memorynew`-free `Memory` argument via the 1-arg `memoryrefnew`, no `Array.ref` hop.
+    # `Memory` can't go through `gradient` (no `zero_tangent` method), so drive `rrule!!` directly.
+    function bulk_mem!(out::Memory{Float64}, x::Float64, N::Int)
+        for i in 1:N
+            @inbounds out[i] = x
+        end
+        return nothing
+    end
+    om = Memory{Float64}(undef, 4); fill!(om, 2.0)
+    dm = Memory{Float64}(undef, 4); fill!(dm, 0.0)
+    _, pbm = rrule!!(zero_fcodual(bulk_mem!), Ctx(), Differ.CoDual(om, dm),
+                     zero_fcodual(5.0), zero_fcodual(4))
+    pbm(NoRData())
+    @test om == Memory{Float64}([2.0, 2.0, 2.0, 2.0])   # restored
+    # One `MemoryRef` (the shadow handle) + one `Float64` (the old tangent) per iteration — the old
+    # *primal* and the primal `MemoryRef` are exactly what bulk mode removed.
+    check_tape_size(bulk_mem!, (Memory{Float64}, Float64, Int); bytes=24)
+
+    # Aliasing within the loop: each iteration reads the element the previous one wrote. The
+    # per-element *shadow* restore is what makes this come out right, and bulk mode must not touch
+    # it. d/da = 2^(n-1) = 8.
+    function bulk_shift!(x::Vector{Float64}, a::Float64)
+        x[1] = a
+        for i in 2:length(x)
+            @inbounds x[i] = x[i-1] * 2
+        end
+        return x[length(x)]
+    end
+    xs = [1.0, 2.0, 3.0, 4.0]
+    _, _, das = gradient(bulk_shift!, xs, 5.0)
+    @test das ≈ 8.0
+    @test das ≈ central_diff(a -> bulk_shift!(copy(xs), a), 5.0) rtol = 1e-5
+    @test xs == [1.0, 2.0, 3.0, 4.0]
+    check_stack_balance(bulk_shift!, xs, 5.0)
+
+    # NEGATIVE: straight-line stores must *not* go bulk — copying a whole array to save two elements
+    # would be a pessimization, so the loop gate is what keeps them on the per-element scheme. This
+    # asserts the gate itself, via the tape still carrying the primal `MemoryRef`/old-value pair.
+    straightline!(v::Vector{Float64}, a::Float64) = (v[1] = a; v[2] = 2a; v[1] + v[2])
+    vsl = [1.0, 2.0]
+    _, _, dasl = gradient(straightline!, vsl, 4.0)
+    @test dasl ≈ 3.0
+    @test vsl == [1.0, 2.0]
+    @test any(T -> T <: Tuple && any(F -> F <: MemoryRef, fieldtypes(T)) && Float64 in fieldtypes(T),
+              check_tape_size(straightline!, (Vector{Float64}, Float64)))
+
+    # NEGATIVE, and the one that discriminates a correct implementation from a plausible-looking
+    # wrong one: an argument's *incoming* shadow must come back exactly as supplied. Every other
+    # test in this suite starts from zero shadows (`value_and_gradient!` zeroes them), so nothing
+    # else would catch a bulk scheme that wrongly swallowed the shadow too.
+    function bulk_fill!(v::Vector{Float64}, a::Float64)
+        for i in 1:length(v)
+            @inbounds v[i] = a
+        end
+        return nothing
+    end
+    u = [1.0, 2.0, 3.0]
+    du = [10.0, 20.0, 30.0]          # deliberately nonzero on entry
+    _, pbu = rrule!!(zero_fcodual(bulk_fill!), Ctx(), Differ.CoDual(u, du), zero_fcodual(4.0))
+    pbu(NoRData())
+    @test du == [10.0, 20.0, 30.0]
+    @test u == [1.0, 2.0, 3.0]
+
+    # A bulk-saving callee reached recursively, called twice on the same array: the inner tape's own
+    # buffer restores the array at each inner pullback, and the outer's at the end. d/da = 1 + 2 = 3.
+    @noinline bulk_inner!(v::Vector{Float64}, a::Float64) =
+        (for i in 1:length(v); @inbounds v[i] = a * i; end; v[1])
+    bulk_outer(v::Vector{Float64}, a::Float64) = bulk_inner!(v, a) + bulk_inner!(v, 2a)
+    vr = [3.0, 4.0]
+    _, _, dar = gradient(bulk_outer, vr, 2.0)
+    @test dar ≈ 3.0
+    @test dar ≈ central_diff(a -> bulk_outer(copy(vr), a), 2.0) rtol = 1e-5
+    @test vr == [3.0, 4.0]
+    checkverify_rev(bulk_outer, (Vector{Float64}, Float64))
+    check_stack_balance(bulk_outer, vr, 2.0)
+end
