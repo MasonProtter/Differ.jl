@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: Dual, NoTangent, frule!!, primal, tangent
+using Differ: Dual, NoTangent, frule!!, primal, tangent, code_dual_ircode
 
 # Dynamic dispatch (`apply_generic`): reading a non-`const` global always infers as `Any`
 # (regardless of the concrete type of the value it holds), so any call whose argument flows
@@ -75,4 +75,44 @@ constref_any_use(x) = x * constref_any[]
     d3 = frule!!(Dual(constref_float_use, NoTangent()), Dual(5.0, 1.0))
     @test primal(d3) ≈ 5.0 * constref_float[]
     @test tangent(d3) ≈ constref_float[]
+end
+
+# A surviving call whose result Julia's own inference proves is a compile-time constant is
+# annotated `Core.Const(v)` in `:type` rather than a plain `Type`. This shows up for an ordinary
+# `@noinline` helper that has a genuine side effect (so the call can't be folded away entirely) but
+# whose *return value* is nonetheless provably fixed for these argument — e.g. a usage-counter/
+# telemetry call guarding a fixed config value, or a feature-flag check guarding a branch. This used
+# to crash with `MethodError: no method matching dual_type(::Core.Const)` inside `frule_split!`. A
+# provably-constant result's derivative is definitionally zero regardless of what the callee
+# computes, so the call is reconstructed faithfully (preserving its side effect) but its shadow is
+# the zero tangent directly, without going through `frule!!` dispatch at all.
+const rate_lookup_count = Ref(0)
+@noinline function default_rate()
+    rate_lookup_count[] += 1     # e.g. telemetry: count how often the default gets used
+    return 0.05                  # the rate itself is fixed
+end
+apply_rate(x) = x * default_rate()          # d/dx = 0.05
+const flag_check_count = Ref(0)
+@noinline function debug_mode_enabled()
+    flag_check_count[] += 1      # e.g. telemetry: count how often the flag is consulted
+    return false                 # the flag itself is fixed at this call site
+end
+scaled(z) = debug_mode_enabled() ? 2z : z   # d/dz = 1 (branch resolves statically to `false`)
+
+@testset "Core.Const-narrowed surviving call" begin
+    ir1, rt1 = code_dual_ircode(apply_rate, (Float64,))
+    Core.Compiler.verify_ir(ir1)
+    rate_lookup_count[] = 0
+    d1 = frule!!(Dual(apply_rate, NoTangent()), Dual(3.0, 1.0))
+    @test primal(d1) ≈ 3.0 * 0.05        # not `apply_rate(3.0)` — that would double-count the effect
+    @test tangent(d1) ≈ 0.05
+    @test rate_lookup_count[] == 1        # the side effect still ran exactly once
+
+    ir2, rt2 = code_dual_ircode(scaled, (Float64,))
+    Core.Compiler.verify_ir(ir2)
+    flag_check_count[] = 0
+    d2 = frule!!(Dual(scaled, NoTangent()), Dual(3.0, 1.0))
+    @test primal(d2) ≈ 3.0
+    @test tangent(d2) ≈ 1.0
+    @test flag_check_count[] == 1
 end

@@ -592,11 +592,16 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # Zero tangent for a *computed* primal value of type `Ti` (the tangent of a non-differentiable
     # operation's result). `NoTangent()` when the tangent type is trivial (`Int`, `Bool`, …), a
     # literal `zero(Ti)` for a concrete `Number`, otherwise a runtime `zero_tangent` on the primal.
+    # `Ti` may be a `Core.PartialStruct`/`Core.Const` lattice element rather than a bare `Type` (see
+    # `tt`'s own note above) — widen it first, same as `tt`, so the `Number` literal-zero fast path
+    # and the `emit_invoke!` argtype (which needs a real `Type` for its dispatch tuple) both still
+    # apply instead of silently falling back to a plain dynamic `:call`.
     function zero_shadow(@nospecialize(Ti), @nospecialize(primal_ssa))
         T = tt(Ti)
         T === NoTangent && return NoTangent()
-        (Ti isa DataType && isconcretetype(Ti) && Ti <: Number) && return zero(Ti)::Ti
-        return emit_invoke!(zerotang_g, T, (Ti,), primal_ssa)
+        Tw = Ti isa Type ? Ti : CC.widenconst(Ti)
+        (Tw isa DataType && isconcretetype(Tw) && Tw <: Number) && return zero(Tw)::Tw
+        return emit_invoke!(zerotang_g, T, (Tw,), primal_ssa)
     end
 
     dualparams = impl_mi.specTypes.parameters[2:end]     # the Dual{…} argument types
@@ -848,6 +853,26 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                            "block at %$i: `$(_stmt_str(s))`"
                 return nothing
             end
+        elseif isa(Ti, Core.Const) && isa(s, Expr) && (s.head === :call || s.head === :invoke)
+            # Julia's own constant-propagation proved this call's result is always exactly this
+            # literal value, regardless of its arguments — the derivative of a provably-constant
+            # quantity is definitionally zero, independent of whatever the callee actually computes.
+            # (Only `Core.Const` licenses this — a `Core.PartialStruct` narrows *some* fields but
+            # doesn't pin the whole value, e.g. `Core.memorynew`'s result, which does carry a real
+            # shadow.) The call is kept in the primal IR rather than folded away only for its own
+            # sake (effects, or simply not inlined), so still reconstruct it faithfully — but skip
+            # the intrinsic/builtin/`frule!!` dispatch below entirely for the shadow, straight to
+            # `zero_shadow`. Resolve the display-callee to its value exactly like the unreachable-block
+            # arm above (a bare non-Core/Base `GlobalRef` in value position is rejected by `verify_ir`).
+            fpos = s.head === :invoke ? s.args[2] : s.args[1]
+            actual = s.head === :invoke ? s.args[3:end] : s.args[2:end]
+            fv = _calleeval(fpos, iworld)
+            fcallee = fv === nothing ? presolve(fpos) : fv
+            ex = s.head === :invoke ?
+                    Expr(:invoke, s.args[1], fcallee, (presolve(a) for a in actual)...) :
+                    Expr(:call, fcallee, (presolve(a) for a in actual)...)
+            primal[i] = emit!(ex, Ti)
+            shadow[i] = zero_shadow(Ti, primal[i])
         elseif isa(s, Core.ReturnNode)
             if !isdefined(s, :val)
                 emit!(Core.ReturnNode(), Union{})   # unreachable terminator
