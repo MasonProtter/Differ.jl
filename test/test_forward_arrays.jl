@@ -140,6 +140,29 @@ include(joinpath(@__DIR__, "testutils.jl"))
                                       Dual(2, NoTangent()))
 end
 
+@testset "nothing-returning primal (forward mode, ISSUES #53)" begin
+    # A mutator that ends in `return nothing` — the ordinary way to write an in-place function.
+    # `return nothing` survives optimization as a bare `GlobalRef` (`Main.nothing`), which used to
+    # (1) leak into value position (verify_ir rejects a non-Core/Base GlobalRef there) and (2) get
+    # typed `GlobalRef` instead of `Nothing`. Fixed: the result is a `Dual{Nothing,NoTangent}` and
+    # the shadow array still receives the tangent write.
+    noret!(v, x) = (v[1] = x; nothing)
+    v, dv = [1.0, 2.0], [0.0, 0.0]
+    r = frule!!(Dual(noret!, NoTangent()), Dual(v, dv), Dual(5.0, 7.0))
+    @test r.x === nothing && r.dx === NoTangent()
+    @test v == [5.0, 2.0] && dv == [7.0, 0.0]      # primal + shadow both written
+    checkverify(noret!, (Vector{Float64}, Float64))
+
+    # The `bench/workloads.jl` `vecloop!` shape: a `nothing`-returning write loop.
+    vecloop!(v::Vector{Float64}, x::Float64) =
+        (for i in 1:length(v); @inbounds v[i] = x * i; end; nothing)
+    v2, dv2 = zeros(3), zeros(3)
+    r2 = frule!!(Dual(vecloop!, NoTangent()), Dual(v2, dv2), Dual(3.0, 1.0))
+    @test r2.x === nothing && r2.dx === NoTangent()
+    @test v2 == [3.0, 6.0, 9.0] && dv2 == [1.0, 2.0, 3.0]   # d(x*i)/dx = i
+    checkverify(vecloop!, (Vector{Float64}, Float64))
+end
+
 @testset "mutable-struct field mutation (setfield!, forward mode)" begin
     # setfield! mutates the primal in place and its `MutableTangent` shadow via
     # `set_tangent_field!` — the mutation-side counterpart of the existing getfield/

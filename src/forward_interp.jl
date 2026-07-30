@@ -380,6 +380,27 @@ function frule_codeinstance(interp::ADInterpreter, @nospecialize(ftype), dual_ar
     return ci
 end
 
+# Resolve an arbitrary call whose dispatch tuple is `tt` to a `CodeInstance` for a static `:invoke`,
+# or `nothing` if unresolved. The generic sibling of `frule_codeinstance`: identical pipeline
+# (`findsup` against the interpreter's method table, `specialize_method`,
+# `typeinf_ext_toplevel(NativeInterpreter, …, SOURCE_MODE_ABI)`) and identical invalidation edges —
+# an mt-backedge so a new/more-specific method invalidates this carrier, plus a direct invoke edge to
+# the resolved CI. Used for the tangent-helper calls (`get_tangent_field`/`set_tangent_field!`
+# fallbacks, `zero_tangent`) that the direct-emission path can't take: a synthesized bare
+# `Expr(:call, helper, …)` carries no `CallInfo`, so `ssa_inlining_pass!` can't inline it and it runs
+# as a dynamic dispatch — an `:invoke` to a CI runs the compiled method directly instead.
+function static_codeinstance(interp::ADInterpreter, @nospecialize(tt), edges::Vector{Any}=Any[])
+    push!(edges, tt, Core.methodtable)   # mt-backedge: a new/more-specific method must invalidate
+    m, _ = CC.findsup(tt, CC.method_table(interp))
+    m === nothing && return nothing
+    isa(m.method, Method) || return nothing
+    mi = specialize_method(m.method, m.spec_types, m.sparams)::MethodInstance
+    world = CC.get_inference_world(interp)
+    ci = CC.typeinf_ext_toplevel(CC.NativeInterpreter(world), mi, CC.SOURCE_MODE_ABI)::CodeInstance
+    CC.add_invoke_edge!(edges, tt, ci)
+    return ci
+end
+
 
 # ===========================================================================
 # The split-shadow dualization engine: post-optimization forward-AD on typed `IRCode`.
@@ -435,6 +456,20 @@ _calleeval(@nospecialize(x), world::UInt) =
     isa(x, Core.SSAValue) || isa(x, Core.Argument) ? nothing :
     x
 
+# Resolve a `GlobalRef` to its bound value, distinguishing "resolved" from "undefined/unresolvable" —
+# which `_calleeval` cannot, since its `nothing` sentinel collides with a binding whose value *is*
+# `nothing` (the exact case of `return nothing`, which survives as `Main.nothing`). Returns
+# `(true, val)` for a defined binding, `(false, nothing)` otherwise. Same world-parameterized
+# `Base.getglobalref` lookup as `_calleeval` (see its note): the `world` argument is mandatory, never
+# the ambient task world.
+function _globalref_val(gr::GlobalRef, world::UInt)
+    try
+        return (true, Base.getglobalref(gr, world))
+    catch
+        return (false, nothing)
+    end
+end
+
 # Build the dualized IRCode for `impl_mi` (a `dualized_impl` specialization) from the primal's
 # optimized IRCode `pir`. `n` = number of dual arguments (= primal args incl. #self#).
 # `pir_is_vararg` selects the argument-unpacking prologue: `false` for an ordinary primal (scalar
@@ -486,6 +521,24 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     code = Any[]; types = Any[]
     emit!(ex, @nospecialize(ty)) = (push!(code, ex); push!(types, ty); Core.SSAValue(length(code)))
     opf(name, ty, args...) = emit!(Expr(:call, intrg(name), args...), ty)
+    # Emit a call `f(args...)` (declared result type `R`) as a static `:invoke` to a resolved
+    # `CodeInstance` when its signature resolves, falling back to a bare `:call` otherwise. The
+    # fallback keeps behavior identical to before; the win is that a resolved call runs the compiled
+    # method directly instead of dynamic-dispatching a `CallInfo`-less synthesized `:call`. `argtypes`
+    # are the argument types (excluding `f`), used only to build the dispatch tuple — pass the
+    # operands' own declared types so the resolved `CodeInstance` matches what runs.
+    #
+    # Only invoke when every `argtype` is *concrete*: a non-concrete argtype (e.g. `Any`, the type of a
+    # dynamic-dispatch result) means dispatch is genuinely runtime — `findsup` would resolve it to an
+    # over-general method (`zero_tangent(::Any)`) and freezing an `:invoke` to that would both defeat
+    # dynamic dispatch and hit that method's unbound-static-param path. A bare `:call` there still
+    # dispatches correctly on the concrete runtime value, exactly as before Part 3.
+    emit_invoke!(@nospecialize(f), @nospecialize(R), argtypes::Tuple, args...) = begin
+        ci = all(_conc, argtypes) ?
+                static_codeinstance(interp, Tuple{Core.Typeof(f), argtypes...}, edges) : nothing
+        ci === nothing ? emit!(Expr(:call, f, args...), R) :
+                         emit!(Expr(:invoke, ci, f, args...), R)
+    end
     # Construct a `Dual{P,T}` directly with `%new` (an immutable-struct construction, no dispatch /
     # allocation) rather than a dynamic `Dual(...)` call the inliner couldn't reach in synthetic IR.
     dual!(@nospecialize(P), @nospecialize(T), @nospecialize(p), @nospecialize(t)) =
@@ -525,8 +578,14 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     function const_tangent(@nospecialize x)
         isa(x, QuoteNode) && return zero_tangent(x.value)
         if isa(x, GlobalRef)
-            gv = _calleeval(x, iworld)
-            gv !== nothing && return emit!(Expr(:call, zerotang_g, x), tangent_type(Core.Typeof(gv)))
+            # `_globalref_val`, not `_calleeval`: a binding holding `nothing` (e.g. `return nothing`)
+            # must still resolve here, not be mistaken for undefined and fall through to
+            # `zero_tangent(gr)` (the tangent of the GlobalRef *struct*, not the bound value).
+            ok, gv = _globalref_val(x, iworld)
+            if ok
+                T = tangent_type(Core.Typeof(gv))
+                return T === NoTangent ? NoTangent() : emit_invoke!(zerotang_g, T, (Core.Typeof(gv),), x)
+            end
         end
         return zero_tangent(x)
     end
@@ -537,7 +596,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         T = tt(Ti)
         T === NoTangent && return NoTangent()
         (Ti isa DataType && isconcretetype(Ti) && Ti <: Number) && return zero(Ti)::Ti
-        return emit!(Expr(:call, zerotang_g, primal_ssa), T)
+        return emit_invoke!(zerotang_g, T, (Ti,), primal_ssa)
     end
 
     dualparams = impl_mi.specTypes.parameters[2:end]     # the Dual{…} argument types
@@ -695,7 +754,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # `optype`/`tt` give those rules the primal-type introspection they need for same-shape-vs-general
     # struct branching that a plain intrinsic never has to do.
     builtin_ctx = (emit! =emit!, presolve=presolve, tresolve=tresolve, zero_shadow=zero_shadow,
-                   optype=a -> _optype(pir, a), tt=tt)
+                   optype=a -> _optype(pir, a), tt=tt, emit_invoke! =emit_invoke!)
 
     # Block topology (block count, order, preds/succs) is preserved 1:1 from the primal: this
     # transform only expands each original statement into more instructions, never splits, merges,
@@ -793,8 +852,25 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             if !isdefined(s, :val)
                 emit!(Core.ReturnNode(), Union{})   # unreachable terminator
             else
-                p = presolve(s.val); t = tresolve(s.val)
-                R = _optype(pir, s.val)
+                if isa(s.val, GlobalRef)
+                    # `return <global>` — e.g. `return nothing`, which survives optimization as the
+                    # bare GlobalRef `Main.nothing`, not a literal. Two things the generic path gets
+                    # wrong here: (1) `presolve` would pass the raw node through and it would land in
+                    # the returned `Dual`'s primal field, which `verify_ir` rejects (a non-Core/Base
+                    # GlobalRef in value position — gotcha #2/#4); emit a real global load instead.
+                    # (2) `_optype` would report `GlobalRef`, not the bound value's type; take the type
+                    # from the binding. A defined `const` binding gives a concrete `Core.Typeof(gv)` —
+                    # for `return nothing` that is `Nothing`, keeping the allocation-free `%new` path;
+                    # a non-`const` (or unresolvable) binding falls to `Any` and the dynamic pack.
+                    gr = s.val::GlobalRef
+                    ok, gv = _globalref_val(gr, iworld)
+                    R = (ok && Base.isconst(gr.mod, gr.name)) ? Core.Typeof(gv) : Any
+                    p = emit!(gr, R)
+                else
+                    p = presolve(s.val)
+                    R = _optype(pir, s.val)
+                end
+                t = tresolve(s.val)
                 # Concrete `R`: pack with an allocation-free `%new` of the exact `Dual{R,tt(R)}`.
                 # Non-concrete `R` (a dynamic-dispatch result, e.g. `Any`): build the `Dual`
                 # dynamically so the runtime type is the concrete leaf, not a frozen `Dual{Any,Any}`.
@@ -845,12 +921,22 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 #    `Array{P,N}`: shadow ref, primal's own size.
                 shadow[i] = emit!(Expr(:new, TT, tresolve(args[1]), presolve(args[2])), TT)
             else
-                # General (im)mutable user struct → `Tangent`/`MutableTangent` via `build_tangent`,
-                # which wraps possibly-undef fields in `PossiblyUninitTangent` and fills the backing
-                # `NamedTuple`. `tresolve`d field tangents already carry `NoTangent()` for non-diff
-                # fields, which `build_tangent` places in the corresponding `NoTangent` slot.
+                # General (im)mutable user struct → `Tangent`/`MutableTangent`. `tresolve`d field
+                # tangents already carry `NoTangent()` for non-diff fields (dropped into the matching
+                # `NoTangent` slot). When every slot is always-initialised (no `PossiblyUninitTangent`)
+                # and `%new` supplies a value for all of them, build the backing `NamedTuple` and wrap
+                # it with `%new` directly — no `build_tangent` call to dynamic-dispatch. Otherwise fall
+                # back to `build_tangent`, which does the `PossiblyUninitTangent` wrapping and
+                # empty-slot construction the direct `%new` can't.
                 tf = Any[tresolve(args[j]) for j in eachindex(args)]
-                shadow[i] = emit!(Expr(:call, buildtang_g, T, tf...), TT)
+                NT = (TT isa DataType && TT <: Union{Tangent,MutableTangent}) ? fields_type(TT) : nothing
+                if NT isa DataType && isconcretetype(NT) && length(args) == fieldcount(NT) &&
+                   !any(j -> fieldtype(NT, j) <: PossiblyUninitTangent, 1:fieldcount(NT))
+                    nt = emit!(Expr(:new, NT, tf...), NT)
+                    shadow[i] = emit!(Expr(:new, TT, nt), TT)
+                else
+                    shadow[i] = emit!(Expr(:call, buildtang_g, T, tf...), TT)
+                end
             end
         elseif isa(s, Expr) && s.head === :boundscheck
             # Marks a compile-time-decided bounds-check mode, consulted downstream by a `GotoIfNot`/

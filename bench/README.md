@@ -1,11 +1,14 @@
-# Differ reverse-mode benchmarks
+# Differ benchmarks
 
-A small suite for tracking the cost of reverse-mode AD, built on
-[BenchmarkTools](https://github.com/JuliaCI/BenchmarkTools.jl).
+A small suite for tracking the cost of AD in both modes — reverse (`rrule!!` + pullback) and forward
+(`frule!!`) — built on [BenchmarkTools](https://github.com/JuliaCI/BenchmarkTools.jl).
 
 ```bash
-# measure the working tree
+# measure the working tree (both modes)
 julia +1.13 --project=bench bench/run.jl
+
+# one mode only
+julia +1.13 --project=bench bench/run.jl --mode=forward
 
 # A/B the working tree against a git revision (checks it out into a temporary worktree)
 julia +1.13 --project=bench bench/compare.jl HEAD
@@ -13,8 +16,14 @@ julia +1.13 --project=bench bench/compare.jl master --n=10000 --seconds=2
 ```
 
 Flags: `--n=` array length / loop trip count (default 1000), `--seconds=` per-workload budget
-(default 1.0), `--json=` write results for a later `BenchmarkTools.load`, `--tolerance=` the
+(default 1.0; primal baselines are capped at 0.5), `--mode=` `reverse` | `forward` | `all` (default
+`all`), `--json=` write results for a later `BenchmarkTools.load`, `--tolerance=` the
 below-which-it's-noise fraction for `compare.jl` (default 0.05).
+
+Forward-mode keys are prefixed `fwd `; reverse-mode keys are bare. Five primals
+(`readonly`, `wrloop`, `structloop`, `scalarcf`, `straightline!`) appear in **both** modes on
+purpose — the same function measured both ways is the only honest way to say what one mode costs
+relative to the other on a given shape.
 
 **Use `--seconds=2` when the result matters.** At the 1 s default the sub-microsecond workload
 (`straightline!`) has measured anywhere from −14% to −39% for the same change; it settles by 2 s.
@@ -35,25 +44,45 @@ any single number.
 ## Reading the table
 
 ```
-┌──────────────────────────────────┬───────────┬────────┬─────────┬────────┬──────────┐
-│ workload                         │       min │ allocs │ comms B │ isbits │ kind     │
-├──────────────────────────────────┼───────────┼────────┼─────────┼────────┼──────────┤
-│ memloop! Memory[1000]            │ 16.341 μs │  79624 │      24 │     no │ mutation │
-│ memloop! Memory[1000] (prealloc) │  4.358 μs │      0 │      24 │     no │ mutation │
-└──────────────────────────────────┴───────────┴────────┴─────────┴────────┴──────────┘
+┌──────────────────────────────────┬──────┬───────────┬────────┬───────────┬───────────────┬────────┬─────────┬────────┬──────────┐
+│ workload                         │ mode │       min │ allocs │    primal │ primal allocs │      × │ comms B │ isbits │ kind     │
+├──────────────────────────────────┼──────┼───────────┼────────┼───────────┼───────────────┼────────┼─────────┼────────┼──────────┤
+│ fwd wrloop Vector[1000]          │ fwd  │  1.282 μs │      0 │ 671.560ns │             0 │   1.9× │       — │      — │ mutation │
+│ memloop! Memory[1000]            │ rev  │ 16.501 μs │  79624 │ 52.990 ns │             0 │ 311.4× │      24 │     no │ mutation │
+│ memloop! Memory[1000] (prealloc) │ rev  │  4.509 μs │      0 │ 52.690 ns │             0 │  85.6× │      24 │     no │ mutation │
+└──────────────────────────────────┴──────┴───────────┴────────┴───────────┴───────────────┴────────┴─────────┴────────┴──────────┘
 ```
 
+- **mode** — `rev` (`rrule!!` + pullback) or `fwd` (`frule!!`).
 - **min** — minimum sample. Compare minima, not medians: on this workload the medians swing ±7% run
   to run while the minima are stable to ~1%. `compare.jl` treats anything under 5% as noise.
+- **primal** / **primal allocs** / **×** — the same call, undifferentiated, and the ratio. Every
+  workload registers one (as a separate `"… [primal]"` benchmark, folded into this row rather than
+  given its own). **The ratio is the only figure comparable across workloads** — an absolute time
+  mostly says how much work the primal does. Two cautions when reading it:
+  - A primal the compiler vectorizes inflates the ratio, and that is real but not all the
+    transform's doing: `memloop!` fills 1000 elements in 53 ns because it becomes a `memset`, and
+    nothing dualized will match that. Compare ratios across *revisions* of the same workload freely;
+    compare them across workloads only with the primal's shape in mind.
+  - A nonzero **primal allocs** would mean the workload's own `allocs` includes allocation the
+    transform is not responsible for. None of the current primals allocate; the column is
+    highlighted if one starts to.
+
+  In `compare.jl` the primal rows appear on their own, marked `(machine)`: the same undifferentiated
+  code runs on both sides, so their Δ *is* the run's noise floor. Most sit under 1%. The exception is
+  `straightline! [primal]` at ~1.7 ns, which is close enough to the timer's resolution to swing ±25%;
+  treat that one as a resolution artifact, not a measurement.
 - **allocs** — bytes allocated per call. Through a `build_ctx(...; prealloc=true)` context this
   should be **0**, and anything else is worth chasing. The fresh-tape (`Ctx()`) workloads allocate
   by construction — that is what they exist to measure, so they are highlighted for attention
-  rather than flagged as faults.
+  rather than flagged as faults. **Forward mode has no such excuse**: there is no tape and no
+  context, so a nonzero figure is a `Dual` that failed to stay in registers — see the forward
+  section below.
 - **commsB** / **isbits** — tape shape: total bytes across the tape's comms stacks, and whether they
   are all pointer-free. A `MemoryRef` in a comms tuple makes the backing buffer GC-tracked, costing a
   write barrier on every push. Note `commsB` is a **whole-function sum over all blocks**, not a
   per-iteration figure — for a loop workload the loop block dominates it, but for a straight-line one
-  it counts blocks that run once.
+  it counts blocks that run once. Blank (`—`) on forward rows: the forward carrier has no tape.
 - **kind** — `mutation` workloads are expected to move when mutation costs change. **`guard`
   workloads are expected not to move at all**: they exercise no mutation machinery, so they are how
   a per-call regression (something added to every tape, say) gets caught. `compare.jl` flags a guard
@@ -68,9 +97,47 @@ that a pre-allocated context amortizes away are paid in full on the fresh-tape p
 optimization that trades an allocation for less per-iteration work will look much better on one than
 the other. Quote both.
 
+## The forward workloads
+
+There is no tape, no context and nothing to pre-allocate, so a forward workload is just
+`frule!!(Dual(f, df), Dual(x, dx), …)` — one variant per primal, and **allocs should be 0**. What the
+set covers, beyond the five primals shared with reverse:
+
+| workload | what it stresses |
+|---|---|
+| `fwd polychain` | branch-free scalar chain: the per-operation floor for a `Dual` |
+| `fwd vecloop_ret!` | shadow array writes with no read-back |
+| `fwd applyN closure` | higher-order: a closure *value* applied through the dual convention each iteration |
+| `fwd cpoly ComplexF64` | a struct-shaped tangent (`Tangent{@NamedTuple{re,im}}`), no array involved |
+| `fwd polychain order-2` | nested duals: the transform applied to its own output |
+
+Order-2 seeds must be **uniform** — the function and the non-differentiable arguments are nested to
+the order too (`nest2`), not just the value being differentiated; a non-uniform seed is rejected.
+
+Three forward paths currently allocate per iteration, which the table makes obvious and which
+`ISSUES.md` #54 records with numbers: `structloop` (mutable-struct shadow), `applyN closure`
+(closure-valued callee), and `cpoly` (struct tangent — ~19 allocations for a *single* complex
+multiply). `structloop` is the sharp one: forward is ~14× *slower* than reverse on the same primal,
+which is backwards for a one-input function.
+
+`vecloop!` and `memloop!` have no forward twin: a `nothing`-returning primal fails forward-mode IR
+verification (`ISSUES.md` #53), so `vecloop_ret!` returns an element instead.
+
+The three allocating workloads are also the **noisy** ones — GC lands in the samples, so their minima
+need a longer budget than the rest. At `--seconds=0.3`, `fwd applyN closure` measured −11% against an
+identical tree (a spurious `GUARD MOVED`); across runs at 1–2 s it holds to ~2%. Use `--seconds=2`
+before believing any movement in those three rows.
+
 ## Writing a workload
 
-Two traps, both of which have already produced wrong numbers in this repo:
+Every workload registers **two** benchmarkables: the AD call, and the same call undifferentiated
+under `"$k [primal]"` (`primal!` in `workloads.jl`). Give the primal the same setup shape as the AD
+workload — same arrays, same lengths, same warm-up — so the ratio compares two calls on identical
+state. Primals may use a high `evals` freely; there is no shadow to share.
+
+Two traps, both **reverse-mode only** — forward mode has neither, since a shadow there is written
+rather than accumulated into and there is no tape, so `evals>1` is always safe. Both have already
+produced wrong numbers in this repo:
 
 **Reset the shadow in `setup`.** A pullback *accumulates* into the shadow. Reuse one across samples
 and you are timing an ever-growing accumulation rather than a call. The primal needs no such care —

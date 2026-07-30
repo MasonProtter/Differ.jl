@@ -38,19 +38,20 @@ end
 
 function (@main)(args)
     isempty(args) && error("usage: julia --project=bench bench/compare.jl <git-rev> " *
-                           "[--n=…] [--seconds=…] [--tolerance=…]")
+                           "[--n=…] [--seconds=…] [--tolerance=…] [--mode=…]")
     rev = args[1]
     extra = String[a for a in args[2:end] if startswith(a, "--")]
     N = parse(Int, argval(extra, "n", "1000"))
     seconds = parse(Float64, argval(extra, "seconds", "1.0"))
     tol = parse(Float64, argval(extra, "tolerance", "0.05"))
-    _, meta = benchmark_group(; N)
+    mode = Symbol(argval(extra, "mode", "all"))
+    _, meta = benchmark_group(; N, mode)
 
     println("=== baseline: $rev ===")
     before = bench_rev(rev, extra)
 
     println("\n=== working tree ===")
-    after = runner(; N, seconds, json=nothing)
+    after = runner(; N, seconds, json=nothing, mode)
 
     println("\n=== comparison ===")
     print_comparison(before, after, meta; tolerance=tol)

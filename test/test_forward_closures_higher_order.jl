@@ -182,15 +182,15 @@ end
     # function has — defeating the `Dual(rec_self, NoTangent())` call below.
     @test_throws ErrorException frule!!(Dual(rec_self, NoTangent()), Dual(1.0, 1.0), Dual(3, NoTangent()))
 
-    # Limitation: a closure/struct with *differentiable fields* cannot be differentiated at order
-    # ≥2. The self-tangent `Dual` scheme (`tangent_type(Dual{P,T}) == Dual{P,T}`) requires each
-    # carried type to be its own tangent type, which fails for such a struct (its tangent is a
-    # `Tangent`, not itself). Surfaces as a clear Differ error, not a miscompile. `mkquad(3.0)` is
-    # a closure with a `Float64` capture, so nesting D over it lands here (whereas nesting D over
-    # the plain-function `scplusx` above is fine). First-order differentiation of the same closure
-    # — including w.r.t. its capture — works and is covered by the closures testset above.
+    # Previously a limitation: a closure/struct with *differentiable fields* could not be
+    # differentiated at order ≥2. The blocker was its shadow being built by a `build_tangent` call —
+    # an opaque `@generated` function the outer dualization pass couldn't re-dualize, so it bailed.
+    # Now that a `Tangent`/`MutableTangent` shadow is emitted as plain `%new`s (which re-dualize like
+    # any other struct construction), this composes cleanly. `mkquad(3.0)` is a closure with a
+    # `Float64` capture, so nesting D over it exercises exactly this path: d²/dx²[3x²] = 6.
     mkquad(a) = x -> a*(x*x)
-    @test_throws ErrorException Dop(z -> Dop(mkquad(3.0), z), 1.7)
+    @test Dop(z -> Dop(mkquad(3.0), z), 1.7) ≈ 6.0
+    @test Dop(z -> Dop(mkquad(-1.5), z), 0.3) ≈ -3.0     # d²/dx²[-1.5 x²] = -3
 end
 
 @testset "user function with a hand-written frule!! (world-age callee resolution)" begin

@@ -54,6 +54,27 @@ function _bi_homog_tangent_type(P)
     return tt1
 end
 
+# For a general-struct field access whose object primal type is `Pobj` and whose field is named by
+# the compile-time literal `name` (a `Symbol`/`Int`/`QuoteNode`): return `(NT, i)` — the object's
+# tangent-backing `NamedTuple` type and the 1-based field index into it — or `nothing` when the
+# direct-emission preconditions don't hold. Callers then fall back to the generic
+# `get_tangent_field`/`set_tangent_field!` helper. Bails on: a non-concrete primal, a tangent that
+# isn't a concrete `Tangent`/`MutableTangent`, an unknown/out-of-range field name, or a
+# `PossiblyUninitTangent` slot — whose `val`-unwrap (read) / `Ti(x)`-wrap (write) a plain
+# `getfield`/`%new` would skip, so those must stay on the helper that performs it.
+function _tangent_field_slot(@nospecialize(Pobj), @nospecialize(name))
+    (Pobj isa DataType && isconcretetype(Pobj)) || return nothing
+    Tobj = tangent_type(Pobj)
+    (Tobj isa DataType && Tobj <: Union{Tangent,MutableTangent}) || return nothing
+    NT = fields_type(Tobj)
+    (NT isa DataType && isconcretetype(NT)) || return nothing
+    sym = name isa QuoteNode ? name.value : name
+    i = sym isa Int ? sym : findfirst(==(sym), fieldnames(Pobj))
+    (i isa Int && 1 <= i <= fieldcount(NT)) || return nothing
+    fieldtype(NT, i) <: PossiblyUninitTangent && return nothing
+    return (NT, i)
+end
+
 const _getfieldg  = GlobalRef(Core, :getfield)
 const _setfieldg  = GlobalRef(Core, :setfield!)
 const _memnewg    = GlobalRef(Core, :memorynew)
@@ -103,10 +124,23 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
                        (ctx.presolve(a) for a in actual[3:end])...), TT)
     else
         # General struct (including a homogeneous mutable struct admitted by the dynamic-index gate
-        # above): read the field's tangent out of the Tangent/MutableTangent. `get_tangent_field` is
-        # generic over both and has a runtime-`Int` method, so a dynamic index here is type-stable
-        # exactly when the gate proved the object homogeneous.
-        ctx.emit!(Expr(:call, get_tangent_field, ctx.tresolve(actual[1]), idx), TT)
+        # above): read the field's tangent out of the Tangent/MutableTangent's `fields` NamedTuple.
+        # With a literal field and an always-initialised slot, emit it as two builtin `getfield`s
+        # (`getfield(shadow, :fields)` then `getfield(_, i)`) — no `get_tangent_field` call to
+        # dynamic-dispatch, and SROA removes the intermediate. Otherwise (a dynamic homogeneous-mutable
+        # index, or a `PossiblyUninitTangent` slot needing a `val`-unwrap) fall back to the generic
+        # helper, which is type-stable over both cases exactly when the gate above allowed us here.
+        slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(Pobj, actual[2]) : nothing
+        if slot === nothing
+            # Fallback (dynamic homogeneous-mutable index, or a PossiblyUninitTangent slot): emit the
+            # generic helper as a static `:invoke` so it runs compiled rather than dynamic-dispatched.
+            ctx.emit_invoke!(get_tangent_field, TT, (ctx.tt(Pobj), ctx.optype(actual[2])),
+                             ctx.tresolve(actual[1]), idx)
+        else
+            NT, fi = slot
+            fnt = ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), QuoteNode(:fields)), NT)
+            ctx.emit!(Expr(:call, _getfieldg, fnt, fi), TT)
+        end
     end
     p, t
 end
@@ -130,10 +164,30 @@ function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
     p = ctx.emit!(Expr(:call, _setfieldg, ctx.presolve(actual[1]), idx, ctx.presolve(actual[3]),
                        (ctx.presolve(a) for a in actual[4:end])...), Ti)
     TT = ctx.tt(Ti)
-    t = TT === NoTangent ? NoTangent() :
-        ctx.emit!(Expr(:call, set_tangent_field!, ctx.tresolve(actual[1]), idx,
-                       ctx.tresolve(actual[3])), TT)
-    p, t
+    TT === NoTangent && return p, NoTangent()
+    newtan = ctx.tresolve(actual[3])
+    slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(Pobj, actual[2]) : nothing
+    if slot === nothing
+        # Fallback (a PossiblyUninitTangent target slot): emit the generic helper as a static
+        # `:invoke` so it runs compiled rather than dynamic-dispatched.
+        t = ctx.emit_invoke!(set_tangent_field!, TT, (ctx.tt(Pobj), ctx.optype(actual[2]), TT),
+                             ctx.tresolve(actual[1]), idx, newtan)
+        return p, t
+    end
+    # Direct emission — what `set_tangent_field!` compiles to, minus the dynamic-dispatched call:
+    # read the shadow MutableTangent's `fields` NamedTuple, rebuild it with slot `fi` replaced by the
+    # new tangent (other slots read back verbatim), and `setfield!` it back. The per-write NamedTuple
+    # allocation stays (a MutableTangent is mutable identity), but boxing the call's result is gone.
+    NT, fi = slot
+    shadow = ctx.tresolve(actual[1])
+    old = ctx.emit!(Expr(:call, _getfieldg, shadow, QuoteNode(:fields)), NT)
+    nf = fieldcount(NT)
+    slots = Any[j == fi ? newtan : ctx.emit!(Expr(:call, _getfieldg, old, j), fieldtype(NT, j))
+                for j in 1:nf]
+    nt = ctx.emit!(Expr(:new, NT, slots...), NT)
+    ctx.emit!(Expr(:call, _setfieldg, shadow, QuoteNode(:fields), nt), NT)
+    # `set_tangent_field!` returns the assigned value `x`, not the NamedTuple — mirror that.
+    return p, newtan
 end
 
 # Array allocation, step 1: `Core.memorynew(Memory{P}, n)` allocates a fresh, uninitialized
