@@ -199,6 +199,40 @@ is_reverse_pullback_impl(mi) = isa(mi.def, Method) && length(mi.specTypes.parame
 is_generated_reverse_fwds_fallback(m::Method) =
     m.sig === Tuple{typeof(rrule!!),CoDual,AbstractCtx,Vararg{CoDual}}
 
+# The `rrule!!` signature a *hypothetical* reverse-mode differentiation of `callee_mi` would resolve
+# against — mirrors `implicit_frule_tt` (`forward_interp.jl`), built from `callee_mi.specTypes`
+# instead of an actual differentiation call site. Returns `nothing` for anything the shape doesn't
+# apply to, rather than throwing: `callee_mi` is an arbitrary callee discovered via `frame.edges`, not
+# something the differentiation call site validated.
+function implicit_rrule_tt(callee_mi::MethodInstance)
+    isa(callee_mi.def, Method) || return nothing
+    params = callee_mi.specTypes.parameters
+    isempty(params) && return nothing
+    ftype = params[1]
+    (ftype isa Type) || return nothing
+    try
+        # `fcodual_type(P)` reaches `tangent_type(P)`, which throws for non-`Type` `P` and can
+        # `MethodError` on a `P` this tangent system has no case for. Best-effort: skip this one
+        # callee's implicit backedge rather than abort the whole build over it.
+        argcodualtys = Any[fcodual_type(P) for P in params[2:end]]
+        return Tuple{typeof(rrule!!),CoDual{ftype,NoFData},Ctx{Nothing},argcodualtys...}
+    catch
+        return nothing
+    end
+end
+
+# An mt-backedge on the `rrule!!` resolution a *hypothetical* differentiation of `callee_mi` would
+# use, registered even though `callee_mi`'s call was (or may have been) inlined away and never
+# actually reached `reverse_fwds_recursive_ci`'s resolution — see the call site in
+# `_optimized_primal_ir`. So a user later hand-writing `rrule!!` for a callee that was inlined away
+# before a rule existed for it still invalidates a derivative built before that rule existed. Mirrors
+# `register_implicit_frule_backedge!` (`forward_interp.jl`).
+function register_implicit_rrule_backedge!(edges::Vector{Any}, callee_mi::MethodInstance)
+    rrule_tt = implicit_rrule_tt(callee_mi)
+    rrule_tt === nothing || push!(edges, rrule_tt, Core.methodtable)
+    return nothing
+end
+
 # Resolve the hand-written `rrule!!` for a call, or `nothing` if only the derived fallback applies.
 # The `ctx` slot of the query is `Ctx{Nothing}` (the fresh-tape mode a recursive inner call uses);
 # every method — hand rule or fallback — declares that slot `::AbstractCtx`, so it never affects which
@@ -352,6 +386,14 @@ function _optimized_primal_ir(interp::ADInterpreter, primal_mi::MethodInstance,
     opt = CC.OptimizationState(frame, interp)
     pir = CC.run_passes_ipo_safe(opt.src, opt, nothing)
     append!(edges, frame.edges)
+    # For every concrete callee discovered above (regardless of whether its call survived or was
+    # inlined away), also register the mt-backedge a hand-written `rrule!!` for it would need — see
+    # `register_implicit_rrule_backedge!`. Mirrors `dualize_to_ircode`'s base case in
+    # `forward_interp.jl`; covers both carriers, since both `build_reverse_fwds_ir` and
+    # `build_reverse_pullback_ir` call this function.
+    for (_, item) in CC.ForwardToBackedgeIterator(Core.svec(frame.edges...))
+        isa(item, MethodInstance) && register_implicit_rrule_backedge!(edges, item)
+    end
     return pir
 end
 

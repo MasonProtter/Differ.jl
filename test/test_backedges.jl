@@ -1,12 +1,14 @@
 using Test
 using Differ
-using Differ: Dual, NoTangent, frule!!
+using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, AbstractCtx, primal
 
 # Tests that Differ attaches real Julia backedges to a compiled derivative, so redefining a primal
-# method (or filling in a `frule!!` for something that previously errored) invalidates and recompiles
-# it — instead of silently keeping a stale `dualized_impl`/`frule!!` `CodeInstance` around forever.
+# method (or filling in a `frule!!`/`rrule!!` for something that previously errored) invalidates and
+# recompiles it — instead of silently keeping a stale `dualized_impl`/`frule!!`/`rrule!!`
+# `CodeInstance` around forever. Covers both forward mode (`frule!!`, dualization) and reverse mode
+# (`rrule!!`, derived-rule building), which use separate but parallel invalidation machinery.
 #
-# The mechanism (see `contextual.jl`'s `finishinfer!` and `forward_interp.jl`'s
+# The forward mechanism (see `contextual.jl`'s `finishinfer!` and `forward_interp.jl`'s
 # `primal_of_impl`/`frule_codeinstance`/`compose`): while dualizing a primal's IR, Differ collects
 # the MethodInstances it depends on (the primal method itself, any `frule!!` resolved for a surviving
 # high-level call, an inner carrier for a composed higher-order derivative) plus mt-backedges keyed
@@ -15,13 +17,18 @@ using Differ: Dual, NoTangent, frule!!
 # folded into `me.src.edges` before the primal `dualized_impl` `MethodInstance`'s own `finishinfer!`
 # runs, so Julia's ordinary `compute_edges!`/`store_backedges` machinery registers them as real
 # backedges on *that* `CodeInstance` — the one whose staleness actually gates recompilation, not
-# merely some caller of it.
+# merely some caller of it. Reverse mode's `_optimized_primal_ir`/`resolve_reverse_primal`/
+# `reverse_fwds_recursive_ci` (`reverse_interp.jl`) mirror this for `rrule!!`.
 #
-# Separately (last two testsets): a related but distinct bug — a callee small enough for Julia's
-# ordinary inliner to merge into its caller vanishes from the IR *before* `dualize_to_ircode` ever
-# runs, so a hand-written `frule!!` for it can never be consulted, no matter the compile order or how
-# good the backedges are. `src_inlining_policy` (`forward_interp.jl`) fixes this by refusing to
-# inline any call whose callee has a hand-written `frule!!`.
+# Separately (last two testsets in each mode): a related but distinct bug — a callee small enough for
+# Julia's ordinary inliner to merge into its caller vanishes from the IR *before*
+# `dualize_to_ircode`/`_optimized_primal_ir` ever runs, so a hand-written `frule!!`/`rrule!!` for it
+# can never be consulted, no matter the compile order or how good the backedges are.
+# `src_inlining_policy` (both files) fixes the "never consulted at all" half by refusing to inline any
+# call whose callee has a hand-written rule. `register_implicit_frule_backedge!`/
+# `register_implicit_rrule_backedge!` fix the other half — invalidation — by registering a
+# speculative mt-backedge on the rule resolution a hypothetical differentiation of each discovered
+# callee would use, even for callees whose call was inlined away before a rule existed for them.
 @testset "backedges: derivative invalidation" begin
     @testset "redefining a differentiated primal invalidates its derivative" begin
         redefinable_sqr(x) = x * x
@@ -76,5 +83,64 @@ using Differ: Dual, NoTangent, frule!!
 
         d2 = frule!!(Dual(inlinable_caller2, NoTangent()), Dual(1.0, 1.0))
         @test d2.dx == 10.0                                   # recompiled + honors the new hand rule
+    end
+
+    @testset "reverse: redefining a differentiated primal invalidates its derivative" begin
+        redefinable_rsqr(x) = x * x
+        _, d1 = gradient(redefinable_rsqr, 2.0)
+        @test d1 == 4.0                                       # d/dx(x^2) at 2 = 4
+
+        redefinable_rsqr(x) = (x * x) * x                     # redefine: same signature, x^3 now
+
+        _, d2 = gradient(redefinable_rsqr, 2.0)
+        @test d2 == 12.0                                      # d/dx(x^3) at 2 = 12, not the stale 4
+    end
+
+    @testset "reverse: a primal that initially errors recompiles once given a real body" begin
+        # Unlike forward mode, this doesn't get to the point of an ordinary runtime `error`: a
+        # function whose every path throws has no reachable `return`, so reverse mode bails *at
+        # compile time* — there's no primal return value to build a pullback structure around
+        # (`reverse_error_ircode` embeds `error(msg)` as the generated carrier body). Still an
+        # `ErrorException` either way, so the assertion is unchanged.
+        placeholder_then_real_rev(x) = error("not implemented yet")
+        @test_throws ErrorException gradient(placeholder_then_real_rev, 3.0)
+
+        placeholder_then_real_rev(x) = (x * x) * (x * x)      # redefine: x^4
+
+        _, d = gradient(placeholder_then_real_rev, 3.0)
+        @test d == 108.0                                      # d/dx(x^4) at 3 = 4*27 = 108
+    end
+
+    @testset "reverse: a hand rule for an inlinable callee is honored, not inlined away" begin
+        # Mirrors the forward testset above, but via `rrule!!`/`has_hand_reverse_rule`/
+        # `src_inlining_policy` (`reverse_interp.jl`) instead of `frule!!`/`has_hand_frule`.
+        inlinable_rcallee(x) = x + 1
+        inlinable_rcaller(x) = inlinable_rcallee(x)
+
+        function Differ.rrule!!(::CoDual{typeof(inlinable_rcallee),NoFData}, ::AbstractCtx,
+                                xcd::CoDual{Float64,NoFData})
+            x = primal(xcd)
+            return CoDual(x + 10, NoFData()), Returns((NoRData(), 10.0))
+        end
+
+        _, d = gradient(inlinable_rcaller, 1.0)
+        @test d == 10.0                                       # the hand rule, not the inlined d/dx(x+1)=1
+    end
+
+    @testset "reverse: a hand rule added after first use still invalidates + is honored" begin
+        inlinable_rcallee2(x) = x + 1
+        inlinable_rcaller2(x) = inlinable_rcallee2(x)
+
+        _, d1 = gradient(inlinable_rcaller2, 1.0)
+        @test d1 == 1.0                                       # no rule yet: plain d/dx(x+1) = 1
+
+        function Differ.rrule!!(::CoDual{typeof(inlinable_rcallee2),NoFData}, ::AbstractCtx,
+                                xcd::CoDual{Float64,NoFData})
+            x = primal(xcd)
+            return CoDual(x + 10, NoFData()), Returns((NoRData(), 10.0))
+        end
+
+        _, d2 = gradient(inlinable_rcaller2, 1.0)
+        @test d2 == 10.0                                      # recompiled + honors the new hand rule
     end
 end
