@@ -85,6 +85,28 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
         @test d2.dx == 10.0                                   # recompiled + honors the new hand rule
     end
 
+    @testset "a hand rule for an inlinable *vararg* callee is honored + invalidates" begin
+        # Julia's compilation-signature heuristic collapses a vararg callee's trailing arguments, so
+        # this callee's `MethodInstance` has `specTypes == Tuple{typeof(inlinable_vcallee), Float64,
+        # Vararg{Float64}}` — the arity isn't recorded. `implicit_frule_tt` mirrors that collapse into
+        # an open-ended `Vararg{Dual{Float64,Float64}}` tail rather than giving up, which is what makes
+        # both halves work here: `src_inlining_policy` keeps the call from being inlined away, and
+        # `register_implicit_frule_backedge!` registers the mt-backedge that invalidates the already
+        # compiled derivative once the rule appears.
+        inlinable_vcallee(a, bs...) = a + sum(bs)
+        inlinable_vcaller(x) = inlinable_vcallee(x, x, 2x)
+
+        d1 = frule!!(Dual(inlinable_vcaller, NoTangent()), Dual(1.0, 1.0))
+        @test d1.dx == 4.0                                    # no rule yet: d/dx(x + x + 2x) = 4
+
+        function Differ.frule!!(::Dual{typeof(inlinable_vcallee)}, da::Dual, dbs::Dual...)
+            Dual(da.x + 100, 100 * da.dx * one(da.x))
+        end
+
+        d2 = frule!!(Dual(inlinable_vcaller, NoTangent()), Dual(1.0, 1.0))
+        @test d2.dx == 100.0                                  # recompiled + honors the new hand rule
+    end
+
     @testset "reverse: redefining a differentiated primal invalidates its derivative" begin
         redefinable_rsqr(x) = x * x
         _, d1 = gradient(redefinable_rsqr, 2.0)

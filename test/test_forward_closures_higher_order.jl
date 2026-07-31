@@ -47,7 +47,7 @@ end
     # re-dualized. ALL seeds — the function included — are nested uniformly to the order, with
     # NoTangent at the function's leaves. Then r.x.x = f(x), r.dx.x = r.x.dx = f'(x), r.dx.dx = f''(x).
     sqr(x)     = x*x
-    mul3(x)    = (x*x)*x   # explicit 2-arg grouping; `x*x*x` would be a 3-arg (vararg) `*`, unsupported
+    mul3(x)    = (x*x)*x   # explicit 2-arg grouping (`x*x*x` inlines to the same two `mul_float`s)
     function p4(x)
         r = x*x
         r = r*x
@@ -76,7 +76,7 @@ end
         end
         s
     end
-    vfun(x, ys...) = x + sum(ys)   # a genuinely vararg-defined primal method — unsupported
+    vfun(x, ys...) = x + sum(ys)   # a genuinely vararg-defined primal method
 
     fseed2(f) = Dual(Dual(f, NoTangent()), Dual(f, NoTangent()))   # constant fn nested to order 2
     seed2(x)  = Dual(Dual(x, 1.0), Dual(1.0, 0.0))
@@ -109,9 +109,13 @@ end
     @test frule!!(fseed3(p4), s3(2.0)).dx.dx.dx ≈ 24*2.0
 
     # the 2nd-order transform produces valid IR, including sin/cos and through control flow (the
-    # tuple-aware vararg prologue composes with phi/goto re-dualization)
+    # tuple-aware vararg prologue composes with phi/goto re-dualization), and over a *vararg primal*
+    # (`vfun`, and Base's 3-arg `*(a,b,c,xs...)`): `compose(0)` re-dualizes the order-1 carrier,
+    # whose own argtypes are already flat, so the primal's vararg-ness is fully absorbed one level
+    # down and never reaches the higher-order branch.
     for (f, at) in ((sqr,(Float64,)), (mul3,(Float64,)), (p4,(Float64,)), (sincosp,(Float64,)),
-                    (relu,(Float64,)), (branch3,(Float64,)), (sumk,(Float64,Int)))
+                    (relu,(Float64,)), (branch3,(Float64,)), (sumk,(Float64,Int)),
+                    (vfun,(Float64,Float64,Float64)), (*,(Float64,Float64,Float64)))
         checkverify2(f, at)
     end
     @test true   # reached here ⇒ every verify_ir above passed
@@ -120,16 +124,28 @@ end
     # peel can't form the inner carrier, so it bails rather than miscompiling.
     @test_throws Exception frule!!(Dual(sqr, NoTangent()), seed2(2.0))
 
-    # graceful bail still holds at higher order: a vararg primal is unsupported → ErrorException
-    # (unrelated to array support — kept as the "some construct is still unsupported" regression).
+    # second derivative of a vararg primal. d²/dx² (x + y + z) = 0 in each variable, so use a
+    # nonlinear one: `vsq(x, ys...) = x*x + sum(ys)` has ∂²/∂x² = 2.
+    vsq(x, ys...) = x*x + sum(ys)
+    zero2 = Dual(Dual(3.0, 0.0), Dual(0.0, 0.0))     # a non-seeded order-2 argument
+    rv = frule!!(fseed2(vsq), seed2(2.0), zero2)
+    @test rv.x.x  ≈ 2.0^2 + 3.0
+    @test rv.x.dx ≈ 4.0 && rv.dx.x ≈ 4.0
+    @test rv.dx.dx ≈ 2.0
+    @test frule!!(fseed2(vfun), seed2(1.0), seed2(2.0)).dx.dx ≈ 0.0   # x+y is linear ⇒ f'' = 0
+
+    # graceful bail regression: splatting something whose length is NOT statically known leaves a
+    # `Core._apply_iterate` (plus `Core.svec`) in the primal IR, which has no dualization rule.
+    # Vararg *methods* are supported; a splat *call site* over a non-tuple is not.
+    vsplat(x, v::Vector{Float64}) = vfun(x, v...)
     err = try
-        frule!!(fseed2(vfun), seed2(1.0), seed2(2.0))
+        frule!!(Dual(vsplat, NoTangent()), Dual(1.0, 1.0), Dual([2.0, 3.0], [0.0, 0.0]))
         nothing
     catch e
         e
     end
     @test err isa ErrorException
-    @test occursin("vararg", err.msg)
+    @test occursin("builtin", err.msg)
 end
 
 @testset "higher-order via composed differentiation (nested frule!! / D-of-D)" begin

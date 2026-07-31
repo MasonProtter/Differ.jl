@@ -1,4 +1,4 @@
-# Hand-written frule!!/rrule!! for LinearAlgebra basics (dot/norm/*/tr).
+# Hand-written frule!!/rrule!! for LinearAlgebra basics (dot/norm/*/tr/mul!).
 import LinearAlgebra
 #
 # `dot`/`norm`/`*` (on `Matrix`/`Vector`) all bottom out in BLAS `ccall`s once inlined, which the
@@ -236,4 +236,122 @@ function rrule!!(
     Y = Base.:*(A, B)
     Ycd = zero_fcodual(Y)
     return Ycd, MatMulPullback(A, B, tangent(Acd), tangent(Bcd), tangent(Ycd))
+end
+
+# ---------------------------------------------------------------------------
+# mul!(C, A, B) — in-place `C = A*B`, `Matrix{Float64}`/`Vector{Float64}` only (3-arg form; the
+# `α`/`β`-scaled 5-arg form is not covered). `C` is mutated, so both modes follow the mutating-array
+# convention used by `map!` (`rules_broadcast.jl`): forward returns the same `Dual` (mutated shadow
+# in place); reverse zeroes `C`'s fdata after reading the old contents as the backward seed (`C`'s
+# previous value is overwritten, not accumulated, so whatever cotangent had built up on it before
+# this call belongs to that overwritten value, not to `A`/`B`) and restores the old fdata afterwards
+# so an earlier write to the same array (if any) still sees its own seed correctly.
+# ---------------------------------------------------------------------------
+
+# --- mul!(y, A, x) — matrix * vector ---
+
+function frule!!(
+    ::Dual{typeof(LinearAlgebra.mul!)}, yd::Dual{Vector{Float64}},
+    Ad::Dual{Matrix{Float64}}, xd::Dual{Vector{Float64}},
+)
+    y, dy = yd.x, yd.dx
+    A, dA = Ad.x, Ad.dx
+    x, dx = xd.x, xd.dx
+    LinearAlgebra.mul!(y, A, x)
+    LinearAlgebra.mul!(dy, dA, x)
+    LinearAlgebra.mul!(dy, A, dx, true, true)
+    return yd
+end
+
+struct MulMatVecPullback
+    A::Matrix{Float64}
+    x::Vector{Float64}
+    dA::Matrix{Float64}
+    dx::Vector{Float64}
+    dy::Vector{Float64}
+    old_dy::Vector{Float64}
+end
+function (pb::MulMatVecPullback)(::NoRData)
+    A, x, dA, dx, dy, old_dy = pb.A, pb.x, pb.dA, pb.dx, pb.dy, pb.old_dy
+    m, n = Base.size(A)
+    for i in 1:m, j in 1:n
+        dA[i, j] = increment!!(dA[i, j], dy[i] * x[j])
+    end
+    for j in 1:n
+        s = 0.0
+        for i in 1:m
+            s += A[i, j] * dy[i]
+        end
+        dx[j] = increment!!(dx[j], s)
+    end
+    dy .= old_dy
+    return (NoRData(), NoRData(), NoRData(), NoRData())
+end
+
+function rrule!!(
+    ::CoDual{typeof(LinearAlgebra.mul!),NoFData},
+    ::AbstractCtx,
+    ycd::CoDual{Vector{Float64},Vector{Float64}},
+    Acd::CoDual{Matrix{Float64},Matrix{Float64}},
+    xcd::CoDual{Vector{Float64},Vector{Float64}},
+)
+    y, dy = primal(ycd), tangent(ycd)
+    A, x = primal(Acd), primal(xcd)
+    old_dy = Base.copy(dy)
+    LinearAlgebra.mul!(y, A, x)
+    Base.fill!(dy, 0.0)
+    return CoDual(y, dy), MulMatVecPullback(A, x, tangent(Acd), tangent(xcd), dy, old_dy)
+end
+
+# --- mul!(C, A, B) — matrix * matrix ---
+
+function frule!!(
+    ::Dual{typeof(LinearAlgebra.mul!)}, Cd::Dual{Matrix{Float64}},
+    Ad::Dual{Matrix{Float64}}, Bd::Dual{Matrix{Float64}},
+)
+    C, dC = Cd.x, Cd.dx
+    A, dA = Ad.x, Ad.dx
+    B, dB = Bd.x, Bd.dx
+    LinearAlgebra.mul!(C, A, B)
+    LinearAlgebra.mul!(dC, dA, B)
+    LinearAlgebra.mul!(dC, A, dB, true, true)
+    return Cd
+end
+
+struct MulMatMatPullback
+    A::Matrix{Float64}
+    B::Matrix{Float64}
+    dA::Matrix{Float64}
+    dB::Matrix{Float64}
+    dC::Matrix{Float64}
+    old_dC::Matrix{Float64}
+end
+function (pb::MulMatMatPullback)(::NoRData)
+    A, B, dA, dB, dC, old_dC = pb.A, pb.B, pb.dA, pb.dB, pb.dC, pb.old_dC
+    # Ā += dC * B',  B̄ += A' * dC
+    dABt = Base.:*(dC, Base.adjoint(B))
+    dAtB = Base.:*(Base.adjoint(A), dC)
+    for i in Base.eachindex(dA, dABt)
+        dA[i] = increment!!(dA[i], dABt[i])
+    end
+    for i in Base.eachindex(dB, dAtB)
+        dB[i] = increment!!(dB[i], dAtB[i])
+    end
+    dC .= old_dC
+    return (NoRData(), NoRData(), NoRData(), NoRData())
+end
+
+function rrule!!(
+    ::CoDual{typeof(LinearAlgebra.mul!),NoFData},
+    ::AbstractCtx,
+    Ccd::CoDual{Matrix{Float64},Matrix{Float64}},
+    Acd::CoDual{Matrix{Float64},Matrix{Float64}},
+    Bcd::CoDual{Matrix{Float64},Matrix{Float64}},
+)
+    C, dC = primal(Ccd), tangent(Ccd)
+    A, B = primal(Acd), primal(Bcd)
+    old_dC = Base.copy(dC)
+    LinearAlgebra.mul!(C, A, B)
+    Base.fill!(dC, 0.0)
+    return CoDual(C, dC), MulMatMatPullback(A, B, tangent(Acd), tangent(Bcd), dC, old_dC)
 end

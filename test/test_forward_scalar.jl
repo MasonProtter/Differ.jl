@@ -1,8 +1,22 @@
 using Test
 using Differ
-using Differ: Dual, NoTangent, frule!!, build_tangent
+using Differ: Dual, NoTangent, frule!!, build_tangent, zero_tangent
 
 include(joinpath(@__DIR__, "testutils.jl"))
+
+# Vararg-primal fixtures. Top level, not testset-local: `@noinline` is load-bearing for two of these
+# (the call must survive into the primal IR as an `:invoke` rather than being inlined away), and a
+# local `@noinline` definition is a closure with a non-singleton tangent, which would confuse the
+# point being tested.
+vsum(x, ys...) = x + sum(ys)
+vint(x, ns::Int...) = x * ns[1]
+vmix(x, zs...) = x*zs[1] + zs[2]
+vfwd(x, ys...) = vsum(x, ys...)          # splat forwarding: the optimizer expands this to getfields
+vnone(x, ys...) = x + 1.0                # never touches the (empty) vararg slot
+@noinline vtupsum(t::Tuple) = sum(t)
+vintsum(x, ns::Int...) = x * vtupsum(ns) # passes the WHOLE all-NoTangent vararg tuple to a live call
+@noinline vg(a, bs...) = a + sum(bs)
+vouter(x) = vg(x, x, 2x)                 # surviving `:invoke` to a vararg callee
 
 @testset "scalar rules" begin
     x, dx = 0.7, 2.0
@@ -115,4 +129,89 @@ end
     d4 = frule!!(Dual(p4, NoTangent()), Dual(2.0, 1.0))
     @test d4.x  ≈ 2.0^4
     @test d4.dx ≈ 4 * 2.0^3
+end
+
+@testset "vararg primal methods" begin
+    # A vararg method's optimized IR has one slot per *declared* parameter, the last holding its
+    # varargs already packed into a tuple (`getfield(_va, j)` in the body), while `frule!!` is always
+    # called flat. The dualization prologue re-packs the trailing dual args into that tuple slot.
+    fz(f) = Dual(f, NoTangent())
+
+    # 1. Ordinary vararg method: one fixed arg + two varargs. Seed each slot in turn.
+    @test frule!!(fz(vsum), Dual(1.0,1.0), Dual(2.0,0.0), Dual(3.0,0.0)) === Dual(6.0, 1.0)
+    @test frule!!(fz(vsum), Dual(1.0,0.0), Dual(2.0,1.0), Dual(3.0,0.0)) === Dual(6.0, 1.0)
+    @test frule!!(fz(vsum), Dual(1.0,0.0), Dual(2.0,0.0), Dual(3.0,1.0)) === Dual(6.0, 1.0)
+    @test frule!!(fz(vsum), Dual(1.0,1.0), Dual(2.0,1.0), Dual(3.0,1.0)) === Dual(6.0, 3.0)
+    @test frule!!(fz(vsum), Dual(1.0,1.0), Dual(2.0,0.0), Dual(3.0,0.0)).dx ≈
+          central_diff(t -> vsum(t, 2.0, 3.0), 1.0)
+
+    # 2. EMPTY vararg slot. Base's `*(a,b,c,xs...)` has `nargs == 5`, so a 3-arg call leaves the
+    # vararg slot empty — and inference types it `Core.Const(())`, a lattice element rather than a
+    # bare `Type`. Product rule: d(xyz) = dx·yz + x·dy·z + xy·dz.
+    x, y, z = 2.0, 3.0, 4.0
+    @test frule!!(fz(*), Dual(x,1.0), Dual(y,0.0), Dual(z,0.0)) === Dual(x*y*z, y*z)
+    @test frule!!(fz(*), Dual(x,0.0), Dual(y,1.0), Dual(z,0.0)) === Dual(x*y*z, x*z)
+    @test frule!!(fz(*), Dual(x,1.0), Dual(y,1.0), Dual(z,1.0)) === Dual(x*y*z, y*z + x*z + x*y)
+    # an empty vararg slot that is genuinely *read* rather than constant-folded away: `sum(())`
+    # throws, so inference types the call `Union{}` and the slot survives as a live
+    # `invoke sum(_3::Tuple{})`. The derivative reproduces the primal's own error.
+    @test_throws ArgumentError vsum(1.0)
+    @test_throws ArgumentError frule!!(fz(vsum), Dual(1.0,1.0))
+    # …and one where the empty slot is dead, so the packed `Core.tuple()` is DCE'd
+    @test frule!!(fz(vnone), Dual(1.0,1.0)) === Dual(2.0, 1.0)
+
+    # 3. One-element vararg slot (`Tuple{Float64}`), which the 4-arg `*` body genuinely reads.
+    w = 5.0
+    @test frule!!(fz(*), Dual(x,1.0), Dual(y,0.0), Dual(z,0.0), Dual(w,0.0)) ===
+          Dual(x*y*z*w, y*z*w)
+    @test frule!!(fz(*), Dual(x,0.0), Dual(y,0.0), Dual(z,0.0), Dual(w,1.0)) ===
+          Dual(x*y*z*w, x*y*z)
+
+    # 4. All-`NoTangent` vararg: `tangent_type(Tuple{Int,Int})` COLLAPSES to `NoTangent` rather than
+    # `Tuple{NoTangent,NoTangent}`, so the packed shadow must be the literal `NoTangent()`. Here the
+    # collapsed slot is only ever read element-wise, and each read takes the `NoTangent()` branch.
+    @test frule!!(fz(vint), Dual(2.0,1.0), Dual(3,NoTangent()), Dual(4,NoTangent())) === Dual(6.0, 3.0)
+
+    # 5. The collapse trap, directly: `vintsum` hands the *whole* all-`NoTangent` tuple to a surviving
+    # call, so `frule_split!` builds `%new(Dual{Tuple{Int,Int},NoTangent}, %packed, <shadow>)`. If the
+    # shadow were an emitted `Core.tuple(NoTangent(), NoTangent())` this would `TypeError` at the
+    # `%new`. This is the regression test for that rule — cases 4 and 6 never read the slot whole.
+    @test frule!!(fz(vintsum), Dual(2.0,1.0), Dual(3,NoTangent()), Dual(4,NoTangent())) ===
+          Dual(14.0, 7.0)
+
+    # 6. Mixed vararg (`Tuple{Float64,Int}` → tangent slot `Tuple{Float64,NoTangent}`): per-element
+    # `NoTangent` placement inside an otherwise-differentiable packed tangent.
+    @test frule!!(fz(vmix), Dual(2.0,1.0), Dual(3.0,0.0), Dual(4,NoTangent())) === Dual(10.0, 3.0)
+    @test frule!!(fz(vmix), Dual(2.0,0.0), Dual(3.0,1.0), Dual(4,NoTangent())) === Dual(10.0, 2.0)
+
+    # 7. Splat forwarding (`vfwd(x, ys...) = vsum(x, ys...)`): lowers to `Core._apply_iterate`, which
+    # the optimizer fully expands for a statically-known tuple length, so it never reaches the engine.
+    @test frule!!(fz(vfwd), Dual(1.0,1.0), Dual(2.0,0.0), Dual(3.0,0.0)) ===
+          frule!!(fz(vsum), Dual(1.0,1.0), Dual(2.0,0.0), Dual(3.0,0.0))
+
+    # 8. A *surviving* call to a vararg callee. Julia's compilation-signature heuristic collapses the
+    # invoke target's `specTypes` to `Tuple{typeof(vg), Float64, Vararg{Float64}}`; `frule_split!`
+    # takes its argument types from the operands (not the callee MI), so the flat `frule!!` call it
+    # builds still resolves. vg(x,x,2x) = 4x ⇒ derivative 4.
+    @test frule!!(fz(vouter), Dual(1.0,1.0)) === Dual(4.0, 4.0)
+    @test frule!!(fz(vouter), Dual(2.5,1.0)).dx ≈ central_diff(vouter, 2.5)
+
+    # 9. A vararg *closure*: `Argument(1)` is a non-singleton captured-field slot alongside the packed
+    # vararg slot. d/dx (a·x + Σys) = a; d/da = x.
+    vclo = let a = 3.0; (x, ys...) -> a*x + sum(ys); end
+    capt(v) = build_tangent(typeof(vclo), v)
+    @test frule!!(Dual(vclo, zero_tangent(vclo)), Dual(2.0,1.0), Dual(5.0,0.0)) === Dual(11.0, 3.0)
+    @test frule!!(Dual(vclo, capt(1.0)), Dual(2.0,0.0), Dual(5.0,0.0)) === Dual(11.0, 2.0)
+    @test frule!!(Dual(vclo, zero_tangent(vclo)), Dual(2.0,0.0), Dual(5.0,1.0)) === Dual(11.0, 1.0)
+
+    # 10. Every shape above produces IR that passes `Core.Compiler.verify_ir`.
+    for (f, at) in ((vsum,   (Float64,Float64,Float64)), (vsum,  (Float64,)),
+                    (*,      (Float64,Float64,Float64)), (*,     (Float64,Float64,Float64,Float64)),
+                    (vnone,  (Float64,)),                (vint,  (Float64,Int,Int)),
+                    (vintsum,(Float64,Int,Int)),         (vmix,  (Float64,Float64,Int)),
+                    (vfwd,   (Float64,Float64,Float64)), (vouter,(Float64,)),
+                    (vclo,   (Float64,Float64)))
+        checkverify(f, at)
+    end
+    @test true   # reached here ⇒ every verify_ir above passed
 end

@@ -14,7 +14,7 @@
 dualized_impl(dualargs::Dual...) =
     error("Differ.dualized_impl ran directly: ADInterpreter could not dualize the primal ",
           "(likely unsupported IR — e.g. a growable-array mutation like `push!`/`resize!`, a ",
-          "builtin with no rule, or a vararg call).")
+          "builtin with no rule, or a splat of something whose length isn't statically known).")
 
 
 # Runtime dispatcher for a *dynamic* (`apply_generic`) call that survived into the primal IR (its
@@ -81,9 +81,9 @@ end
 # shape `frule_codeinstance`/`primal_of_impl` build from a genuine surviving call, but derived
 # instead from `callee_mi.specTypes` (the exact concrete call signature Julia's own call-graph
 # discovery already found — see `register_implicit_frule_backedge!`/`src_inlining_policy` below).
-# Returns `nothing` for anything the shape doesn't apply to (varargs, `Type`-valued parameters,
-# …) rather than throwing: `callee_mi` may be an arbitrary callee Julia's compiler discovered, not
-# something Differ validated.
+# Returns `nothing` for anything the shape doesn't apply to (`Type`-valued parameters, a parameter
+# with no `tangent_type`, …) rather than throwing: `callee_mi` may be an arbitrary callee Julia's
+# compiler discovered, not something Differ validated.
 function implicit_frule_tt(callee_mi::MethodInstance)
     isa(callee_mi.def, Method) || return nothing
     params = callee_mi.specTypes.parameters
@@ -91,7 +91,21 @@ function implicit_frule_tt(callee_mi::MethodInstance)
     ftype = params[1]
     (ftype isa Type) || return nothing
     try
-        dualargs = Any[Dual{P,tangent_type(P)} for P in params[2:end]]
+        # Julia's compilation-signature heuristic collapses a vararg callee's trailing arguments into
+        # a single `Vararg{T}` (`invoke vg(_2::Float64, _2::Float64, %1::Vararg{Float64})`), so
+        # `specTypes` doesn't record the call's arity and `Dual{Vararg{Float64},…}` would throw.
+        # Mirror the collapse into the `frule!!` signature as an open-ended `Vararg` tail instead of
+        # giving up: `findsup` resolves such a query fine (returning a hand rule when one exists and
+        # the generated fallback otherwise), and a hand-written rule for a vararg function is exactly
+        # the case that needs it. An imprecise match only ever *restricts*: `has_hand_frule` suppresses
+        # an inline, `register_implicit_frule_backedge!` over-invalidates. Both are sound.
+        rest = Any[params[2:end]...]     # `params[2:end]` is a SimpleVector; need a Vector to `pop!`
+        va = !isempty(rest) && isa(last(rest), Core.TypeofVararg) ? pop!(rest) : nothing
+        dualargs = Any[Dual{P,tangent_type(P)} for P in rest]
+        if va !== nothing
+            D = Dual{va.T,tangent_type(va.T)}
+            push!(dualargs, isdefined(va, :N) ? Vararg{D,va.N} : Vararg{D})
+        end
         return Tuple{typeof(frule!!), Dual{ftype,NoTangent}, dualargs...}
     catch
         return nothing
@@ -155,8 +169,12 @@ end
 function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance, reason::Ref{String}=Ref(""),
                         edges::Vector{Any}=Any[])
     dualparams = impl_mi.specTypes.parameters[2:end]
+    # Defensive: `frule!!`/`dualized_impl` are `@generated`, and a generator is never handed a
+    # `Vararg`-collapsed signature (verified for 1..10 arguments), so `dualparams` is always the
+    # flat, exact list of `Dual`s the call supplied — no arity ceiling. Kept as a guard rather than
+    # an assert in case a carrier `MethodInstance` is ever reached by some other route.
     if !all(P -> P isa Type && P <: Dual, dualparams)
-        reason[] = "not every dual argument type is a `Dual` (a vararg call?)"
+        reason[] = "not every dual argument type is a concrete `Dual`"
         return nothing
     end
     primal_tt = Base.to_tuple_type(Any[_dual_primal_type(P) for P in dualparams])
@@ -170,10 +188,6 @@ function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance, reason::
     end
     if !isa(pmatch.method, Method)
         reason[] = "the resolved primal match is not a concrete Method"
-        return nothing
-    end
-    if pmatch.method.isva
-        reason[] = "the primal method $(pmatch.method) is a vararg method (not yet supported)"
         return nothing
     end
     primal_mi = specialize_method(pmatch.method, pmatch.spec_types, pmatch.sparams)::MethodInstance
@@ -209,7 +223,10 @@ end
 # Two cases, distinguished by whether any *value* argument's primal is itself a `Dual`:
 #
 #  * First order (base case): the primal is an ordinary user method (or a hand-written `frule!!`),
-#    found via `primal_of_impl`, and dualized directly. `pir` has scalar positional arguments.
+#    found via `primal_of_impl`, and dualized directly. `pir` has positional arguments — one slot per
+#    declared parameter, which for a *vararg* primal (`f(a, xs...)`) means its varargs arrive as a
+#    single already-packed tuple slot; `primal_nfixed` below tells the prologue to re-pack the
+#    trailing (flat) dual args into it.
 #  * Higher order (Option A — compose the transform): a request whose value args are nested Duals
 #    (e.g. `Dual{Dual{F,F},Dual{F,F}}`) is differentiating the *order-(k-1) dualized function*. That
 #    function's optimized dual IR is obtained by peeling one `Dual` level off each value arg,
@@ -302,6 +319,14 @@ function _build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::
         return nothing
     end
     primal_mi, _ = info
+    # A vararg primal (`f(a, xs...)`) declares one extra argument slot holding its varargs already
+    # packed into a tuple, so its optimized IR has `nargs` slots while the dual call always supplies
+    # `n` *flat* `Dual`s. `nargs` counts `#self#` and the vararg slot, so `nargs - 1` is the number of
+    # slots before it, and `dualize_to_ircode`'s prologue re-packs dual args `nargs..n` into that
+    # slot. Read off `primal_mi.def` rather than threading it out of `primal_of_impl`, whose `(mi, n)`
+    # return shape is referenced elsewhere.
+    pmethod = primal_mi.def::Method
+    primal_nfixed = pmethod.isva ? Int(pmethod.nargs) - 1 : nothing
     # Optimized primal IR, computed by hand (mirroring `Core.Compiler.typeinf_ircode`'s own body)
     # rather than calling that function directly, so we can also read off `frame.edges` — see below.
     # Compiled with `interp` itself (not a bare `NativeInterpreter`): this is what makes our
@@ -337,7 +362,7 @@ function _build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::
     for (_, item) in CC.ForwardToBackedgeIterator(Core.svec(frame.edges...))
         isa(item, MethodInstance) && register_implicit_frule_backedge!(edges, item)
     end
-    return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=false, reason, edges)
+    return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=false, primal_nfixed, reason, edges)
 end
 
 # The optimized dual `IRCode` for a `dualized_impl` carrier: exactly what `CC.optimize`
@@ -424,8 +449,10 @@ end
 # *handling* (`try`/`catch`) is supported as well: `UpsilonNode`/`PhiCNode` are duplicated into
 # primal + shadow copies and `EnterNode`/`:leave`/`:pop_exception` carry over as control markers.
 # Returns `nothing` to bail on still-unsupported constructs — e.g. a `Core.Builtin` with no rule
-# (`Core.memoryrefoffset`, used by `push!`/`resize!`, or a non-bits/undef-checked element access) or
-# a vararg call — and the caller then bails gracefully. Array element read/write, array
+# (`Core.memoryrefoffset`, used by `push!`/`resize!`; a non-bits/undef-checked element access; or the
+# `Core._apply_iterate` left behind by splatting something whose length isn't statically known) — and
+# the caller then bails gracefully. Vararg primal *methods* are supported (see `primal_nfixed`
+# below); only a splat *call site* over a non-tuple is not. Array element read/write, array
 # *allocation* (`zeros`/`similar`/`Vector{T}(undef,n)`/comprehensions, via `memorynew`), and
 # mutable-struct field mutation (`setfield!`) *are* supported — see the `memorynew`/`memoryrefnew`/
 # `memoryrefget`/`memoryrefset!`/`setfield!` arms below.
@@ -471,14 +498,23 @@ function _globalref_val(gr::GlobalRef, world::UInt)
 end
 
 # Build the dualized IRCode for `impl_mi` (a `dualized_impl` specialization) from the primal's
-# optimized IRCode `pir`. `n` = number of dual arguments (= primal args incl. #self#).
-# `pir_is_vararg` selects the argument-unpacking prologue: `false` for an ordinary primal (scalar
-# positional args, first-order/base case), `true` when `pir` is itself an order-(k-1) dual IR (a
-# vararg `dualized_impl` taking one tuple of Duals — the higher-order case; see the prologue below).
+# optimized IRCode `pir`. `n` = number of (flat) dual arguments.
+# `pir_is_vararg` selects the argument-unpacking prologue: `false` for an ordinary primal (positional
+# args, first-order/base case), `true` when `pir` is itself an order-(k-1) dual IR (a vararg
+# `dualized_impl` taking one tuple of Duals — the higher-order case; see the prologue below).
+# `primal_nfixed` is `nothing` for a non-vararg primal, or — when the primal *method* is itself
+# vararg (`f(a, b, xs...)`) — the number of slots it declares before the vararg one (`#self#`
+# included, i.e. `method.nargs - 1`). The prologue then re-packs the trailing flat dual args into the
+# single tuple slot `pir` expects at `Argument(primal_nfixed+1)`, after which the rest of this
+# transform sees exactly the argument shape `pir` was compiled with and needs no vararg awareness.
+# Only meaningful with `pir_is_vararg=false`: an order-(k-1) dual carrier has already absorbed any
+# vararg-ness of its own primal into its flat `argtypes`.
 # Returns `ir::IRCode` or `nothing`.
 function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                            pir_is_vararg::Bool=false, pir_arg_offset::Int=0,
+                           primal_nfixed::Union{Int,Nothing}=nothing,
                            reason::Ref{String}=Ref(""), edges::Vector{Any}=Any[])
+    @assert !(pir_is_vararg && primal_nfixed !== nothing)   # internal invariant, not user input
     pstmts = pir.stmts
     N = length(pstmts)
     # Resolve `GlobalRef` callees/operands at the interpreter's *inference* world (see `_calleeval`):
@@ -609,15 +645,86 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
 
     primal = Vector{Any}(undef, N); shadow = Vector{Any}(undef, N)
     if !pir_is_vararg
-        # Base case: `pir` has scalar positional args (`Argument(k)` is the k-th primal arg). Unpack
-        # each incoming `Dual` into its primal/tangent, indexed by argument position so `presolve`/
-        # `tresolve` can treat `Argument`s uniformly with `SSAValue`s.
-        parg = Vector{Any}(undef, n); targ = Vector{Any}(undef, n)
+        # Base case: `pir` has positional args — `Argument(k)` is its k-th declared slot. Unpack each
+        # incoming `Dual` into its primal/tangent, indexed by slot so `presolve`/`tresolve` can treat
+        # `Argument`s uniformly with `SSAValue`s.
+        #
+        # A *vararg* primal (`primal_nfixed !== nothing`) declares one extra slot holding its varargs
+        # already packed into a tuple, read in its body as `getfield(_va, j)`. The dual call is always
+        # flat (`frule!!(Dual(f), Dual(a), Dual(x1), Dual(x2))`), so the trailing dual args are
+        # re-packed here into exactly that tuple — after which the rest of this transform sees the
+        # argument shape `pir` expects and needs no vararg awareness at all.
+        nfixed = primal_nfixed === nothing ? n : primal_nfixed
+        if nfixed > n
+            reason[] = "the primal vararg method declares $nfixed argument slots before its vararg " *
+                       "slot, but only $n dual arguments were supplied"
+            return nothing
+        end
+        # Settle the packed tuple's primal/tangent types *before* emitting anything, so a shape
+        # disagreement bails cleanly instead of leaving half-emitted statements behind.
+        vptys = Any[_dual_primal_type(dualparams[i]) for i in (nfixed + 1):n]
+        vttys = Any[_dual_tangent_type(dualparams[i]) for i in (nfixed + 1):n]
+        Pva = Tuple{vptys...}
+        Tva = tangent_type(Pva)
+        if primal_nfixed !== nothing
+            # `pir`'s own vararg slot type is a lattice element, not necessarily a bare `Type`
+            # (`Core.Const(())` when the vararg is empty, `Core.Const((Float64,))` for a `Type`-valued
+            # element), so widen before comparing. `<:` rather than `===`: the reconstruction can be
+            # legitimately *sharper* than inference's summary of the same slot (that `Core.Const((Float64,))`
+            # widens to `Tuple{DataType}` where this rebuilds `Tuple{Type{Float64}}`), which is sound —
+            # every use of the slot then carries a subtype of what the primal statement was typed
+            # against. A genuine disagreement (a different arity) still fails. And this *bails* rather
+            # than asserting, unlike the `pir_is_vararg` branch below where both sides are this pass's
+            # own construction: here the shape is driven by user argument types, and an `AssertionError`
+            # thrown out of the `@generated frule!!` body aborts compilation instead of producing an
+            # `error_ircode` carrier that can report why.
+            Pvaslot = CC.widenconst(pir.argtypes[nfixed + 1])
+            if !(Pva <: Pvaslot)
+                reason[] = "the reconstructed vararg tuple type $Pva does not match the primal " *
+                           "method's own vararg slot type $Pvaslot"
+                return nothing
+            end
+            # The tangent side is NOT simply the mirror of the primal tuple: `tangent_type` *collapses*
+            # an all-`NoTangent` tuple to plain `NoTangent` (`tangent_type(Tuple{Int,Int}) === NoTangent`,
+            # and likewise `Tuple{}` — the empty-vararg case). `Dual{P,T}` requires `T == tangent_type(P)`,
+            # so a collapsed slot must hold the *literal* `NoTangent()`: an emitted
+            # `Core.tuple(NoTangent(), NoTangent())` is a `Tuple{NoTangent,NoTangent}` and would
+            # `TypeError` at the `%new(Dual{P,NoTangent}, …)` `frule_split!` builds when the whole tuple
+            # is passed on to a surviving call. Same rule, same reason, as `Core.tuple`'s own shadow —
+            # see `apply_builtin_frule!(::Val{Core.tuple}, …)` in `builtins.jl`. Nothing ever *reads* a
+            # tangent out of a collapsed slot: collapse means every element's own tangent type is
+            # `NoTangent`, so every `getfield` on it takes the `NoTangent()` branch too.
+            if !(Tva === NoTangent || Tva === Tuple{vttys...})
+                reason[] = "the vararg tuple's tangent type $Tva is neither `NoTangent` nor the " *
+                           "tuple $(Tuple{vttys...}) of its elements' tangent types"
+                return nothing
+            end
+        end
+
+        nslots = primal_nfixed === nothing ? n : nfixed + 1
+        parg = Vector{Any}(undef, nslots); targ = Vector{Any}(undef, nslots)
+        argty = Vector{Any}(undef, nslots)
+        pelts = Any[]; telts = Any[]
         for i in 1:n
             Di = dualparams[i]
             di = emit!(Expr(:call, getf, Core.Argument(2), i), Di)
-            parg[i] = emit!(Expr(:call, getf, di, 1), _dual_primal_type(Di))
-            targ[i] = emit!(Expr(:call, getf, di, 2), _dual_tangent_type(Di))
+            p = emit!(Expr(:call, getf, di, 1), _dual_primal_type(Di))
+            if i <= nfixed
+                parg[i]  = p
+                targ[i]  = emit!(Expr(:call, getf, di, 2), _dual_tangent_type(Di))
+                argty[i] = _dual_primal_type(Di)
+            else
+                push!(pelts, p)
+                # No tangent read at all for a collapsed vararg tangent — it would be dead code.
+                Tva === NoTangent ||
+                    push!(telts, emit!(Expr(:call, getf, di, 2), _dual_tangent_type(Di)))
+            end
+        end
+        if primal_nfixed !== nothing
+            va = nfixed + 1
+            parg[va]  = emit!(Expr(:call, ctuple, pelts...), Pva)
+            targ[va]  = Tva === NoTangent ? NoTangent() : emit!(Expr(:call, ctuple, telts...), Tva)
+            argty[va] = Pva
         end
     else
         # Higher-order case: `pir` is a vararg `dualized_impl` whose only real argument is
@@ -649,6 +756,9 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         ttuple = emit!(Expr(:call, ctuple, telts...), Tuple{ttys...})
         @assert Tuple{ptys...} === pir.argtypes[2]     # reconstructed tuple == pir's own arg type
         parg = Any[dualized_impl, ptuple]; targ = Any[NoTangent(), ttuple]
+        # `pir` here is a dual carrier this pass built itself (see the `argtypes` at the bottom of
+        # this function), so both slots are already plain `Type`s; spelled out for `optype` below.
+        argty = Any[typeof(dualized_impl), Tuple{ptys...}]
     end
 
     presolve(@nospecialize x) =
@@ -657,6 +767,16 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         isa(x, Core.SSAValue) ? shadow[x.id] :
         isa(x, Core.Argument) ? targ[x.n] :
         const_tangent(x)                                 # constant tangent (literal)
+    # Declared primal type of an operand. `Argument`s go through `argty` rather than `pir.argtypes`
+    # directly, for two reasons. (1) `pir.argtypes` holds *lattice elements*, not necessarily bare
+    # `Type`s — `Core.Const(f)` for a singleton function slot, `Core.Const(())` for an empty vararg
+    # slot — and the results below are consumed as genuine *type parameters* (`Dual{P,tt(P)}`,
+    # `Tuple{ptys...}`, `dual_type(R)`, `Pobj <: Tuple` in the builtin rules), each of which throws on
+    # a non-`Type`; `_conc` is the only tolerant consumer and it just routes into one of the throwing
+    # ones. (2) For a vararg primal the vararg slot's type is the tuple this pass reconstructed above,
+    # which is what actually flows there. `_optype` still handles `SSAValue`s and literals, and stays
+    # as-is for reverse mode's own call sites.
+    optype(@nospecialize x) = isa(x, Core.Argument) ? argty[x.n] : _optype(pir, x)
 
     function frule_split!(fpos, actual, R)
         # Dual(callee, NoTangent()) and each Dual(arg_primal, arg_tangent), constructed via %new.
@@ -668,7 +788,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # `presolve`/`_optype` rather than embedding the raw (old-numbered) AST node.
         fval = _calleeval(fpos, iworld)
         fcallee = fval === nothing ? presolve(fpos) : fval
-        ftype   = fval === nothing ? _optype(pir, fpos) : _typeof(fval)
+        ftype   = fval === nothing ? optype(fpos) : _typeof(fval)
         # The callee's own tangent: a statically-known function is a code constant (zero tangent —
         # `NoTangent()` for a plain function); a genuinely dynamic callee (read out of a container)
         # carries whatever tangent the shadow pass computed for it.
@@ -687,7 +807,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # Any`, left after a `Ref{Any}` was SROA'd away) takes the static path below, which annotates
         # its result with the *abstract* `dual_type(R)` — sound because `Dual` is invariant so the
         # concrete `Dual{Rc,Tc}` the rule returns is `<: Dual` but not `<: Dual{Any,Any}`.
-        if !_conc(ftype) || !all(a -> _conc(_optype(pir, a)), actual)
+        if !_conc(ftype) || !all(a -> _conc(optype(a)), actual)
             # A statically-known operand (a `GlobalRef` to a defined binding, or a `QuoteNode` — e.g.
             # the `^` passed as an argument to `Base.literal_pow`) must be embedded as its *resolved
             # value*, not the raw node: a bare non-Core/Base `GlobalRef` in value position is rejected
@@ -698,7 +818,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             for a in actual
                 v = _calleeval(a, iworld)
                 if v === nothing                       # genuinely dynamic operand (SSAValue/Argument)
-                    P = _optype(pir, a)
+                    P = optype(a)
                     push!(pvals, presolve(a)); push!(ptys, P)
                     push!(tvals, tresolve(a)); push!(ttys, tt(P))
                 else                                   # statically-known: embed the value + its zero
@@ -729,7 +849,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         for a in actual
             v = _calleeval(a, iworld)
             if v === nothing                            # genuinely dynamic operand
-                P = _optype(pir, a)
+                P = optype(a)
                 push!(dualtys, Dual{P,tt(P)})
                 push!(duals, dual!(P, tt(P), presolve(a), tresolve(a)))
             else                                        # statically-known: embed value + its zero tangent
@@ -759,7 +879,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # `optype`/`tt` give those rules the primal-type introspection they need for same-shape-vs-general
     # struct branching that a plain intrinsic never has to do.
     builtin_ctx = (emit! =emit!, presolve=presolve, tresolve=tresolve, zero_shadow=zero_shadow,
-                   optype=a -> _optype(pir, a), tt=tt, emit_invoke! =emit_invoke!)
+                   optype=optype, tt=tt, emit_invoke! =emit_invoke!)
 
     # Block topology (block count, order, preds/succs) is preserved 1:1 from the primal: this
     # transform only expands each original statement into more instructions, never splits, merges,
@@ -893,7 +1013,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                     p = emit!(gr, R)
                 else
                     p = presolve(s.val)
-                    R = _optype(pir, s.val)
+                    R = optype(s.val)
                 end
                 t = tresolve(s.val)
                 # Concrete `R`: pack with an allocation-free `%new` of the exact `Dual{R,tt(R)}`.

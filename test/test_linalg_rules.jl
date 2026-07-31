@@ -204,6 +204,128 @@ tr_fn(A) = tr(A)
         end
     end
 
+    @testset "mul! (matrix-vector)" begin
+        A = [1.0 2.0; 3.0 4.0; 5.0 6.0]   # 3x2
+        x = [1.5, -0.5]
+        mulv(A, x) = mul!(zeros(3), A, x)
+
+        # Forward mode: cross-check each entry of `A` and `x` against central differences.
+        for i in 1:3, j in 1:2
+            y = zeros(3)
+            dAseed = zeros(3, 2); dAseed[i, j] = 1.0
+            dd = Differ.frule!!(Differ.Dual(mul!, Differ.NoTangent()), Differ.Dual(y, zeros(3)),
+                                 Differ.Dual(A, dAseed), Differ.Dual(x, zeros(2)))
+            @test Differ.primal(dd) === y  # mul! returns (and mutates) y in place
+            @test y == A * x
+            Ap = copy(A); Ap[i, j] += 1e-6
+            Am = copy(A); Am[i, j] -= 1e-6
+            @test Differ.tangent(dd) ≈ (Ap * x - Am * x) / 2e-6 atol = 1e-6
+        end
+        for k in 1:2
+            dxseed = zeros(2); dxseed[k] = 1.0
+            dd = Differ.frule!!(Differ.Dual(mul!, Differ.NoTangent()), Differ.Dual(zeros(3), zeros(3)),
+                                 Differ.Dual(A, zeros(3, 2)), Differ.Dual(x, dxseed))
+            xp = copy(x); xp[k] += 1e-6
+            xm = copy(x); xm[k] -= 1e-6
+            @test Differ.tangent(dd) ≈ (A * xp - A * xm) / 2e-6 atol = 1e-6
+        end
+        checkverify(mulv, (Matrix{Float64}, Vector{Float64}))
+
+        # Reverse mode: same reasoning as `*`'s matrix-vector case above — direct `rrule!!` call.
+        y = zeros(3)
+        dA = zeros(size(A)); dx = zeros(size(x))
+        ycd, Acd, xcd = Differ.CoDual(y, zeros(3)), Differ.CoDual(A, dA), Differ.CoDual(x, dx)
+        outcd, pb = Differ.rrule!!(Differ.zero_fcodual(mul!), Differ.Ctx(), ycd, Acd, xcd)
+        @test Differ.primal(outcd) === y
+        @test y == A * x
+        seed = [1.0, 2.0, 3.0]
+        Differ.tangent(outcd) .= seed
+        pb(Differ.NoRData())
+        @test dA ≈ seed * x'
+        @test dx ≈ A' * seed
+        floss(A, x) = dot(seed, A * x)
+        for i in 1:3, j in 1:2
+            Ap = copy(A); Ap[i, j] += 1e-6
+            Am = copy(A); Am[i, j] -= 1e-6
+            @test dA[i, j] ≈ (floss(Ap, x) - floss(Am, x)) / 2e-6 rtol = 1e-5
+        end
+        for k in 1:2
+            xp = copy(x); xp[k] += 1e-6
+            xm = copy(x); xm[k] -= 1e-6
+            @test dx[k] ≈ (floss(A, xp) - floss(A, xm)) / 2e-6 rtol = 1e-5
+        end
+
+        # Overwrite semantics: stale fdata already on `y` must not leak into `dA`/`dx`, and must be
+        # restored after the pullback runs (mirrors `map!`'s `old_ddest` restore, `rules_broadcast.jl`).
+        dy2 = [10.0, 20.0, 30.0]
+        dA2 = zeros(size(A)); dx2 = zeros(size(x))
+        ycd2, Acd2, xcd2 = Differ.CoDual(zeros(3), dy2), Differ.CoDual(A, dA2), Differ.CoDual(x, dx2)
+        outcd2, pb2 = Differ.rrule!!(Differ.zero_fcodual(mul!), Differ.Ctx(), ycd2, Acd2, xcd2)
+        @test Differ.tangent(outcd2) == zeros(3)
+        Differ.tangent(outcd2) .= seed
+        pb2(Differ.NoRData())
+        @test dA2 ≈ seed * x'
+        @test dx2 ≈ A' * seed
+        @test dy2 == [10.0, 20.0, 30.0]
+    end
+
+    @testset "mul! (matrix-matrix)" begin
+        A = [1.0 2.0; 3.0 4.0]
+        B = [5.0 6.0; 7.0 8.0]
+        mulm(A, B) = mul!(zeros(2, 2), A, B)
+
+        # Forward mode.
+        for i in 1:2, j in 1:2
+            C = zeros(2, 2)
+            dAseed = zeros(2, 2); dAseed[i, j] = 1.0
+            dd = Differ.frule!!(Differ.Dual(mul!, Differ.NoTangent()), Differ.Dual(C, zeros(2, 2)),
+                                 Differ.Dual(A, dAseed), Differ.Dual(B, zeros(2, 2)))
+            @test Differ.primal(dd) === C
+            @test C == A * B
+            Ap = copy(A); Ap[i, j] += 1e-6
+            Am = copy(A); Am[i, j] -= 1e-6
+            @test Differ.tangent(dd) ≈ (Ap * B - Am * B) / 2e-6 atol = 1e-6
+        end
+        checkverify(mulm, (Matrix{Float64}, Matrix{Float64}))
+
+        # Reverse mode: direct `rrule!!` call.
+        C = zeros(2, 2)
+        dA = zeros(size(A)); dB = zeros(size(B))
+        Ccd, Acd, Bcd = Differ.CoDual(C, zeros(2, 2)), Differ.CoDual(A, dA), Differ.CoDual(B, dB)
+        outcd, pb = Differ.rrule!!(Differ.zero_fcodual(mul!), Differ.Ctx(), Ccd, Acd, Bcd)
+        @test Differ.primal(outcd) === C
+        @test C == A * B
+        seed = [1.0 0.5; -0.5 2.0]
+        Differ.tangent(outcd) .= seed
+        pb(Differ.NoRData())
+        @test dA ≈ seed * B'
+        @test dB ≈ A' * seed
+        floss(A, B) = tr(seed' * (A * B))
+        for i in 1:2, j in 1:2
+            Ap = copy(A); Ap[i, j] += 1e-6
+            Am = copy(A); Am[i, j] -= 1e-6
+            @test dA[i, j] ≈ (floss(Ap, B) - floss(Am, B)) / 2e-6 rtol = 1e-5
+        end
+        for i in 1:2, j in 1:2
+            Bp = copy(B); Bp[i, j] += 1e-6
+            Bm = copy(B); Bm[i, j] -= 1e-6
+            @test dB[i, j] ≈ (floss(A, Bp) - floss(A, Bm)) / 2e-6 rtol = 1e-5
+        end
+
+        # Overwrite semantics: stale fdata already on `C` must not leak into `dA`/`dB`, and must be
+        # restored after the pullback runs.
+        dC2 = [10.0 20.0; 30.0 40.0]
+        dA2 = zeros(size(A)); dB2 = zeros(size(B))
+        Ccd2, Acd2, Bcd2 = Differ.CoDual(zeros(2, 2), dC2), Differ.CoDual(A, dA2), Differ.CoDual(B, dB2)
+        outcd2, pb2 = Differ.rrule!!(Differ.zero_fcodual(mul!), Differ.Ctx(), Ccd2, Acd2, Bcd2)
+        @test Differ.tangent(outcd2) == zeros(2, 2)
+        Differ.tangent(outcd2) .= seed
+        pb2(Differ.NoRData())
+        @test dA2 ≈ seed * B'
+        @test dB2 ≈ A' * seed
+        @test dC2 == [10.0 20.0; 30.0 40.0]
+    end
+
     @testset "transpose/adjoint already work with NO new rule" begin
         # Regression tests documenting that `transpose`/`adjoint` are deliberately *not* given
         # rules: their tangent already routes through the generic struct-tangent machinery

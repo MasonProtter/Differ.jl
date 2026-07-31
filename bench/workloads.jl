@@ -18,10 +18,12 @@
 #  * **Reset the shadow in `setup`.** A pullback *accumulates* into the shadow. Reuse one across
 #    samples and you are timing an ever-growing accumulation, not a call. The primal needs no such
 #    care — the pullback restores it — but the shadow does.
-#  * **`evals=1` wherever setup state must not be shared.** BenchmarkTools runs `setup` once per
-#    *sample*, not per eval, so `evals>1` reuses one shadow across the whole eval group. It is only
-#    safe where the accumulation cannot affect the timing (pure float adds into an existing buffer),
-#    and it is needed there — a ~30 ns call can't be timed at `evals=1`.
+#  * **Reset the shadow in the benchmarked body too, wherever it carries fdata.** BenchmarkTools runs
+#    `setup` once per *sample*, not per eval, so `evals>1` reuses one shadow across the whole eval
+#    group; without a reset that times an ever-growing accumulation instead of a call. The fix is a
+#    `set_to_zero!!(cd.dx)` (or the equivalent `.= 0` for a plain array) as the first statement of the
+#    benchmarked expression — allocation-free, so it doesn't distort the timing — which is what lets
+#    every workload here pick its own `evals` instead of being pinned to `evals=1`.
 #
 # Forward mode has neither problem: a shadow is *written*, not accumulated into, and there is no
 # tape, so `evals>1` is safe throughout and setup is just "build the `Dual`s and warm the call".
@@ -32,7 +34,7 @@
 
 using BenchmarkTools
 using Differ
-using Differ: CoDual, NoRData, rrule!!, build_ctx, zero_fcodual
+using Differ: CoDual, NoRData, rrule!!, build_ctx, zero_fcodual, set_to_zero!!
 using Differ: Dual, NoTangent, frule!!, zero_tangent, build_tangent
 
 mutable struct BenchPoint
@@ -170,6 +172,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
     let k = "memloop! Memory[$N] (prealloc)"
         suite[k] = @benchmarkable(
             begin
+                ocd.dx .= 0
                 y, pb = rrule!!(fcd, ctx, ocd, xcd, ncd)
                 pb(NoRData())
             end,
@@ -181,7 +184,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 xcd = zero_fcodual(3.0); ncd = zero_fcodual($N)
                 ctx = build_ctx(memloop!, (Memory{Float64}, Float64, Int))
                 y0, pb0 = rrule!!(fcd, ctx, ocd, xcd, ncd); pb0(NoRData())
-            end, evals = 1)
+            end)
         meta[k] = WorkloadMeta(memloop!, (Memory{Float64}, Float64, Int), :mutation,
                                "argument Memory written in a loop, through a pre-allocated context: " *
                                "the bulk-save best case, and the path that should allocate nothing")
@@ -201,6 +204,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
     let k = "memloop! Memory[$N]"
         suite[k] = @benchmarkable(
             begin
+                ocd.dx .= 0
                 y, pb = rrule!!(fcd, ctx, ocd, xcd, ncd)
                 pb(NoRData())
             end,
@@ -213,7 +217,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 ncd = zero_fcodual($N)
                 ctx = Ctx()
                 y0, pb0 = rrule!!(fcd, ctx, ocd, xcd, ncd); pb0(NoRData())
-            end, evals = 1)
+            end)
         meta[k] = WorkloadMeta(memloop!, (Memory{Float64}, Float64, Int), :mutation,
                                "same call on a fresh `Ctx()` tape: allocates by construction; keeps " *
                                "the per-call cost of bulk save's buffer visible")
@@ -232,6 +236,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
     let k = "vecloop! Vector[$N]"
         suite[k] = @benchmarkable(
             begin
+                vcd.dx .= 0
                 y, pb = rrule!!(fcd, ctx, vcd, xcd)
                 pb(NoRData())
             end,
@@ -241,7 +246,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 fcd = zero_fcodual(vecloop!); xcd = zero_fcodual(3.0)
                 ctx = build_ctx(vecloop!, (Vector{Float64}, Float64))
                 y0, pb0 = rrule!!(fcd, ctx, vcd, xcd); pb0(NoRData())
-            end, evals = 1)
+            end)
         meta[k] = WorkloadMeta(vecloop!, (Vector{Float64}, Float64), :mutation,
                                "same, through an Array: adds the `getfield(a, :ref)` hop")
         primal!(suite, meta, k, @benchmarkable(
@@ -255,6 +260,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
     let k = "wrloop Vector[$N]"
         suite[k] = @benchmarkable(
             begin
+                vcd.dx .= 0
                 y, pb = rrule!!(fcd, ctx, vcd, acd)
                 pb(1.0)
             end,
@@ -264,7 +270,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 fcd = zero_fcodual(wrloop); acd = zero_fcodual(3.0)
                 ctx = build_ctx(wrloop, (Vector{Float64}, Float64))
                 y0, pb0 = rrule!!(fcd, ctx, vcd, acd); pb0(1.0)
-            end, evals = 1)
+            end)
         meta[k] = WorkloadMeta(wrloop, (Vector{Float64}, Float64), :mutation,
                                "write loop + read-back loop; diluted by reads nothing here optimizes")
         primal!(suite, meta, k, @benchmarkable(
@@ -306,6 +312,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
     let k = "structloop $N iters"
         suite[k] = @benchmarkable(
             begin
+                set_to_zero!!(pcd.dx)
                 y, pb = rrule!!(fcd, ctx, pcd, acd, ncd)
                 pb(1.0)
             end,
@@ -315,7 +322,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 acd = zero_fcodual(0.5); ncd = zero_fcodual($N)
                 ctx = build_ctx(structloop, (BenchPoint, Float64, Int))
                 y0, pb0 = rrule!!(fcd, ctx, pcd, acd, ncd); pb0(1.0)
-            end, evals = 1)
+            end)
         meta[k] = WorkloadMeta(structloop, (BenchPoint, Float64, Int), :mutation,
                                "mutable-struct setfield! in a loop; dominated by the tangent-field " *
                                "accessor invokes, which nothing has optimized yet")
@@ -330,6 +337,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
     let k = "readonly Vector[$N]"
         suite[k] = @benchmarkable(
             begin
+                vcd.dx .= 0
                 y, pb = rrule!!(fcd, ctx, vcd)
                 pb(1.0)
             end,
@@ -339,7 +347,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 fcd = zero_fcodual(readonly)
                 ctx = build_ctx(readonly, (Vector{Float64},))
                 y0, pb0 = rrule!!(fcd, ctx, vcd); pb0(1.0)
-            end, evals = 1)
+            end)
         meta[k] = WorkloadMeta(readonly, (Vector{Float64},), :guard,
                                "read-only array reduction: no mutation machinery at all")
         primal!(suite, meta, k, @benchmarkable(
@@ -361,7 +369,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 xcd = zero_fcodual(1.5); ncd = zero_fcodual($N)
                 ctx = build_ctx(scalarcf, (Float64, Int))
                 y0, pb0 = rrule!!(fcd, ctx, xcd, ncd); pb0(1.0)
-            end, evals = 1)
+            end)
         meta[k] = WorkloadMeta(scalarcf, (Float64, Int), :guard,
                                "scalar arithmetic + a branch in a loop: block stack and rdata routing only")
         primal!(suite, meta, k, @benchmarkable(
