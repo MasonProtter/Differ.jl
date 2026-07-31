@@ -24,6 +24,12 @@ include("builtins_reverse.jl")     # dispatch-based Core.Builtin vjp rules (appl
 include("reverse_interp.jl")
 include("rrules.jl")               # hand-written reverse-mode rules (mirrors frules.jl)
 
+include("rules_math.jl")        # scalar math (transcendentals + intrinsic-backed functions)
+include("rules_reductions.jl")  # sum/prod/maximum/minimum/mapreduce/cumsum/extrema
+include("rules_broadcast.jl")   # map/map!/broadcast
+include("rules_indexing.jl")    # fancy/logical indexing, generic AbstractArray
+include("rules_linalg.jl")      # LinearAlgebra basics
+
 include("reflection.jl")
 
 # using PrecompileTools: @compile_workload

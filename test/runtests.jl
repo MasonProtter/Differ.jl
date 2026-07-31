@@ -15,3 +15,9 @@ using SafeTestsets
 @safetestset "backedges: derivative invalidation" begin include("test_backedges.jl") end
 @safetestset "cfg / IR" begin include("test_cfg_ir.jl") end
 @safetestset "intrinsic dispatch" begin include("test_intrinsic_dispatch.jl") end
+@safetestset "rules: math" begin include("test_math_rules.jl") end
+@safetestset "rules: reductions" begin include("test_reduction_rules.jl") end
+@safetestset "rules: broadcast" begin include("test_broadcast_rules.jl") end
+@safetestset "rules: indexing" begin include("test_indexing_rules.jl") end
+@safetestset "rules: linalg" begin include("test_linalg_rules.jl") end
+@safetestset "rules: no ambiguities" begin include("test_rule_ambiguities.jl") end

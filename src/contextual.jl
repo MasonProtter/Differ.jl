@@ -153,11 +153,11 @@ function CC.finishinfer!(me::CC.InferenceState, interp::ADInterpreter, cycleid::
         if edges !== nothing && !isempty(edges)
             existing = me.src.edges
             me.src.edges = (existing === nothing || existing === CC.empty_edges) ? edges :
-                           Any[existing..., edges...]
+                Any[existing..., edges...]
         end
     end
-    return @invoke CC.finishinfer!(me::CC.InferenceState, interp::CC.AbstractInterpreter,
-                                   cycleid::Int, opt_cache::IdDict{MethodInstance, CodeInstance})
+    @invoke CC.finishinfer!(me::CC.InferenceState, interp::CC.AbstractInterpreter,
+                            cycleid::Int, opt_cache::IdDict{MethodInstance, CodeInstance})
 end
 
 # Replaces the optimization result with the transformed IR built in `finishinfer!`, then runs
@@ -172,8 +172,8 @@ function CC.optimize(interp::ADInterpreter, opt::CC.OptimizationState,
         CC.finishopt!(interp, opt, ir)
         return nothing
     end
-    return @invoke CC.optimize(interp::CC.AbstractInterpreter, opt::CC.OptimizationState,
-                               caller::CC.InferenceResult)
+    @invoke CC.optimize(interp::CC.AbstractInterpreter, opt::CC.OptimizationState,
+                        caller::CC.InferenceResult)
 end
 
 # The IRCode half of `run_passes_ipo_safe` (our transformed IR is already SSA IRCode, so
