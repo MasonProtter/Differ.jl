@@ -175,6 +175,22 @@ end
 # tracked; nothing here can catch it.
 # ---------------------------------------------------------------------------
 
+# The null shadow pointer: what a rule hands back when the primal pointer addresses a buffer whose
+# *tangent* elements are `NoTangent`, i.e. there is no shadow storage to point at (`Vector{Int}`,
+# `Vector{Bool}`, `collect(1:n)`). Not read off the shadow buffer — a zero-size-element `MemoryRef`
+# stores its 0-based *index* in `ptr_or_offset`, not an address (measured: element 3 of a
+# `Memory{NoTangent}` reads back `Ptr{Nothing}(0x2)`), so mirroring the read would produce a small
+# bogus address. Synthesised instead, and recognised downstream by `===`: it is a compile-time
+# literal, and `Ptr{NoTangent}` only ever arises as a tangent type, never from user code.
+#
+# Every rule that would *dereference* a shadow pointer must therefore either skip the shadow
+# operation (when the element's tangent type is `NoTangent`, so there is nothing to transfer) or
+# decline — see `pointerref`/`pointerset`/`bitcast`/`add_ptr` below and the `memmove` rule in
+# `src/foreigncalls.jl`. `tangent_type(Ptr{NoTangent}) === Ptr{NoTangent}`, so the sentinel is
+# type-correct wherever `tangent_type(Ptr{Nothing})` is required, and is its own tangent (which is
+# what `const_tangent` relies on to keep IR containing it re-dualizable at order ≥ 2).
+const NULL_SHADOW_PTR = Ptr{NoTangent}(0)
+
 # Element type of a concrete `Ptr{P}`; `nothing` for anything else. Also the guard that keeps every
 # type test in this section away from a non-`Type`: a lattice element (`Core.PartialStruct`) isn't a
 # `DataType`, so it lands here as `nothing` instead of a `TypeError` from `<:`.
@@ -222,6 +238,21 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.bitcast}, actual, Ti, ctx)
                            "no tangent storage to point at, and a `Ptr` has no zero tangent"
             return nothing
         end
+        # Relabelling a pointer with no tangent storage behind it (`NULL_SHADOW_PTR`): the address is
+        # preserved on the primal side, but there is still nothing on the shadow side, so the sentinel
+        # is carried through unchanged. It can only stay the sentinel if that is still the required
+        # tangent type — otherwise this cast is asking for a *differentiable* view of a buffer with no
+        # shadow (`unsafe_load(Ptr{Float64}(pointer(v_int)))`), and mirroring it would launder a null
+        # into a genuine dereference. Decline that.
+        if ctx.tresolve(a) === NULL_SHADOW_PTR
+            if TT !== typeof(NULL_SHADOW_PTR)
+                ctx.reason[] = "`bitcast` to `$Ti` from a pointer with no tangent storage behind it " *
+                               "(its buffer's elements have no tangent): the result would need a " *
+                               "`$TT` shadow pointer, but there is no shadow buffer to point at"
+                return nothing
+            end
+            return ctx.opf(:bitcast, Ti, ctx.presolve(T), ctx.presolve(a)), NULL_SHADOW_PTR
+        end
     end
     p = ctx.opf(:bitcast, Ti, ctx.presolve(T), ctx.presolve(a))
     inptrspace && return p, ctx.opf(:bitcast, TT, TT, ctx.tresolve(a))
@@ -244,6 +275,13 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.pointerref}, actual, Ti, c
     TT = ctx.tt(Ti)
     TT === NoTangent ||
         _ptr_deref_ok(ctx.optype(ptr), align, ctx, "pointerref") || return nothing
+    # Defensive: the `bitcast` rule already refuses to relabel the null sentinel into a
+    # differentiable pointer, so this should be unreachable — but a shadow load through it would be a
+    # null dereference, so never take it on trust.
+    if TT !== NoTangent && ctx.tresolve(ptr) === NULL_SHADOW_PTR
+        ctx.reason[] = "`pointerref` of a `$Ti` through a pointer with no tangent storage behind it"
+        return nothing
+    end
     pidx, palign = ctx.presolve(idx), ctx.presolve(align)
     p = ctx.opf(:pointerref, Ti, ctx.presolve(ptr), pidx, palign)
     TT === NoTangent && return p, NoTangent()
@@ -256,12 +294,21 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.pointerset}, actual, Ti, c
     ptr, val, idx, align = actual[1], actual[2], actual[3], actual[4]
     Pptr = ctx.optype(ptr)
     _ptr_deref_ok(Pptr, align, ctx, "pointerset") || return nothing
-    pidx, palign = ctx.presolve(idx), ctx.presolve(align)
-    p = ctx.opf(:pointerset, Ti, ctx.presolve(ptr), ctx.presolve(val), pidx, palign)
     # `Ti` is `Ptr{P}` (the pointer is returned), so `ctx.tt(Ti)` is a `Ptr` and never `NoTangent` —
     # gate on the stored *element*'s tangent type instead. With nothing to store, the shadow "result"
-    # is just the shadow pointer, which is already typed `Ptr{NoTangent} === ctx.tt(Ti)`.
-    tangent_type(_ptr_eltype(Pptr)) === NoTangent && return p, ctx.tresolve(ptr)
+    # is just the shadow pointer (already typed `Ptr{NoTangent} === ctx.tt(Ti)`, and the null sentinel
+    # when the buffer has no tangent storage), and the shadow store is skipped entirely.
+    nostore = tangent_type(_ptr_eltype(Pptr)) === NoTangent
+    # Defensive, as in `pointerref`: a genuine tangent store through the null sentinel would be a null
+    # dereference. The `bitcast` rule should have declined before this is reachable.
+    if !nostore && ctx.tresolve(ptr) === NULL_SHADOW_PTR
+        ctx.reason[] = "`pointerset` through a pointer with no tangent storage behind it, storing a " *
+                       "`$(_ptr_eltype(Pptr))` whose tangent is not `NoTangent`"
+        return nothing
+    end
+    pidx, palign = ctx.presolve(idx), ctx.presolve(align)
+    p = ctx.opf(:pointerset, Ti, ctx.presolve(ptr), ctx.presolve(val), pidx, palign)
+    nostore && return p, ctx.tresolve(ptr)
     p, ctx.opf(:pointerset, ctx.tt(Ti), ctx.tresolve(ptr), ctx.tresolve(val), pidx, palign)
 end
 
@@ -279,6 +326,19 @@ for op in (:add_ptr, :sub_ptr)
         ptr, off = actual[1], actual[2]
         P = _ptr_eltype(Ti)
         T = P === nothing ? nothing : tangent_type(P)
+        # No tangent storage behind this address: there is no shadow buffer to offset into, so carry
+        # the null sentinel through unchanged rather than computing an offset from it. Must be tested
+        # *before* the stride gate below, which would otherwise reject this case outright
+        # (`NoTangent`'s stride is 0, and `> 0` is exactly what that gate demands).
+        if ctx.tresolve(ptr) === NULL_SHADOW_PTR
+            if ctx.tt(Ti) !== typeof(NULL_SHADOW_PTR)
+                ctx.reason[] = "`$($(QuoteNode(op)))` on `$Ti` from a pointer with no tangent storage " *
+                               "behind it: the result would need a `$(ctx.tt(Ti))` shadow pointer, " *
+                               "but there is no shadow buffer to point at"
+                return nothing
+            end
+            return ctx.opf($(QuoteNode(op)), Ti, ctx.presolve(ptr), ctx.presolve(off)), NULL_SHADOW_PTR
+        end
         if P === nothing || !(isbitstype(P) && isbitstype(T) &&
                               Base.aligned_sizeof(P) == Base.aligned_sizeof(T) > 0)
             ctx.reason[] = "`$($(QuoteNode(op)))` on `$Ti`: a byte offset only carries over to the " *

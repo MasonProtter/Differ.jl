@@ -89,6 +89,37 @@ end
     @test D(g, 1.0) == 6.0
 end
 
+@testset "pointers into a buffer whose elements have no tangent" begin
+    # A `Vector{Int}`'s shadow is a `Memory{NoTangent}`: zero-size elements, so there is no tangent
+    # storage for its data pointer to address. The `getfield` branch hands out `NULL_SHADOW_PTR`
+    # instead of mirroring the read (a zero-size-element `MemoryRef` stores its 0-based *index* in
+    # `ptr_or_offset`, so a mirrored read would be a small bogus address), and every pointer rule then
+    # carries the sentinel through without ever dereferencing it: nothing here is differentiable, so
+    # there is nothing to transfer.
+    load(x) = (v = Int[3, 4]; GC.@preserve v Base.unsafe_load(pointer(v), 2) * x)
+    @test load(2.0) == 8.0
+    @test D(load, 2.0) == 4.0                       # d(4x)/dx
+    checkverify(load, (Float64,))
+
+    store(x) = (v = Int[3, 4]; GC.@preserve v Base.unsafe_store!(pointer(v), 7); v[1] * x)
+    @test store(2.0) == 14.0
+    @test D(store, 2.0) == 7.0
+    checkverify(store, (Float64,))
+
+    # `p + k` on such a pointer: the primal offset is computed, the sentinel is carried through
+    # unchanged rather than offset (there is no shadow buffer to offset into).
+    offs(x) = (v = Int[3, 4]; GC.@preserve v Base.unsafe_load(pointer(v) + sizeof(Int)) * x)
+    @test offs(2.0) == 8.0
+    @test D(offs, 2.0) == 4.0
+    checkverify(offs, (Float64,))
+
+    # No shadow pointer traffic is emitted at all — one `pointerset`, not the mirrored pair the
+    # `Float64` testsets above assert.
+    ir, _ = code_dual_ircode(store, (Float64,))
+    stmts = string.(ir.stmts.stmt)
+    @test count(s -> occursin("pointerset", s), stmts) == 1
+end
+
 @testset "caller-supplied shadow pointer, allocation-free" begin
     # Pointers in, pointers out: no array allocation of its own, so this isolates the pointer rules.
     # The tangent pointer is the caller's shadow buffer — exactly the contract `Dual{Ptr{P},Ptr{P}}`
@@ -137,13 +168,14 @@ struct StridePair
 end
 
 @testset "graceful bails (located reason, no miscompile)" begin
-    # A `Vector{Int}`'s shadow is a `Memory{NoTangent}` — zero-size elements, so its `ptr_or_offset`
-    # is `Ptr(0x0)` rather than an address. Mirroring that read would hand back a null for the
-    # Ptr->Ptr `bitcast` rule to launder into a real dereference.
+    # A `Vector{Int}`'s shadow is a `Memory{NoTangent}` — zero-size elements, so there is no tangent
+    # storage its data pointer could address and the `getfield` branch hands out `NULL_SHADOW_PTR`.
+    # Relabelling that as a `Ptr{Float64}` asks for a *differentiable* view of a buffer with no
+    # shadow, which the Ptr->Ptr `bitcast` rule would otherwise launder into a real dereference.
     ints(x) = Base.unsafe_load(Ptr{Float64}(pointer(Int[1, 2]))) * x
     r = bail_reason(ints, (Float64,))
     @test r !== nothing
-    @test occursin("does not store its elements inline", r)
+    @test occursin("no tangent storage behind it", r)
 
     # A pointer built from an integer address has no tangent storage behind it, and `Ptr` has no zero
     # tangent to fall back on (`zero_tangent(::Ptr)` throws by design).

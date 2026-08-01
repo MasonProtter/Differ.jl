@@ -85,26 +85,35 @@ function _bi_field_index(@nospecialize(Pobj), @nospecialize(name))
 end
 
 # `MemoryRef.ptr_or_offset` / `Memory.ptr` hold a real *address* only when the buffer's element layout
-# is inline and non-empty. Otherwise the field is an offset (bits-union elements, `arrayelem == 2`) or
-# a bare `Ptr(0x0)` (zero-size element type, `layoutsize == 0`) — Base's own
-# `unsafe_convert(::Type{Ptr{Cvoid}}, ::GenericMemoryRef)` branches on exactly this pair of conditions.
+# is inline and non-empty. Otherwise the field is an offset — for a bits-union element (`arrayelem == 2`)
+# or a zero-size one (`layoutsize == 0`), where a `MemoryRef` stores its 0-based *index* there. Base's
+# own `unsafe_convert(::Type{Ptr{Cvoid}}, ::GenericMemoryRef)` branches on exactly this pair of
+# conditions.
 #
 # The catch: a shadow buffer's element type is `tangent_type(P)`, which can sit in a *different* regime
-# than `P`. A `Vector{Int}`'s shadow is a `Memory{NoTangent}` (`layoutsize == 0`), whose
-# `ptr_or_offset` really is `Ptr(0x0)` — mirroring the read would hand back a null that the Ptr→Ptr
-# `bitcast` rule (`src/intrinsics.jl`) then launders into a genuine dereference. So require the
-# inline-bits regime on *both* sides, and bail with a reason otherwise.
-function _bi_mem_ptr_field_ok(@nospecialize(Pobj), @nospecialize(Tobj), ctx)
+# than `P`. Classify the mirrored read rather than allowing/refusing it outright:
+#
+#   `:null`    — the shadow's elements are `NoTangent` (`Vector{Int}`, `Vector{Bool}`): zero-size, so
+#                there is no tangent storage to address at all. The caller hands back
+#                `NULL_SHADOW_PTR` (`src/intrinsics.jl`) — *not* a mirrored read, which would yield the
+#                shadow ref's index dressed up as an address — and every downstream pointer rule
+#                either skips the shadow operation (nothing to transfer) or declines.
+#   `:address` — both buffers store their elements inline, so mirroring the read gives a genuine
+#                address into tangent storage.
+#   `nothing`  — declined, `ctx.reason` set. The case that matters is a bits-union shadow, whose
+#                offset is scaled by an element size the primal doesn't share.
+function _bi_mem_ptr_field_regime(@nospecialize(Pobj), @nospecialize(Tobj), ctx)
+    eltype(Tobj) === NoTangent && return :null
     for (obj, side) in ((Pobj, "primal"), (Tobj, "shadow"))
         M = obj <: Memory ? obj : fieldtype(obj, :mem)
         if !(M isa DataType && Base.datatype_arrayelem(M) == 0 && Base.datatype_layoutsize(M) != 0)
             ctx.reason[] = "reading the data pointer of `$Pobj`: the $side buffer `$M` does not store " *
                            "its elements inline (a bits-union or zero-size element type), so that " *
                            "field is an offset rather than an address"
-            return false
+            return nothing
         end
     end
-    return true
+    return :address
 end
 
 const _getfieldg  = GlobalRef(Core, :getfield)
@@ -152,6 +161,7 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
     # `:not_atomic`/`Core.CPU` aliases have same-shape `tangent_type` methods (`src/tangents.jl`), and an
     # `AtomicMemoryRef`'s tangent is an ordinary `Tangent`, which a mirrored `getfield` would not find.
     memfield = nothing
+    nullshadow = false
     if TT !== NoTangent && Pobj isa DataType && (Pobj <: MemoryRef || Pobj <: Memory)
         Tobj = ctx.tt(Pobj)
         fi = _bi_field_index(Pobj, actual[2])
@@ -162,7 +172,8 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
         # The *shadow object's* own field type, which is what the mirrored read actually produces.
         Fsh = fieldtype(Tobj, fi)
         if Fsh <: Ptr
-            _bi_mem_ptr_field_ok(Pobj, Tobj, ctx) || return nothing
+            regime = _bi_mem_ptr_field_regime(Pobj, Tobj, ctx)
+            regime === nothing && return nothing
             # A `Ptr` field is the one place the shadow's field type disagrees with the shadow
             # statement's required type: `:ptr_or_offset` is a `Ptr{Nothing}` on both sides, while the
             # statement must be declared `tangent_type(Ptr{Nothing}) === Ptr{NoTangent}` to keep the
@@ -174,17 +185,32 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
                 ctx.reason[] = "reading `$Pobj`'s `Ptr` field, whose tangent type `$TT` is not a `Ptr`"
                 return nothing
             end
+            if regime === :null
+                # The sentinel is typed `Ptr{NoTangent}`; anything else would violate that same
+                # invariant, so decline rather than mis-declare it.
+                if TT !== typeof(NULL_SHADOW_PTR)
+                    ctx.reason[] = "reading the data pointer of `$Pobj`, whose shadow has no tangent " *
+                                   "storage, but the required tangent type is `$TT` rather than " *
+                                   "`$(typeof(NULL_SHADOW_PTR))`"
+                    return nothing
+                end
+                nullshadow = true
+            end
         elseif Fsh !== TT
             ctx.reason[] = "reading field $fi of `$Pobj`: the shadow's field type `$Fsh` is neither " *
                            "the required tangent type `$TT` nor a `Ptr` that can be reinterpreted"
             return nothing
         end
-        memfield = Fsh
+        nullshadow || (memfield = Fsh)     # `memfield !== nothing` ⇒ mirror the read
     end
     p = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(actual[1]), idx,
                        (ctx.presolve(a) for a in actual[3:end])...), Ti)
     t = if TT === NoTangent
         NoTangent()
+    elseif nullshadow
+        # No tangent storage behind the primal's address (`:null` regime above) — synthesise the null
+        # sentinel instead of mirroring the read.
+        NULL_SHADOW_PTR
     elseif memfield !== nothing
         m = ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), idx,
                            (ctx.presolve(a) for a in actual[3:end])...), memfield)

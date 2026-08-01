@@ -53,6 +53,41 @@ end
     @test dy == dx                                   # ...and its tangent landed in the shadow buffer
 end
 
+@testset "elements with no tangent: the copy is primal-only" begin
+    # `copy(::Vector{Int})` and friends. The shadow of a `Vector{Int}` is a `Memory{NoTangent}` with
+    # no addressable storage, so the pass hands out `NULL_SHADOW_PTR` for its data pointer and this
+    # rule emits the primal `memmove` alone — copying nothing is exactly the tangent of copying
+    # non-differentiable data. (Before this, the whole path bailed one statement earlier, in the
+    # `MemoryRef` data-pointer layout gate.)
+    ints(v::Vector{Int}) = copy(v)
+    v = [1, 2, 3]
+    r = frule!!(Dual(ints, NoTangent()), Dual(v, zero_tangent(v)))
+    @test r.x == v && r.x !== v                       # a real copy
+    @test r.dx isa Vector{NoTangent} && length(r.dx) == 3
+    checkverify(ints, (Vector{Int},))
+
+    # The copied values still drive a differentiable result, and the `Int` array contributes no
+    # tangent of its own.
+    scale(v::Vector{Int}, x::Float64) = copy(v)[2] * x
+    @test D2(scale, v, zero_tangent(v), 2.0, 1.0) ≈ 2.0
+
+    @test D(w -> copy(w)[1] * 1.0, [true, false], zero_tangent([true, false])) ≈ 0.0
+    checkverify(w -> copy(w), (Vector{Bool},))
+    checkverify(n -> collect(1:n), (Int,))
+
+    # No shadow copy and — unlike the mirrored case above — no extent guards either: a
+    # `Memory{NoTangent}` holds nothing that could be overrun.
+    ir, _ = code_dual_ircode(ints, (Vector{Int},))
+    stmts = ir.stmts.stmt
+    @test count(s -> s isa Expr && s.head === :foreigncall, stmts) == 1
+    @test !any(s -> s isa Expr && s.head === :invoke &&
+                    occursin("_fc_check_extent", string(s.args[2])), stmts)
+
+    # Re-dualizable: the null sentinel is a `Ptr` literal in the emitted IR, and `zero_tangent(::Ptr)`
+    # throws by design — `const_tangent` has to recognise it (a null shadow's shadow is again null).
+    checkverify2(scale, (Vector{Int}, Float64); order=2)
+end
+
 @testset "emitted IR: the copy is mirrored, the guards are static invokes" begin
     f(x) = (y = similar(x); copyto!(y, x); y[1])
     ir, _ = code_dual_ircode(f, (Vector{Float64},))
@@ -94,12 +129,14 @@ end
     @test D(x -> x .* 2.0, x, dx) ≈ 2 .* dx
     @test D(x -> 2.0 .* x, x, dx) ≈ 2 .* dx
 
-    # NOT yet supported, and pinned so the reason stays honest: broadcasting over *two* arrays
-    # (`x .* y`) reaches `Base.broadcasted`'s `%new(Broadcasted{…}, …, Base.Broadcast.nothing)`,
-    # whose raw `GlobalRef` operand `verify_ir` rejects. That is ISSUES #60 — a pre-existing `:new`
-    # arm defect with its own fix, entirely separate from the foreigncall this file is about; it was
-    # simply unreachable while the memmove bailed first.
-    @test_throws Exception code_dual_ircode(x -> x .* x, (Vector{Float64},))
+    # Two-array broadcast, which needed the ISSUES #60 fix on top of this file's memmove support:
+    # `Base.broadcasted` builds `%new(Broadcasted{…}, …, Base.Broadcast.nothing)`, whose raw
+    # `GlobalRef` operand `verify_ir` rejected until the `:new` arm learned to resolve it.
+    y, dy = [2.0, 3.0, 5.0, 7.0], [0.0, 1.0, 0.0, 0.0]
+    @test D2((a, b) -> a .* b, x, dx, y, dy) ≈ dx .* y .+ x .* dy
+    @test D2((a, b) -> a .+ b, x, dx, y, dy) ≈ dx .+ dy
+    @test D2((a, b) -> a .* b .+ 2.0 .* a, x, dx, y, dy) ≈ dx .* y .+ x .* dy .+ 2 .* dx
+    checkverify((a, b) -> a .* b, (Vector{Float64}, Vector{Float64}))
 end
 
 @testset "a short shadow buffer raises BoundsError, not memory corruption" begin
@@ -165,6 +202,14 @@ end
 mvptr!(dst::Ptr{Float64}, src::Ptr{Float64}, n::Int) =
     ccall(:memmove, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), dst, src, n * sizeof(Float64))
 
+# A bulk copy whose two buffers are in different tangent regimes: the destination has shadow storage,
+# the source (a `Vector{Int}`) has none. Not reachable through `copyto!`, which converts elementwise.
+mixedcopy!(dst::Vector{Float64}, src::Vector{Int}) = begin
+    GC.@preserve dst src ccall(:memmove, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t),
+                               pointer(dst), pointer(src), length(src) * sizeof(Int))
+    dst[1]
+end
+
 @testset "graceful bails (located reason, no miscompile)" begin
     # No rule for the target. The message must name the target and point at where to add one.
     unreg(x) = (ccall(:getpid, Cint, ()); x * x)
@@ -199,17 +244,15 @@ mvptr!(dst::Ptr{Float64}, src::Ptr{Float64}, n::Int) =
     @test r !== nothing
     @test occursin("unrecognised signature", r)
 
-    # Known limitation, pinned so a change in behaviour is deliberate: an array whose elements have
-    # no tangent (`Vector{Int}`) still bails *upstream* of the foreigncall, in the `MemoryRef`
-    # data-pointer layout gate, because its shadow is a zero-size-element `Memory{NoTangent}`.
-    ints(v::Vector{Int}) = copy(v)[1]
-    r = bail_reason(ints, (Vector{Int},))
+    # A copy between buffers in *different* tangent regimes — one side has shadow storage and the
+    # other does not — is a reinterpreting copy whose tangent this rule cannot express.
+    r = bail_reason(mixedcopy!, (Vector{Float64}, Vector{Int}))
     @test r !== nothing
-    @test occursin("does not store its elements inline", r)
+    @test occursin("different tangent regimes", r)
 
     # Every one of these is a *reason*, not the misleading "no rule registered" fallback.
     for (f, at) in ((fnptr, (Ptr{Cvoid}, Float64)), (mvptr!, (Ptr{Float64}, Ptr{Float64}, Int)),
-                    (strided, (Vector{FCStridePair},)), (ints, (Vector{Int},)))
+                    (strided, (Vector{FCStridePair},)), (mixedcopy!, (Vector{Float64}, Vector{Int})))
         @test !occursin("no rule registered", bail_reason(f, at))
     end
 end

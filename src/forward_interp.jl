@@ -497,6 +497,23 @@ function _globalref_val(gr::GlobalRef, world::UInt)
     end
 end
 
+# Whether `gr`'s binding is a defined *constant* — i.e. whether its value may be frozen into the IR —
+# asked **at `world`**, the interpreter's inference world, never the ambient task world. The world
+# argument is as load-bearing here as in `_calleeval`: `Base.isconst(mod, name)` answers for the
+# *current* task world, and inside the generated `frule!!` body that world predates a user's `const`
+# declaration, so it reports `false` for a genuinely constant binding (measured, not theoretical —
+# a `const` global array operand degraded to `Any` and took the wrong branch in the `getfield` rule).
+# This is the same check `verify_ir` performs on a value-position `GlobalRef`
+# (`is_defined_const_binding(binding_kind(bpart))`, `Compiler/src/ssair/verify.jl`).
+function _globalref_isconst(gr::GlobalRef, world::UInt)
+    try
+        bpart = Base.lookup_binding_partition(world, gr)
+        return Base.is_defined_const_binding(Base.binding_kind(bpart))
+    catch
+        return false
+    end
+end
+
 # Build the dualized IRCode for `impl_mi` (a `dualized_impl` specialization) from the primal's
 # optimized IRCode `pir`. `n` = number of (flat) dual arguments.
 # `pir_is_vararg` selects the argument-unpacking prologue: `false` for an ordinary primal (positional
@@ -598,6 +615,33 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # unaffected.
     dyn_dual!(@nospecialize(R), @nospecialize(p), @nospecialize(t)) =
         emit!(Expr(:call, Dualg, p, t), dual_type(R))
+    # `(true, value)` when `gr` names a defined *constant* binding at the inference world — the test
+    # that licenses both embedding its value in the IR and using that value's exact type. Returns a
+    # separate flag rather than a `nothing` sentinel (`_globalref_val`'s reason: a binding whose
+    # value *is* `nothing` must still resolve), and asks constness at `iworld`, never the ambient
+    # world (`_globalref_isconst`'s reason).
+    function gref_constval(gr::GlobalRef)
+        ok, gv = _globalref_val(gr, iworld)
+        return (ok && _globalref_isconst(gr, iworld)) ? (true, gv) : (false, nothing)
+    end
+    # A `GlobalRef` in *value* position (a `%new` field, an `:invoke` operand) is rejected by
+    # `verify_ir` unless its module is `Core`/`Base` or its binding is proven constant across the
+    # IR's valid worlds (`check_op` in `Compiler/src/ssair/verify.jl`) — see gotcha #2 in the
+    # `differ-ircode-dualization` skill. Turn one into something legal: a defined `const` binding is
+    # embedded as its *value* (no instruction, and what keeps `return nothing`/`%new(…, nothing)`
+    # allocation-free), anything else becomes a real global-load instruction whose `SSAValue` is used
+    # instead. Never cached across uses — an `SSAValue` reused from a non-dominating block would fail
+    # `verify_ir`'s dominance check.
+    function gref_operand!(gr::GlobalRef)
+        ok, gv = gref_constval(gr)
+        return ok ? gv : emit!(gr, Any)
+    end
+    # Declared type of what `gref_operand!` produces for `gr` (`Core.Typeof` of a `const` binding's
+    # value; `Any` for a load).
+    function gref_optype(gr::GlobalRef)
+        ok, gv = gref_constval(gr)
+        return ok ? Core.Typeof(gv) : Any
+    end
     # The tangent of a compile-time-constant primal is its zero tangent, computed now and embedded
     # as a literal so no call survives into the IR. `zero_tangent` handles singletons (-> the zero
     # tangent, e.g. `NoTangent()` for a function/`Int`), scalars (`0.0`), `Dual` carriers (a
@@ -613,6 +657,12 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # this compiled carrier, corrupted by the first call that mutates it.
     function const_tangent(@nospecialize x)
         isa(x, QuoteNode) && return zero_tangent(x.value)
+        # The null shadow-pointer sentinel (`src/intrinsics.jl`): a `Ptr` operand with no tangent
+        # storage behind it. `zero_tangent(::Ptr)` throws by design, but this one *does* have a
+        # well-defined tangent — a null shadow's own shadow is again null
+        # (`tangent_type(Ptr{NoTangent}) === Ptr{NoTangent}`) — which is what keeps IR containing it
+        # re-dualizable at order ≥ 2.
+        x === NULL_SHADOW_PTR && return NULL_SHADOW_PTR
         if isa(x, GlobalRef)
             # `_globalref_val`, not `_calleeval`: a binding holding `nothing` (e.g. `return nothing`)
             # must still resolve here, not be mistaken for undefined and fall through to
@@ -620,7 +670,10 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             ok, gv = _globalref_val(x, iworld)
             if ok
                 T = tangent_type(Core.Typeof(gv))
-                return T === NoTangent ? NoTangent() : emit_invoke!(zerotang_g, T, (Core.Typeof(gv),), x)
+                # The `zero_tangent` argument goes through `gref_operand!`, never the raw node: an
+                # `:invoke` operand is a value position too.
+                return T === NoTangent ? NoTangent() :
+                       emit_invoke!(zerotang_g, T, (Core.Typeof(gv),), gref_operand!(x))
             end
         end
         return zero_tangent(x)
@@ -763,6 +816,11 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
 
     presolve(@nospecialize x) =
         isa(x, Core.SSAValue) ? primal[x.id] : isa(x, Core.Argument) ? parg[x.n] : x
+    # `presolve` for an operand that lands in *value* position (a `%new` field). It passes a
+    # `GlobalRef` through unchanged, which `verify_ir` rejects — resolve it (`gref_operand!`).
+    # Call/invoke argument positions don't need this: `frule_split!` and the `Core.Const` arm already
+    # embed a statically-known operand's resolved value via `_calleeval`.
+    vpresolve(@nospecialize x) = isa(x, GlobalRef) ? gref_operand!(x) : presolve(x)
     tresolve(@nospecialize x) =
         isa(x, Core.SSAValue) ? shadow[x.id] :
         isa(x, Core.Argument) ? targ[x.n] :
@@ -774,9 +832,15 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # `Tuple{ptys...}`, `dual_type(R)`, `Pobj <: Tuple` in the builtin rules), each of which throws on
     # a non-`Type`; `_conc` is the only tolerant consumer and it just routes into one of the throwing
     # ones. (2) For a vararg primal the vararg slot's type is the tuple this pass reconstructed above,
-    # which is what actually flows there. `_optype` still handles `SSAValue`s and literals, and stays
-    # as-is for reverse mode's own call sites.
-    optype(@nospecialize x) = isa(x, Core.Argument) ? argty[x.n] : _optype(pir, x)
+    # which is what actually flows there. (3) A `GlobalRef` operand — `_optype`'s literal fallback
+    # would report `GlobalRef`, the type of the *node*, not of the value the binding names. That is a
+    # silent miscompile, not a bail: `getfield(Main.CONST_VEC, :ref)` would take the builtin rule's
+    # general-struct branch (`GlobalRef` is not `<: Array`) and emit `get_tangent_field` against an
+    # array shadow, which `MethodError`s at run time. Take the type from the binding instead, exactly
+    # as the `ReturnNode` arm does. `_optype` still handles `SSAValue`s and literals, and stays as-is
+    # for reverse mode's own call sites.
+    optype(@nospecialize x) = isa(x, Core.Argument) ? argty[x.n] :
+                              isa(x, GlobalRef) ? gref_optype(x) : _optype(pir, x)
 
     function frule_split!(fpos, actual, R)
         # Dual(callee, NoTangent()) and each Dual(arg_primal, arg_tangent), constructed via %new.
@@ -958,7 +1022,15 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                           (presolve(a) for a in s.args[2:end])...)
                 primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
             elseif isa(s, Expr) && s.head === :new
-                ex = Expr(:new, s.args[1], (presolve(a) for a in s.args[2:end])...)
+                # Type argument and field operands both get the same `GlobalRef` resolution as the
+                # live-path `:new` arm below (ISSUES #60) — a throw block builds exception objects,
+                # and `%new(Main.MyError, …)` is exactly the shape that trips it.
+                T = s.args[1]
+                if isa(T, GlobalRef)
+                    ok, gv = _globalref_val(T, iworld)
+                    (ok && isa(gv, Type)) && (T = gv)
+                end
+                ex = Expr(:new, T, (vpresolve(a) for a in s.args[2:end])...)
                 primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
             elseif isa(s, Expr) && s.head === :boundscheck
                 primal[i] = emit!(Expr(:boundscheck, (presolve(a) for a in s.args)...), Ti)
@@ -1036,15 +1108,14 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                     # bare GlobalRef `Main.nothing`, not a literal. Two things the generic path gets
                     # wrong here: (1) `presolve` would pass the raw node through and it would land in
                     # the returned `Dual`'s primal field, which `verify_ir` rejects (a non-Core/Base
-                    # GlobalRef in value position — gotcha #2/#4); emit a real global load instead.
+                    # GlobalRef in value position — gotcha #2/#4); `gref_operand!` resolves it.
                     # (2) `_optype` would report `GlobalRef`, not the bound value's type; take the type
                     # from the binding. A defined `const` binding gives a concrete `Core.Typeof(gv)` —
                     # for `return nothing` that is `Nothing`, keeping the allocation-free `%new` path;
                     # a non-`const` (or unresolvable) binding falls to `Any` and the dynamic pack.
                     gr = s.val::GlobalRef
-                    ok, gv = _globalref_val(gr, iworld)
-                    R = (ok && Base.isconst(gr.mod, gr.name)) ? Core.Typeof(gv) : Any
-                    p = emit!(gr, R)
+                    p = gref_operand!(gr)
+                    R = gref_optype(gr)
                 else
                     p = presolve(s.val)
                     R = optype(s.val)
@@ -1059,9 +1130,28 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         elseif isa(s, Core.PiNode)
             primal[i] = presolve(s.val); shadow[i] = tresolve(s.val)
         elseif isa(s, Expr) && s.head === :new
+            # The constructed type is a `GlobalRef` whenever the struct is named by a module-level
+            # binding — a top-level `struct S` lowers to `%new(Main.S, …)`. It has to be resolved
+            # *before* anything else in this arm: every branch below tests it with `<:`/`fieldtype`,
+            # which throw a raw `TypeError` on a `GlobalRef`, and it is an operand position
+            # `verify_ir` checks too (ISSUES #60). Resolution alone here, without the `const` test
+            # `gref_constval` applies to *field* operands: a struct name is always a constant
+            # binding, and refusing one that a world-lookup happened to report otherwise would turn a
+            # working case into a bail. `isa(gv, Type)` is the actual guard.
             T = s.args[1]
+            if isa(T, GlobalRef)
+                ok, gv = _globalref_val(T, iworld)
+                (ok && isa(gv, Type)) && (T = gv)
+            end
+            if !isa(T, Type)
+                reason[] = "`%new` whose type argument `$(s.args[1])` is not a statically-known " *
+                           "type at %$i: `$(_stmt_str(s))`"
+                return nothing
+            end
             args = @view s.args[2:end]
-            pf = Any[presolve(a) for a in args]
+            # `vpresolve`, not `presolve`: a field operand is a value position, so a `GlobalRef` there
+            # (`%new(Broadcasted{…}, …, Base.Broadcast.nothing)`) must be resolved — same issue.
+            pf = Any[vpresolve(a) for a in args]
             primal[i] = emit!(Expr(:new, T, pf...), Ti)
             TT = tt(Ti)
             if T <: Dual
@@ -1070,7 +1160,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # (whose tangent is `NoTangent` and can't fill e.g. a `typeof(sin)` or `Int` slot)
                 # which carries the primal value through unchanged. This is what lets a
                 # `Dual{typeof(sin),NoTangent}` be re-dualized at higher order.
-                tf = Any[_nondiff_field(fieldtype(T, j)) ? presolve(args[j]) : tresolve(args[j])
+                tf = Any[_nondiff_field(fieldtype(T, j)) ? vpresolve(args[j]) : tresolve(args[j])
                          for j in eachindex(args)]
                 shadow[i] = emit!(Expr(:new, T, tf...), Ti)
             elseif TT === NoTangent
@@ -1098,7 +1188,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 #    verbatim (`presolve`, not `tresolve`) rather than fabricate a bogus
                 #    all-`NoTangent()` shadow tuple. Matches Mooncake's reference `_new_` rule for
                 #    `Array{P,N}`: shadow ref, primal's own size.
-                shadow[i] = emit!(Expr(:new, TT, tresolve(args[1]), presolve(args[2])), TT)
+                shadow[i] = emit!(Expr(:new, TT, tresolve(args[1]), vpresolve(args[2])), TT)
             else
                 # General (im)mutable user struct → `Tangent`/`MutableTangent`. `tresolve`d field
                 # tangents already carry `NoTangent()` for non-diff fields (dropped into the matching

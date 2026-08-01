@@ -163,6 +163,50 @@ end
     checkverify(vecloop!, (Vector{Float64}, Float64))
 end
 
+# Must be top level: the point of these is that the struct *name* and the global are module-level
+# bindings, so the primal IR really does carry `%new(<Module>.NewHolder, …)` and a raw `GlobalRef`
+# field operand. A testset-local `struct` would not reproduce either.
+struct NewHolder; a::Float64; b::Any; end
+struct NewPair;   a::Float64; b::Int; end
+const NEWCONST = [1.5, 2.5]                      # mutable, so inference keeps it a `GlobalRef` operand
+                                                 # rather than folding it into a literal
+newnothing(x) = NewHolder(x*x, nothing)
+newpair(x)    = [NewPair(x, 1)][1].a
+newconst(x)   = NewHolder(x*x, NEWCONST)
+newconstuse(x) = NEWCONST[1] * x
+
+@testset "`%new` with GlobalRef operands (forward mode, ISSUES #60)" begin
+    # `%new`'s type argument and its field operands are both value positions `verify_ir` checks, and
+    # the arm used to test `T <: Dual` on the raw node. A struct defined at module level lowers to
+    # `%new(<Module>.NewHolder, %1, <Module>.nothing)`, so both defects fired at once: a `TypeError`
+    # from `<:` on a `GlobalRef`, and (once past that) "Unbound or partitioned GlobalRef not allowed
+    # in value position". Both operands are now resolved through the binding.
+    r = frule!!(Dual(newnothing, NoTangent()), Dual(3.0, 1.0))
+    @test r.x == NewHolder(9.0, nothing)
+    @test get_tangent_field(r.dx, :a) ≈ 6.0            # d(x²)/dx
+    @test get_tangent_field(r.dx, :b) === NoTangent()  # `nothing` is non-differentiable
+    checkverify(newnothing, (Float64,))
+
+    # Same defect via the *type* argument alone, with every field operand an ordinary SSA/literal.
+    @test frule!!(Dual(newpair, NoTangent()), Dual(4.0, 1.0)) === Dual(4.0, 1.0)
+    checkverify(newpair, (Float64,))
+
+    # A `const` global whose tangent is *not* `NoTangent`: the field's shadow is a genuine runtime
+    # `zero_tangent` of the bound value, and that call's own operand is a value position too.
+    r2 = frule!!(Dual(newconst, NoTangent()), Dual(3.0, 1.0))
+    @test r2.x.b === NEWCONST
+    @test get_tangent_field(r2.dx, :b) == [0.0, 0.0]   # a const global contributes no tangent
+    checkverify(newconst, (Float64,))
+
+    # Reading through the same binding. Resolving its *type* has to happen at the interpreter's
+    # inference world, not the ambient one: inside the generated `frule!!` body the ambient world
+    # predates the `const` declaration, and answering "not constant" there degrades the operand to
+    # `Any` and sends the `getfield` rule down its general-struct branch — a `MethodError` at run
+    # time, which `code_dual_ircode` (running at the ambient world) would not reproduce.
+    @test frule!!(Dual(newconstuse, NoTangent()), Dual(3.0, 1.0)) === Dual(4.5, 1.5)
+    checkverify(newconstuse, (Float64,))
+end
+
 @testset "mutable-struct field mutation (setfield!, forward mode)" begin
     # setfield! mutates the primal in place and its `MutableTangent` shadow via
     # `set_tangent_field!` — the mutation-side counterpart of the existing getfield/

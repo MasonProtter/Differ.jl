@@ -185,9 +185,49 @@ for op in (:memmove, :memcpy)
         # Both addresses must trace back to a `Memory`/`MemoryRef` this pass gave a real shadow
         # buffer, and the tangent element must have the primal's stride — a byte count is only
         # transferable when a byte offset means the same thing on both sides.
+        #
+        # Exception, settled first: when a buffer's elements have no tangent (`copy(::Vector{Int})`,
+        # a `Bool` mask, `collect(1:n)`) there is no shadow storage to copy *into or out of*, and the
+        # pass hands out `NULL_SHADOW_PTR` for its address. Copying nothing is exactly the tangent of
+        # copying non-differentiable data, so the primal call is emitted alone — no shadow copy, and
+        # no extent guards either, since a `Memory{NoTangent}` holds nothing that could be overrun.
+        # Both sides must agree: a byte copy between a shadowed and an unshadowed buffer is a
+        # reinterpreting copy whose tangent this rule cannot express.
+        sides = ((dstx, "destination"), (srcx, "source"))
+        walked = Any[_fc_ptr_origin(x, ctx) for (x, _) in sides]
+        nulls = Bool[]
+        for ((x, side), o) in zip(sides, walked)
+            nt = o !== nothing && tangent_type(o[1]) === NoTangent
+            # The walk's verdict and the shadow operand must agree, or something other than this
+            # rule's assumptions produced that operand — decline rather than guess which one is right.
+            if nt != (ctx.tresolve(x) === NULL_SHADOW_PTR)
+                ctx.reason[] = "`$what` whose $side pointer disagrees with its shadow: the buffer's " *
+                               "elements $(nt ? "have no tangent, but the shadow pointer is not the " *
+                               "null sentinel" : "have a tangent, but the shadow pointer is the null " *
+                               "sentinel")"
+                return nothing
+            end
+            push!(nulls, nt)
+        end
+        if all(nulls)
+            p = ctx.emit!(_fc_stmt(fc, (ctx.presolve(dstx), ctx.presolve(srcx), ctx.presolve(nx)),
+                                   map(ctx.presolve, fc.roots)), Ti)
+            TT = ctx.tt(Ti)
+            if TT !== NoTangent && TT !== typeof(NULL_SHADOW_PTR)
+                ctx.reason[] = "`$what` over elements with no tangent, but its own result needs a " *
+                               "`$TT` shadow rather than `$(typeof(NULL_SHADOW_PTR))`"
+                return nothing
+            end
+            return p, TT === NoTangent ? NoTangent() : NULL_SHADOW_PTR
+        elseif any(nulls)
+            ctx.reason[] = "`$what` between buffers in different tangent regimes — one side's " *
+                           "elements have a tangent and the other's do not, so the byte copy has no " *
+                           "shadow counterpart"
+            return nothing
+        end
+
         origins = Any[]
-        for (x, side) in ((dstx, "destination"), (srcx, "source"))
-            o = _fc_ptr_origin(x, ctx)
+        for ((x, side), o) in zip(sides, walked)
             if o === nothing
                 ctx.reason[] = "`$what` whose $side pointer is not traceable to a `Memory`/" *
                                "`MemoryRef` this pass shadows (only a `pointer`-style " *
