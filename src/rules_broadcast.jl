@@ -1,12 +1,18 @@
 # Hand-written frule!!/rrule!! for map/map! and (where feasible) broadcast. See ISSUES.md #31.
 #
 # Same motivation as `sum`/`sum(f, ·)` in `rrules.jl`: Base's real `map`/`map!`/broadcast
-# implementations use IR constructs (self-recursive pairwise reduction, `Expr(:gc_preserve_begin)`/
-# `:gc_preserve_end` inside broadcast's `copy`/`copyto!`) that Differ's dualization engine does not
-# support. Every rule below is an explicit per-element loop calling `frule!!`/`rrule!!` on the
-# user's function `f`, never touching Base's actual `map`/`broadcast` internals — this is what lets
-# `map(sin, x)` differentiate even though `sin.(x)` (unmodified, no hand rule) would fail on the
-# `:gc_preserve` construct inside `copy`.
+# implementations use IR constructs Differ's dualization engine does not support (self-recursive
+# pairwise reduction, chiefly). Every rule below is an explicit per-element loop calling
+# `frule!!`/`rrule!!` on the user's function `f`, never touching Base's actual `map`/`broadcast`
+# internals.
+#
+# The broadcast half of that motivation has narrowed a lot: the `Expr(:gc_preserve_begin)`/
+# `:gc_preserve_end` pair inside `copy`/`copyto!` gained forward-mode support on 2026-07-31, and the
+# `Expr(:foreigncall)` `memmove` it wraps (plus `@simd`'s `Expr(:loopinfo)`) on 2026-08-01
+# (`src/foreigncalls.jl`, ISSUES #62). Unmodified `.`-syntax now dualizes in forward mode for a
+# single array argument (`sin.(x)`) and for array-with-scalar forms (`x .* 2.0`); *two-array*
+# broadcast (`x .* y`) is the remaining gap, blocked by ISSUES #60 rather than by anything here.
+# These rules still matter — they cover reverse mode, `map`/`map!` proper, and the two-array case.
 #
 # Reverse-mode rules follow `SumMapPullback`'s structure exactly (`rrules.jl`): call `rrule!!` on
 # each element, collect the per-element pullbacks in a `Vector`, and replay them in reverse in the

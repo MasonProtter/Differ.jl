@@ -13,6 +13,7 @@ include("stack.jl")        # Stack/SingletonStack — reverse-mode control-flow 
 # Forward-mode AD engine, compiler-level Dual arithmetic
 include("intrinsics.jl")   # dispatch-based intrinsic handling (apply_intrinsic_frule!)
 include("builtins.jl")     # dispatch-based Core.Builtin handling (apply_builtin_frule!)
+include("foreigncalls.jl") # dispatch-based Expr(:foreigncall) handling (apply_foreigncall_frule!)
 include("frules.jl")
 include("contextual.jl")
 include("cfg_ir.jl")       # ID/CFGBlock working-IR layer (reverse-mode control flow only)

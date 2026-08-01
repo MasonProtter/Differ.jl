@@ -75,6 +75,38 @@ function _tangent_field_slot(@nospecialize(Pobj), @nospecialize(name))
     return (NT, i)
 end
 
+# 1-based field index for a compile-time literal `getfield` name/index operand, or `nothing` when the
+# operand is dynamic or names no field of `Pobj`.
+function _bi_field_index(@nospecialize(Pobj), @nospecialize(name))
+    _bi_literal_index(name) || return nothing
+    sym = name isa QuoteNode ? name.value : name
+    i = sym isa Int ? sym : findfirst(==(sym), fieldnames(Pobj))
+    return (i isa Int && 1 <= i <= fieldcount(Pobj)) ? i : nothing
+end
+
+# `MemoryRef.ptr_or_offset` / `Memory.ptr` hold a real *address* only when the buffer's element layout
+# is inline and non-empty. Otherwise the field is an offset (bits-union elements, `arrayelem == 2`) or
+# a bare `Ptr(0x0)` (zero-size element type, `layoutsize == 0`) — Base's own
+# `unsafe_convert(::Type{Ptr{Cvoid}}, ::GenericMemoryRef)` branches on exactly this pair of conditions.
+#
+# The catch: a shadow buffer's element type is `tangent_type(P)`, which can sit in a *different* regime
+# than `P`. A `Vector{Int}`'s shadow is a `Memory{NoTangent}` (`layoutsize == 0`), whose
+# `ptr_or_offset` really is `Ptr(0x0)` — mirroring the read would hand back a null that the Ptr→Ptr
+# `bitcast` rule (`src/intrinsics.jl`) then launders into a genuine dereference. So require the
+# inline-bits regime on *both* sides, and bail with a reason otherwise.
+function _bi_mem_ptr_field_ok(@nospecialize(Pobj), @nospecialize(Tobj), ctx)
+    for (obj, side) in ((Pobj, "primal"), (Tobj, "shadow"))
+        M = obj <: Memory ? obj : fieldtype(obj, :mem)
+        if !(M isa DataType && Base.datatype_arrayelem(M) == 0 && Base.datatype_layoutsize(M) != 0)
+            ctx.reason[] = "reading the data pointer of `$Pobj`: the $side buffer `$M` does not store " *
+                           "its elements inline (a bits-union or zero-size element type), so that " *
+                           "field is an offset rather than an address"
+            return false
+        end
+    end
+    return true
+end
+
 const _getfieldg  = GlobalRef(Core, :getfield)
 const _setfieldg  = GlobalRef(Core, :setfield!)
 const _memnewg    = GlobalRef(Core, :memorynew)
@@ -114,10 +146,49 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
             return nothing
         end
     end
+    # `MemoryRef`/`Memory` are same-shape too (`tangent_type(MemoryRef{P}) === MemoryRef{tangent_type(P)}`),
+    # but their shadow field types don't all match the primal's, so they need their own branch — settled
+    # here, before anything is emitted. Deliberately *not* `GenericMemoryRef`/`GenericMemory`: only the
+    # `:not_atomic`/`Core.CPU` aliases have same-shape `tangent_type` methods (`src/tangents.jl`), and an
+    # `AtomicMemoryRef`'s tangent is an ordinary `Tangent`, which a mirrored `getfield` would not find.
+    memfield = nothing
+    if TT !== NoTangent && Pobj isa DataType && (Pobj <: MemoryRef || Pobj <: Memory)
+        Tobj = ctx.tt(Pobj)
+        fi = _bi_field_index(Pobj, actual[2])
+        if fi === nothing
+            ctx.reason[] = "dynamic field index into `$Pobj` — its fields do not share one tangent type"
+            return nothing
+        end
+        # The *shadow object's* own field type, which is what the mirrored read actually produces.
+        Fsh = fieldtype(Tobj, fi)
+        if Fsh <: Ptr
+            _bi_mem_ptr_field_ok(Pobj, Tobj, ctx) || return nothing
+            # A `Ptr` field is the one place the shadow's field type disagrees with the shadow
+            # statement's required type: `:ptr_or_offset` is a `Ptr{Nothing}` on both sides, while the
+            # statement must be declared `tangent_type(Ptr{Nothing}) === Ptr{NoTangent}` to keep the
+            # "shadow is typed `tangent_type(primal)`" invariant — a value that violates it can reach a
+            # `%new(Dual{P,tangent_type(P)}, …)`, which type-checks its fields at run time. Reconcile
+            # honestly with a no-op `bitcast` (what `Base.convert(::Type{Ptr{T}}, ::Ptr)` compiles to)
+            # rather than by mis-declaring the read.
+            if !(TT isa DataType && TT <: Ptr)
+                ctx.reason[] = "reading `$Pobj`'s `Ptr` field, whose tangent type `$TT` is not a `Ptr`"
+                return nothing
+            end
+        elseif Fsh !== TT
+            ctx.reason[] = "reading field $fi of `$Pobj`: the shadow's field type `$Fsh` is neither " *
+                           "the required tangent type `$TT` nor a `Ptr` that can be reinterpreted"
+            return nothing
+        end
+        memfield = Fsh
+    end
     p = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(actual[1]), idx,
                        (ctx.presolve(a) for a in actual[3:end])...), Ti)
     t = if TT === NoTangent
         NoTangent()
+    elseif memfield !== nothing
+        m = ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), idx,
+                           (ctx.presolve(a) for a in actual[3:end])...), memfield)
+        memfield === TT ? m : ctx.opf(:bitcast, TT, TT, m)
     elseif Pobj <: Dual || Pobj <: Tuple || Pobj <: NamedTuple || Pobj <: Array
         # Same-shape tangent (Dual/Tuple/NamedTuple/Array): index/name the shadow aggregate directly.
         ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), idx,
@@ -266,12 +337,17 @@ end
 
 # Same-shape tangent tuple: a non-differentiable slot holds NoTangent(), a differentiable slot holds
 # its resolved tangent.
+#
+# `Ti` needs widening before `fieldtype`: a tuple whose elements inference partly pinned down (e.g.
+# the `Broadcasted` argument tuple in `x .+ 1.0`) carries a `Core.PartialStruct` lattice element, not
+# a bare `Type`, and `fieldtype` throws a `TypeError` on one. Same trap `tt` already guards against.
 function apply_builtin_frule!(::Val{Core.tuple}, actual, Ti, ctx)
     p = ctx.emit!(Expr(:call, _ctupleg, (ctx.presolve(a) for a in actual)...), Ti)
     TT = ctx.tt(Ti)
+    Tw = Ti isa Type ? Ti : CC.widenconst(Ti)
     t = TT === NoTangent ? NoTangent() :
         ctx.emit!(Expr(:call, _ctupleg,
-                  (ctx.tt(fieldtype(Ti, j)) === NoTangent ? NoTangent() : ctx.tresolve(actual[j])
+                  (ctx.tt(fieldtype(Tw, j)) === NoTangent ? NoTangent() : ctx.tresolve(actual[j])
                    for j in eachindex(actual))...), TT)
     p, t
 end

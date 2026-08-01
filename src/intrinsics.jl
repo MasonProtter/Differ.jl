@@ -154,6 +154,148 @@ for op in (:fpext, :fptrunc)
 end
 
 # ---------------------------------------------------------------------------
+# Raw pointers: `bitcast` in `Ptr` space, `pointerref`/`pointerset` (`unsafe_load`/`unsafe_store!`),
+# and `add_ptr`/`sub_ptr` (`p ± k`).
+#
+# These all rest on `tangent_type(Ptr{P}) === Ptr{tangent_type(P)}` (`src/tangents.jl`): a shadow
+# pointer is a handle to *tangent* storage at the position its primal addresses, so every rule here is
+# a mirror. Two things make the mirror conditional rather than automatic:
+#
+#  * A shadow buffer's element type is `tangent_type(P)`, whose stride and alignment need not match
+#    `P`'s. An *element index* survives that (`pointerref` scales by the shadow pointer's own element
+#    type) but a *byte offset* does not — hence the stride check in `add_ptr`/`sub_ptr`.
+#  * A pointer with no tangent storage behind it (one built from an integer address) has no shadow
+#    at all: `Ptr` has no zero tangent (`zero_tangent(::Ptr)` throws by design), so there is nothing
+#    to fall back on and the rule declines via `ctx.reason` rather than inventing one.
+#
+# NOTE (limitation, see ISSUES): a `Ptr` *field* of a struct gets the primal's own address as its
+# tangent (`zero_tangent_internal(x::Ptr)`/`uninit_tangent(x::Ptr)` — a type-correct placeholder that
+# must not be dereferenced). `pointerset` cannot tell that apart from a genuine shadow pointer, so
+# storing through such a field writes tangent values over primal data. Pointer provenance isn't
+# tracked; nothing here can catch it.
+# ---------------------------------------------------------------------------
+
+# Element type of a concrete `Ptr{P}`; `nothing` for anything else. Also the guard that keeps every
+# type test in this section away from a non-`Type`: a lattice element (`Core.PartialStruct`) isn't a
+# `DataType`, so it lands here as `nothing` instead of a `TypeError` from `<:`.
+function _ptr_eltype(@nospecialize(T))
+    (T isa DataType && T <: Ptr && isconcretetype(T)) || return nothing
+    P = T.parameters[1]
+    return P isa Type ? P : nothing
+end
+
+# Shared gate for the dereferencing intrinsics: the primal pointer must be a concrete `Ptr{P}` (an
+# unparameterized `Ptr` has `tangent_type === NoTangent`, i.e. no shadow pointer to mirror onto), and
+# a non-default alignment must mean the same thing for the tangent's element type as for the primal's.
+# Base always passes `1` (`base/pointer.jl`), which claims nothing about either type's alignment.
+function _ptr_deref_ok(@nospecialize(Pptr), @nospecialize(align), ctx, what::String)
+    P = _ptr_eltype(Pptr)
+    if P === nothing
+        ctx.reason[] = "`$what` through `$Pptr` — only a concrete `Ptr{P}` has a shadow pointer " *
+                       "(`tangent_type` of an abstract `Ptr` is `NoTangent`)"
+        return false
+    end
+    T = tangent_type(P)
+    if align !== 1 && !(isbitstype(P) && isbitstype(T) &&
+                        Base.datatype_alignment(P) == Base.datatype_alignment(T))
+        ctx.reason[] = "`$what` on `$Pptr` with alignment `$align` — the tangent element type `$T` " *
+                       "is not known to share `$P`'s alignment, so the primal's alignment claim " *
+                       "does not carry over to the shadow buffer"
+        return false
+    end
+    return true
+end
+
+# `bitcast(T, x)`: raw bit reinterpretation. Non-differentiable in general, *except* between pointer
+# types, which is where `pointer(v)` ends up (`getfield(ref, :ptr_or_offset)::Ptr{Nothing}` then
+# `bitcast(Ptr{Float64}, _)`). `bitcast` preserves the address whatever the element-type label says,
+# so reinterpreting the shadow pointer the same way keeps it pointing at tangent storage — this is
+# also what lets a `Ptr{Cvoid}` round trip survive.
+function apply_intrinsic_frule!(::Val{Core.Intrinsics.bitcast}, actual, Ti, ctx)
+    T, a = actual[1], actual[2]
+    TT = ctx.tt(Ti)
+    inptrspace = TT !== NoTangent && _ptr_eltype(Ti) !== nothing
+    if inptrspace
+        Pa = ctx.optype(a)
+        if !(Pa isa DataType && Pa <: Ptr)
+            ctx.reason[] = "`bitcast` to `$Ti` from `$Pa` — a pointer built from a non-pointer has " *
+                           "no tangent storage to point at, and a `Ptr` has no zero tangent"
+            return nothing
+        end
+    end
+    p = ctx.opf(:bitcast, Ti, ctx.presolve(T), ctx.presolve(a))
+    inptrspace && return p, ctx.opf(:bitcast, TT, TT, ctx.tresolve(a))
+    # Non-pointer reinterpretation. `NoTangent` results (the `UInt` cast every bounds check does) are
+    # the common case. A *differentiable* non-pointer result — `bitcast(Float64, ::UInt64)`, i.e.
+    # `reinterpret` — gets a zero tangent, which is deliberate but not universally right: such a cast
+    # is genuinely zero-derivative in some kernels (`exp`'s `reinterpret(Float64, (k+1023) << 52)`
+    # scale factor) and value-carrying in others (`atanh`'s `|x|` bit trick). Differ's answer is a
+    # zero here plus a hand-written rule for each affected function (`src/rules_math.jl`), which is
+    # why hand-ruled kernels are never dualized in the first place — see `test/test_math_rules.jl`.
+    p, ctx.zero_shadow(Ti, p)
+end
+
+# `pointerref(p, i, align)` — `unsafe_load(p, i)`. Mirror the load on the shadow pointer. Mirroring
+# the *element index* (rather than computing a byte offset) is what makes a differing tangent stride
+# correct: `pointerref` scales by the shadow pointer's own element type, so element `i` is element `i`.
+# Matches Mooncake's rule for this intrinsic.
+function apply_intrinsic_frule!(::Val{Core.Intrinsics.pointerref}, actual, Ti, ctx)
+    ptr, idx, align = actual[1], actual[2], actual[3]
+    TT = ctx.tt(Ti)
+    TT === NoTangent ||
+        _ptr_deref_ok(ctx.optype(ptr), align, ctx, "pointerref") || return nothing
+    pidx, palign = ctx.presolve(idx), ctx.presolve(align)
+    p = ctx.opf(:pointerref, Ti, ctx.presolve(ptr), pidx, palign)
+    TT === NoTangent && return p, NoTangent()
+    p, ctx.opf(:pointerref, TT, ctx.tresolve(ptr), pidx, palign)
+end
+
+# `pointerset(p, v, i, align)` — `unsafe_store!(p, v, i)`, returns `p`. Mirror the store: the tangent
+# of the stored value goes to the same element of the shadow buffer.
+function apply_intrinsic_frule!(::Val{Core.Intrinsics.pointerset}, actual, Ti, ctx)
+    ptr, val, idx, align = actual[1], actual[2], actual[3], actual[4]
+    Pptr = ctx.optype(ptr)
+    _ptr_deref_ok(Pptr, align, ctx, "pointerset") || return nothing
+    pidx, palign = ctx.presolve(idx), ctx.presolve(align)
+    p = ctx.opf(:pointerset, Ti, ctx.presolve(ptr), ctx.presolve(val), pidx, palign)
+    # `Ti` is `Ptr{P}` (the pointer is returned), so `ctx.tt(Ti)` is a `Ptr` and never `NoTangent` —
+    # gate on the stored *element*'s tangent type instead. With nothing to store, the shadow "result"
+    # is just the shadow pointer, which is already typed `Ptr{NoTangent} === ctx.tt(Ti)`.
+    tangent_type(_ptr_eltype(Pptr)) === NoTangent && return p, ctx.tresolve(ptr)
+    p, ctx.opf(:pointerset, ctx.tt(Ti), ctx.tresolve(ptr), ctx.tresolve(val), pidx, palign)
+end
+
+# `p ± k` — byte arithmetic. In Julia 1.13 this stays *in `Ptr` space*
+# (`add_ptr(::Ptr{P}, ::UInt)::Ptr{P}`), so the shadow address survives and the same byte offset can
+# be applied to it — but only when a byte offset means the same thing on both sides, i.e. the tangent
+# element has the primal's stride. `> 0` is load-bearing, not pedantic: `Base.aligned_sizeof` is `0`
+# for both `Nothing` and `NoTangent`, so accepting an equal-but-zero stride would wave through
+# `Ptr{Nothing}` (void) and every `tangent_type(P) === NoTangent` element — pointers whose shadow is a
+# placeholder or a bare offset, which the `bitcast` rule above would then happily launder into a real
+# dereference at the wrong stride. Mooncake has no `frule` for these at all, so there is no reference
+# implementation to mirror here.
+for op in (:add_ptr, :sub_ptr)
+    @eval function apply_intrinsic_frule!(::Val{Core.Intrinsics.$op}, actual, Ti, ctx)
+        ptr, off = actual[1], actual[2]
+        P = _ptr_eltype(Ti)
+        T = P === nothing ? nothing : tangent_type(P)
+        if P === nothing || !(isbitstype(P) && isbitstype(T) &&
+                              Base.aligned_sizeof(P) == Base.aligned_sizeof(T) > 0)
+            ctx.reason[] = "`$($(QuoteNode(op)))` on `$Ti`: a byte offset only carries over to the " *
+                           "shadow pointer when the tangent element type has the same stride, and " *
+                           (P === nothing ? "`$Ti` is not a concrete `Ptr{P}`" :
+                            "`$P` (stride $(isbitstype(P) ? Base.aligned_sizeof(P) : "?")) and its " *
+                            "tangent `$T` (stride $(isbitstype(T) ? Base.aligned_sizeof(T) : "?")) " *
+                            "do not")
+            return nothing
+        end
+        poff = ctx.presolve(off)
+        ctx.opf($(QuoteNode(op)), Ti, ctx.presolve(ptr), poff),
+        ctx.opf($(QuoteNode(op)), ctx.tt(Ti), ctx.tresolve(ptr), poff)
+    end
+end
+
+# ---------------------------------------------------------------------------
 # Non-differentiable intrinsics — comparisons, integer arithmetic, bit/boolean ops, rounding to an
 # integer value, and int↔float / bit conversions. Each gets an auto-generated rule via
 # `@inactive_intrinsic`: compute the primal from the argument primals, give the result a zero
@@ -192,12 +334,11 @@ for name in (
     :have_fma,
     # rounding to an integral floating-point value (piecewise-constant → zero derivative)
     :floor_llvm, :ceil_llvm, :trunc_llvm, :rint_llvm,
-    # int↔float and integer-width conversions (first argument is a type), plus `bitcast` (a raw
-    # bit-level reinterpretation — e.g. `UInt`-casting an index/length for the unsigned bounds
-    # compare that array indexing lowers to). The macro fully qualifies everything via
-    # `Core.Intrinsics.$name`/`GlobalRef(Core.Intrinsics, name)`, so this doesn't collide with the
-    # unrelated `const bitcast = Core.Intrinsics.bitcast` alias in `tangent_utils.jl`.
-    :sitofp, :uitofp, :fptosi, :fptoui, :trunc_int, :sext_int, :zext_int, :bitcast,
+    # int↔float and integer-width conversions (first argument is a type). `bitcast` is *not* here:
+    # it needs the hand-written rule above, which keeps this same zero-tangent behaviour for
+    # non-pointer results (e.g. the `UInt` cast in a bounds-check comparison) but mirrors the cast
+    # onto the shadow pointer in `Ptr` space.
+    :sitofp, :uitofp, :fptosi, :fptoui, :trunc_int, :sext_int, :zext_int,
 )
     @eval @inactive_intrinsic $name
 end

@@ -17,6 +17,18 @@ central_diff(f, x, y, k::Int; h=1e-6) =
 # Forward-mode dualized IR is legal (order-1).
 checkverify(f, at) = Core.Compiler.verify_ir(code_dual_ircode(f, at)[1])
 
+# The bail message for a function Differ declines to dualize, or `nothing` if it dualizes fine.
+# Every graceful bail is supposed to name a *reason*, so tests assert on this rather than just on
+# "it threw".
+function bail_reason(f, at)
+    try
+        code_dual_ircode(f, at)
+        return nothing
+    catch e
+        return sprint(showerror, e)
+    end
+end
+
 # Forward-mode dualized IR is legal at a given nesting order.
 checkverify2(f, at; order=2) = Core.Compiler.verify_ir(code_dual_ircode(f, at; order)[1])
 

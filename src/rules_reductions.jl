@@ -5,9 +5,11 @@
 # (`prod`, `maximum`/`minimum`, `mapreduce`, `cumsum`) go through `mapreduce`/`_mapreduce` /
 # `mapfoldl_impl` machinery that is self-recursive (pairwise divide-and-conquer) and `@simd`
 # annotated above `Base.pairwise_blocksize` elements. Differ's reverse-mode recursion engine bails
-# on genuine self-recursion, and its forward-mode dualization engine has no `:loopinfo` support, so
-# generic recursion into these only works below ~1024 elements. Every rule below is a plain
-# hand-written loop that never touches Base's internals, so it is correct and efficient at any size.
+# on genuine self-recursion, which is what makes generic recursion into these fail above ~1024
+# elements. (Forward mode's half of that reason is gone as of 2026-08-01 — `:loopinfo` is now carried
+# through, ISSUES #62 — but the self-recursion half stands, so these rules stay.) Every rule below is
+# a plain hand-written loop that never touches Base's internals, so it is correct and efficient at
+# any size.
 
 # `sum`'s REVERSE rule already lives in `rrules.jl` (`SumPullback`). Only the forward half is
 # missing; `sum` is linear so both primal and tangent are computed by the same accumulation.

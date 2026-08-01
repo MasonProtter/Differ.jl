@@ -873,13 +873,25 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # Bundle of closures `apply_intrinsic_frule!` (`src/intrinsics.jl`) needs to emit an intrinsic's
     # primal + shadow IR directly, without going through `frule_split!`'s `Dual`-boxing/`CodeInstance`
     # machinery — see that file for why intrinsics get this cheaper path.
-    intrinsic_ctx = (opf=opf, emit! =emit!, presolve=presolve, tresolve=tresolve, zero_shadow=zero_shadow)
+    # `optype`/`tt` give the pointer rules (`bitcast`/`pointerref`/`pointerset`/`add_ptr`) the same
+    # primal-type introspection the builtin rules get; `reason` lets a rule that *declines* say why
+    # (see the dispatch sites below).
+    intrinsic_ctx = (opf=opf, emit! =emit!, presolve=presolve, tresolve=tresolve, zero_shadow=zero_shadow,
+                     optype=optype, tt=tt, reason=reason)
     # Same idea for `apply_builtin_frule!` (`src/builtins.jl`), which handles `Core.Builtin`s
     # (`getfield`, `setfield!`, `Core.tuple`, `Core.ifelse`, the array-allocation builtins, `===`).
     # `optype`/`tt` give those rules the primal-type introspection they need for same-shape-vs-general
     # struct branching that a plain intrinsic never has to do.
     builtin_ctx = (emit! =emit!, presolve=presolve, tresolve=tresolve, zero_shadow=zero_shadow,
-                   optype=optype, tt=tt, emit_invoke! =emit_invoke!)
+                   optype=optype, tt=tt, emit_invoke! =emit_invoke!, opf=opf, reason=reason)
+    # And for `apply_foreigncall_frule!` (`src/foreigncalls.jl`). Two extra members beyond the builtin
+    # bundle, both for the pointer-provenance walk: `pstmt` reads a *primal* statement node back out of
+    # `pir` (old numbering — unaffected by the shadow statements already interleaved into `code`), and
+    # `calleeval` resolves a callee node so the walk can recognise `bitcast`/`getfield` in the chain.
+    pstmt(@nospecialize x) = isa(x, Core.SSAValue) ? pstmts[x.id][:stmt] : nothing
+    foreigncall_ctx = (emit! =emit!, presolve=presolve, tresolve=tresolve, zero_shadow=zero_shadow,
+                       optype=optype, tt=tt, emit_invoke! =emit_invoke!, opf=opf, reason=reason,
+                       pstmt=pstmt, calleeval=(@nospecialize(x) -> _calleeval(x, iworld)))
 
     # Block topology (block count, order, preds/succs) is preserved 1:1 from the primal: this
     # transform only expands each original statement into more instructions, never splits, merges,
@@ -960,6 +972,28 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # otherwise consumed.
                 primal[i] = emit!(Expr(:throw_undef_if_not, s.args[1], presolve(s.args[2])), Ti)
                 shadow[i] = primal[i]
+            elseif isa(s, Expr) && s.head === :gc_preserve_begin
+                # Primal-only reconstruction: nothing in a throw-only block carries a tangent, so
+                # there is no shadow object to root (unlike the live-path arm below).
+                primal[i] = emit!(Expr(:gc_preserve_begin, (presolve(a) for a in s.args)...), Any)
+                shadow[i] = primal[i]
+            elseif isa(s, Expr) && s.head === :gc_preserve_end
+                primal[i] = emit!(Expr(:gc_preserve_end, presolve(s.args[1])), Ti)
+                shadow[i] = primal[i]
+            elseif isa(s, Expr) && s.head === :foreigncall
+                # Primal-only reconstruction. `args[2:5]` (return type, argument-type `svec`, `nreq`,
+                # calling convention) are literals copied verbatim; `args[1]` usually is too, but the
+                # runtime-function-pointer form puts an `SSAValue` there, which must be resolved into
+                # this pass's numbering like any other operand — and `verify_ir`'s `check_op`
+                # whitelists only an `Expr(:tuple)` at that position, so a bare non-Core/Base
+                # `GlobalRef` needs resolving as well.
+                nm = s.args[1]
+                pnm = isa(nm, Expr) ? Expr(nm.head, nm.args...) : presolve(nm)
+                primal[i] = emit!(Expr(:foreigncall, pnm, s.args[2], s.args[3], s.args[4], s.args[5],
+                                       (presolve(a) for a in s.args[6:end])...), Ti)
+                shadow[i] = primal[i]
+            elseif isa(s, Expr) && s.head === :loopinfo
+                primal[i] = emit!(Expr(:loopinfo, s.args...), Ti); shadow[i] = primal[i]
             elseif isa(s, Core.PiNode)
                 primal[i] = presolve(s.val); shadow[i] = primal[i]
             elseif isa(s, GlobalRef)
@@ -1110,11 +1144,18 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # loop — no `Dual` boxing, `frule!!` dispatch, or `CodeInstance` resolution. Explicit,
                 # not implicit: the fallback method returns `nothing`, so an *unregistered* intrinsic
                 # bails gracefully with a located reason rather than crashing or silently miscompiling.
+                why = reason[]
                 res = apply_intrinsic_frule!(Val(f), actual, Ti, intrinsic_ctx)
                 if res === nothing
-                    reason[] = "unsupported intrinsic `$(nameof(f))` at %$i: `$(_stmt_str(s))` " *
-                               "(no rule registered; add one in src/intrinsics.jl via " *
-                               "`apply_intrinsic_frule!`)"
+                    # A *registered* rule can also decline — the pointer rules do, when the shadow's
+                    # element stride wouldn't match the primal's — recording its own explanation in
+                    # `ctx.reason` (unlocated; the location is added here). Only claim "no rule
+                    # registered" when the rule left the reason untouched, or the message is a lie.
+                    reason[] = reason[] === why ?
+                        "unsupported intrinsic `$(nameof(f))` at %$i: `$(_stmt_str(s))` " *
+                        "(no rule registered; add one in src/intrinsics.jl via " *
+                        "`apply_intrinsic_frule!`)" :
+                        "$(reason[]) at %$i: `$(_stmt_str(s))`"
                     return nothing
                 end
                 primal[i], shadow[i] = res
@@ -1125,11 +1166,15 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # above. The fallback method returns `nothing`, so an unregistered builtin (e.g.
                 # `Core.memoryrefoffset`, used by `push!`/`resize!`, or a non-bits/undef-checked
                 # array element access) bails gracefully with a located reason.
+                why = reason[]
                 res = apply_builtin_frule!(Val(f), actual, Ti, builtin_ctx)
                 if res === nothing
-                    reason[] = "no dualization rule for builtin `$f` (e.g. `Core.memoryrefoffset` used " *
-                               "by `push!`/`resize!`, or a non-bits/undef-checked array element " *
-                               "access) at %$i: `$(_stmt_str(s))`"
+                    # As with intrinsics above: a registered rule that declines records its own reason.
+                    reason[] = reason[] === why ?
+                        "no dualization rule for builtin `$f` (e.g. `Core.memoryrefoffset` used " *
+                        "by `push!`/`resize!`, or a non-bits/undef-checked array element " *
+                        "access) at %$i: `$(_stmt_str(s))`" :
+                        "$(reason[]) at %$i: `$(_stmt_str(s))`"
                     return nothing
                 end
                 primal[i], shadow[i] = res
@@ -1208,6 +1253,64 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             # primal, give it a zero tangent like other non-diff results.
             primal[i] = emit!(Expr(:the_exception), Ti)
             shadow[i] = zero_shadow(Ti, primal[i])
+        elseif isa(s, Expr) && s.head === :foreigncall
+            # `ccall`. Dispatched per *target symbol* to `apply_foreigncall_frule!`
+            # (`src/foreigncalls.jl`), mirroring the intrinsic/builtin dispatch above. Native code can
+            # write through any pointer it is handed, so unlike an unregistered intrinsic there is no
+            # "primal plus a zero tangent" fallback that would be safe here: an unregistered target
+            # bails, full stop.
+            fc = _fc_parse(s)
+            if fc === nothing
+                reason[] = "`foreigncall` with a non-literal target (a runtime function pointer) " *
+                           "at %$i: `$(_stmt_str(s))`"
+                return nothing
+            end
+            why = reason[]
+            res = apply_foreigncall_frule!(Val(fc.name), fc, Ti, foreigncall_ctx)
+            if res === nothing
+                # As with intrinsics/builtins: a registered rule that declines records its own reason.
+                reason[] = reason[] === why ?
+                    "no dualization rule for `foreigncall` target `$(fc.name)` at %$i: " *
+                    "`$(_stmt_str(s))` (add one in src/foreigncalls.jl via " *
+                    "`apply_foreigncall_frule!`)" :
+                    "$(reason[]) at %$i: `$(_stmt_str(s))`"
+                return nothing
+            end
+            primal[i], shadow[i] = res
+        elseif isa(s, Expr) && s.head === :loopinfo
+            # `@simd`'s loop marker (`base/simdloop.jl` is Base's only construction site). Pure
+            # metadata: its operands are `Symbol`s/`nothing` that codegen turns into LLVM loop
+            # metadata, and `:loopinfo` isn't in the compiler's `is_relevant_expr`, so `userefs` never
+            # traverses them at all — presolving them would be actively wrong, not just unnecessary.
+            # Copied through verbatim, with no shadow value of its own.
+            #
+            # Two invariants this relies on: codegen consumes the marker positionally from the
+            # block's terminator backwards, so nothing may be emitted between it and the terminator
+            # (this pass emits shadow statements *before* it, which is fine); and a `julia.ivdep`
+            # marker carries over to the dualized loop, where it now also asserts non-aliasing for the
+            # shadow buffer's accesses — true whenever it was true of the primal, since the shadow
+            # mirrors the primal's access pattern one-for-one.
+            primal[i] = emit!(Expr(:loopinfo, s.args...), Ti); shadow[i] = primal[i]
+        elseif isa(s, Expr) && s.head === :gc_preserve_begin
+            # `GC.@preserve`: roots its operands until the matching `:gc_preserve_end`, so an interior
+            # pointer into them (`pointer(v)`) stays valid. The dualized code holds interior pointers
+            # into *both* the primal object and its shadow, so root both — preserving only the primal
+            # would let the shadow array be collected while a shadow `Ptr` into it is still live.
+            # A tangent that isn't an SSA/argument (a literal `NoTangent()`, a spliced constant
+            # tangent) is skipped: there is no heap object of ours to root. Type is `Any`, matching
+            # what inference assigns the token.
+            pargs = Any[]
+            for a in s.args
+                push!(pargs, presolve(a))
+                t = tresolve(a)
+                (isa(t, Core.SSAValue) || isa(t, Core.Argument)) && push!(pargs, t)
+            end
+            primal[i] = emit!(Expr(:gc_preserve_begin, pargs...), Any); shadow[i] = primal[i]
+        elseif isa(s, Expr) && s.head === :gc_preserve_end
+            # Ends the region, referencing the `:gc_preserve_begin` token by `SSAValue` — `presolve`
+            # remaps it to the begin's primal SSA. `verify_ir` skips its usual dominance check for
+            # this head (a token may span try/catch blocks), so nothing else is needed.
+            primal[i] = emit!(Expr(:gc_preserve_end, presolve(s.args[1])), Ti); shadow[i] = primal[i]
         elseif isa(s, GlobalRef)
             # A bare GlobalRef *statement* is a global-variable load (not a pure alias like a
             # `PiNode`): it must be *emitted* as a real instruction. Aliasing it away would let the

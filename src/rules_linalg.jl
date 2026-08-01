@@ -2,9 +2,11 @@
 import LinearAlgebra
 #
 # `dot`/`norm`/`*` (on `Matrix`/`Vector`) all bottom out in BLAS `ccall`s once inlined, which the
-# dualization engine cannot see through (`ccall` is opaque, a permanent boundary — not something a
-# future engine improvement lifts). A hand rule is therefore the only way to differentiate them:
-# there is no generic-recursion fallback to fall back to, unlike an ordinary composite function.
+# dualization engine cannot see through. Forward mode does now have a per-target `:foreigncall` rule
+# layer (`src/foreigncalls.jl`, ISSUES #62), but that changes nothing here: it registers bulk memory
+# copies, and a BLAS kernel like `:cblas_ddot64_` is opaque native code with no rule and no prospect
+# of one, so it bails with a located reason. A hand rule is therefore still the only way to
+# differentiate these: there is no generic-recursion fallback, unlike an ordinary composite function.
 # Each rule below computes the primal via a plain, untracked call to the real function (or an
 # explicit loop) and supplies the tangent/gradient via the closed-form identity — never by trying
 # to dualize the target's actual body.

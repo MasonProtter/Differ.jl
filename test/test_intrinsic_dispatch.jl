@@ -19,11 +19,10 @@ using Differ: Dual, NoTangent, frule!!, code_dual_ircode
 
 @testset "intrinsic dispatch" begin
     @testset "unregistered intrinsic bails with a located reason" begin
-        # `pointerref` is deliberately never registered (see `src/intrinsics.jl` — pointer/atomic
-        # ops are exotic and out of scope); hitting it must bail gracefully with a message naming
-        # the intrinsic, not throw/miscompile. (`bitcast` itself is registered now — see the array
-        # indexing support, which needs it for the `UInt`-cast in bounds-check comparisons.)
-        f(x) = unsafe_load(x)
+        # The *atomic* pointer intrinsics are unregistered (the plain `pointerref`/`pointerset` are
+        # not — see `test_forward_pointers.jl`); hitting one must bail gracefully with a message
+        # naming the intrinsic, not throw or miscompile.
+        f(p) = Core.Intrinsics.atomic_pointerref(p, :monotonic)
         err = try
             code_dual_ircode(f, (Ptr{Float64},))
             nothing
@@ -31,7 +30,25 @@ using Differ: Dual, NoTangent, frule!!, code_dual_ircode
             e
         end
         @test err !== nothing
-        @test occursin("pointerref", sprint(showerror, err))
+        @test occursin("atomic_pointerref", sprint(showerror, err))
+        @test occursin("no rule registered", sprint(showerror, err))
+    end
+
+    @testset "a registered rule that declines reports its own reason" begin
+        # A rule can be registered and still decline (the pointer rules do, when the shadow buffer's
+        # element stride wouldn't match the primal's). The bail must then carry the rule's own
+        # explanation, not the misleading "no rule registered" fallback.
+        f(p) = Core.Intrinsics.bitcast(Ptr{Float64}, p)     # a pointer conjured from an integer
+        err = try
+            code_dual_ircode(f, (UInt,))
+            nothing
+        catch e
+            e
+        end
+        @test err !== nothing
+        msg = sprint(showerror, err)
+        @test occursin("no tangent storage", msg)
+        @test !occursin("no rule registered", msg)
     end
 
     @testset "inactive (non-differentiable) intrinsics" begin
