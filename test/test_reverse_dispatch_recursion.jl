@@ -213,10 +213,16 @@ end
 
 @testset "reverse mode: dynamic (non-statically-resolvable) callee bails" begin
     @test_throws ErrorException gradient(dyncallee, 1.0)
-    # Asserting the exception is a located `ErrorException` naming the construct
-    # (`_static_recursible_call`'s "dynamic (non-statically-resolvable) callee" message,
-    # `src/reverse_interp.jl`), not just any `ErrorException` — and explicitly not a `MethodError`
-    # or other crash, which a bare `@test_throws ErrorException` would not distinguish from.
+    # Asserting the exception is a located `ErrorException` naming the construct, not just any
+    # `ErrorException` — and explicitly not a `MethodError` or other crash, which a bare
+    # `@test_throws ErrorException` would not distinguish from.
+    #
+    # `dyn_g` is a non-`const` global, so its read has no statically-known *value* (`_calleeval`
+    # returns `nothing`) — but `_static_recursible_call` (`src/reverse_interp.jl`) now falls back to
+    # the operand's *type* instead of bailing immediately on that (this is what lets an
+    # argument-position callee like `sum(sin, v)`'s `f` recurse). Here that fallback type is itself
+    # `Any` (an unannotated mutable global has no static type either), so the call still bails, just
+    # on the next guard down: "not a concrete DataType", rather than "dynamic callee" directly.
     err_dyncall = try
         gradient(dyncallee, 1.0)
         nothing
@@ -225,7 +231,7 @@ end
     end
     @test err_dyncall isa ErrorException
     @test !(err_dyncall isa MethodError)
-    @test occursin("dynamic (non-statically-resolvable) callee", err_dyncall.msg)
+    @test occursin("is not a concrete DataType", err_dyncall.msg)
 end
 
 @testset "reverse mode: dynamic (non-literal) getfield index" begin

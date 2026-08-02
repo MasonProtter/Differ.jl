@@ -4,14 +4,13 @@
 # Same motivation as `sum`/`sum(f,·)` in `rrules.jl`: Base's real implementations of these
 # (`prod`, `maximum`/`minimum`, `mapreduce`, `cumsum`) go through `mapreduce`/`_mapreduce` /
 # `mapfoldl_impl` machinery that is self-recursive (pairwise divide-and-conquer), whose non-recursive
-# base case is `@simd`-annotated. Direct self-recursion itself is no longer a blocker in reverse mode
-# (ISSUES #65 — a self-recursive primal has a finite, closed-form `Tape` type after all), but reverse
-# mode still has no `Expr(:loopinfo)` support (`@simd`'s marker — forward mode carries it through
-# unchanged, ISSUES #62; reverse mode's own per-block comms/block-stack pushes make that not a safe
-# copy-paste, see ISSUES #65's "still open" note). Since the base case is reached at essentially any
-# input size, not just above `Base.pairwise_blocksize`, generic recursion into these still fails at
-# essentially any size until that gap is closed. Every rule below is a plain hand-written loop that
-# never touches Base's internals, so it is correct and efficient at any size regardless.
+# base case is `@simd`-annotated. Both former blockers to generic recursion into that machinery are
+# now fixed (ISSUES #65): a self-recursive primal has a finite, closed-form `Tape` type, and reverse
+# mode now carries `Expr(:loopinfo)` through, mirroring forward mode (dropping only `julia.ivdep` —
+# see the `:loopinfo` arms in `src/reverse_interp.jl`). Unlike `sum`/`sum(f,·)` in `rrules.jl`, the
+# rules below are kept regardless (not re-verified end to end against the generic path as part of
+# that fix) as a known-efficient fallback that never recompiles through Base's internals. Every rule
+# below is a plain hand-written loop, so it is correct and efficient at any size regardless.
 
 # `sum`'s REVERSE rule already lives in `rrules.jl` (`SumPullback`). Only the forward half is
 # missing; `sum` is linear so both primal and tangent are computed by the same accumulation.

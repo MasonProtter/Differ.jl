@@ -47,84 +47,89 @@ function rrule!!(::CoDual{typeof(cos),NoFData}, ::AbstractCtx, xcd::CoDual{Float
     return CoDual(Base.cos(x), NoFData()), CosPullback(x)
 end
 
-# NOTE on `sum`/`sum(f, ·)`: these exist for the same reason Mooncake hand-writes them
-# (`src/rules/performance_patches.jl`) rather than relying on generic recursion through Base's own
-# `mapreduce`/`_mapreduce`/`mapreduce_impl` machinery — that internal implementation is a
-# performance-tuned, *self-recursive* (divide-and-conquer, pairwise) algorithm for large arrays, and
-# Differ's reverse-mode recursion engine has a permanent cycle guard that bails on genuine
-# self-recursion (no finite `Tape` type exists for it here). Recursing generically into `Base`'s
-# private `_mapreduce` internals therefore only works below `Base.pairwise_blocksize` elements (1024
-# for `+`); these hand rules make `sum`/`sum(f, x)` correct and efficient at any array size, by never
-# touching that internal implementation at all — `has_hand_reverse_rule`/`src_inlining_policy`
-# (`reverse_interp.jl`) keep a hand-ruled call from being inlined away, so `sum(f, v)` survives in the
-# primal IR as itself rather than as whatever Base's own optimizer would otherwise reduce it to.
 
-struct SumPullback{Dx<:Array}
-    dx::Dx
-end
-function (pb::SumPullback)(seed)
-    dx = pb.dx
-    for i in eachindex(dx)
-        dx[i] = increment!!(dx[i], seed)
-    end
-    return (NoRData(), NoRData())
-end
 
-function rrule!!(
-    ::CoDual{typeof(sum),NoFData}, ::AbstractCtx, xcd::CoDual{X,X}
-) where {X<:Array{<:IEEEFloat}}
-    x = primal(xcd)
-    dx = tangent(xcd)
-    s = zero(eltype(x))
-    for xi in x
-        s += xi
-    end
-    return zero_fcodual(s), SumPullback(dx)
-end
+### Commenting these out because they should ideally not be needed anymore
+### once we get a few more rules implemented
 
-# `sum(f, x)` — what `sum(v) do vi ... end` desugars to. `G`/`FG` are left unconstrained (rather than
-# forced to `NoFData`, unlike the derived recursion path's own callee guard) since a hand rule is
-# free to accept a closure with real differentiable captures directly.
-struct SumMapPullback{G,PB,Dx<:Array}
-    pbs::Vector{PB}
-    dx::Dx
-end
-function (pb::SumMapPullback{G})(seed) where {G}
-    pbs = pb.pbs
-    dx = pb.dx
-    # `zero_like_rdata_from_type`, not `zero_rdata_from_type`: `G` is normally concrete (an ordinary
-    # dynamic dispatch to this hand rule always binds `G` to the closure's actual runtime type), but
-    # the derived recursion glue (`reverse_fwds_recursive_ci` in `reverse_interp.jl`) can resolve a
-    # hand rule via a *static* call-site type that isn't concrete (e.g. `g` reached through an
-    # abstractly-typed field/container) — that binds `G` to that same non-concrete type here, and
-    # `zero_rdata_from_type` would return the `CannotProduceZeroRDataFromType` sentinel instead of
-    # throwing outright, which `increment!!` below would then choke on. `grdata` only ever flows into
-    # `increment!!` (already `ZeroRData`-aware) or straight back out in the returned tuple (routed by
-    # the caller, also `ZeroRData`-aware), so no further instantiation is needed here.
-    grdata = zero_like_rdata_from_type(G)
-    for i in length(pbs):-1:1
-        gi_r, xi_r = pbs[i](seed)
-        grdata = increment!!(grdata, gi_r)
-        dx[i] = increment!!(dx[i], xi_r)
-    end
-    return (NoRData(), grdata, NoRData())
-end
+# NOTE on `sum`/`sum(f, ·)`: these existed for the same reason Mooncake hand-writes them
+# (`src/rules/performance_patches.jl`) — generic recursion through Base's own
+# `mapreduce`/`_mapreduce`/`mapreduce_impl` machinery used to be blocked on two independent gaps: no
+# finite `Tape` type for `mapreduce_impl`'s self-recursive pairwise structure, and no reverse-mode
+# `Expr(:loopinfo)` support for its `@simd`-annotated non-recursive base case. Both are fixed now
+# (ISSUES #65 — see `reverse_fwds_recursive_ci`/`_scan_block_comms` and the `:loopinfo` arms in
+# `src/reverse_interp.jl`), so `sum`/`sum(f, x)` compose correctly through the generic path at any
+# array size, including past `Base.pairwise_blocksize`. Left here commented out rather than deleted,
+# in case a future performance regression in the generic path needs a hand-written fallback again —
+# `has_hand_reverse_rule`/`src_inlining_policy` (`reverse_interp.jl`) would keep a hand-ruled call
+# from being inlined away, exactly as they did before.
 
-function rrule!!(
-    ::CoDual{typeof(sum),NoFData}, ::AbstractCtx, gcd::CoDual{G,FG}, xcd::CoDual{X,X}
-) where {G,FG,X<:Array{<:IEEEFloat}}
-    x = primal(xcd)
-    dx = tangent(xcd)
-    n = length(x)
-    n == 0 && error("Differ: sum(f, x) over an empty array is not supported by this rule")
-    y1, pb1 = rrule!!(gcd, Ctx(), CoDual(x[1], NoFData()))
-    s = primal(y1)
-    pbs = Vector{typeof(pb1)}(undef, n)
-    pbs[1] = pb1
-    for i in 2:n
-        yi, pbi = rrule!!(gcd, Ctx(), CoDual(x[i], NoFData()))
-        s += primal(yi)
-        pbs[i] = pbi
-    end
-    return zero_fcodual(s), SumMapPullback{G,typeof(pb1),typeof(dx)}(pbs, dx)
-end
+# struct SumPullback{Dx<:Array}
+#     dx::Dx
+# end
+# function (pb::SumPullback)(seed)
+#     dx = pb.dx
+#     for i in eachindex(dx)
+#         dx[i] = increment!!(dx[i], seed)
+#     end
+#     return (NoRData(), NoRData())
+# end
+
+# function rrule!!(
+#     ::CoDual{typeof(sum),NoFData}, ::AbstractCtx, xcd::CoDual{X,X}
+# ) where {X<:Array{<:IEEEFloat}}
+#     x = primal(xcd)
+#     dx = tangent(xcd)
+#     s = zero(eltype(x))
+#     for xi in x
+#         s += xi
+#     end
+#     return zero_fcodual(s), SumPullback(dx)
+# end
+
+# # `sum(f, x)` — what `sum(v) do vi ... end` desugars to. `G`/`FG` are left unconstrained (rather than
+# # forced to `NoFData`, unlike the derived recursion path's own callee guard) since a hand rule is
+# # free to accept a closure with real differentiable captures directly.
+# struct SumMapPullback{G,PB,Dx<:Array}
+#     pbs::Vector{PB}
+#     dx::Dx
+# end
+# function (pb::SumMapPullback{G})(seed) where {G}
+#     pbs = pb.pbs
+#     dx = pb.dx
+#     # `zero_like_rdata_from_type`, not `zero_rdata_from_type`: `G` is normally concrete (an ordinary
+#     # dynamic dispatch to this hand rule always binds `G` to the closure's actual runtime type), but
+#     # the derived recursion glue (`reverse_fwds_recursive_ci` in `reverse_interp.jl`) can resolve a
+#     # hand rule via a *static* call-site type that isn't concrete (e.g. `g` reached through an
+#     # abstractly-typed field/container) — that binds `G` to that same non-concrete type here, and
+#     # `zero_rdata_from_type` would return the `CannotProduceZeroRDataFromType` sentinel instead of
+#     # throwing outright, which `increment!!` below would then choke on. `grdata` only ever flows into
+#     # `increment!!` (already `ZeroRData`-aware) or straight back out in the returned tuple (routed by
+#     # the caller, also `ZeroRData`-aware), so no further instantiation is needed here.
+#     grdata = zero_like_rdata_from_type(G)
+#     for i in length(pbs):-1:1
+#         gi_r, xi_r = pbs[i](seed)
+#         grdata = increment!!(grdata, gi_r)
+#         dx[i] = increment!!(dx[i], xi_r)
+#     end
+#     return (NoRData(), grdata, NoRData())
+# end
+
+# function rrule!!(
+#     ::CoDual{typeof(sum),NoFData}, ::AbstractCtx, gcd::CoDual{G,FG}, xcd::CoDual{X,X}
+# ) where {G,FG,X<:Array{<:IEEEFloat}}
+#     x = primal(xcd)
+#     dx = tangent(xcd)
+#     n = length(x)
+#     n == 0 && error("Differ: sum(f, x) over an empty array is not supported by this rule")
+#     y1, pb1 = rrule!!(gcd, Ctx(), CoDual(x[1], NoFData()))
+#     s = primal(y1)
+#     pbs = Vector{typeof(pb1)}(undef, n)
+#     pbs[1] = pb1
+#     for i in 2:n
+#         yi, pbi = rrule!!(gcd, Ctx(), CoDual(x[i], NoFData()))
+#         s += primal(yi)
+#         pbs[i] = pbi
+#     end
+#     return zero_fcodual(s), SumMapPullback{G,typeof(pb1),typeof(dx)}(pbs, dx)
+# end

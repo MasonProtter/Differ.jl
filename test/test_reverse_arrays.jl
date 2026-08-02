@@ -2,7 +2,7 @@ using Test
 using Differ
 using Differ: gradient, MutableTangent, rdata_type, tangent_type, NoTangent
 using Differ: zero_rdata_from_type, zero_like_rdata_from_type, CannotProduceZeroRDataFromType
-using Differ: ZeroRData, SumMapPullback, NoRData, increment!!
+using Differ: ZeroRData, NoRData, increment!!
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
@@ -153,20 +153,25 @@ end
     check_stack_balance(arr_via_mut, MPoint(1.0, 2.0))
 end
 
-@testset "SumMapPullback with a non-concrete (Union) closure type `G`" begin
-    # `sum(f, x)`'s hand rule (`src/rrules.jl`, `SumMapPullback`) normally binds its own `G` type
-    # parameter to the closure's concrete runtime type, but the derived recursion glue can resolve
-    # the hand rule via a static call-site type that isn't concrete (`g` reached through an
-    # abstractly-typed field/container) — that binds `G` to a non-concrete type here too. This used
-    # to call `zero_rdata_from_type(G)`, which for a non-concrete `G` with real (non-`NoRData`)
-    # rdata returns the `CannotProduceZeroRDataFromType()` sentinel — and `increment!!` has no
-    # method for that, so the pullback crashed with a raw `MethodError`. The fix
-    # (`zero_like_rdata_from_type(G)`) returns `ZeroRData()` instead, which `increment!!` handles.
+@testset "zero_like_rdata_from_type for a non-concrete (Union) closure type" begin
+    # A pullback that has to produce a zero rdata for a closure type `G` normally sees `G` bound to
+    # the closure's concrete runtime type, but the derived recursion glue can resolve a rule via a
+    # static call-site type that isn't concrete (`g` reached through an abstractly-typed
+    # field/container) — that binds `G` to a non-concrete type. Calling `zero_rdata_from_type(G)`
+    # there returns the `CannotProduceZeroRDataFromType()` sentinel for a `G` with real
+    # (non-`NoRData`) rdata — and `increment!!` has no method for that, so the pullback crashed with
+    # a raw `MethodError`. The fix is `zero_like_rdata_from_type(G)`, which returns `ZeroRData()`
+    # instead, and which `increment!!` handles.
+    #
+    # This was originally written against `sum(f, x)`'s hand rule (`SumMapPullback`), whose `G`
+    # parameter is exactly that shape. Those `sum` rules are currently commented out in
+    # `src/rrules.jl` (the generic `mapreduce` path covers `sum` now), so the part that constructed
+    # a `SumMapPullback` directly is gone; what's asserted below is the underlying tangent-system
+    # behaviour, which is what actually regressed and is rule-independent. Restore the
+    # `SumMapPullback` construction alongside those rules if they ever come back.
     #
     # `make_sum_map_closures` returns two closures over distinct captured `Float64`s, each with
-    # real (non-`NoRData`) rdata, whose common supertype is a non-concrete `Union` — the shape
-    # `SumMapPullback`'s own `G` type parameter binds to when the derived recursion glue resolves
-    # the `sum(f,·)` hand rule via a static call-site type that isn't concrete. Built inside a
+    # real (non-`NoRData`) rdata, whose common supertype is a non-concrete `Union`. Built inside a
     # function so `a`/`b` are genuine captured closure fields, not global bindings.
     function make_sum_map_closures()
         a = 1.0
@@ -189,14 +194,4 @@ end
     new_grdata = zero_like_rdata_from_type(G2)
     @test new_grdata isa ZeroRData
     @test increment!!(new_grdata, 1.0) == 1.0
-
-    # `SumMapPullback` itself, constructed directly with `G` bound to `G2` and an empty `pbs`/`dx`
-    # (isolating exactly the line Phase 2 touched — `grdata = zero_like_rdata_from_type(G)` — from
-    # the unrelated, separately-scoped question of *calling* a `Union`-typed closure per element,
-    # which needs reverse-mode dynamic dispatch, not yet implemented; see `ISSUES.md`). With no
-    # elements to accumulate, the returned `grdata` is exactly `zero_like_rdata_from_type(G2)`.
-    dx_empty = Float64[]
-    pb = SumMapPullback{G2,Any,typeof(dx_empty)}(Any[], dx_empty)
-    result = pb(1.0)
-    @test result == (NoRData(), ZeroRData(), NoRData())
 end

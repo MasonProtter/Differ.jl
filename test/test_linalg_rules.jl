@@ -348,40 +348,39 @@ tr_fn(A) = tr(A)
         checkverify(g_a, (Matrix{Float64},))
     end
 
-    @testset "reverse mode over a Transpose/Adjoint bails (unsupported @simd loop, not recursion)" begin
+    @testset "reverse mode over a Transpose/Adjoint (ISSUES #65)" begin
         # `sum(::Transpose)` misses the `sum` hand rules (they require `X<:Array{<:IEEEFloat}`) and
         # falls through to Base's *pairwise* `mapreduce_impl`, which is self-recursive. Direct
-        # self-recursion is now supported (see `reverse_fwds_recursive_ci`, `src/reverse_interp.jl`,
-        # ISSUES #65) — this build no longer bails on the `in_progress` cycle guard, and gets past the
-        # recursive structure fine. It still bails, but on a *different*, unrelated, pre-existing gap:
-        # `mapreduce_impl`'s non-recursive base case is an `@simd for` loop, and reverse mode has never
-        # supported `Expr(:loopinfo)` (`@simd`'s marker) — forward mode does (see
-        # `differ-ircode-dualization`'s per-construct table), reverse mode doesn't yet. This is a
-        # separate, still-open piece of work (logged in ISSUES.md #65), not something this testset can
-        # assert as fixed. What's asserted here is that the failure is graceful and the *reason* named
-        # is the loop-marker gap, not a recursion bail and not an illegal-IR crash.
+        # self-recursion is supported (`reverse_fwds_recursive_ci`, `src/reverse_interp.jl`, ISSUES
+        # #65), so this no longer bails on the `in_progress` cycle guard. It used to still bail past
+        # that, on `mapreduce_impl`'s non-recursive base case: an `@simd for` loop, which reverse mode
+        # had no `Expr(:loopinfo)` support for. Reverse mode now carries `:loopinfo` through (mirroring
+        # forward mode, dropping only `julia.ivdep` — see the comment on the fwds carrier's `:loopinfo`
+        # arm, `src/reverse_interp.jl`), so this composes correctly end to end.
         #
-        # This testset used to assert working 2x2 gradients. Those were unsound: `mapreduce_impl`'s
-        # `op` operand is a `GlobalRef`, which `_static_recursible_call` mistyped as `GlobalRef`
-        # (the node's type, not the value's — the reverse-mode half of ISSUES #63), resolving a
-        # *different*, non-self-recursive specialization and emitting
+        # This testset used to assert only a graceful bail, and before that (briefly) unsound working
+        # gradients: `mapreduce_impl`'s `op` operand is a `GlobalRef`, which `_static_recursible_call`
+        # used to mistype as `GlobalRef` (the node's type, not the value's — the reverse-mode half of
+        # ISSUES #63), resolving a *different*, non-self-recursive specialization and emitting
         # `%new(CoDual{GlobalRef,NoFData}, Base.add_sum, …)`. At 2x2 that statement sits on a branch
         # below `pairwise_blocksize` and never runs; at 40x40 it does, and the same call died with
-        # `TypeError: in new, expected GlobalRef, got a value of type typeof(Base.add_sum)`.
+        # `TypeError: in new, expected GlobalRef, got a value of type typeof(Base.add_sum)`. Keep both
+        # sizes so a regression in either the base case or the pairwise-recursive branch is caught.
         g_t(M) = sum(transpose(M))
 
         for n in (2, 40)   # 40x40 is the size that used to reach the illegal statement
-            err = try
-                Differ.gradient(g_t, ones(n, n))
-                nothing
-            catch e
-                e
-            end
-            @test err isa ErrorException            # a graceful, located bail...
-            @test !(err isa TypeError)              # ...never the old illegal-IR crash
-            @test !occursin("self- or mutually-recursive primal", err.msg)   # recursion is no longer the blocker
-            @test occursin("loopinfo", err.msg)      # the actual (separate, still-open) blocker
+            M = rand(n, n)
+            _, dM = Differ.gradient(g_t, M)
+            @test dM == ones(n, n)
+
+            k = (1, min(2, n))   # a single perturbed entry, central-differenced against g_t
+            Mp = copy(M); Mp[k...] += 1e-6
+            Mm = copy(M); Mm[k...] -= 1e-6
+            @test dM[k...] ≈ (g_t(Mp) - g_t(Mm)) / 2e-6 rtol = 1e-5
         end
+
+        checkverify_rev(g_t, (Matrix{Float64},))
+        check_stack_balance(g_t, ones(2, 2))
     end
 
 end

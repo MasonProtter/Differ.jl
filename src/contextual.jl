@@ -71,10 +71,20 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
     # build recursed into it (`reverse_fwds_recursive_ci`, `reverse_interp.jl`) can report the inner
     # reason instead of just "the callee bailed". Best-effort: `typeinf_ext_toplevel` can hand back a
     # cached CodeInstance without re-running the transform, so a reader must tolerate a missing entry.
+    #
+    # For `Reverse`, this field *is* the module-level `REVERSE_BAIL_REASONS` below, not a fresh dict
+    # per instance (see the outer `ADInterpreter{Reverse}` constructor). The `CodeInstance` cache is
+    # keyed on the mode-level `cache_owner` (`Reverse()`, shared across every `ADInterpreter{Reverse}`
+    # instance), so a later interpreter can hit an already-cached bailed carrier without ever
+    # re-running `build_contextual_ir` itself — a fresh per-instance `bail_reasons` would then have
+    # nothing in it, defeating the whole point of this field. Entries can go stale after invalidation;
+    # that's fine, since they're only ever read when a build has in fact bailed, and a rebuild
+    # overwrites the entry before anything reads it.
     bail_reasons::IdDict{MethodInstance, String}
     function ADInterpreter{M}(world::UInt,
                               ip::InferenceParams,
-                              op::OptimizationParams) where {M<:ADMode}
+                              op::OptimizationParams,
+                              bail_reasons::IdDict{MethodInstance, String}=IdDict{MethodInstance, String}()) where {M<:ADMode}
         @assert world <= Base.get_world_counter()
         return new{M}(
             InferenceResult[],
@@ -85,7 +95,7 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
             IdDict{MethodInstance, IRCode}(),
             IdDict{MethodInstance, Vector{Any}}(),
             IdDict{MethodInstance, Nothing}(),
-            IdDict{MethodInstance, String}(),
+            bail_reasons,
         )
     end
 end
@@ -93,6 +103,14 @@ function ADInterpreter{M}(;world=Base.get_world_counter(),
                           inf_params=InferenceParams(),
                           opt_params=OptimizationParams()) where {M<:ADMode}
     ADInterpreter{M}(world, inf_params, opt_params)
+end
+
+# Shared across every `ADInterpreter{Reverse}` instance — see the `bail_reasons` field comment above.
+const REVERSE_BAIL_REASONS = IdDict{MethodInstance, String}()
+function ADInterpreter{Reverse}(;world=Base.get_world_counter(),
+                                inf_params=InferenceParams(),
+                                opt_params=OptimizationParams())
+    ADInterpreter{Reverse}(world, inf_params, opt_params, REVERSE_BAIL_REASONS)
 end
 
 Core.Compiler.InferenceParams(interp::ADInterpreter) = interp.inf_params

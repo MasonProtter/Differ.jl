@@ -247,12 +247,18 @@ end
 end
 
 @testset "reverse mode: composing map inside gradient bails cleanly (documented engine gap)" begin
-    # See the module-level note: `map`'s hand rule is correct (tested directly above), but the
-    # *general* reverse-mode recursive-call dispatcher (`_static_recursible_call`,
-    # `reverse_interp.jl`) unconditionally bails on any call whose result carries fdata (an array),
-    # before it ever gets to consult `map`'s hand rule. This is a pre-existing, `map`-independent
-    # engine limitation — out of scope to fix here (`reverse_interp.jl` is not part of this rule
-    # file) — asserted here as a clean, located `ErrorException`, not a crash.
+    # See the module-level note: `map`'s hand rule is correct (tested directly above), but a `map`
+    # call *result* is an array with no provenance traceable to a function argument, which the
+    # engine has no way to thread a real shadow for — so composing `map` inside a differentiated
+    # function still bails, before `map`'s hand rule is ever consulted. This is a `map`-independent
+    # engine limitation, out of scope for this rule file — asserted here as a clean, located
+    # `ErrorException`, not a crash.
+    #
+    # The *reason string* changed when reverse mode gained `:loopinfo` support (ISSUES #65): `sum`
+    # now composes through Base's generic `mapreduce` machinery instead of bailing on the `@simd`
+    # marker first, so the build gets further and the untracked-array-provenance guard is what stops
+    # it, rather than `_static_recursible_call`'s "non-trivial-fdata result" guard. Same underlying
+    # gap, caught one guard later.
     f(x) = sum(map(sin, x))
     e = try
         Differ.gradient(f, [0.3, 1.2, -0.7])
@@ -261,5 +267,5 @@ end
         e
     end
     @test e isa ErrorException
-    @test occursin("non-trivial-fdata result", e.msg)
+    @test occursin("no differentiable provenance", e.msg)
 end

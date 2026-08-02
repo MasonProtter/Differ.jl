@@ -97,6 +97,70 @@ include(joinpath(@__DIR__, "testutils.jl"))
         end
     end
 
+    @testset "sum(f, x) with a closure over a non-differentiable capture" begin
+        # `f`'s type here is a non-singleton `DataType` (a closure struct with an `Int` field), unlike
+        # `sumsin`/`sumabs2` above (top-level functions, i.e. singletons) — this exercises the other
+        # half of the argument-position-callee fix (`_static_recursible_call`, `src/reverse_interp.jl`):
+        # `tangent_type(ftype) === NoTangent` is what actually licenses recursion, not
+        # `Base.issingletontype`. `n = 3; sum(x -> x^n, v)` was the case this was designed to cover, but
+        # `^` for a non-literal integer exponent goes through `Base.Math.pow_body`, which recurses
+        # through `Core.ifelse` — reverse mode has no rule for that builtin (a separate, pre-existing
+        # gap, unrelated to this fix), so that exact case still bails. `y -> y + n` isolates the same
+        # closure-capture shape without hitting it.
+        n = 3
+        v = [0.3, -1.2, 2.0, 0.75]
+        sumaddn(v) = sum(y -> y + n, v)
+
+        _, dv = gradient(sumaddn, v)
+        @test dv == ones(length(v))
+        for k in eachindex(v)
+            vp = copy(v); vp[k] += 1e-6
+            vm = copy(v); vm[k] -= 1e-6
+            @test dv[k] ≈ (sumaddn(vp) - sumaddn(vm)) / 2e-6 rtol = 1e-5
+        end
+
+        checkverify(sumaddn, (Vector{Float64},))
+        checkverify_rev(sumaddn, (Vector{Float64},))
+        check_stack_balance(sumaddn, v)
+    end
+
+    @testset "reverse mode: :loopinfo (@simd) is carried through" begin
+        # Mirrors forward mode's ":loopinfo (@simd) is carried through" (`test_forward_foreigncall.jl`)
+        # for the reverse-mode arm (`src/reverse_interp.jl`) — this is what the "sum"/"sum(f, x)
+        # through a composite" testsets above rely on once `sum`/`mapreduce` fall through to `Base`'s
+        # own `mapreduce_impl` (an `@simd for` loop). A hand-written `@simd` loop isolates the
+        # `:loopinfo` passthrough itself from anything about `mapreduce`'s own recursive structure.
+        function simdsum(x)
+            s = 0.0
+            @simd for i in eachindex(x)
+                s += x[i]
+            end
+            return s
+        end
+        n = 2000   # past `Base.pairwise_blocksize`, matching forward mode's own regression size
+        x = rand(n)
+        _, dx = gradient(simdsum, x)
+        @test dx == ones(n)
+
+        checkverify_rev(simdsum, (Vector{Float64},))
+        check_stack_balance(simdsum, x)
+
+        # `@simd ivdep`: reverse mode drops the `julia.ivdep` marker (it would otherwise assert no
+        # loop-carried memory dependence, which is false of the reverse carrier's epilogue — see the
+        # comment on the fwds carrier's `:loopinfo` arm). Only affects vectorization, so the gradient
+        # must still be correct.
+        function simdsum_ivdep(x)
+            s = 0.0
+            @simd ivdep for i in eachindex(x)
+                s += x[i]
+            end
+            return s
+        end
+        _, dx_ivdep = gradient(simdsum_ivdep, x)
+        @test dx_ivdep == ones(n)
+        checkverify_rev(simdsum_ivdep, (Vector{Float64},))
+    end
+
     @testset "prod" begin
         f = prod
         x = [1.0, 2.0, 3.0, 1.5]

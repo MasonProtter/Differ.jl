@@ -831,14 +831,27 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
                                  arg_tracked::BitVector, fdata_tracked::BitVector)
     fpos, actual = _call_parts(s)
     fval = _calleeval(fpos, iworld)
-    if fval === nothing
-        reason[] = "dynamic (non-statically-resolvable) callee not supported yet at %$i: " *
-                   "`$(_stmt_str(s))`"
-        return nothing
-    end
-    ftype = _typeof(fval)
+    # `_calleeval` returns `nothing` for a callee in argument position (an `Argument`/`SSAValue`, e.g.
+    # `mapreduce_impl(f, op, A, ...)`'s `f`) — no compile-time *value*, but the recursion machinery
+    # below never needs one: `reverse_fwds_recursive_ci` takes `ftype`, not `fval`, and `fval` is used
+    # only once, to build the callee's `CoDual` at emission (below, in the fwds pass) — where
+    # `fval === nothing` means "resolve the operand there instead" (`presolve(fpos)`). So fall back to
+    # the operand's *type* (`_optype_w`, which widens `Const`/`PartialStruct` and handles
+    # `GlobalRef`/`QuoteNode`) rather than bailing outright. This is what lets a call like
+    # `sum(sin, v)` recurse: `sin`'s type is `typeof(sin)`, a concrete singleton, even though its
+    # *value* isn't statically known inside `mapreduce_impl`'s body.
+    ftype = fval === nothing ? _optype_w(pir, iworld, fpos) : _typeof(fval)
     if !(ftype isa DataType && isconcretetype(ftype))
         reason[] = "callee type $(ftype) is not a concrete DataType at %$i: `$(_stmt_str(s))`"
+        return nothing
+    end
+    if ftype === DataType
+        # "Some Type value, identity erased" — mirrors the argument-side rejection below
+        # (`P === DataType`): a genuinely concrete singleton type value (`Type{Float64}`) is handled
+        # fine by `fcodual_type`; a bare `DataType` isn't, and the `%new(CoDual{...}, ...)` this guard
+        # protects (the fwds-pass emission, below) would be illegal IR.
+        reason[] = "recursive call with a Type-valued callee of erased identity is not supported " *
+                   "yet at %$i: `$(_stmt_str(s))`"
         return nothing
     end
     if tangent_type(ftype) !== NoTangent
@@ -1555,6 +1568,11 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                 # main (reachable-block) loop below for the full rationale. `args[1]` (name) is copied
                 # verbatim; `args[2]` (condition) is resolved like any other operand.
                 primal_map[i] = emit!(Expr(:throw_undef_if_not, s.args[1], presolve(s.args[2])), Ti)
+            elseif isa(s, Expr) && s.head === :loopinfo
+                # Same treatment (and same `julia.ivdep` filtering) as the main loop's `:loopinfo` arm
+                # below — see there for the full rationale.
+                args = filter(a -> a !== Symbol("julia.ivdep"), s.args)
+                primal_map[i] = emit!(Expr(:loopinfo, args...), Ti)
             elseif isa(s, Core.PiNode)
                 primal_map[i] = presolve(s.val)
             elseif isa(s, GlobalRef)
@@ -1654,6 +1672,28 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
             # in the unreachable-block arm above — or an SSA reference on a live path). No fdata: its
             # result is never consumed.
             primal_map[i] = emit!(Expr(:throw_undef_if_not, s.args[1], presolve(s.args[2])), Ti)
+        elseif isa(s, Expr) && s.head === :loopinfo
+            # `@simd`'s loop marker. Pure metadata, copied through like `:boundscheck` above (no
+            # `shadow_map` entry): its operands are `Symbol`s/`nothing`, and `:loopinfo` isn't in the
+            # compiler's `is_relevant_expr`, so `userefs` never traverses them — `presolve`ing them
+            # would be wrong, not just unnecessary. Same reasoning as forward mode's
+            # `forward_interp.jl:1379-1392`; not restated here.
+            #
+            # One difference from forward mode: `julia.ivdep` is dropped, `julia.simdloop` and
+            # anything else pass through. `ivdep` asserts no loop-carried memory dependence, which
+            # forward mode's shadow honestly preserves (mirrors the primal's access pattern
+            # one-for-one) but the reverse carrier does not — `emit_epilogue!` pushes onto the tape's
+            # stacks on every iteration, which *is* a loop-carried dependence. Keeping the marker
+            # would be a silent miscompile; dropping it only costs vectorization, which the carrier's
+            # `rrule!!` calls and stack pushes preclude in practice anyway.
+            #
+            # The other difference — ISSUES #65's original worry — turned out not to apply: codegen's
+            # `LowerSIMDLoop` resolves the loop from the marker's *basic block* via LLVM `LoopInfo`,
+            # not by scanning backward from the terminator (measured on Julia 1.13), so
+            # `emit_epilogue!`'s pushes landing between this statement and the block terminator is
+            # harmless.
+            args = filter(a -> a !== Symbol("julia.ivdep"), s.args)
+            primal_map[i] = emit!(Expr(:loopinfo, args...), Ti)
         elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
             fpos, actual = _call_parts(s)
             f = _calleeval(fpos, iworld)
@@ -1698,7 +1738,11 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                 # as the caller's own.
                 InnerTapeT = InnerTapeT0 === Tape ? TapeT : InnerTapeT0
                 FCT = CoDual{ftype,NoFData}
-                fcodual = emit!(Expr(:new, FCT, fval, NoFData()), FCT)
+                # `fval === nothing` means `_static_recursible_call` resolved `ftype` from the
+                # operand's type, not its value (an argument-position callee) — `presolve(fpos)`
+                # resolves the operand itself uniformly, exactly as it already does for the argument
+                # coduals just below.
+                fcodual = emit!(Expr(:new, FCT, fval === nothing ? presolve(fpos) : fval, NoFData()), FCT)
                 argcoduals = Any[]
                 for (j, a) in enumerate(actual)
                     Cj = fcodual_type(argtypes[j])
@@ -1887,12 +1931,12 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     end
 
     # Every statement except a pure control marker (or one living in a throw-only block) gets a
-    # `Ref` to accumulate rdata into; literal/GlobalRef/`:boundscheck` operands never do (no
-    # gradient to route to — `:boundscheck`'s rdata is always `NoRData`, so skipping it here just
-    # avoids a useless allocation, it isn't load-bearing).
+    # `Ref` to accumulate rdata into; literal/GlobalRef/`:boundscheck`/`:loopinfo` operands never do
+    # (no gradient to route to — both always have `NoRData`, so skipping them here just avoids a
+    # useless allocation, it isn't load-bearing).
     needs_ref(i) = !unreachable_block[stmt_block[i]] &&
                    !isa(pstmts[i][:stmt], Union{Core.GotoNode,Core.GotoIfNot,Core.ReturnNode}) &&
-                   !(isa(pstmts[i][:stmt], Expr) && (pstmts[i][:stmt]::Expr).head === :boundscheck)
+                   !(isa(pstmts[i][:stmt], Expr) && (pstmts[i][:stmt]::Expr).head in (:boundscheck, :loopinfo))
 
     entry_id = ID()
     block_id = [ID() for _ in 1:nblocks]
@@ -2117,6 +2161,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             elseif isa(s, Expr) && s.head === :boundscheck
                 continue   # pure control marker, always `NoRData` — nothing to route
             elseif isa(s, Expr) && s.head === :throw_undef_if_not
+                continue   # pure control marker, always `NoRData` — nothing to route
+            elseif isa(s, Expr) && s.head === :loopinfo
                 continue   # pure control marker, always `NoRData` — nothing to route
             elseif isa(s, Core.PiNode)
                 acc = deref_and_zero!(ssa_ref_id[i], Ti)
