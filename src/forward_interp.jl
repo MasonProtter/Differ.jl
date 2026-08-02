@@ -55,7 +55,15 @@ function build_contextual_ir(interp::ADInterpreter{Forward}, mi::MethodInstance)
     return ir
 end
 
-is_dualized_impl(mi) = isa(mi.def, Method) && !isempty(mi.specTypes.parameters) &&
+# `isa(specTypes, DataType)`, not just `isa(mi.def, Method)`: a MethodInstance's `specTypes` can be a
+# `UnionAll` (a signature with free typevars, e.g. `Tuple{typeof(convert),Type{T},Type} where T`,
+# which ordinary inference produces), and `.parameters` on a `UnionAll` throws a `FieldError` —
+# uncaught, from inside `finishinfer!`, killing the whole compile rather than bailing. A carrier
+# signature is always a concrete `DataType`, so a `UnionAll` is simply "not a carrier". Same guard on
+# every other predicate that reads an arbitrary callee's `specTypes` (see `implicit_frule_tt` below,
+# and the reverse-mode set in `reverse_interp.jl`).
+is_dualized_impl(mi) = isa(mi.def, Method) && isa(mi.specTypes, DataType) &&
+                       !isempty(mi.specTypes.parameters) &&
                        mi.specTypes.parameters[1] === typeof(dualized_impl)
 
 # Build a minimal IRCode whose only effect is to `error(msg)` when invoked, installed via the same
@@ -86,6 +94,7 @@ end
 # compiler discovered, not something Differ validated.
 function implicit_frule_tt(callee_mi::MethodInstance)
     isa(callee_mi.def, Method) || return nothing
+    isa(callee_mi.specTypes, DataType) || return nothing   # `UnionAll` sig — see `is_dualized_impl`
     params = callee_mi.specTypes.parameters
     isempty(params) && return nothing
     ftype = params[1]
@@ -1459,6 +1468,31 @@ end
 # the fallback (`typeof(x)`) only covers genuine literal constants.
 _optype(pir, @nospecialize x) = isa(x, Core.SSAValue) ? pir.stmts[x.id][:type] :
                                 isa(x, Core.Argument) ? pir.argtypes[x.n] : typeof(x)
+
+# The type of the *value* an operand denotes, as a bare `Type` — what a caller that is about to type
+# a `CoDual`/`Dual` slot for that operand needs, and what `_optype` alone cannot give:
+#
+#  * a `GlobalRef` *names* a binding rather than being a value, so `_optype`'s literal fallback
+#    answers `GlobalRef` — the type of the node. Resolve it the way `gref_optype` does (const-gated
+#    at `world`, never the ambient task world — see `_globalref_isconst`); a non-`const` binding is
+#    only knowable at run time, hence `Any`. (In practice a non-`const` binding survives
+#    optimization as its own `%k = Main.g` load statement, so it arrives here as an `SSAValue`.)
+#  * a `QuoteNode` is the same defect one node kind over (`typeof(node) === QuoteNode`).
+#  * an `SSAValue`/`Argument` type may be a lattice element (`Core.Const`/`PartialStruct`) the
+#    primal's own const-prop produced; every consumer here wants the widened `Type` (`_widen`, defined
+#    with the rest of the reverse-mode type helpers in `reverse_interp.jl`).
+#
+# Used by reverse mode's `_static_recursible_call`; forward mode resolves the same two node kinds
+# through its own `gref_operand!`/`gref_optype` closures, which also *emit* for a non-`const` load.
+function _optype_w(pir, world::UInt, @nospecialize x)
+    if isa(x, GlobalRef)
+        _globalref_isconst(x, world) || return Any
+        ok, v = _globalref_val(x, world)
+        return ok ? Core.Typeof(v) : Any
+    end
+    isa(x, QuoteNode) && return Core.Typeof(x.value)
+    return _widen(_optype(pir, x))
+end
 # Compact, single-line rendering of a primal IR statement for a bail `reason` message, so the error
 # tells the user *what* IR construct was unsupported (e.g. the actual `Base.arrayref(...)` call)
 # rather than just its kind. Kept defensive: `show` on a stray node must never mask the real bail.

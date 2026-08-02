@@ -45,6 +45,58 @@ include(joinpath(@__DIR__, "testutils.jl"))
         @test dxbig == ones(length(xbig))
     end
 
+    @testset "sum over a SubArray (ISSUES #65, reverse mode)" begin
+        # `sum`'s hand rules are constrained to `X<:Array{<:IEEEFloat}` (above), so `sum(view(v,…))`
+        # misses them and falls through to Base's own `_mapreduce`/`mapreduce_impl`, which is
+        # self-recursive. That used to bail unconditionally on the `in_progress` cycle guard; direct
+        # self-recursion is now supported (see `reverse_fwds_recursive_ci`, `src/reverse_interp.jl`),
+        # and this specific reduction works end to end through it.
+        wrap_view_sum(v) = sum(view(v, 2:4))
+        v = [1.0, 2.0, 3.0, 4.0, 5.0]
+
+        _, dv = gradient(wrap_view_sum, v)
+        @test dv == [0.0, 1.0, 1.0, 1.0, 0.0]
+        d = Differ.frule!!(Differ.zero_dual(wrap_view_sum), Differ.Dual(v, ones(length(v))))
+        @test d.x == sum(view(v, 2:4))
+        @test d.dx ≈ sum(dv)   # JVP in direction `ones(5)` == dot(gradient, direction)
+
+        checkverify(wrap_view_sum, (Vector{Float64},))
+        checkverify_rev(wrap_view_sum, (Vector{Float64},))
+        check_stack_balance(wrap_view_sum, v)
+    end
+
+    @testset "sum(f, x) through a composite" begin
+        # Regression for the reverse-mode half of ISSUES #63: in `sum(sin, v)` the `sin` operand of
+        # the surviving `sum` call is a `GlobalRef`, which `_static_recursible_call` typed as
+        # `GlobalRef` (the node's type, not the named value's). The `sum(f,x)` hand rule then
+        # matched with `G === GlobalRef`, its body wouldn't infer, and the whole thing bailed with
+        # "recursion into the callee's own reverse-mode forwards pass failed".
+        v = [0.3, -1.2, 2.0, 0.75]
+
+        sumsin(v) = sum(sin, v)
+        sumabs2(v) = sum(abs2, v)
+        sumsq(v)  = sum(y -> y * y, v)   # a local closure operand — this shape always worked
+
+        _, dsin = gradient(sumsin, v)
+        @test dsin ≈ cos.(v)
+        _, dabs2 = gradient(sumabs2, v)
+        @test dabs2 ≈ 2 .* v
+        _, dsq = gradient(sumsq, v)
+        @test dsq ≈ 2 .* v
+
+        for k in eachindex(v)
+            vp = copy(v); vp[k] += 1e-6
+            vm = copy(v); vm[k] -= 1e-6
+            @test dsin[k] ≈ (sumsin(vp) - sumsin(vm)) / 2e-6 rtol = 1e-5
+        end
+
+        for wrap in (sumsin, sumabs2, sumsq)
+            checkverify(wrap, (Vector{Float64},))
+            checkverify_rev(wrap, (Vector{Float64},))
+            check_stack_balance(wrap, v)
+        end
+    end
+
     @testset "prod" begin
         f = prod
         x = [1.0, 2.0, 3.0, 1.5]
@@ -129,16 +181,14 @@ include(joinpath(@__DIR__, "testutils.jl"))
     end
 
     @testset "mapreduce(f, +, x)" begin
-        # `mapreduce(f, +, x)`'s 3-positional-argument call shape, once compiled under Differ's
-        # reverse-mode interpreter, is resolved as a "dynamic invoke" with `f`/`+` widened to
-        # abstract `Function` (confirmed by inspecting `Base.code_typed(...; interp)` directly) —
-        # unlike `sum(f, x)`'s 2-argument shape, which survives with concrete argument types. A
-        # concrete-type dispatch constraint on `op` therefore never matches in that composite-call
-        # path, and the call falls through to (failing) generic recursion — a pre-existing engine
-        # limitation in the reverse-mode recursive-call resolution (`_static_recursible_call` /
-        # `reverse_interp.jl`), not something fixable from a rules file. So the reverse-mode rule
-        # below is exercised directly (`rrule!!` + its pullback), which exercises the exact same
-        # rule code a working composite call would eventually reach.
+        # `mapreduce(f, +, x)` compiles to a "dynamic invoke" whose *specialization* signature has
+        # `f`/`op` widened to abstract `Function` (Base doesn't specialize on a function argument it
+        # only passes along). That widening is in `specTypes` only — the operands themselves are a
+        # closure value and a `GlobalRef`, whose real types `_static_recursible_call` reads from the
+        # IR. It used to read the `GlobalRef` as type `GlobalRef` and never match the rule's
+        # concrete-`op` constraint, which is why this case was once documented as an engine
+        # limitation and exercised only through a direct `rrule!!` call; it now composes through
+        # `gradient` (see the composite checks below).
         g(y) = y^2 + 3y   # g'(y) = 2y + 3
         x = [1.0, 2.0, -1.5, 0.5]
         mr(x) = mapreduce(g, +, x)
@@ -160,7 +210,13 @@ include(joinpath(@__DIR__, "testutils.jl"))
         central_dir = (mr(x .+ h) - mr(x .- h)) / 2h
         @test d.dx ≈ central_dir rtol = 1e-5
 
-        # reverse mode, direct `rrule!!` call (see note above for why not via `gradient`).
+        # reverse mode through the composite call (the case the note above used to say was
+        # impossible), and then the same rule driven directly.
+        _, dx_mr = gradient(mr, x)
+        @test dx_mr ≈ 2 .* x .+ 3
+        checkverify_rev(mr, (Vector{Float64},))
+        check_stack_balance(mr, x)
+
         dx = zeros(length(x))
         ycd, pb = rrule!!(zero_fcodual(mapreduce), Ctx(), zero_fcodual(g), zero_fcodual(+), CoDual(x, dx))
         @test primal(ycd) ≈ mr(x)

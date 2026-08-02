@@ -34,10 +34,13 @@
 # structs (`Core.getfield`/`Expr(:new,...)` via `increment_field!!`/`RData`), statically-resolvable
 # recursive calls into another primal (concrete callee + concrete, trivial-fdata args only — see
 # `_static_recursible_call`; a hand-written rule, `src/rrules.jl`, always takes priority over raw
-# recursion via ordinary method-table dispatch, mirroring `frules.jl`), and read-only array indexing
-# via a provenance chain traceable to a function argument (see `_fdata_tracked`). Still out of
-# scope, bails cleanly: mutable structs, array mutation, dynamic-dispatch recursion, try/catch (see
-# the control-flow plan's Phase E).
+# recursion via ordinary method-table dispatch, mirroring `frules.jl`), **direct self-recursion**
+# (the callee resolves to the exact primal being differentiated — a finite, closed-form `Tape` type,
+# resolved to a static self-`:invoke` with no fixed point to solve and no extra compilation; see
+# `reverse_fwds_recursive_ci`, ISSUES #65), and read-only array indexing via a provenance chain
+# traceable to a function argument (see `_fdata_tracked`). Still out of scope, bails cleanly: mutable
+# structs, array mutation, dynamic-dispatch recursion, *mutual* recursion (A→B→A — needs a tape-type
+# pre-pass across the whole SCC), try/catch (see the control-flow plan's Phase E).
 
 _codual_primal_type(@nospecialize P) = fieldtype(P, 1)
 _codual_fdata_type(@nospecialize P) = fieldtype(P, 2)
@@ -184,11 +187,17 @@ reverse_pullback_impl(tape, seed) =
 
 # Is `mi` a *carrier* specialization — the thing `build_contextual_ir` transforms? The carrier is
 # `reverse_fwds_impl(fcd::CoDual, ctx::AbstractCtx, argcds::CoDual...)`, so `ctx` is at `params[3]`.
-is_reverse_fwds_impl(mi) = isa(mi.def, Method) && length(mi.specTypes.parameters) >= 3 &&
+# The `isa(mi.specTypes, DataType)` guard is load-bearing, not defensive: these run on *every*
+# MethodInstance the interpreter infers, and a `specTypes` with free typevars is a `UnionAll`, whose
+# `.parameters` throws a `FieldError` straight out of `finishinfer!` (see `is_dualized_impl`,
+# `forward_interp.jl`, for the same guard and a concrete offender). A carrier is always concrete.
+is_reverse_fwds_impl(mi) = isa(mi.def, Method) && isa(mi.specTypes, DataType) &&
+                          length(mi.specTypes.parameters) >= 3 &&
                           mi.specTypes.parameters[1] === typeof(reverse_fwds_impl) &&
                           mi.specTypes.parameters[2] <: CoDual &&
                           mi.specTypes.parameters[3] <: AbstractCtx
-is_reverse_pullback_impl(mi) = isa(mi.def, Method) && length(mi.specTypes.parameters) >= 2 &&
+is_reverse_pullback_impl(mi) = isa(mi.def, Method) && isa(mi.specTypes, DataType) &&
+                              length(mi.specTypes.parameters) >= 2 &&
                               mi.specTypes.parameters[1] === typeof(reverse_pullback_impl) &&
                               mi.specTypes.parameters[2] <: Tape
 
@@ -206,6 +215,7 @@ is_generated_reverse_fwds_fallback(m::Method) =
 # something the differentiation call site validated.
 function implicit_rrule_tt(callee_mi::MethodInstance)
     isa(callee_mi.def, Method) || return nothing
+    isa(callee_mi.specTypes, DataType) || return nothing   # `UnionAll` sig — see `is_reverse_fwds_impl`
     params = callee_mi.specTypes.parameters
     isempty(params) && return nothing
     ftype = params[1]
@@ -251,6 +261,7 @@ end
 # regardless of how cheap the callee looks to Julia's ordinary cost heuristic.
 function has_hand_reverse_rule(interp::ADInterpreter, callee_mi::MethodInstance)
     isa(callee_mi.def, Method) || return false
+    isa(callee_mi.specTypes, DataType) || return false     # `UnionAll` sig — see `is_reverse_fwds_impl`
     params = callee_mi.specTypes.parameters
     isempty(params) && return false
     ftype = params[1]
@@ -278,7 +289,8 @@ end
 # common supertype to test (it is a method on the rule author's own type, e.g. `SinPullback`), so
 # those are blocked at the call site instead: the emitted pullback-recursion `:invoke` carries
 # `CC.IR_FLAG_NOINLINE`, which `resolve_todo` honours regardless of the callee's type.
-_is_reverse_carrier_mi(mi::MethodInstance) = isa(mi.def, Method) && !isempty(mi.specTypes.parameters) &&
+_is_reverse_carrier_mi(mi::MethodInstance) = isa(mi.def, Method) && isa(mi.specTypes, DataType) &&
+    !isempty(mi.specTypes.parameters) &&
     (mi.specTypes.parameters[1] === typeof(reverse_fwds_impl) ||
      mi.specTypes.parameters[1] === typeof(reverse_pullback_impl) ||
      mi.specTypes.parameters[1] === typeof(rrule!!))
@@ -329,14 +341,20 @@ function build_contextual_ir(interp::ADInterpreter{Reverse}, mi::MethodInstance)
         edges = Any[]
         ir = build_reverse_fwds_ir(interp, mi, reason, edges)
         interp.transformed_edges[mi] = edges
-        ir === nothing && return reverse_error_ircode(mi, reason[])
+        if ir === nothing
+            interp.bail_reasons[mi] = reason[]   # so a recursing caller can report *this* reason
+            return reverse_error_ircode(mi, reason[])
+        end
         return ir
     elseif is_reverse_pullback_impl(mi)
         reason = Ref("Differ could not build the reverse pullback pass (no specific reason recorded).")
         edges = Any[]
         ir = build_reverse_pullback_ir(interp, mi, reason, edges)
         interp.transformed_edges[mi] = edges
-        ir === nothing && return reverse_error_ircode(mi, reason[])
+        if ir === nothing
+            interp.bail_reasons[mi] = reason[]
+            return reverse_error_ircode(mi, reason[])
+        end
         return ir
     end
     return nothing
@@ -397,17 +415,22 @@ function _optimized_primal_ir(interp::ADInterpreter, primal_mi::MethodInstance,
     return pir
 end
 
-# Recursion cycle guard (see `interp.in_progress`, `contextual.jl`): a genuinely cyclic primal has
-# no finite `Tape` type in this design (Part 1's recursion support nests the inner call's `Tape` type
-# as a literal type parameter inside the outer block's comms-tuple type — see `reverse_fwds_recursive_ci`
-# below), so a self- or mutually-recursive primal must bail cleanly here rather than recursing forever
-# building ever-deeper `CodeInstance`s. Keying by the carrier `impl_mi` is sufficient: a genuine cycle
-# (direct self-recursion, or A→B→A mutual recursion) always re-encounters the exact same `impl_mi`
-# still on the stack, since recursive resolution always reuses *this same* `interp` instance (see
-# `reverse_fwds_recursive_ci`/`reverse_pullback_recursive_ci`) rather than crossing through a fresh
-# interpreter the way forward mode's `frule!!` `@generated`-function boundary does (see
-# `dualized_impl_in_progress`, `forward_interp.jl`, for that task-local cross-instance variant of this
-# same guard).
+# Recursion cycle guard (see `interp.in_progress`, `contextual.jl`), keyed by the *carrier* mi —
+# unchanged from before this file supported self-recursion. This guard's job is purely "don't
+# recompile a carrier that's already being compiled higher up the call stack" (mutual recursion,
+# A→B→A); it has nothing to do with whether an edge is *cyclic* (same primal), which is a separate,
+# ctx-independent question `reverse_fwds_recursive_ci`/`reverse_pullback_recursive_ci` answer on
+# their own from an explicitly-passed `primal_mi` — see their docstrings.
+#
+# Carrier-mi keying matters because the *fwds* carrier alone has two independent specializations per
+# primal: `Ctx{Nothing}` (fresh-tape, what a recursive inner call always targets) and `Ctx{<:Tape}`
+# (pre-allocated, what `build_ctx(...; prealloc=true)` uses). Building the pre-allocated variant of a
+# self-recursive primal genuinely requires *also* compiling the `Ctx{Nothing}` sibling (the recursive
+# edge always targets that one) — a real, bounded, one-off nested compile, not a cycle. A primal-mi-
+# keyed guard would wrongly treat that nested compile as "this primal is already in progress" and
+# bail, even though the `Ctx{Nothing}` build being triggered is a *different* carrier that has never
+# been built and terminates cleanly (its own self-edge resolves via literal carrier-mi identity, no
+# further nesting). Keying by carrier mi keeps the two independent builds from colliding.
 function build_reverse_fwds_ir(interp::ADInterpreter, impl_mi::MethodInstance,
                                reason::Ref{String}=Ref(""), edges::Vector{Any}=Any[])
     if haskey(interp.in_progress, impl_mi)
@@ -426,7 +449,7 @@ function build_reverse_fwds_ir(interp::ADInterpreter, impl_mi::MethodInstance,
         primal_mi, n = info
         pir = _optimized_primal_ir(interp, primal_mi, reason, edges)
         pir === nothing && return nothing
-        return reverse_fwds_to_ircode(interp, impl_mi, pir, n; reason, edges)
+        return reverse_fwds_to_ircode(interp, impl_mi, pir, n, primal_mi; reason, edges)
     finally
         delete!(interp.in_progress, impl_mi)
     end
@@ -454,7 +477,7 @@ function build_reverse_pullback_ir(interp::ADInterpreter, impl_mi::MethodInstanc
         primal_mi, n = info
         pir = _optimized_primal_ir(interp, primal_mi, reason, edges)
         pir === nothing && return nothing
-        return reverse_pullback_to_ircode(interp, impl_mi, pir, n; reason, edges)
+        return reverse_pullback_to_ircode(interp, impl_mi, pir, n, primal_mi; reason, edges)
     finally
         delete!(interp.in_progress, impl_mi)
     end
@@ -823,7 +846,12 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
                    "supported yet at %$i: `$(_stmt_str(s))`"
         return nothing
     end
-    argtypes = Any[_optype(pir, a) for a in actual]
+    # `_optype_w`, not `_optype`: an operand can be a `GlobalRef`/`QuoteNode` naming a value (e.g.
+    # `sum(sin, v)`, whose `sin` operand `_optype` would type as `GlobalRef`), and the types derived
+    # here decide which `rrule!!` the recursion resolves *and* annotate the `%new(CoDual{…}, …)` the
+    # emission side builds from `presolve`d values — so a node-shaped answer both misresolves the
+    # rule and emits IR whose declared type doesn't match the value in it.
+    argtypes = Any[_optype_w(pir, iworld, a) for a in actual]
     for (j, P) in enumerate(argtypes)
         if !(P isa DataType && isconcretetype(P))
             reason[] = "recursive call has a non-concrete argument type $(P) at %$i: `$(_stmt_str(s))`"
@@ -897,7 +925,37 @@ end
 #
 # Returns `(ci, callee_val, InnerFCoDualT, InnerPullbackT)` on success or `nothing` (with `reason[]`
 # set); the emit sites build `invoke(callee_val, ci, fcd, Ctx(), argcds...)`.
-function reverse_fwds_recursive_ci(interp, @nospecialize(ftype), argtypes::Vector{Any},
+#
+# `impl_mi` is the *carrier* mi of the build this call is part of; `current_primal_mi` is that
+# build's own primal mi (passed all the way down from `build_reverse_fwds_ir`'s
+# `resolve_reverse_primal` call). `R` is this call statement's own (widened) primal result type, read
+# straight off the primal IR — already fixed-point-solved by Julia's own inference when it built
+# `pir`, so no extra resolution is needed.
+#
+# Direct self-recursion (the callee's own primal mi is exactly `current_primal_mi`) never needs a
+# fixed point solved for its `Tape` type: the comms slot is declared as the bare `Tape` UnionAll
+# (`InnerPullbackT` below), which is what makes the comms-tuple type finite. That part is
+# ctx-independent and unconditional whenever the primal mi matches — it must be, since both the fwds
+# and pullback builders, and every ctx-type variant of the fwds carrier (`Ctx{Nothing}` fresh-tape vs
+# `Ctx{<:Tape}` pre-allocated — see `_scan_block_comms`'s callers), have to agree on it or the
+# concrete `Tape` type they each separately compute would disagree.
+#
+# *Whether compiling is needed* is a narrower, ctx-dependent question, decided by comparing the
+# resolved recursive-call target `callee_impl_mi` (always `Ctx{Nothing}`, per the fixed convention
+# below) against `impl_mi` itself:
+#   * `callee_impl_mi === impl_mi` — a literal self-edge (only possible when this build's own ctx is
+#     already `Ctx{Nothing}`). No compile: `CC.typeinf_ext_toplevel` is skipped entirely, and codegen's
+#     `mi == ctx.linfo` self-recursion fast path (`src/codegen.cpp`) triggers for the emitted `:invoke`.
+#   * otherwise — same primal, different carrier (this build is the `Ctx{<:Tape}` pre-allocated
+#     variant, whose recursive edge always targets the `Ctx{Nothing}` sibling). That sibling genuinely
+#     has never been compiled, so it must be, via the ordinary `typeinf_ext_toplevel` path — but this
+#     always terminates in exactly one bounded nested compile: building it hits *its own* recursive
+#     edge, for which its own ctx *is* `Ctx{Nothing}`, so that inner resolution takes the literal-
+#     identity branch above and stops. (This is also why `interp.in_progress` stays keyed by carrier
+#     mi, not primal mi — see its docstring in `contextual.jl`: a primal-keyed guard would mistake
+#     this legitimate nested compile for the primal already being in progress and bail incorrectly.)
+function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_primal_mi::MethodInstance,
+                                   @nospecialize(ftype), argtypes::Vector{Any}, @nospecialize(R),
                                    edges::Vector{Any}, reason::Ref{String})
     argcodualtys = Any[fcodual_type(P) for P in argtypes]
     hand = hand_reverse_rule_match(interp, ftype, argtypes)
@@ -906,6 +964,34 @@ function reverse_fwds_recursive_ci(interp, @nospecialize(ftype), argtypes::Vecto
         callee_val = rrule!!
     else
         tt = Tuple{typeof(reverse_fwds_impl),CoDual{ftype,NoFData},Ctx{Nothing},argcodualtys...}
+        primal_tt = Base.to_tuple_type(Any[ftype, argtypes...])
+        push!(edges, primal_tt, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
+        pmatch, _ = CC.findsup(primal_tt, CC.method_table(interp))
+        if pmatch !== nothing && isa(pmatch.method, Method)
+            callee_primal_mi =
+                specialize_method(pmatch.method, pmatch.spec_types, pmatch.sparams)::MethodInstance
+            if callee_primal_mi === current_primal_mi
+                push!(edges, tt, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
+                # `CC.findall`, not `findsup` — see the ABI note above `helper_ci`: `findall` gives a
+                # `spec_types` already intersected with `tt`, so `specialize_method` yields a
+                # `MethodInstance` whose `specTypes` is exactly `tt`.
+                matches = CC.findall(tt, CC.method_table(interp))
+                if matches === nothing || length(matches) != 1 || !matches[1].fully_covers
+                    reason[] = "no reverse-mode rule resolves for recursive (self-cyclic) call " *
+                               "signature $(tt)"
+                    return nothing
+                end
+                callee_impl_mi = specialize_method(matches[1])::MethodInstance
+                if callee_impl_mi === impl_mi
+                    CC.add_inlining_edge!(edges, callee_impl_mi)
+                    return callee_impl_mi, reverse_fwds_impl, CoDual{R,NoFData}, Tape
+                else
+                    ci = CC.typeinf_ext_toplevel(interp, callee_impl_mi, CC.SOURCE_MODE_ABI)::CodeInstance
+                    CC.add_invoke_edge!(edges, tt, ci)
+                    return ci, reverse_fwds_impl, CoDual{R,NoFData}, Tape
+                end
+            end
+        end
         fm, _ = CC.findsup(tt, CC.method_table(interp))
         if fm === nothing || !isa(fm.method, Method)
             reason[] = "no reverse-mode rule resolves for recursive call signature $(tt)"
@@ -924,8 +1010,18 @@ function reverse_fwds_recursive_ci(interp, @nospecialize(ftype), argtypes::Vecto
     if !(InnerRT isa DataType && InnerRT <: Tuple && length(InnerRT.parameters) == 2 &&
          InnerRT.parameters[1] isa DataType && InnerRT.parameters[1] <: CoDual &&
          isconcretetype(InnerRT.parameters[2]))
-        reason[] = "recursion into the callee's own reverse-mode forwards pass failed " *
-                  "(it bailed on something inside its own body)"
+        # Two distinct causes, worth telling apart: `Union{}` means the callee's own carrier bailed
+        # and only its error stub compiled (its recorded reason, if this same interpreter built it,
+        # names the real problem); anything else means a rule *did* resolve but its return type
+        # isn't the concrete `(CoDual, pullback)` pair the emission below needs — typically because
+        # an argument type handed to it was wrong or too abstract for the rule's body to infer.
+        inner = get(interp.bail_reasons, callee_impl_mi, nothing)
+        reason[] = inner !== nothing ? "the reverse-mode build for `$(tt)` bailed: $(inner)" :
+            InnerRT === Union{} ?
+                "the reverse rule resolved for `$(tt)` never returns — either its own derived " *
+                "build bailed, or it cannot run on those argument types" :
+                "the reverse rule resolved for `$(tt)` returned `$(InnerRT)`, which is not a " *
+                "concrete `(CoDual, pullback)` pair"
         return nothing
     end
     CC.add_invoke_edge!(edges, tt, ci)
@@ -940,8 +1036,49 @@ end
 # handling below — and both builders derive it identically since `CC.cache_owner` is a mode-level
 # singleton, so the `CodeInstance` compiled there is found, not recompiled, here), so no "did the
 # callee bail" recovery logic is needed beyond a defensive rettype-shape check.
-function reverse_pullback_recursive_ci(interp, @nospecialize(InnerTapeT), @nospecialize(InnerSeedT),
-                                       edges::Vector{Any}, reason::Ref{String})
+#
+# Cyclic edge (self-recursion): `InnerTapeT` arrives as the bare `Tape` UnionAll — the marker
+# `reverse_fwds_recursive_ci` leaves in a cyclic block's comms type (see `_scan_block_comms`) — never
+# a concrete type there, so it can't be resolved into a `tt` directly. The concrete type is
+# `own_TapeT`, the *current* pullback build's own tape type (`impl_mi.specTypes.parameters[2]`): a
+# self-recursive callee's tape is by construction the same type as the caller's own. The callee's
+# rettype is likewise closed-form regardless of whether compiling turns out to be needed below
+# (`zero_like_rdata_type` of each argument's primal type, exact per the derived pullback's own return
+# convention, `:2196-2203` below), computed straight from `own_codualparams` (also the current build's
+# own — same reasoning).
+#
+# Whether compiling is needed mirrors `reverse_fwds_recursive_ci`'s fwds-side reasoning, but the
+# source of the mismatch differs: the pullback carrier has no ctx-type variance (`reverse_pullback_impl`
+# takes only `(tape, seed)`), but the recursive call's own seed type (`InnerSeedT` — the local
+# accumulator's type at *this* call site) need not equal the current build's own incoming seed type
+# (`impl_mi`'s own `SeedT`) even for a literally self-recursive primal. `pb_mi === impl_mi` catches
+# exactly the case where it does (both `own_TapeT` and the seed type agree) — codegen's self-recursion
+# fast path, no compile. Otherwise `pb_mi` is a genuine, not-yet-compiled sibling (same tape, different
+# seed type), compiled the ordinary way; that nested compile's own recursive edge targets *its own*
+# seed type, so it resolves via the literal-identity branch and terminates.
+function reverse_pullback_recursive_ci(interp, impl_mi::MethodInstance, @nospecialize(own_TapeT),
+                                       own_codualparams::Vector{Any}, @nospecialize(InnerTapeT),
+                                       @nospecialize(InnerSeedT), edges::Vector{Any}, reason::Ref{String})
+    if InnerTapeT === Tape
+        tt = Tuple{typeof(reverse_pullback_impl),own_TapeT,InnerSeedT}
+        push!(edges, tt, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
+        # `CC.findall`, not `findsup` — same ABI reasoning as `reverse_fwds_recursive_ci`.
+        matches = CC.findall(tt, CC.method_table(interp))
+        if matches === nothing || length(matches) != 1 || !matches[1].fully_covers
+            reason[] = "no pullback method resolves for recursive (self-cyclic) call signature $(tt)"
+            return nothing
+        end
+        pb_mi = specialize_method(matches[1])::MethodInstance
+        InnerRdatasT = Tuple{(zero_like_rdata_type(_codual_primal_type(c)) for c in own_codualparams)...}
+        if pb_mi === impl_mi
+            CC.add_inlining_edge!(edges, pb_mi)
+            return pb_mi, true, InnerRdatasT
+        else
+            ci = CC.typeinf_ext_toplevel(interp, pb_mi, CC.SOURCE_MODE_ABI)::CodeInstance
+            CC.add_invoke_edge!(edges, tt, ci)
+            return ci, true, InnerRdatasT
+        end
+    end
     # Mirrors the fwds side's two shapes. A derived inner pullback is a `Tape`, so we target its
     # *carrier* directly rather than the generated `(t::Tape)(seed)` entry — the entry is only a
     # one-line `:invoke` wrapper, and skipping it keeps this a single static call. A hand-written
@@ -958,12 +1095,16 @@ function reverse_pullback_recursive_ci(interp, @nospecialize(InnerTapeT), @nospe
     callee_impl_mi = specialize_method(fm.method, fm.spec_types, fm.sparams)::MethodInstance
     ci = CC.typeinf_ext_toplevel(interp, callee_impl_mi, CC.SOURCE_MODE_ABI)::CodeInstance
     if !(ci.rettype isa DataType && ci.rettype <: Tuple)
-        reason[] = "recursion into the callee's own reverse-mode pullback pass failed " *
-                  "(it bailed on something inside its own body)"
+        inner = get(interp.bail_reasons, callee_impl_mi, nothing)
+        reason[] = inner !== nothing ? "the reverse-mode pullback build for `$(tt)` bailed: $(inner)" :
+            ci.rettype === Union{} ?
+                "the pullback resolved for `$(tt)` never returns — either its own derived build " *
+                "bailed, or it cannot run on that tape/seed" :
+                "the pullback resolved for `$(tt)` returned `$(ci.rettype)`, not a tuple of rdatas"
         return nothing
     end
     CC.add_invoke_edge!(edges, tt, ci)
-    return ci, derived
+    return ci, derived, ci.rettype
 end
 
 # ===========================================================================
@@ -1036,8 +1177,8 @@ end
 # found, not recompiled, when the other builder's separate `interp` instance resolves the same
 # callsite. `interp`/`reason`/`edges` are only exercised by the `:subtape`/`:shadow_ref` paths;
 # plain intrinsic/`getfield` scanning is unchanged from before recursion/arrays existed.
-function _scan_block_comms(interp, pir, iworld, unreachable, codualparams::Vector{Any},
-                           reason::Ref{String}, edges::Vector{Any})
+function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::MethodInstance, pir, iworld,
+                           unreachable, codualparams::Vector{Any}, reason::Ref{String}, edges::Vector{Any})
     nblocks = length(pir.cfg.blocks)
     nodes = [Any[] for _ in 1:nblocks]
     types = [Any[] for _ in 1:nblocks]
@@ -1127,8 +1268,17 @@ function _scan_block_comms(interp, pir, iworld, unreachable, codualparams::Vecto
             info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, fdata_tracked)
             info === nothing && continue
             _, ftype, argtypes = info
-            resolved = reverse_fwds_recursive_ci(interp, ftype, argtypes, edges, reason)
-            resolved === nothing && return nothing
+            R = _widen(pir.stmts[i][:type])
+            resolved = reverse_fwds_recursive_ci(interp, scan_impl_mi, primal_mi, ftype, argtypes, R,
+                                                 edges, reason)
+            if resolved === nothing
+                reason[] *= " — at %$i: `$(_stmt_str(s))`"
+                return nothing
+            end
+            # For a cyclic edge this is the bare `Tape` UnionAll (see `reverse_fwds_recursive_ci`),
+            # which is exactly what makes the comms-tuple type finite — a concrete `TapeT` isn't known
+            # yet at scan time (it depends on this very comms scan), and doesn't need to be: the
+            # abstract element type is enough to close the loop.
             InnerTapeT = resolved[4]
             push!(nodes[bidx], (:subtape, Core.SSAValue(i)))
             push!(types[bidx], InnerTapeT)
@@ -1142,7 +1292,7 @@ end
 # `dualize_to_ircode` is, minus any shadow/tangent — see this file's header), instrumented with the
 # block-stack/comms pushes described above.
 # ===========================================================================
-function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
+function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, primal_mi::MethodInstance;
                                 reason::Ref{String}=Ref(""), edges::Vector{Any}=Any[])
     pstmts = pir.stmts
     N = length(pstmts)
@@ -1170,7 +1320,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     vararg_tt = Tuple{impl_mi.specTypes.parameters[4:end]...}
     ArgsTT = Tuple{codualparams...}
 
-    scan = _scan_block_comms(interp, pir, iworld, unreachable_block, codualparams, reason, edges)
+    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, codualparams, reason, edges)
     scan === nothing && return nothing
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
@@ -1534,9 +1684,19 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked)
                 info === nothing && return nothing
                 fval, ftype, argtypes = info
-                resolved = reverse_fwds_recursive_ci(interp, ftype, argtypes, edges, reason)
-                resolved === nothing && return nothing
-                ci, callee_val, InnerFCoDualT, InnerTapeT = resolved
+                R = _widen(Ti)
+                resolved = reverse_fwds_recursive_ci(interp, impl_mi, primal_mi, ftype, argtypes, R,
+                                                     edges, reason)
+                if resolved === nothing
+                    reason[] *= " — at %$i: `$(_stmt_str(s))`"
+                    return nothing
+                end
+                ci, callee_val, InnerFCoDualT, InnerTapeT0 = resolved
+                # Cyclic edge: `reverse_fwds_recursive_ci` leaves this the bare `Tape` UnionAll (see
+                # its docstring); the concrete type is this build's own `TapeT`, already computed
+                # above (`:1276`) — a self-recursive callee's tape is, by construction, the same type
+                # as the caller's own.
+                InnerTapeT = InnerTapeT0 === Tape ? TapeT : InnerTapeT0
                 FCT = CoDual{ftype,NoFData}
                 fcodual = emit!(Expr(:new, FCT, fval, NoFData()), FCT)
                 argcoduals = Any[]
@@ -1656,7 +1816,8 @@ end
 @noinline _rr_realize_rdata(acc, ::Type{RDataT}) where {RDataT} =
     (acc isa ZeroRData ? zero_rdata_from_type(RDataT) : acc)::RDataT
 
-function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
+function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int,
+                                    primal_mi::MethodInstance;
                                     reason::Ref{String}=Ref(""), edges::Vector{Any}=Any[])
     pstmts = pir.stmts
     N = length(pstmts)
@@ -1680,7 +1841,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     CS = TapeT.parameters[2]
     comms_stack_ty = Any[CS.parameters...]
 
-    scan = _scan_block_comms(interp, pir, iworld, unreachable_block, codualparams, reason, edges)
+    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, codualparams, reason, edges)
     scan === nothing && return nothing
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
@@ -2091,17 +2252,27 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     _, ftype, argtypes = info
                     acc = deref_and_zero!(ssa_ref_id[i], Ti)   # this call's own seed for the inner pullback
                     subtape_key = (:subtape, Core.SSAValue(i))
-                    inner_tape = comms_val_id[subtape_key]
+                    inner_tape_raw = comms_val_id[subtape_key]
                     InnerTapeT = comms_type_id[subtape_key]
                     # `zero_like_rdata_type`, not `rdtype`: `acc`'s actual type (see `deref_and_zero!`
                     # above) may include `ZeroRData` when `Ti` isn't concrete enough on its own, so the
                     # inner pullback must be resolved to accept exactly that (possibly wider) seed type
                     # — its own exit-route `increment!!` already tolerates `ZeroRData` generically.
                     SeedT = zero_like_rdata_type(_widen(Ti))
-                    pb_resolved = reverse_pullback_recursive_ci(interp, InnerTapeT, SeedT, edges, reason)
-                    pb_resolved === nothing && return nothing
-                    pb_ci, pb_derived = pb_resolved
-                    InnerRdatasT = pb_ci.rettype
+                    # Cyclic edge: `comms_type_id` for this item is the bare `Tape` UnionAll (what the
+                    # fwds pass's `_scan_block_comms` declared it as — see `reverse_fwds_recursive_ci`).
+                    # The popped value's declared type is therefore abstract; narrow it to this build's
+                    # own concrete `TapeT` (a self-recursive callee's tape is, by construction, the same
+                    # type as the caller's own) via an unchecked `PiNode` before invoking with it.
+                    inner_tape = InnerTapeT === Tape ? emit!(Core.PiNode(inner_tape_raw, TapeT), TapeT) :
+                                                        inner_tape_raw
+                    pb_resolved = reverse_pullback_recursive_ci(interp, impl_mi, TapeT, codualparams,
+                                                                 InnerTapeT, SeedT, edges, reason)
+                    if pb_resolved === nothing
+                        reason[] *= " — at %$i: `$(_stmt_str(s))`"
+                        return nothing
+                    end
+                    pb_ci, pb_derived, InnerRdatasT = pb_resolved
                     # A derived inner pullback goes through its carrier (so `reverse_pullback_impl`
                     # is the callee and the tape an argument); a hand-written one *is* the callee.
                     # The hand-written case is flagged `IR_FLAG_NOINLINE`: inlining a rule author's

@@ -3,13 +3,15 @@
 #
 # Same motivation as `sum`/`sum(f,·)` in `rrules.jl`: Base's real implementations of these
 # (`prod`, `maximum`/`minimum`, `mapreduce`, `cumsum`) go through `mapreduce`/`_mapreduce` /
-# `mapfoldl_impl` machinery that is self-recursive (pairwise divide-and-conquer) and `@simd`
-# annotated above `Base.pairwise_blocksize` elements. Differ's reverse-mode recursion engine bails
-# on genuine self-recursion, which is what makes generic recursion into these fail above ~1024
-# elements. (Forward mode's half of that reason is gone as of 2026-08-01 — `:loopinfo` is now carried
-# through, ISSUES #62 — but the self-recursion half stands, so these rules stay.) Every rule below is
-# a plain hand-written loop that never touches Base's internals, so it is correct and efficient at
-# any size.
+# `mapfoldl_impl` machinery that is self-recursive (pairwise divide-and-conquer), whose non-recursive
+# base case is `@simd`-annotated. Direct self-recursion itself is no longer a blocker in reverse mode
+# (ISSUES #65 — a self-recursive primal has a finite, closed-form `Tape` type after all), but reverse
+# mode still has no `Expr(:loopinfo)` support (`@simd`'s marker — forward mode carries it through
+# unchanged, ISSUES #62; reverse mode's own per-block comms/block-stack pushes make that not a safe
+# copy-paste, see ISSUES #65's "still open" note). Since the base case is reached at essentially any
+# input size, not just above `Base.pairwise_blocksize`, generic recursion into these still fails at
+# essentially any size until that gap is closed. Every rule below is a plain hand-written loop that
+# never touches Base's internals, so it is correct and efficient at any size regardless.
 
 # `sum`'s REVERSE rule already lives in `rrules.jl` (`SumPullback`). Only the forward half is
 # missing; `sum` is linear so both primal and tangent are computed by the same accumulation.

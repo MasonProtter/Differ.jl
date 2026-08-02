@@ -21,6 +21,33 @@ dyncallee(x) = dyn_g(x)
     return rec_self(x, n - 1)
 end
 
+# Same requirement as `rec_self` above (must be module-level, not testset-local): a genuinely
+# self-recursive primal used across several ISSUES #65 tests below (plain recursion, under a branch,
+# under a loop, and through both the tape-allocating and pre-allocated carrier specializations).
+@noinline function rec_sum(v::Vector{Float64}, i::Int)
+    i > length(v) && return 0.0
+    return v[i] + rec_sum(v, i + 1)
+end
+
+# Genuine mutual recursion (A -> B -> A), also module-level for the same reason. Must still bail
+# cleanly — it needs a tape-type pre-pass across the whole SCC, out of scope for direct self-recursion.
+@noinline mutA(x::Float64, n::Int) = n <= 0 ? x : mutB(x, n - 1)
+@noinline mutB(x::Float64, n::Int) = mutA(x, n - 1)
+
+# A `const` global holding a function, passed as an *operand* of a surviving call: the operand is a
+# `GlobalRef` in the optimized IR, so its type has to come from the binding, not from the node (the
+# reverse-mode half of ISSUES #63). Module-level `const` for the same reason `dyn_g` is module-level.
+const CONST_G = sin
+usecg(v) = sum(CONST_G, v)
+
+# The non-`const` twin. Its operand survives as its own `%k = Main.dyn_g` load statement typed
+# `Any`, so this must bail (reverse) or dispatch dynamically (forward) — and, before the
+# `isa(specTypes, DataType)` guard in `is_reverse_fwds_impl`/`is_dualized_impl`, it crashed the
+# compile outright with `FieldError: type UnionAll has no field parameters` from inside
+# `finishinfer!`, because inference reaches a MethodInstance whose signature has free typevars.
+nonconst_g = sin
+usencg(v) = sum(nonconst_g, v)
+
 @testset "reverse mode: recursion into a hand-written rule" begin
     # A surviving high-level call differentiates via the recursive `rrule` support below (`sin`
     # specifically resolves to the hand-written rule in `src/rrules.jl`, not raw recursion into
@@ -67,11 +94,121 @@ end
     @test dx_rl ≈ 3 * 2 * 2.0
     check_stack_balance(rec_loop, 2.0, 5)
 
-    @test_throws ErrorException gradient(rec_self, 1.0, 3)
-
     checkverify_rev(rec_call, (Float64,))
     checkverify_rev(rec_branch, (Float64,))
     checkverify_rev(rec_loop, (Float64, Int))
+end
+
+@testset "reverse mode: direct self-recursion (ISSUES #65)" begin
+    # `rec_self` is genuinely self-recursive: no hand `rrule!!`, and the recursive call resolves to
+    # the exact primal currently being differentiated — the case the `in_progress` cycle guard used
+    # to bail on unconditionally. `d(rec_self(x,n))/dx = 1` for every `n >= 0`.
+    _, dx_self, dn_self = gradient(rec_self, 1.0, 3)
+    @test dx_self == 1.0
+    @test dn_self isa NoTangent
+    for n in 0:4
+        _, dx_n, _ = gradient(rec_self, 2.7, n)
+        @test dx_n == 1.0
+    end
+    checkverify_rev(rec_self, (Float64, Int))
+    # Exercises both the tape-allocating (`Ctx{Nothing}`) and pre-allocated (`Ctx{<:Tape}`) carrier
+    # specializations — the recursive edge always targets the former even when the outer call uses
+    # the latter, which is what makes this the discriminating regression: a self-recursive primal's
+    # pre-allocated carrier must actually compile the sibling it recurses into, not assume it's the
+    # literal carrier being compiled (only true when the outer carrier is *also* `Ctx{Nothing}`).
+    check_stack_balance(rec_self, 1.0, 3)
+
+    # Accumulating self-recursion: each level contributes a distinct addend, so a wrong tape layout
+    # or a stale/misrouted comms value would show up as a wrong (not just uniformly-1) gradient.
+    v = [1.0, 2.0, 3.0, 4.0]
+    _, dv, _ = gradient(rec_sum, v, 1)
+    @test dv == ones(4)
+    h = 1e-6
+    for k in 1:4
+        vp = copy(v); vp[k] += h
+        vm = copy(v); vm[k] -= h
+        @test dv[k] ≈ (rec_sum(vp, 1) - rec_sum(vm, 1)) / 2h rtol = 1e-6
+    end
+    checkverify_rev(rec_sum, (Vector{Float64}, Int))
+    check_stack_balance(rec_sum, [1.0, 2.0, 3.0], 1)
+
+    # Self-recursion reached under a branch: the recursive call site itself lives in one arm only.
+    function rec_sum_branch(v::Vector{Float64}, flag::Bool)
+        return flag ? rec_sum(v, 1) : 0.0
+    end
+    _, dvb, _ = gradient(rec_sum_branch, v, true)
+    @test dvb == ones(4)
+    _, dvb0, _ = gradient(rec_sum_branch, v, false)
+    @test dvb0 == zeros(4)
+    checkverify_rev(rec_sum_branch, (Vector{Float64}, Bool))
+    check_stack_balance(rec_sum_branch, v, true)
+
+    # Self-recursion invoked repeatedly from inside a loop.
+    function rec_sum_loop(v::Vector{Float64}, k::Int)
+        s = 0.0
+        for _ in 1:k
+            s += rec_sum(v, 1)
+        end
+        return s
+    end
+    _, dvl, _ = gradient(rec_sum_loop, v, 3)
+    @test dvl == fill(3.0, 4)
+    checkverify_rev(rec_sum_loop, (Vector{Float64}, Int))
+    check_stack_balance(rec_sum_loop, v, 3)
+
+    # Mutual recursion (A -> B -> A) is explicitly out of scope (needs a tape-type pre-pass across
+    # the whole SCC) and must still bail cleanly — never hang, never crash on `verify_ir`.
+    err_mut = try
+        gradient(mutA, 1.0, 4)
+        nothing
+    catch e
+        e
+    end
+    @test err_mut isa ErrorException
+    @test occursin("self- or mutually-recursive primal", err_mut.msg)
+end
+
+@testset "operand types come from the value a node names, not from the node" begin
+    # ISSUES #63, reverse-mode half. `_optype_w` is the single place that answers this.
+    interp = Differ.ADInterpreter{Differ.Reverse}()
+    world = Core.Compiler.get_inference_world(interp)
+    @test Differ._optype_w(nothing, world, GlobalRef(@__MODULE__, :CONST_G)) === typeof(sin)
+    @test Differ._optype_w(nothing, world, GlobalRef(@__MODULE__, :nonconst_g)) === Any
+    @test Differ._optype_w(nothing, world, QuoteNode(:a)) === Symbol
+    @test Differ._optype_w(nothing, world, 1.5) === Float64
+    # A `Core.Const`-narrowed argument type widens to a bare `Type` (ISSUES #57): the callee guard
+    # tests `isconcretetype`, which a lattice element fails. `_optype` only reads `argtypes`/`stmts`
+    # off `pir`, so a stand-in carrying just `argtypes` exercises the path exactly.
+    @test Differ._optype_w((; argtypes=Any[Core.Const(3)]), world, Core.Argument(1)) === Int
+
+    # End to end: a `const` global function operand differentiates.
+    v = [0.4, -1.1, 2.5]
+    _, dv = gradient(usecg, v)
+    @test dv ≈ cos.(v)
+    checkverify_rev(usecg, (Vector{Float64},))
+    check_stack_balance(usecg, v)
+end
+
+@testset "a UnionAll specTypes must not crash the compile" begin
+    # Regression for the `FieldError: type UnionAll has no field parameters` escape described above.
+    # Reverse mode bails cleanly (the operand is `Any`); forward mode dispatches dynamically and
+    # gets a real answer. Both paths previously died inside `finishinfer!` instead.
+    v = [0.4, -1.1, 2.5]
+
+    err = try
+        gradient(usencg, v)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test !(err isa FieldError)
+    @test occursin("non-concrete argument type", err.msg)
+
+    d = frule!!(Dual(usencg, NoTangent()), Dual(v, ones(3)))
+    @test d.x ≈ sum(sin, v)
+    @test d.dx ≈ sum(cos, v)
+    checkverify(usencg, (Vector{Float64},))
 end
 
 @testset "reverse mode: dynamic (non-statically-resolvable) callee bails" begin

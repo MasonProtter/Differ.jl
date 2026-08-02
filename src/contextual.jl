@@ -49,10 +49,29 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
     # real Julia backedges, without Differ calling any invalidation ccall itself.
     transformed_edges::IdDict{MethodInstance, Vector{Any}}
     # Reverse-mode recursion cycle guard: carrier MethodInstances currently being built by
-    # `build_reverse_fwds_ir`/`build_reverse_pullback_ir` (`reverse_interp.jl`), so a self- or
-    # mutually-recursive primal bails cleanly instead of recursing into the transform forever.
-    # Mode-agnostic field (harmless, always empty, for `Forward`).
+    # `build_reverse_fwds_ir`/`build_reverse_pullback_ir` (`reverse_interp.jl`), so a mutually-
+    # recursive primal (A -> B -> A) bails cleanly instead of recursing into the transform forever.
+    # Keyed by the *carrier* mi, not the primal mi — the fwds carrier alone has two independent
+    # specializations per primal (`Ctx{Nothing}` fresh-tape vs `Ctx{<:Tape}` pre-allocated), and
+    # building the pre-allocated one for a self-recursive primal legitimately requires *also*
+    # compiling the `Ctx{Nothing}` sibling (a bounded, one-off nested compile, not a cycle) — a
+    # primal-keyed guard would conflate that with genuine in-progress-ness and bail incorrectly. See
+    # the comment on `build_reverse_fwds_ir` for the full reasoning.
+    #
+    # Direct self-recursion (a callee whose primal mi equals the current build's own) is a *separate*
+    # question from this guard, answered locally and ctx-independently by
+    # `reverse_fwds_recursive_ci`/`reverse_pullback_recursive_ci` from an explicitly-passed
+    # `primal_mi` — not by consulting this field. It only reaches this guard at all when the
+    # recursive edge's target carrier differs from the one currently being built (the `Ctx{Nothing}`-
+    # sibling case above); a literal self-edge resolves to a static self-`:invoke` without recursing
+    # into the builder at all. Mode-agnostic field (harmless, always empty, for `Forward`).
     in_progress::IdDict{MethodInstance, Nothing}
+    # Why a carrier's transform bailed, keyed by that carrier MethodInstance — recorded by
+    # `build_contextual_ir` right where it installs the error-raising IRCode, so a *caller* whose own
+    # build recursed into it (`reverse_fwds_recursive_ci`, `reverse_interp.jl`) can report the inner
+    # reason instead of just "the callee bailed". Best-effort: `typeinf_ext_toplevel` can hand back a
+    # cached CodeInstance without re-running the transform, so a reader must tolerate a missing entry.
+    bail_reasons::IdDict{MethodInstance, String}
     function ADInterpreter{M}(world::UInt,
                               ip::InferenceParams,
                               op::OptimizationParams) where {M<:ADMode}
@@ -66,6 +85,7 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
             IdDict{MethodInstance, IRCode}(),
             IdDict{MethodInstance, Vector{Any}}(),
             IdDict{MethodInstance, Nothing}(),
+            IdDict{MethodInstance, String}(),
         )
     end
 end
