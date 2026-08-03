@@ -37,7 +37,7 @@ function enzyme_benchmark_group(; N::Int=1000, mode::Symbol=:all)
 end
 
 function enzyme_reverse_workloads!(suite::BenchmarkGroup, N::Int)
-    suite["memloop! Memory[$N] (prealloc)"] = @benchmarkable(
+    suite["memloop! Memory[$N]"] = @benchmarkable(
         begin
             d .= 0
             Enzyme.autodiff(Reverse, memloop!, Const, Duplicated(o, d), Active(3.0), Const($N))
