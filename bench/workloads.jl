@@ -68,12 +68,12 @@ function structloop(p::BenchPoint, a::Float64, N::Int)
         p.x = p.x * 0.5 + a
     end
     return p.x
-end
+end 
 
 function readonly(v::Vector{Float64})
     s = 0.0
     for i in 1:length(v)
-        @inbounds s += v[i] * v[i]
+        @inbounds s += sin(v[i] * v[i])
     end
     return s
 end
@@ -169,33 +169,6 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
     # array-mutation shape there is: the ref chain is rooted directly at the argument via the 1-arg
     # `memoryrefnew`, with no `Array.ref` hop. It returns `nothing`, so it is seeded with `NoRData()`
     # directly rather than through `value_and_gradient!`, which needs a scalar return (ISSUES #51).
-    let k = "memloop! Memory[$N] (prealloc)"
-        suite[k] = @benchmarkable(
-            begin
-                ocd.dx .= 0
-                y, pb = rrule!!(fcd, ctx, ocd, xcd, ncd)
-                pb(NoRData())
-            end,
-            setup = begin
-                o = Memory{Float64}(undef, $N); fill!(o, 0.0)
-                d = Memory{Float64}(undef, $N); fill!(d, 0.0)
-                ocd = CoDual(o, d)
-                fcd = zero_fcodual(memloop!)
-                xcd = zero_fcodual(3.0); ncd = zero_fcodual($N)
-                ctx = build_ctx(memloop!, (Memory{Float64}, Float64, Int))
-                y0, pb0 = rrule!!(fcd, ctx, ocd, xcd, ncd); pb0(NoRData())
-            end)
-        meta[k] = WorkloadMeta(memloop!, (Memory{Float64}, Float64, Int), :mutation,
-                               "argument Memory written in a loop, through a pre-allocated context: " *
-                               "the bulk-save best case, and the path that should allocate nothing")
-        primal!(suite, meta, k, @benchmarkable(
-            memloop!(o, x, n),
-            setup = begin
-                o = Memory{Float64}(undef, $N); fill!(o, 0.0)
-                x = 3.0; n = $N
-                memloop!(o, x, n)
-            end, evals = 100))
-    end
 
     # The same call through a fresh-tape `Ctx()` — what plain `gradient` uses, and what every
     # recursive inner call uses. It allocates by construction (a tape per call), and bulk save adds

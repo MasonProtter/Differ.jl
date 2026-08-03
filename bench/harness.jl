@@ -132,3 +132,35 @@ function print_comparison(before::BenchmarkGroup, after::BenchmarkGroup,
     isempty(moved_guard) || println(io, "\nGUARDS MOVED: ", join(moved_guard, ", "))
     return nothing
 end
+
+# Differ vs Enzyme, on the core workload set (see enzyme_workloads.jl). Unlike `print_comparison`
+# this isn't a regression check against history — it's a snapshot of where Differ stands against an
+# established IR-based AD tool on the same primals — so there's no noise tolerance or guard-movement
+# tracking, just the two numbers and their ratio. Iterates `keys(enzyme_results)` rather than every
+# Differ key: only the core subset has an Enzyme twin.
+function print_vs_enzyme(differ_results::BenchmarkGroup, enzyme_results::BenchmarkGroup,
+                         meta::Dict{String,WorkloadMeta}; io::IO=stdout)
+    names = sort!(collect(keys(enzyme_results)))
+    data = Matrix{Any}(undef, length(names), 8)
+    for (i, k) in enumerate(names)
+        td, te = minimum(differ_results[k]), minimum(enzyme_results[k])
+        m = get(meta, k, nothing)
+        data[i, :] = Any[k, m === nothing ? "" : (m.mode === :forward ? "fwd" : "rev"),
+                         BenchmarkTools.prettytime(time(td)), memory(td),
+                         BenchmarkTools.prettytime(time(te)), memory(te),
+                         _ratio(time(td), time(te)),
+                         m === nothing ? "" : String(m.kind)]
+    end
+    hl_alloc_d = TextHighlighter((d, i, j) -> j == 4 && d[i, j] isa Integer && d[i, j] > 0,
+                                 crayon"yellow")
+    hl_alloc_e = TextHighlighter((d, i, j) -> j == 6 && d[i, j] isa Integer && d[i, j] > 0,
+                                 crayon"yellow")
+    pretty_table(io, data;
+                 column_labels=["workload", "mode", "Differ min", "Differ allocs",
+                               "Enzyme min", "Enzyme allocs", "Differ/Enzyme", "kind"],
+                 alignment=[:l, :l, :r, :r, :r, :r, :r, :l],
+                 highlighters=[hl_alloc_d, hl_alloc_e],
+                 display_size=(-1, -1))
+    println(io, "Minima compared. `Differ/Enzyme` > 1× means Differ is slower on that workload.")
+    return nothing
+end

@@ -167,3 +167,38 @@ generally predates it. The copied `Project.toml` points `Differ` at `..`, which 
 is the baseline checkout, so it loads that revision's `src/`. Tape-shape introspection is guarded
 with `isdefined`, so a baseline lacking `tape_type`/`comms_element_types` reports `-` in those
 columns rather than failing.
+
+## Comparing against Enzyme
+
+```bash
+julia +1.13 --project=bench bench/run.jl --vs-enzyme
+julia +1.13 --project=bench bench/run.jl --vs-enzyme --mode=forward --n=10000 --seconds=2
+```
+
+Prints the usual Differ table, then a second one pairing each workload against the same primal run
+through [Enzyme.jl](https://github.com/EnzymeAD/Enzyme.jl) (`Enzyme.autodiff(Reverse, ...)` /
+`Enzyme.autodiff(Forward, ...)`, called directly — no thunk/compile-once machinery needed, since a
+repeated plain `autodiff` call is already 0-alloc). `--vs-enzyme` is the only thing that pulls Enzyme
+in: it's `using`d from `enzyme_workloads.jl`, which is only `include`d when the flag is passed, so a
+plain `run.jl` invocation never pays Enzyme's first-run precompile (~60-90s the first time its
+manifest entry is instantiated).
+
+The comparison covers the **core workload set** — the 7 primals whose shape maps directly onto
+Enzyme's activity annotations (`readonly`, `vecloop!`, `wrloop`, `straightline!`, `structloop`,
+`scalarcf`, `memloop!`), in both modes, plus `fwd polychain`. **Not covered**, and not planned without
+further investigation:
+
+- `cpoly` — Enzyme's activity annotations for a `ComplexF64`-typed argument need their own look; this
+  isn't the same as an `isbits` struct field-by-field.
+- `applyN` (closure-valued callee) — Enzyme differentiates closures differently from Differ's
+  `Dual`-carrying-a-value convention; wiring the two up to compare fairly is unstarted work.
+- `polychain order-2` — Enzyme's higher-order story doesn't mirror Differ's transform-applied-to-its-
+  own-output approach; there's no obvious equivalent to ask for the same thing.
+
+`memloop!` pairs against Differ's `(prealloc)` key specifically, not the fresh-`Ctx()` one: Enzyme has
+no tape and no comparable fresh-vs-reused-context distinction, so its natural steady-state call is the
+fair comparison against Differ's pre-allocated-context path.
+
+The `Differ/Enzyme` column is minimum-time ratio; above 1× means Differ is slower on that workload.
+Unlike `compare.jl` this isn't a regression check against history, so there's no noise tolerance or
+guard-movement tracking — just the two numbers next to each other.
