@@ -317,6 +317,9 @@ function builtin_rrule_comms(::Val{Base.memoryrefget}, actual, Ti, ctx)
                        "argument at %$(ctx.ssa.id)"
         return false
     end
+    # A statically-derivable `MemoryRef` is re-derived in the pullback, so skip pushing its
+    # shadow handle — keeps the comms tuple empty (`SingletonStack`) for static-index reads.
+    ctx.static_ref(ref_node) === nothing || return Tuple{Any,Any}[]
     return Tuple{Any,Any}[((:shadow_ref, ref_node), ctx.optype(ref_node))]
 end
 
@@ -503,7 +506,13 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
                        "argument at %$(ctx.ssa.id)"
         return false
     end
-    items = Tuple{Any,Any}[((:shadow_ref, ref_node), ctx.optype(ref_node))]
+    # A statically-derivable `MemoryRef` is re-derived in the pullback, so neither its shadow nor
+    # primal handle is pushed — only the overwritten values remain (`:old_tangent` always recorded).
+    derivable = ctx.static_ref(ref_node) !== nothing
+    items = Tuple{Any,Any}[]
+    if !derivable
+        push!(items, ((:shadow_ref, ref_node), ctx.optype(ref_node)))
+    end
     # The primal side — the element this store overwrote, and the `MemoryRef` to write it back
     # through — is needed only to restore the primal, and only when that restore is done one element
     # at a time. When this array is bulk-saved (`_bulk_save_args`) the whole thing is copied back at
@@ -511,7 +520,9 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     # either way: the pullback reads and rewrites the shadow slot as it goes, so its old value is
     # genuinely live during the reverse sweep (see the `old_tangent` note in `apply_builtin_rrule!`).
     if !ctx.bulk_saved(ref_node)
-        push!(items, ((:primal, ref_node), ctx.optype(ref_node)))
+        if !derivable
+            push!(items, ((:primal, ref_node), ctx.optype(ref_node)))
+        end
         push!(items, ((:old_primal, ctx.ssa), elt))
     end
     push!(items, ((:old_tangent, ctx.ssa), tangent_type(_widen(elt))))

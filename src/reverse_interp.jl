@@ -643,6 +643,33 @@ function _bulk_save_args(pir, iworld, arg_primal_types::Vector{Any})
 end
 
 # ===========================================================================
+# Statically re-derivable `MemoryRef` handles.
+#
+# A `memoryrefget`/`memoryrefset!` over a `MemoryRef` built by
+# `memoryrefnew(getfield(arr, :ref), idx, boundscheck)` with `arr` an `Argument(k)` and `idx` a
+# literal `Int` can be rebuilt in the pullback from `tape.args[k]` + `idx`, so its handles need not
+# be pushed on the comms tuple (which would make it GC-tracked).
+#
+# Returns `(k::Int, idx::Int, bc::Bool)` when `node` is such a `MemoryRef` SSA, else `nothing`
+# (dynamic index, 1-arg form over a fresh allocation, or non-argument root).
+# ===========================================================================
+function _static_ref_derivation(pir, iworld, @nospecialize(node))
+    isa(node, Core.SSAValue) || return nothing
+    s = pir.stmts[node.id][:stmt]
+    (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || return nothing
+    fpos, actual = _call_parts(s)
+    _calleeval(fpos, iworld) === Base.memoryrefnew || return nothing
+    length(actual) >= 3 || return nothing          # need the 3-arg offsetting form
+    idx = _calleeval(actual[2], iworld)
+    (idx isa Int) || return nothing                 # literal Int index only
+    bc = _calleeval(actual[3], iworld)
+    (bc isa Bool) || return nothing                 # literal Bool boundscheck
+    root = _provenance_root(pir, iworld, actual[1])
+    isa(root, Core.Argument) || return nothing
+    return (root.n, idx, bc)
+end
+
+# ===========================================================================
 # Phase D: unique-predecessor analysis (Mooncake's `_characterise_unique_predecessor_blocks`,
 # `reverse_mode.jl:660-702`), worked directly over primal block *numbers* rather than the `ID`s
 # `cfg_ir.jl`'s copy of that algorithm uses — the forwards pass never leaves block-number space (see
@@ -1508,7 +1535,10 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             # differentiable builtin with no rule happens at point-of-use, in the emission loops).
             ctx = (optype=(@nospecialize x) -> _optype(pir, x), ssa=Core.SSAValue(i),
                   tracked=fdata_tracked, arg_tracked=arg_tracked, reason=reason,
-                  bulk_saved=bulk_saved)
+                  bulk_saved=bulk_saved,
+                  # A `MemoryRef` statically re-derivable from an argument + literal index need not
+                  # be pushed (see `_static_ref_derivation`). Consulted by `builtins_reverse.jl`.
+                  static_ref=(@nospecialize x) -> _static_ref_derivation(pir, iworld, x))
             result = builtin_rrule_comms(Val(f), actual, pir.stmts[i][:type], ctx)
             result === false && return nothing
             if result !== nothing
@@ -1641,10 +1671,20 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     args_tup_ssa = emit!(Expr(:call, ctuple, carg...), ArgsTT)
 
     # --- Tape prologue. Two shapes, chosen by the `ctx` type in `Argument(3)`. ---
+    # Select `CommsCell{T}` (single-slot inline holder) for a non-loop block whose comms tuple is
+    # `isbits` (pushed once per call): the carrier emits a direct `setfield!`/`getfield`, no
+    # `push!`/`pop!`/`position`/boundscheck. A loop block or non-`isbits` tuple keeps `Stack{T}`;
+    # an empty tuple uses `SingletonStack`.
     comms_stack_ty = Vector{Any}(undef, nblocks)
+    inloop = _loop_blocks(pir)
     for b in 1:nblocks
         CommsT = Tuple{block_comms_types[b]...}
-        comms_stack_ty[b] = Base.issingletontype(CommsT) ? SingletonStack{CommsT} : Stack{CommsT}
+        if Base.issingletontype(CommsT)
+            comms_stack_ty[b] = SingletonStack{CommsT}
+        else
+            static_ok = !inloop[b] && isbitstype(CommsT)
+            comms_stack_ty[b] = static_ok ? CommsCell{CommsT} : Stack{CommsT}
+        end
     end
     TapeT = Tape{ArgsTT,Tuple{comms_stack_ty...}}
     comms_stack_ssa = Vector{Any}(undef, nblocks)
@@ -1657,8 +1697,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
         block_stack_ssa = icall!(Stack{Int32}, Stack{Int32}, ())
         for b in 1:nblocks
             ST = comms_stack_ty[b]
-            # A `SingletonStack` has no fields and stores nothing — construct it with `%new` rather
-            # than paying a call to reach a constructor that does nothing.
+            # `SingletonStack` has no fields, so `%new`. `CommsCell{T}()` zero-fills `val`.
+            # `Stack{T}` takes a capacity (pre-size to 1 for a single push).
             comms_stack_ssa[b] = ST <: SingletonStack ? emit!(Expr(:new, ST), ST) : icall!(ST, ST, ())
         end
     else
@@ -1683,7 +1723,10 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
         # pass and never call the pullback, or to bail out partway through.
         emit!(Expr(:call, setf, block_stack_ssa, 2, 0), Any)
         for b in 1:nblocks
-            comms_stack_ty[b] <: SingletonStack && continue   # no fields, nothing to reset
+            ST = comms_stack_ty[b]
+            (ST <: SingletonStack || ST <: CommsCell) && continue
+            # `Stack` only: reset `position` (field 2) to 0. `CommsCell` is overwritten in place;
+            # `SingletonStack` is empty.
             emit!(Expr(:call, setf, comms_stack_ssa[b], 2, 0), Any)
         end
         # This call's coduals replace the previous call's. A re-used context therefore keeps the
@@ -1747,6 +1790,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
 
     emit_epilogue!(b) = begin
         nodes = block_comms_nodes[b]
+        ST = comms_stack_ty[b]
         # Nothing to communicate: the stack is a `SingletonStack` whose `push!` is a no-op, so the
         # tuple construction and the push are both pure overhead. (The pullback already skips the
         # matching `pop!` for exactly this case.)
@@ -1761,7 +1805,12 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                     sresolve(nd[2]) for nd in nodes)
             CommsT = Tuple{block_comms_types[b]...}
             tup = emit!(Expr(:call, ctuple, vals...), CommsT)
-            icall!(push_g, Any, (comms_stack_ty[b], CommsT), comms_stack_ssa[b], tup)
+            if ST <: CommsCell
+                # Unrolled single-slot store: `setfield!` to `val` (field 1) — no `push!`/`position`/boundscheck.
+                emit!(Expr(:call, setf, comms_stack_ssa[b], 1, tup), Any)
+            else
+                icall!(push_g, Any, (ST, CommsT), comms_stack_ssa[b], tup)
+            end
         end
         # Phase D: skip the block-stack push when `b` is a unique predecessor of whatever runs next
         # (an ordinary successor, or — for a lone exit — the pullback's own entry routing): nothing
@@ -2361,8 +2410,14 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         comms_val_id = Dict{Any,Any}()
         comms_type_id = Dict{Any,Any}()
         if !isempty(block_comms_types[b])
-            popped = emit!(icall(pop_g, (comms_stack_ty[b],), comms_obj_id[b]),
-                           Tuple{block_comms_types[b]...})
+            ST = comms_stack_ty[b]
+            if ST <: CommsCell
+                # Unrolled single-slot read: `getfield` of `val` (field 1) — no `pop!`/`position`.
+                popped = emit!(Expr(:call, getf, comms_obj_id[b], 1), Tuple{block_comms_types[b]...})
+            else
+                popped = emit!(icall(pop_g, (ST,), comms_obj_id[b]),
+                               Tuple{block_comms_types[b]...})
+            end
             for (j, nd) in enumerate(block_comms_nodes[b])
                 comms_val_id[nd] = emit!(Expr(:call, getf, popped, j), block_comms_types[b][j])
                 comms_type_id[nd] = block_comms_types[b][j]
@@ -2378,11 +2433,30 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         # `getfield`/`setfield!`/a tracked `%new` declare for a struct object). They mean the same
         # thing and are resolved identically by `emit_epilogue!`; the two node populations are
         # disjoint, so trying both here is unambiguous and saves renaming ten declaration sites.
+        #
+        # When neither is on the tape, a statically-derivable `MemoryRef` is re-derived from
+        # `tape.args` + the literal index (`pb_rederive_ref`) — the comms rule skipped it for that.
+        pb_rederive_ref(@nospecialize(a), shadow::Bool) = begin
+            d = _static_ref_derivation(pir, iworld, a)
+            d === nothing && return nothing
+            k, idx, bc = d
+            arr = shadow ? farg_pb[k] : parg_pb[k]
+            arr === nothing && return nothing        # argument carries no fdata
+            reft = _optype(pir, a)
+            base = emit!(Expr(:call, getf, arr, QuoteNode(:ref)), reft)
+            # Shadow ref forces boundscheck `true`; primal ref keeps the primal's own.
+            return emit!(Expr(:call, Base.memoryrefnew, base, idx, shadow ? true : bc), reft)
+        end
+
         pb_fetch_shadow(@nospecialize a) =
             haskey(comms_val_id, (:shadow_ref, a)) ? comms_val_id[(:shadow_ref, a)] :
             haskey(comms_val_id, (:fshadow, a)) ? comms_val_id[(:fshadow, a)] :
-            error("Differ internal error: no shadow comms item for $(a) in block $(b) — its rule's " *
-                  "`builtin_rrule_comms` and its pullback disagree about what was recorded")
+            begin
+                rd = pb_rederive_ref(a, true)
+                rd === nothing ? error("Differ internal error: no shadow comms item for $(a) in " *
+                                       "block $(b) — its rule's `builtin_rrule_comms` and its " *
+                                       "pullback disagree about what was recorded") : rd
+            end
 
         # A literal/`GlobalRef` operand needs no comms item at all (`_calleeval` resolves it); an
         # `SSAValue`/`Argument` does, and `_calleeval` returns `nothing` for those. Erroring on that
@@ -2391,6 +2465,9 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         pb_presolve(@nospecialize a) = begin
             haskey(comms_val_id, (:primal, a)) && return comms_val_id[(:primal, a)]
             isa(a, Core.Argument) && return parg_pb[a.n]
+            # A statically-derivable primal `MemoryRef` handle is re-derived, not pushed.
+            rd = pb_rederive_ref(a, false)
+            rd === nothing || return rd
             v = _calleeval(a, iworld)
             (v === nothing && (isa(a, Core.SSAValue) || isa(a, Core.Argument))) &&
                 error("Differ internal error: no primal comms item for $(a) in block $(b) — a rule " *
@@ -2880,8 +2957,12 @@ end
 # anything, the singleton instance for the rest (a `SingletonStack` has no fields and stores nothing).
 function _fresh_tape_expr(@nospecialize(TapeT))
     CS = TapeT.parameters[2]
-    slots = Any[:($S()) for S in CS.parameters]
-    return :($TapeT($(Stack{Int32})(), ($(slots...),), $(Vector{Any})()))
+    # Construct each comms stack slot: `SingletonStack`/`CommsCell` take no args (`%new`);
+    # `Stack{T}` takes a capacity (pre-size to 1 so a single push is always in-bounds).
+    slots = Any[S <: SingletonStack ? :($S()) :
+                S <: CommsCell ? :($S()) :
+                :($S(1)) for S in CS.parameters]
+    return :($TapeT($(Stack{Int32})(1), ($(slots...),), $(Vector{Any})()))
 end
 
 function refresh_build_tape()

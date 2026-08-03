@@ -14,6 +14,9 @@ mutable struct Stack{T}
     const memory::Vector{T}
     position::Int
     Stack{T}() where {T} = new{T}(Vector{T}(undef, 0), 0)
+    # Pre-allocated capacity: keeps the first `n` pushes on the in-bounds branch so LLVM can fold
+    # the boundscheck away when the stack is pre-sized (used by `_fresh_tape_expr`).
+    Stack{T}(n::Int) where {T} = new{T}(Vector{T}(undef, n), 0)
 end
 
 _copy(::Stack{T}) where {T} = Stack{T}()
@@ -25,7 +28,9 @@ _copy(::Stack{T}) where {T} = Stack{T}()
 # implicit `using Base` binding, which `Core.Compiler.verify_ir` rejects as an "unbound or
 # partitioned GlobalRef ... in value position" once re-embedded in the carrier's own compiled unit
 # (see the same hazard documented in `reverse_interp.jl`, for hand rules). Naming `Base` explicitly
-# makes it a genuine bound cross-module reference that survives inlining.
+# makes it a genuine bound cross-module reference that survives inlining. Keeping the grow call
+# inlineable lets `ssa_inlining_pass!` fold `Stack.push!` into the carrier so LLVM can eliminate the
+# grow path when the stack is pre-sized (`_fresh_tape_expr` pre-allocates capacity 1 per slot).
 @inline function Base.push!(x::Stack{T}, val::T) where {T}
     position = x.position + 1
     memory = x.memory
@@ -33,7 +38,7 @@ _copy(::Stack{T}) where {T} = Stack{T}()
     if position <= length(memory)
         @inbounds memory[position] = val
     else
-        @noinline Base.push!(memory, val)
+        Base.push!(memory, val)
     end
     return nothing
 end
@@ -80,3 +85,19 @@ struct SingletonStack{T} end
 
 Base.push!(::SingletonStack, ::Any) = nothing
 Base.pop!(::SingletonStack{T}) where {T} = T.instance
+
+# ===========================================================================
+# `CommsCell{T}` — single-slot holder for a non-loop block whose comms tuple is `isbits`.
+#
+# Fully-unrolled static stack: no `position`, no `push!`/`pop!`, no boundscheck. The transform emits
+# the read/write of `val` directly into the carrier IR (`setfield!` on push, `getfield` on pop). When
+# `T` is `isbits` the cell is `isbits` — inline in the tape's comms tuple, no heap object, no write
+# barrier.
+#
+# Selected only when the block is not in any loop (`_loop_blocks`) and `isbitstype(CommsT)`; a loop
+# block or non-`isbits` tuple keeps `Stack{T}`, an empty tuple uses `SingletonStack`.
+# ===========================================================================
+mutable struct CommsCell{T}
+    val::T
+    CommsCell{T}() where {T} = new{T}()
+end

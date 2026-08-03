@@ -447,15 +447,15 @@ end
     @test xs == [1.0, 2.0, 3.0, 4.0]
     check_stack_balance(bulk_shift!, xs, 5.0)
 
-    # NEGATIVE: straight-line stores must *not* go bulk — copying a whole array to save two elements
-    # would be a pessimization, so the loop gate is what keeps them on the per-element scheme. This
-    # asserts the gate itself, via the tape still carrying the primal `MemoryRef`/old-value pair.
+    # Straight-line stores stay on the per-element scheme (not bulk), but their `MemoryRef`
+    # handles are re-derived in the pullback rather than pushed — so no comms tuple for
+    # `straightline!` contains a GC-tracked `MemoryRef`.
     straightline!(v::Vector{Float64}, a::Float64) = (v[1] = a; v[2] = 2a; v[1] + v[2])
     vsl = [1.0, 2.0]
     _, _, dasl = gradient(straightline!, vsl, 4.0)
     @test dasl ≈ 3.0
     @test vsl == [1.0, 2.0]
-    @test any(T -> T <: Tuple && any(F -> F <: MemoryRef, fieldtypes(T)) && Float64 in fieldtypes(T),
+    @test all(T -> !(T <: Tuple) || all(F -> !(F <: MemoryRef), fieldtypes(T)),
               check_tape_size(straightline!, (Vector{Float64}, Float64)))
 
     # NEGATIVE, and the one that discriminates a correct implementation from a plausible-looking
