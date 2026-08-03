@@ -662,7 +662,8 @@ end
 # predecessor `p` pushes anyway (because *another* successor of `p` is ambiguous), `b` must still pop
 # to keep the stack balanced, even though its own arrival is individually unambiguous.
 # ===========================================================================
-function _unique_predecessor_info(pir, exit_blocks::Vector{Int})
+function _unique_predecessor_info(pir, exit_blocks::Vector{Int}, unreachable::AbstractVector{Bool},
+                                  block_comms_nodes::Vector{Vector{Any}})
     nblocks = length(pir.cfg.blocks)
     preds = [filter(!=(0), pir.cfg.blocks[b].preds) for b in 1:nblocks]
     succs = [pir.cfg.blocks[b].succs for b in 1:nblocks]
@@ -676,14 +677,121 @@ function _unique_predecessor_info(pir, exit_blocks::Vector{Int})
     # unique predecessor of "the pullback's entry routing" even though `succs[b]` is empty for it.
     length(exit_blocks) == 1 && (is_unique_pred[only(exit_blocks)] = true)
 
+    # Collapsible regions (the `@boundscheck` diamond — see `_collapsible_regions`): none of a
+    # region's blocks (entry `br`, interior `chk`/`pass`) need to push, exactly as if their
+    # ambiguous successor were unique — nothing downstream can ever need to know whether the direct
+    # or the checked edge into `merge` ran. `chk`/`pass` fail the plain test above for the same
+    # reason `br` does (their only real successor besides a dead end is the still-ambiguous
+    # `merge`), so all of `quiet` needs forcing, not just `br`.
+    regions, quiet = _collapsible_regions(pir, unreachable, block_comms_nodes)
+    for b in quiet
+        is_unique_pred[b] = true
+    end
+
     pred_is_unique_pred = falses(nblocks)
     for b in 1:nblocks
         pred_is_unique_pred[b] = length(preds[b]) == 1 && is_unique_pred[only(preds[b])]
     end
     # The entry block has no real predecessor (only ever entered one way: the function is called).
     pred_is_unique_pred[1] = isempty(preds[1])
+    # A collapsible region's `merge` block has two real predecessors, so the generic formula above
+    # never marks it — force it directly: `reverse_pullback_to_ircode` routes it through the
+    # canonical `br` alone (see `regions`), so nothing is ever popped on its behalf either.
+    for merge in keys(regions)
+        pred_is_unique_pred[merge] = true
+    end
 
-    return is_unique_pred, pred_is_unique_pred
+    return is_unique_pred, pred_is_unique_pred, regions
+end
+
+# ===========================================================================
+# Collapsible regions: extends the unique-predecessor optimization above from a single edge to a
+# whole comms-free sub-region. The fixed shape Julia's `@boundscheck` lowering produces around
+# every `getindex`/`setindex!` is exactly this: an entry block `br` branches to `{merge, chk}` (the
+# "skip the check" vs "run the check" edge); `chk` is a single-predecessor, comms-free block that
+# itself branches to `{thrw, onward}` (checked-fail vs checked-pass), where `onward` reaches `merge`
+# either directly or through a linear chain of further single-predecessor, single-successor,
+# comms-free pass-through blocks (`setindex!`'s lowering reaches `merge` directly; `getindex`'s adds
+# one or two trivial routing blocks in between — a bare `goto` / a placeholder `nothing` statement,
+# nothing that carries a value); `thrw` is an `_unreachable_blocks` dead end (an `invoke
+# Base.throw_boundserror` that never returns). Since `chk` and every chain block push nothing onto
+# any comms stack (checked below via `block_comms_nodes`, never assumed) and `merge` has no leading
+# `PhiNode` (checked below too — nothing differs by which edge was actually taken, both arms compute
+# the same statements), the pullback never needs to know whether the forwards pass took the direct
+# `br`→`merge` edge or the checked detour through the chain: replaying `merge` in reverse and always
+# routing back through `br` directly reaches the correct upstream state either way, and the chain's
+# own (empty) reverse processing is safe to skip outright.
+#
+# Deliberately narrow (a linear, comms-free chain with no branching of its own) rather than a
+# general dominance/SESE analysis — this exact shape (plus however many trivial routing blocks the
+# optimizer happens to leave in the chain) is what every array index produces, and anything that
+# doesn't match it byte-for-byte falls through to the ordinary (still correct, just not free)
+# unique-predecessor handling above — never guess. Returns `(merges, quiet)`: `merges` is
+# a `Dict{Int,Int}` mapping a collapsible `merge` block to its canonical entry `br`; `quiet` is the
+# `Set{Int}` of every block in every matched region (`br` plus its interior `chk`/`pass`) that must
+# stop pushing onto the block stack.
+# ===========================================================================
+function _collapsible_regions(pir, unreachable::AbstractVector{Bool},
+                              block_comms_nodes::Vector{Vector{Any}})
+    nblocks = length(pir.cfg.blocks)
+    preds = [filter(!=(0), pir.cfg.blocks[b].preds) for b in 1:nblocks]
+    succs = [pir.cfg.blocks[b].succs for b in 1:nblocks]
+    comms_free(b) = isempty(block_comms_nodes[b])
+    dead_end(b) = unreachable[b] && isempty(succs[b])
+    solo_pred(b, from) = length(preds[b]) == 1 && only(preds[b]) == from
+    no_leading_phi(b) = !isa(pir.stmts[pir.cfg.blocks[b].stmts.start][:stmt], Core.PhiNode)
+    # `merge`'s full predecessor set must reduce to exactly `{br, exitb}` — no third, unrelated edge
+    # feeding it from elsewhere — and it must be a genuine reachable block, not itself a dead end.
+    closes_at(merge, br, exitb) = !unreachable[merge] && no_leading_phi(merge) &&
+                                  Set(preds[merge]) == Set((br, exitb))
+
+    # Does `chk` (the "run the check" arm out of `br`) lead only to `merge` (directly, or via a
+    # linear chain of further comms-free pass-through blocks) and a throw dead end, with nothing of
+    # its own — or the chain's — to communicate back? Returns the interior block list
+    # (`[chk]`, `[chk, pass1]`, `[chk, pass1, pass2]`, ...) on a match, `nothing` otherwise.
+    function matches_check(br, chk, merge)
+        (solo_pred(chk, br) && comms_free(chk) && length(succs[chk]) == 2) || return nothing
+        for (thrw, onward) in ((succs[chk][1], succs[chk][2]), (succs[chk][2], succs[chk][1]))
+            dead_end(thrw) || continue
+            interior = [chk]
+            cur = onward
+            # Bounded by `nblocks`: a comms-free chain can't legitimately revisit a block (that
+            # would need a real loop back-edge, which fails `solo_pred` — this is just a hard stop
+            # against ever spinning on a shape this analysis didn't anticipate).
+            while cur != merge && length(interior) <= nblocks && solo_pred(cur, interior[end]) &&
+                  comms_free(cur) && length(succs[cur]) == 1
+                push!(interior, cur)
+                cur = only(succs[cur])
+            end
+            cur == merge && closes_at(merge, br, interior[end]) && return interior
+        end
+        return nothing
+    end
+
+    # `merges`: merge block -> canonical entry `br`, consumed by the pullback builder to route
+    # `merge`'s reverse-replay through `br` alone. `quiet`: every block in every matched region
+    # (`br` plus its interior `chk`/`pass`) that must stop pushing onto the block stack — not just
+    # `br` itself, since `chk`/`pass` independently fail the plain unique-predecessor test too (their
+    # only real successor besides the dead end is `merge`, whose predecessor count doesn't change
+    # just because we've decided to stop caring about it).
+    merges = Dict{Int,Int}()
+    quiet = Set{Int}()
+    for br in 1:nblocks
+        length(succs[br]) == 2 || continue
+        s1, s2 = succs[br]
+        s1 == s2 && continue
+        interior = matches_check(br, s1, s2)
+        merge = s2
+        if interior === nothing
+            interior = matches_check(br, s2, s1)
+            merge = s1
+        end
+        interior === nothing && continue
+        merges[merge] = br
+        push!(quiet, br)
+        union!(quiet, interior)
+    end
+    return merges, quiet
 end
 
 # Part 2 (read-only array indexing) static provenance analysis, extended by Part 3 (`src/CLAUDE.md`
@@ -1323,7 +1431,6 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                    "differentiate a function that never returns"
         return nothing
     end
-    is_unique_pred, _ = _unique_predecessor_info(pir, exit_blocks)
 
     # Carrier is `reverse_fwds_impl(fcd, ctx, argcds...)`: `params[2]` is `fcd`, `params[3]` is the
     # `ctx`, `params[4:end]` are the argument coduals. `codualparams`/`ArgsTT` are the *full* codual
@@ -1340,6 +1447,9 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     # they must agree exactly, since it decides which comms items exist.
     block_comms_nodes, block_comms_types, bulk_args = scan
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
+    # Needs `block_comms_nodes` (collapsible-region detection — see `_collapsible_regions`), hence
+    # computed after the scan above rather than before it as its Phase-D-only predecessor was.
+    is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, block_comms_nodes)
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = begin
@@ -1877,7 +1987,6 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                    "differentiate a function that never returns"
         return nothing
     end
-    _, pred_is_unique_pred = _unique_predecessor_info(pir, exit_blocks)
 
     params = impl_mi.specTypes.parameters
     TapeT = params[2]
@@ -1893,6 +2002,9 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # than per overwritten element. Derived inside the scan so both builders get it identically —
     # they must agree exactly, since it decides which comms items exist.
     block_comms_nodes, block_comms_types, bulk_args = scan
+    # Needs `block_comms_nodes` (collapsible-region detection — see `_collapsible_regions`), hence
+    # computed after the scan above rather than before it as its Phase-D-only predecessor was.
+    _, pred_is_unique_pred, regions = _unique_predecessor_info(pir, exit_blocks, unreachable_block, block_comms_nodes)
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
@@ -2350,6 +2462,11 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
 
         # (c) Leading PhiNodes: dereference+zero each accumulated rdata, then route per-predecessor.
         preds = filter(!=(0), pir.cfg.blocks[b].preds)
+        # Collapsible region (`_collapsible_regions`): `b` is a `merge` block whose real, ambiguous
+        # predecessor set is a comms-free `@boundscheck` diamond around one canonical entry. Route
+        # through that entry alone — `pred_is_unique_pred[b]` is forced `true` for exactly this case
+        # (`_unique_predecessor_info`), so `_emit_switch!` below never pops for it either.
+        haskey(regions, b) && (preds = [regions[b]])
         phi_acc = Any[]
         for i in lo:phi_end
             Ti = pstmts[i][:type]

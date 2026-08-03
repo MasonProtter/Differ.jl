@@ -47,6 +47,15 @@ include(joinpath(@__DIR__, "testutils.jl"))
     checkverify_rev(arr_idx_branch, (Vector{Float64}, Bool))
     checkverify_rev(arr_sum, (Vector{Float64},))
     check_stack_balance(arr_sum, [1.0, 2.0, 3.0])
+
+    # `_collapsible_regions`: a single fixed-index read is nothing but a `@boundscheck` diamond, so
+    # it collapses to zero block-stack traffic. `arr_idx_branch`'s merge point has a real `PhiNode`
+    # (it selects between two *different* values, `x[1]` vs `x[2]`) and `arr_sum`'s loop has a real
+    # back-edge — both must keep paying block-stack traffic, and this locks that in as a regression
+    # guard against the optimization over-firing.
+    check_block_stack_traffic(arr_idx3, x4; expect_zero=true)
+    check_block_stack_traffic(arr_idx_branch, x2, true; expect_zero=false)
+    check_block_stack_traffic(arr_sum, x3; expect_zero=false)
 end
 
 @testset "reverse mode: array mutation (memoryrefset!)" begin
@@ -65,6 +74,57 @@ end
 
     checkverify_rev(arr_mutate!, (Vector{Float64},))
     check_stack_balance(arr_mutate!, [1.0, 2.0])
+    check_block_stack_traffic(arr_mutate!, [1.0, 2.0]; expect_zero=true)
+end
+
+@testset "reverse mode: collapsible @boundscheck regions" begin
+    # The motivating case: a genuinely straight-line primal (no real branch or loop, just plain
+    # array reads/writes) whose `@boundscheck` diamonds — normally CFG-ambiguous, since `merge` has
+    # two real static predecessors, the direct "skip the check" edge and the checked "pass" edge —
+    # should all collapse away, per `_collapsible_regions` (`src/reverse_interp.jl`).
+    function straightline!(v::Vector{Float64}, a::Float64)
+        v[1] = a
+        v[2] = 2a
+        return v[1] + v[2]
+    end
+
+    v0 = [0.0, 0.0]
+    _, dv, da = gradient(straightline!, v0, 3.0)
+    @test dv == [0.0, 0.0]     # both elements overwritten before being read back — no dependence on v0
+    @test da == 3.0            # d/da (a + 2a) = 3
+
+    checkverify_rev(straightline!, (Vector{Float64}, Float64))
+    check_stack_balance(straightline!, [1.0, 2.0], 4.0)
+    check_block_stack_traffic(straightline!, [1.0, 2.0], 4.0; expect_zero=true)
+
+    # A loop over indices is a different source of ambiguity (a genuine back-edge, Phase B/D) and
+    # must keep paying block-stack traffic even though every individual access is still a collapsed
+    # `@boundscheck` diamond underneath — collapsing the diamonds must not be mistaken for
+    # collapsing the loop itself.
+    # `check_stack_balance`/`check_block_stack_traffic` seed the pullback with `one(primal(ycd))`,
+    # so — unlike `bench/workloads.jl`'s `nothing`-returning version — this one returns a value
+    # (ISSUES #51: a `Nothing`-returning primal isn't drivable through those helpers at all).
+    function vecloop!(v::Vector{Float64}, x::Float64)
+        for i in 1:length(v)
+            v[i] = x
+        end
+        return v[end]
+    end
+    checkverify_rev(vecloop!, (Vector{Float64}, Float64))
+    check_stack_balance(vecloop!, [1.0, 2.0, 3.0], 5.0)
+    check_block_stack_traffic(vecloop!, [1.0, 2.0, 3.0], 5.0; expect_zero=false)
+
+    # 2-D indexing: not required to collapse (out of scope for v1 — see `_collapsible_regions`'s
+    # docstring), but must still be correct either way.
+    function mat_mutate!(A::Matrix{Float64}, a::Float64)
+        A[1, 1] = a
+        return A[1, 1]
+    end
+    _, dA, dmat_a = gradient(mat_mutate!, zeros(2, 2), 3.0)
+    @test dA == [0.0 0.0; 0.0 0.0]
+    @test dmat_a == 1.0
+    checkverify_rev(mat_mutate!, (Matrix{Float64}, Float64))
+    check_stack_balance(mat_mutate!, zeros(2, 2), 3.0)
 end
 
 @testset "reverse mode: recursive calls with an array argument" begin

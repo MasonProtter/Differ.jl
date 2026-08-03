@@ -83,6 +83,24 @@ function check_stack_balance(f, args...)
     return nothing
 end
 
+# Collapsible-region optimization (`_collapsible_regions`, `src/reverse_interp.jl`): asserts whether
+# a fresh (non-preallocated) round trip ever actually grew the block stack's backing memory —
+# `length(pb.block_stack.memory)`, not `.position` (already asserted back to 0 by
+# `check_stack_balance`; a Stack never shrinks its backing `Vector`, so peak usage is what this
+# checks). `expect_zero=true` is the "genuinely straight-line, modulo `@boundscheck`" claim: every
+# array access in `f` collapsed to zero block-stack traffic. `expect_zero=false` documents the
+# opposite for a case that must keep paying it (a real data-dependent branch or loop) — passing
+# `false` here is itself a regression guard against the optimization over-firing.
+function check_block_stack_traffic(f, args...; expect_zero::Bool)
+    ctx = build_ctx(f, map(Differ._typeof, args); prealloc=false)
+    fcd, argcds = zero_fcodual(f), map(zero_fcodual, args)
+    ycd, pb = rrule!!(fcd, ctx, argcds...)
+    pb(one(Differ.primal(ycd)))
+    grew = length(pb.block_stack.memory) > 0
+    @test grew == !expect_zero
+    return nothing
+end
+
 # Tape size. Asserts on properties of the *whole* set of comms element types (their total size, and
 # whether they are all `isbits` — i.e. whether the comms stacks are flat buffers or GC-tracked ones
 # needing a write barrier per push), never on a particular block's index: block numbering shifts
