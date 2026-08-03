@@ -398,7 +398,7 @@ function lower_cfg_blocks_to_ir(blks::Vector{CFGBlock}, ir::CC.IRCode;
         Any[x.stmt for x in insts], Any[x.type for x in insts],
         CC.CallInfo[x.info for x in insts], lines, UInt32[x.flag for x in insts],
     )
-    return CC.IRCode(stream, cfg, debuginfo, Any[argtypes...], copy(ir.meta), copy(ir.sptypes))
+    return CC.IRCode(stream, cfg, debuginfo, Any[argtypes...], copy(ir.meta), copy(ir.sptypes), ir.valid_worlds)
 end
 
 """

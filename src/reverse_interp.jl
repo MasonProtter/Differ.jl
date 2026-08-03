@@ -1825,7 +1825,9 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     # `_impl_argtypes(impl_mi)`, which is what the bail path (`reverse_error_ircode`) uses.
     argtypes = Any[impl_mi.specTypes.parameters[1], impl_mi.specTypes.parameters[2],
                    impl_mi.specTypes.parameters[3], vararg_tt]
-    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[])
+    # `pir.valid_worlds`, not the constructor's unbounded default — see the matching comment in
+    # `forward_interp.jl`'s `dualize_to_ircode` and `cfg_ir.jl`'s `lower_cfg_blocks_to_ir`.
+    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[], pir.valid_worlds)
     CC.verify_ir(ir)
     return ir
 end

@@ -173,6 +173,18 @@ function CC.finishinfer!(me::CC.InferenceState, interp::ADInterpreter, cycleid::
                          opt_cache::IdDict{MethodInstance, CodeInstance})
     ir = build_contextual_ir(interp, me.linfo)
     if ir !== nothing
+        # `build_contextual_ir` builds `ir` via the 6-arg `CC.IRCode(...)` constructor, which
+        # defaults `valid_worlds` to the unbounded sentinel `WorldRange(0, typemax(UInt))`. That
+        # sentinel fails `abstract_eval_globalref_type`'s partition-coverage check
+        # (`Compiler/src/abstractinterpretation.jl`) for any `GlobalRef` whose binding partition
+        # doesn't itself span the full sentinel range — e.g. `Base.add_float` (an *imported*
+        # binding, pulled in when inlining primal library code like `increment!!`), whose partition
+        # starts at a finite world — so `argextype`/the IR pretty-printer mislabels those calls
+        # "dynamic" even though they're ordinary builtin/intrinsic calls. Fix by giving `ir` a real
+        # world range: `interp.world` onward, since every binding this IR references was already
+        # resolved successfully at that world.
+        ir = CC.IRCode(ir.stmts, ir.cfg, ir.debuginfo, ir.argtypes, ir.meta, ir.sptypes,
+                       CC.WorldRange(interp.world, typemax(UInt)))
         interp.transformed_ir[me.linfo] = ir
         me.bestguess = CC.compute_ir_rettype(ir)
         # Fold in whatever backedges the mode's transform discovered (e.g. the primal method(s) a

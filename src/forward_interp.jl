@@ -1458,7 +1458,13 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     di  = CC.DebugInfoStream(stream.line)
     di.def = impl_mi                                # required: Core.DebugInfo(di, n) does something(di.def)
     argtypes = Any[impl_mi.specTypes.parameters[1], vararg_tt]
-    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[])
+    # `pir.valid_worlds` (not the constructor's unbounded default): this IR mirrors `pir` statement
+    # for statement, so it's valid for exactly as long as `pir` is — see `cfg_ir.jl`'s
+    # `lower_cfg_blocks_to_ir`, which threads the same value through for the same reason. Leaving the
+    # default sentinel here makes `Base`-namespaced builtin/intrinsic `GlobalRef`s (pulled in by
+    # inlined primal library code) print as "dynamic" in the IR pretty-printer, even though they're
+    # ordinary static calls.
+    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[], pir.valid_worlds)
     CC.verify_ir(ir)                                # a failure here is a bug in this transform, not
                                                      # unsupported input IR — let it throw plainly
     return ir
