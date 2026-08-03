@@ -10,6 +10,7 @@ using SafeTestsets
 @safetestset "forward: closures & higher-order" begin include("test_forward_closures_higher_order.jl") end
 @safetestset "reverse: scalar & struct" begin include("test_reverse_scalar_struct.jl") end
 @safetestset "reverse: control flow" begin include("test_reverse_control_flow.jl") end
+@safetestset "reverse: block-stack push/edge split (ISSUES #52)" begin include("test_reverse_block_stack_split.jl") end
 @safetestset "reverse: dispatch & recursion" begin include("test_reverse_dispatch_recursion.jl") end
 @safetestset "reverse: arrays" begin include("test_reverse_arrays.jl") end
 @safetestset "reverse: mutation & aliasing" begin include("test_reverse_mutation_aliasing.jl") end

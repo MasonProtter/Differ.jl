@@ -688,12 +688,19 @@ function _unique_predecessor_info(pir, exit_blocks::Vector{Int}, unreachable::Ab
         is_unique_pred[b] = true
     end
 
+    # Per-edge pop (ISSUES #52): `b` pops iff it has multiple predecessors, each of which pushed on
+    # its edge into `b` so `b` can learn which one fired. A single-predecessor block's sole
+    # predecessor pushes *only* if `b` is ambiguous -- but `b` having a single predecessor means it
+    # is not ambiguous, so that predecessor never pushes on the edge into `b`, and `b` must not pop
+    # either. (The old formula `length(preds[b])==1 && is_unique_pred[only(preds[b])]` popped for
+    # *balance* whenever the sole predecessor pushed for some *other* successor; that balance was
+    # only needed because the forwards push was per-block. `_split_ambiguous_block_pushes` makes the
+    # push per-edge, so the balance-pop is gone -- the two changes are coupled, see #52.) The entry
+    # block's 0-predecessor case is covered directly by `<= 1`.
     pred_is_unique_pred = falses(nblocks)
     for b in 1:nblocks
-        pred_is_unique_pred[b] = length(preds[b]) == 1 && is_unique_pred[only(preds[b])]
+        pred_is_unique_pred[b] = length(preds[b]) <= 1
     end
-    # The entry block has no real predecessor (only ever entered one way: the function is called).
-    pred_is_unique_pred[1] = isempty(preds[1])
     # A collapsible region's `merge` block has two real predecessors, so the generic formula above
     # never marks it — force it directly: `reverse_pullback_to_ircode` routes it through the
     # canonical `br` alone (see `regions`), so nothing is ever popped on its behalf either.
@@ -792,6 +799,136 @@ function _collapsible_regions(pir, unreachable::AbstractVector{Bool},
         union!(quiet, interior)
     end
     return merges, quiet
+end
+
+# ===========================================================================
+# ISSUES #52: split a block's stack push per *edge* rather than per *block*.
+#
+# `is_unique_pred[b] == false` makes `emit_epilogue!` push block `b`'s number unconditionally, but a
+# `GotoIfNot` with one unambiguous arm (unique predecessor) and one ambiguous arm (multiple
+# predecessors) only ever needs the push on the ambiguous arm — the unambiguous arm's target never
+# pops it. This is a post-processing pass over the already-built fwds-carrier `ir`: relocate the push
+# into a new relay block reached only via the ambiguous arm, using the `ID`/`CFGBlock` working-IR
+# layer (`cfg_ir.jl`) the pullback pass already uses for its own extra routing blocks.
+#
+# Redirecting one arm through a relay changes the ambiguous target's *real* predecessor from `b` to
+# the relay — any `PhiNode` there still names `b`, so its `edges` must be patched to match, or the
+# result miscompiles (a stale edge reference is not something `verify_ir`/codegen catch on their own:
+# the block number the edge resolves to still exists, it just now names the wrong predecessor).
+# ===========================================================================
+
+"""
+    _is_expected_block_push(inst::CC.NewInstruction, b::Int)::Bool
+
+`true` iff `inst` is exactly the block-stack push `emit_epilogue!` emits for block `b`
+(`push!(block_stack, Int32(b))`, as a `:call` or a resolved `:invoke`) — the shape
+`_split_ambiguous_block_pushes` expects at `blks[b].insts[end-1]`.
+"""
+function _is_expected_block_push(inst::CC.NewInstruction, b::Int)::Bool
+    s = inst.stmt
+    isa(s, Expr) || return false
+    if s.head === :invoke
+        length(s.args) == 4 || return false
+        callee, args = s.args[2], s.args[3:4]
+    elseif s.head === :call
+        length(s.args) == 3 || return false
+        callee, args = s.args[1], s.args[2:3]
+    else
+        return false
+    end
+    return callee === Base.push! && args[2] === Int32(b)
+end
+
+"""
+    _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool})::CC.IRCode
+
+Post-processes the already-built forwards-carrier `ir` (still 1:1 in block topology with the primal
+`pir`) so a block with a `GotoIfNot` terminator where exactly one arm is ambiguous no longer pushes
+its block number on the unambiguous arm. Three stages: classify candidates in primal block-number
+space (Stage 0), splice a relay block per candidate plus fix up any `PhiNode` edge the redirect
+disturbs (Stage 1), reassemble and lower back to a real `IRCode` (Stage 2). Returns `ir` unchanged
+(no round trip through the `cfg_ir.jl` layer at all) when there is nothing to split.
+"""
+function _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool})::CC.IRCode
+    nblocks = length(pir.cfg.blocks)
+
+    # Stage 0: classify, in primal block-number space — no IR construction yet.
+    candidates = Tuple{Int,Symbol,Int}[]   # (b, :dest|:fallthrough, ambiguous target block number)
+    for b in 1:(nblocks - 1)
+        is_unique_pred[b] && continue
+        term = pir.stmts[pir.cfg.blocks[b].stmts.stop][:stmt]
+        isa(term, Core.GotoIfNot) || continue    # the only 2-successor terminator kind in primal IR
+        dest, fall = Int(term.dest), b + 1
+        npd = length(filter(!=(0), pir.cfg.blocks[dest].preds))
+        npf = length(filter(!=(0), pir.cfg.blocks[fall].preds))
+        if npd > 1 && npf > 1
+            continue                              # both already ambiguous — nothing to split off
+        elseif npd > 1
+            push!(candidates, (b, :dest, dest))
+        elseif npf > 1
+            push!(candidates, (b, :fallthrough, fall))
+        end
+        # else: neither ambiguous — contradicts `!is_unique_pred[b]`; skip defensively.
+    end
+    isempty(candidates) && return ir
+
+    # Stage 1: surgery + PhiNode fixup.
+    blks = _ircode_to_cfg_blocks(ir)          # blks[b] is primal block b — order-preserving
+
+    rewritten = Dict{Int,CFGBlock}()          # b -> its push-stripped (maybe re-terminated) block
+    append_relays = CFGBlock[]                # `:dest` relays — appended at the very end
+    insert_after = Dict{Int,CFGBlock}()       # b -> its `:fallthrough` relay, inserted right after b
+    phi_fixups = Tuple{Int,ID,ID}[]           # (target block#, old pred ID, relay ID) — pre-mutation
+
+    for (b, side, target) in candidates
+        blk = blks[b]
+        length(blk) >= 2 ||
+            error("Differ internal error: block $b has no room for the block-stack push expected " *
+                  "by _split_ambiguous_block_pushes")
+        push_id, push_inst = blk.inst_ids[end - 1], blk.insts[end - 1]
+        _is_expected_block_push(push_inst, b) ||
+            error("Differ internal error: expected a block-stack push as the second-to-last " *
+                  "instruction of block $b, found `$(push_inst.stmt)`")
+
+        relay_id = ID()
+        relay = CFGBlock(relay_id, [push_id, ID()],
+                         CC.NewInstruction[push_inst, new_inst(IDGotoNode(blks[target].id), Any)])
+
+        term_id, term_inst = blk.inst_ids[end], blk.insts[end]
+        if side === :dest
+            old_term = term_inst.stmt::IDGotoIfNot
+            new_term = CC.NewInstruction(term_inst; stmt=IDGotoIfNot(old_term.cond, relay_id))
+            push!(append_relays, relay)
+        else
+            new_term = term_inst              # dest untouched — only the implicit fallthrough moves
+            insert_after[b] = relay
+        end
+        rewritten[b] = CFGBlock(blk.id, vcat(blk.inst_ids[1:(end - 2)], term_id),
+                                vcat(blk.insts[1:(end - 2)], new_term))
+        push!(phi_fixups, (target, blk.id, relay_id))
+    end
+
+    # Applied in one dedicated pass, over the pre-mutation candidate list, so a target block number
+    # being before or after `b` (a loop back-edge target has a *lower* number) can't cause ordering
+    # or aliasing bugs.
+    for (target, old_id, relay_id) in phi_fixups
+        _, phis = phi_nodes(blks[target])
+        for phi_inst in phis
+            phi = phi_inst.stmt::IDPhiNode
+            for j in eachindex(phi.edges)
+                phi.edges[j] == old_id && (phi.edges[j] = relay_id)
+            end
+        end
+    end
+
+    # Stage 2: reassemble in primal block order, then lower back to a real IRCode.
+    final = CFGBlock[]
+    for b in 1:nblocks
+        push!(final, get(rewritten, b, blks[b]))
+        haskey(insert_after, b) && push!(final, insert_after[b])
+    end
+    append!(final, append_relays)
+    return lower_cfg_blocks_to_ir(final, ir)
 end
 
 # Part 2 (read-only array indexing) static provenance analysis, extended by Part 3 (`src/CLAUDE.md`
@@ -1938,6 +2075,13 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     # `pir.valid_worlds`, not the constructor's unbounded default — see the matching comment in
     # `forward_interp.jl`'s `dualize_to_ircode` and `cfg_ir.jl`'s `lower_cfg_blocks_to_ir`.
     ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[], pir.valid_worlds)
+    # `_split_ambiguous_block_pushes` (ISSUES #52): relocate the per-block block-stack push onto
+    # only the ambiguous arm of a mixed `GotoIfNot` (one ambiguous + one unambiguous successor), so
+    # the forwards push becomes per-edge. This is the companion to the per-edge `pred_is_unique_pred`
+    # formula above: with the push now per-edge, the pullback must stop balance-popping single-pred
+    # successors (`pred_is_unique_pred[b] = length(preds[b]) <= 1`), which it now does. The two
+    # changes are coupled -- neither is correct alone. See ISSUES.md #52.
+    ir = _split_ambiguous_block_pushes(ir, pir, is_unique_pred)
     CC.verify_ir(ir)
     return ir
 end
@@ -2565,11 +2709,15 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     return ir2
 end
 
-# Emits a plain goto (`skip_pop`, or a lone predecessor with nothing pushed for it to consume — see
-# `_unique_predecessor_info`) or `pop!(block_stack)` followed by either a plain goto (a single
-# candidate — the pop is still needed here purely for stack balance, since *some* predecessor pushed
-# unconditionally) or a `Switch` comparing the popped id against each candidate (`preds[1:end-1]`),
-# falling through to `preds[end]`.
+# Emits a plain goto (`skip_pop`, the only path a single-predecessor block ever takes under
+# the per-edge formula — ISSUES #52) or `pop!(block_stack)` followed by a `Switch` comparing the
+# popped id against each candidate (`preds[1:end-1]`), falling through to `preds[end]`.
+#
+# The `length(preds) == 1` branch below is now dead code: with `pred_is_unique_pred[b] =
+# length(preds[b]) <= 1`, every single-predecessor block has `skip_pop == true` and returns early
+# above. It's kept as a defensive no-op rather than removed, because the old per-block world needed
+# it (a sole predecessor that pushed for *another* successor required a balance-pop here). Do not
+# rely on it without confirming the per-edge formula is live.
 function _emit_switch!(emit!, icall, block_stack_id, preds::Vector{Int}, targets::Vector{ID};
                        skip_pop::Bool=false)
     if skip_pop
@@ -2579,6 +2727,7 @@ function _emit_switch!(emit!, icall, block_stack_id, preds::Vector{Int}, targets
     end
     prev_id = emit!(icall(__pop_blk_stack!, (Stack{Int32},), block_stack_id), Int32)
     if length(preds) == 1
+        # Dead under the per-edge formula (see above) — defensive balance-pop, kept for safety.
         emit!(IDGotoNode(targets[1]), Any)
         return nothing
     end
