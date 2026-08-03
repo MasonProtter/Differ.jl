@@ -983,7 +983,17 @@ end
 
 Set `x` to its zero element (`x` should be a tangent, so the zero must exist).
 """
-set_to_zero!!(x) = set_to_zero!!(x, require_tangent_cache(typeof(x)))
+# `set_to_zero!!` uses a more permissive cache decision than `require_tangent_cache`:
+# zeroing is idempotent, so the `Vector{UInt}` visited-cache is only a perf optimization
+# (skips re-zeroing aliased mutable subtrees), never needed for correctness. `increment!!`
+# shares `require_tangent_cache` and does need the `IdDict` cache (it double-counts on
+# aliasing). Skip the per-call `Vector{UInt}()` allocation whenever the tangent's reachable
+# substructure has no `MutableTangent` — i.e. a `MutableTangent{Tfields}` with isbits `Tfields`.
+@inline _set_to_zero_cache(::Type{MutableTangent{Tfields}}) where {Tfields<:NamedTuple} =
+    Val{!isbitstype(Tfields)}()
+@inline _set_to_zero_cache(@nospecialize T) = require_tangent_cache(T)
+
+set_to_zero!!(x) = set_to_zero!!(x, _set_to_zero_cache(typeof(x)))
 set_to_zero!!(x, ::Val{true}) = set_to_zero_internal!!(Vector{UInt}(), x)
 set_to_zero!!(x, ::Val{false}) = set_to_zero_internal!!(NoCache(), x)
 

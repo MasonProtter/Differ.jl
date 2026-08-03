@@ -83,6 +83,35 @@ _bi_fieldname(@nospecialize(node)) = isa(node, QuoteNode) ? node.value : node
 @noinline _rr_zero_tangent2(p, f) = zero_tangent(p, f)
 @noinline _rr_build_tangent(::Type{P}, fields...) where {P} = build_tangent(P, fields...)
 
+# Direct-emission fast paths for `get_tangent_field`/`set_tangent_field!`, the reverse-mode
+# analogue of forward mode's `_tangent_field_slot` (`src/builtins.jl`). The `@noinline`
+# `_rr_*` barriers above are required because `CC.ssa_inlining_pass!` mis-optimises their
+# inlined bodies inside a carrier (inlining silently drops the gradient; `verify_ir` still
+# passes). For the common case — a concrete struct whose `MutableTangent` field is *not* a
+# `PossiblyUninitTangent` — the equivalent instructions can be emitted directly with qualified
+# `Core` GlobalRefs (`_getfieldg`/`_setfieldg`), dropping the per-iteration `:invoke`.
+# `_tangent_field_slot(P, name)` returns `(NT, fi)` for that case and `nothing` otherwise,
+# routing the latter back to the `_rr_*` barrier.
+
+# `getfield(getfield(mt, :fields), fi)`; `PossiblyUninitTangent` slots go through the barrier.
+function _emit_gtf!(ctx, mt, slot)
+    NT, fi = slot
+    fnt = ctx.emit!(Expr(:call, _getfieldg, mt, QuoteNode(:fields)), NT)
+    return ctx.emit!(Expr(:call, _getfieldg, fnt, fi), fieldtype(NT, fi))
+end
+
+# Rebuild `mt.fields` with slot `fi` set to `val`, then `setfield!` it back — what
+# `set_tangent_field!` compiles to.
+function _emit_stf!(ctx, mt, slot, val)
+    NT, fi = slot
+    old = ctx.emit!(Expr(:call, _getfieldg, mt, QuoteNode(:fields)), NT)
+    slots = Any[j == fi ? val : ctx.emit!(Expr(:call, _getfieldg, old, j), fieldtype(NT, j))
+                for j in 1:fieldcount(NT)]
+    nt = ctx.emit!(Expr(:new, NT, slots...), NT)
+    ctx.emit!(Expr(:call, _setfieldg, mt, QuoteNode(:fields), nt), NT)
+    return nothing
+end
+
 # `rdata` of a tangent, emitted only when it actually does something. `rdata` is the identity
 # whenever the tangent type *is* its own rdata type (every bits scalar — `Float64`, an isbits
 # struct), and the constant `NoRData()` whenever there is no rdata at all. Both are the common case
@@ -226,8 +255,21 @@ function apply_builtin_rrule!(::Val{Core.getfield}, actual, Ti, ctx)
     # is `zero_like_rdata_type(P)`, not `rdtype(P)`, whenever `obj`'s own primal type isn't concrete.
     if ismutabletype(P)
         mt = ctx.fetch_shadow(obj)
-        ctx.emit!(ctx.icall(_rr_increment_field_rdata!, (fdtype(P), zero_like_rdata_type(_widen(Ti)), idxty),
-                            mt, acc, idxval), fdtype(P))
+        slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(P, actual[2]) : nothing
+        if slot !== nothing
+            # `increment_field_rdata!` is `set_tangent_field!(dx, f, increment_rdata!!(get_tangent_field(dx, f), acc))`;
+            # emit the read/write directly. `increment_rdata!!` inlines safely for a scalar field —
+            # it touches no `MutableTangent.fields` rebuild, the construct the `_rr_*` barriers protect.
+            TFslot = fieldtype(slot[1], slot[2])
+            RTcur = zero_like_rdata_type(_widen(Ti))
+            cur = _emit_gtf!(ctx, mt, slot)
+            cur_rdata = _emit_rdata!(ctx, TFslot, RTcur, cur)
+            new = ctx.emit!(ctx.icall(increment_rdata!!, (TFslot, RTcur), cur_rdata, acc), TFslot)
+            _emit_stf!(ctx, mt, slot, new)
+        else
+            ctx.emit!(ctx.icall(_rr_increment_field_rdata!, (fdtype(P), zero_like_rdata_type(_widen(Ti)), idxty),
+                                mt, acc, idxval), fdtype(P))
+        end
     else
         target = ctx.ref_for(obj)
         if target !== nothing
@@ -427,16 +469,30 @@ function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
     old_primal = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(obj), name_node), Ti)
     fname = _bi_fieldname(name_node)
     fieldidx = fname isa Symbol ? findfirst(==(fname), fieldnames(P)) : fname
-    old_tangent = ctx.icall!(_rr_get_tangent_field, TF, (fdtype(P), Int), mt, fieldidx)
-    # The field's new tangent: `zero_tangent(p, f)` embeds `f` (the assigned value's own fdata)
-    # directly rather than fabricating a fresh zero when the field carries fdata — that embedding
-    # *is* the alias that makes later in-place accumulation into this field flow straight into the
-    # assigned value's own shadow. `f = NoFData()` for a pure-rdata field collapses this back to the
-    # original fresh-zero behavior (`zero_tangent(p, ::NoFData) = zero_tangent(p)`).
     FTi = fdtype(Ti)
-    fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
-    zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTi), ctx.presolve(val_node), fdata_val)
-    ctx.icall!(_rr_set_tangent_field!, TF, (fdtype(P), Int, TF), mt, fieldidx, zt)
+    slot = _tangent_field_slot(P, name_node)
+    if slot !== nothing
+        # Emit the field read/write directly instead of the `_rr_*` `:invoke` barriers.
+        # New field tangent is `zero_tangent(p, f)`; for a pure-rdata IEEEFloat field this is `zero(TF)`.
+        old_tangent = _emit_gtf!(ctx, mt, slot)
+        if FTi === NoFData && TF <: IEEEFloat
+            zt = ctx.emit!(zero(TF), TF)
+        else
+            fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
+            zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTi), ctx.presolve(val_node), fdata_val)
+        end
+        _emit_stf!(ctx, mt, slot, zt)
+    else
+        old_tangent = ctx.icall!(_rr_get_tangent_field, TF, (fdtype(P), Int), mt, fieldidx)
+        # The field's new tangent: `zero_tangent(p, f)` embeds `f` (the assigned value's own fdata)
+        # directly rather than fabricating a fresh zero when the field carries fdata — that embedding
+        # *is* the alias that makes later in-place accumulation into this field flow straight into the
+        # assigned value's own shadow. `f = NoFData()` for a pure-rdata field collapses this back to the
+        # original fresh-zero behavior (`zero_tangent(p, ::NoFData) = zero_tangent(p)`).
+        fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
+        zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTi), ctx.presolve(val_node), fdata_val)
+        ctx.icall!(_rr_set_tangent_field!, TF, (fdtype(P), Int, TF), mt, fieldidx, zt)
+    end
     p = ctx.emit!(Expr(:call, _setfieldg, ctx.presolve(obj), name_node, ctx.presolve(val_node)), Ti)
     saved = Dict{Any,Any}((:old_primal, ctx.ssa) => old_primal, (:old_tangent, ctx.ssa) => old_tangent)
     return p, nothing, saved
@@ -462,11 +518,21 @@ function apply_builtin_rrule!(::Val{Core.setfield!}, actual, Ti, ctx)
     # wider) `RT` is harmless.
     RT = zero_like_rdata_type(_widen(Ti))
     acc = ctx.deref_and_zero!(Ti)
-    cur_tangent = ctx.emit!(ctx.icall(_rr_get_tangent_field, (fdtype(P), Int), mt, fieldidx), TF)
+    slot = _tangent_field_slot(P, name_node)
+    if slot !== nothing
+        # Emit the read, rdata extract, increment, and restore directly, avoiding the `_rr_*` barriers.
+        cur_tangent = _emit_gtf!(ctx, mt, slot)
+    else
+        cur_tangent = ctx.emit!(ctx.icall(_rr_get_tangent_field, (fdtype(P), Int), mt, fieldidx), TF)
+    end
     cur_rdata = _emit_rdata!(ctx, TF, RT, cur_tangent)
     new_dx = ctx.emit!(ctx.icall(increment!!, (RT, RT), acc, cur_rdata), RT)
     ctx.emit!(Expr(:call, _setfieldg, primal_obj, name_node, old_primal), Any)
-    ctx.emit!(ctx.icall(_rr_set_tangent_field!, (fdtype(P), Int, TF), mt, fieldidx, old_tangent), TF)
+    if slot !== nothing
+        _emit_stf!(ctx, mt, slot, old_tangent)
+    else
+        ctx.emit!(ctx.icall(_rr_set_tangent_field!, (fdtype(P), Int, TF), mt, fieldidx, old_tangent), TF)
+    end
     return ntuple(j -> j == 3 ? new_dx : nothing, length(actual))
 end
 

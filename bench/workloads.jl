@@ -170,10 +170,10 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
     # `memoryrefnew`, with no `Array.ref` hop. It returns `nothing`, so it is seeded with `NoRData()`
     # directly rather than through `value_and_gradient!`, which needs a scalar return (ISSUES #51).
 
-    # The same call through a fresh-tape `Ctx()` — what plain `gradient` uses, and what every
-    # recursive inner call uses. It allocates by construction (a tape per call), and bulk save adds
-    # one buffer allocation per call on top, so this is the workload that keeps that cost visible
-    # instead of hiding it behind the pre-allocated path.
+    # The same call through a pre-allocated `build_ctx` tape — what every recursive inner call uses
+    # once warmed. The setup warm-up call grows the comms stacks to steady-state capacity (one slot
+    # per loop iteration) so a measured call reuses them rather than paying for `push!` growth, which
+    # is the same shape `vecloop!`/`wrloop`/`structloop` below all use.
     let k = "memloop! Memory[$N]"
         suite[k] = @benchmarkable(
             begin
@@ -189,10 +189,11 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 xcd = zero_fcodual(3.0);
                 ncd = zero_fcodual($N)
                 ctx = build_ctx(memloop!, (Memory{Float64}, Float64, Int))
+                y0, pb0 = rrule!!(fcd, ctx, ocd, xcd, ncd); pb0(NoRData())
             end)
         meta[k] = WorkloadMeta(memloop!, (Memory{Float64}, Float64, Int), :mutation,
-                               "same call on a fresh `Ctx()` tape: allocates by construction; keeps " *
-                               "the per-call cost of bulk save's buffer visible")
+                               "cleanest array-mutation shape: ref chain rooted directly at the " *
+                               "argument via 1-arg `memoryrefnew`, no `Array.ref` hop")
         # Same primal as the pre-allocated row above, measured again rather than shared: the two
         # figures landing on the same number is a free check on the run's noise floor.
         primal!(suite, meta, k, @benchmarkable(
