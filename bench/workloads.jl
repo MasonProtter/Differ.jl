@@ -177,7 +177,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
     let k = "memloop! Memory[$N]"
         suite[k] = @benchmarkable(
             begin
-                ocd.dx .= 0
+                fill!(ocd.dx, 0.0)
                 y, pb = rrule!!(fcd, ctx, ocd, xcd, ncd)
                 pb(NoRData())
             end,
@@ -188,8 +188,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 fcd = zero_fcodual(memloop!)
                 xcd = zero_fcodual(3.0);
                 ncd = zero_fcodual($N)
-                ctx = Ctx()
-                y0, pb0 = rrule!!(fcd, ctx, ocd, xcd, ncd); pb0(NoRData())
+                ctx = build_ctx(memloop!, (Memory{Float64}, Float64, Int))
             end)
         meta[k] = WorkloadMeta(memloop!, (Memory{Float64}, Float64, Int), :mutation,
                                "same call on a fresh `Ctx()` tape: allocates by construction; keeps " *
