@@ -1839,7 +1839,13 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
         # per-predecessor routing. Not conditioned on "the terminator is an explicit GotoNode/
         # GotoIfNot": Julia's optimizer leaves some fallthrough blocks with no explicit terminator at
         # all (last statement a bare placeholder like `nothing`), yet they still have a real successor.
-        if is_terminator && !unreachable_block[bidx]
+        #
+        # Defer the push when the terminator is a `PhiNode` (merge-only block with implicit
+        # fallthrough): a push before the phi violates `verify_ir`'s "phi leads its block" rule.
+        # Control-transfer terminators keep the pre-statement push; `_split_ambiguous_block_pushes`
+        # later relocates the `GotoIfNot` case per-edge.
+        defer_epilogue = is_terminator && !unreachable_block[bidx] && isa(s, Core.PhiNode)
+        if is_terminator && !unreachable_block[bidx] && !defer_epilogue
             emit_epilogue!(bidx)
         end
         if unreachable_block[bidx]
@@ -2089,6 +2095,11 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                 arr[slot] = primal_map[i]
             end
             delete!(pending, i)
+        end
+        # Deferred for a phi-terminator block (see above): the push follows the phi so it leads
+        # its block, still within this block's range.
+        if defer_epilogue
+            emit_epilogue!(bidx)
         end
     end
     if length(code) < block_start_new[nblocks]
