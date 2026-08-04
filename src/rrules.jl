@@ -54,11 +54,11 @@ end
 # finite `Tape` type for `mapreduce_impl`'s self-recursive pairwise structure, and no reverse-mode
 # `Expr(:loopinfo)` support for its `@simd`-annotated non-recursive base case. Both are fixed now
 # (ISSUES #65 — see `reverse_fwds_recursive_ci`/`_scan_block_comms` and the `:loopinfo` arms in
-# `src/reverse_interp.jl`), so `sum`/`sum(f, x)` compose correctly through the generic path at any
-# array size, including past `Base.pairwise_blocksize`. Left here commented out rather than deleted,
-# in case a future performance regression in the generic path needs a hand-written fallback again —
-# `has_hand_reverse_rule`/`src_inlining_policy` (`reverse_interp.jl`) would keep a hand-ruled call
-# from being inlined away, exactly as they did before.
+# `src/reverse_interp.jl`), so `sum`/`sum(f, x)` would now also compose correctly through the generic
+# path at any array size, including past `Base.pairwise_blocksize`. Kept as hand rules anyway, as a
+# known-efficient fallback that never recompiles through Base's internals —
+# `has_hand_reverse_rule`/`src_inlining_policy` (`reverse_interp.jl`) keep a hand-ruled call from
+# being inlined away, exactly as they did before.
 
 struct SumPullback{Dx<:Array}
     dx::Dx

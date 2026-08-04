@@ -64,6 +64,13 @@ apply_builtin_rrule!(::Val{F}, actual, Ti, ctx) where {F} = nothing
 
 _bi_fieldname(@nospecialize(node)) = isa(node, QuoteNode) ? node.value : node
 
+# Whether `node`'s fdata (shadow) is statically known: an `SSAValue` traceable to a tracked
+# statement, an `Argument` (always tracked), or `false` for anything else (a literal/`GlobalRef`).
+_bi_tracked(@nospecialize(node), ctx) =
+    isa(node, Core.SSAValue) ? (node.id <= length(ctx.tracked) && ctx.tracked[node.id]) :
+    isa(node, Core.Argument) ? (node.n <= length(ctx.arg_tracked) && ctx.arg_tracked[node.n]) :
+    false
+
 # `@noinline` wrappers around the small `Tangent`-system accessors this file threads through `icall`/
 # `icall!` into hand-built carrier IR. Without this, `CC.ssa_inlining_pass!` happily inlines the real
 # (tiny, `@inline`-marked) functions' bodies straight into the carrier — and those bodies contain a
@@ -168,10 +175,7 @@ function builtin_rrule_comms(::Val{Core.getfield}, actual, Ti, ctx)
     end
     if rdtype(Ti) !== NoRData
         if P isa DataType && ismutabletype(P)
-            tracked_here = isa(obj, Core.SSAValue) ? (obj.id <= length(ctx.tracked) && ctx.tracked[obj.id]) :
-                           isa(obj, Core.Argument) ? (obj.n <= length(ctx.arg_tracked) && ctx.arg_tracked[obj.n]) :
-                           false
-            if !tracked_here
+            if !_bi_tracked(obj, ctx)
                 ctx.reason[] = "mutable-struct `getfield` has no differentiable provenance traceable " *
                                "to a function argument at %$(ctx.ssa.id) (object type $(P))"
                 return false
@@ -206,7 +210,7 @@ function apply_builtin_rrule_fwds!(::Val{Core.getfield}, actual, Ti, ctx)
     # not embedded as a dangling reference into the primal's numbering.
     p = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(obj), ctx.presolve(actual[2])), Ti)
     shadow = nothing
-    if ctx.ssa.id <= length(ctx.tracked) && ctx.tracked[ctx.ssa.id]
+    if _bi_tracked(ctx.ssa, ctx)
         P = ctx.optype(obj)
         if P isa DataType && P <: Array
             # Same-shape shadow array: mirror the primal `.ref` access on the shadow directly.
@@ -296,7 +300,7 @@ function apply_builtin_rrule_fwds!(::Val{Core.memorynew}, actual, Ti, ctx)
     p = ctx.emit!(Expr(:call, Core.memorynew, ctx.presolve(actual[1]),
                        (ctx.presolve(a) for a in actual[2:end])...), Ti)
     shadow = nothing
-    if ctx.ssa.id <= length(ctx.tracked) && ctx.tracked[ctx.ssa.id]
+    if _bi_tracked(ctx.ssa, ctx)
         TT = tangent_type(_widen(Ti))
         shadow = ctx.emit!(Expr(:call, Core.memorynew, TT,
                            (ctx.presolve(a) for a in actual[2:end])...), TT)
@@ -321,7 +325,7 @@ builtin_rrule_comms(::Val{Base.memoryrefnew}, actual, Ti, ctx) = Tuple{Any,Any}[
 function apply_builtin_rrule_fwds!(::Val{Base.memoryrefnew}, actual, Ti, ctx)
     p = ctx.emit!(Expr(:call, Base.memoryrefnew, (ctx.presolve(a) for a in actual)...), Ti)
     shadow = nothing
-    if ctx.ssa.id <= length(ctx.tracked) && ctx.tracked[ctx.ssa.id]
+    if _bi_tracked(ctx.ssa, ctx)
         nargs = length(actual)
         shadow_args = Any[ctx.sresolve(actual[1])]
         if nargs >= 3
@@ -373,7 +377,7 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefget}, actual, Ti, ctx)
     # corresponding element of the shadow array.
     p = ctx.emit!(Expr(:call, Base.memoryrefget, (ctx.presolve(a) for a in actual)...), Ti)
     shadow = nothing
-    if ctx.ssa.id <= length(ctx.tracked) && ctx.tracked[ctx.ssa.id]
+    if _bi_tracked(ctx.ssa, ctx)
         shadow = ctx.emit!(Expr(:call, Base.memoryrefget, ctx.sresolve(actual[1]),
                                 (ctx.presolve(a) for a in actual[2:end])...), Ti)
     end
@@ -439,20 +443,14 @@ function builtin_rrule_comms(::Val{Core.setfield!}, actual, Ti, ctx)
     fname = _bi_fieldname(actual[2])
     if fdtype(tangent_type(fieldtype(P, fname))) !== NoFData
         val_node = actual[3]
-        val_tracked = isa(val_node, Core.SSAValue) ? (val_node.id <= length(ctx.tracked) && ctx.tracked[val_node.id]) :
-                      isa(val_node, Core.Argument) ? (val_node.n <= length(ctx.arg_tracked) && ctx.arg_tracked[val_node.n]) :
-                      false
-        if !val_tracked
+        if !_bi_tracked(val_node, ctx)
             ctx.reason[] = "reverse mode `setfield!` of a field whose tangent carries fdata " *
                            "($(fieldtype(P, fname))) requires the assigned value's own fdata to be " *
                            "traceable to a function argument at %$(ctx.ssa.id)"
             return false
         end
     end
-    tracked_here = isa(obj, Core.SSAValue) ? (obj.id <= length(ctx.tracked) && ctx.tracked[obj.id]) :
-                   isa(obj, Core.Argument) ? (obj.n <= length(ctx.arg_tracked) && ctx.arg_tracked[obj.n]) :
-                   false
-    if !tracked_here
+    if !_bi_tracked(obj, ctx)
         ctx.reason[] = "mutable-struct `setfield!` has no differentiable provenance traceable to a " *
                        "function argument at %$(ctx.ssa.id) (object type $(P))"
         return false
@@ -553,10 +551,7 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     elt = Ti
     ref_node, val_node = actual[1], actual[2]
     if fdtype(elt) !== NoFData
-        val_tracked = isa(val_node, Core.SSAValue) ? (val_node.id <= length(ctx.tracked) && ctx.tracked[val_node.id]) :
-                      isa(val_node, Core.Argument) ? (val_node.n <= length(ctx.arg_tracked) && ctx.arg_tracked[val_node.n]) :
-                      false
-        if !val_tracked
+        if !_bi_tracked(val_node, ctx)
             ctx.reason[] = "reverse mode `memoryrefset!` of a non-bits element ($(elt)) requires the " *
                            "assigned value's own fdata to be traceable to a function argument at " *
                            "%$(ctx.ssa.id)"

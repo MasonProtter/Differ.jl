@@ -542,7 +542,7 @@ end
 """
     as_tangent(x)::tangent_type(typeof(x))
 
-Returns a value matching a primal type `x` projected to the tangent space, following the rules of ``
+Returns a value matching a primal type `x` projected to the tangent space.
 
 Examples:
 
@@ -694,7 +694,6 @@ end
         else
             return tangent_type(P)(fields)
         end
-        return t
     end
 end
 
@@ -808,7 +807,6 @@ end
         else
             return tangent_type(P)(fields)
         end
-        return t
     end
 end
 

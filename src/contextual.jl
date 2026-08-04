@@ -10,9 +10,7 @@ const CC = Core.Compiler
 #
 # `ADInterpreter` is parameterized by the AD mode it runs in, so one interpreter and one set
 # of `finishinfer!`/`optimize` overrides serve every mode; only the mode-specific IR transform
-# differs. Forward mode is
-# implemented (see `forward_interp.jl`); reverse mode is not yet implemented (the marker type exists
-# so the machinery is ready for it).
+# differs. Forward mode is implemented in `forward_interp.jl`, reverse mode in `reverse_interp.jl`.
 # ---------------------------------------------------------------------------
 abstract type ADMode end
 struct Forward <: ADMode end

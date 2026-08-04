@@ -657,7 +657,6 @@ zero_rdata(p::IEEEFloat) = zero(p)
         # T ought to be a `Tangent`. If it's not, something has gone wrong.
         T <: Tangent || error("Unhandled type $T")
 
-        # return $backing_expr
         return R($backing_expr)
     end
 end
@@ -837,12 +836,12 @@ _verify_rdata_value(::Array, ::NoRData) = nothing
 
 function _verify_rdata_value(p, r)
 
-    # If f is a NoFData then there are no checks needed, because we have already verified
-    # that NoFData is the correct type for fdata for p, and NoFData is a singleton type.
+    # If r is a NoRData then there are no checks needed, because we have already verified
+    # that NoRData is the correct type for rdata for p, and NoRData is a singleton type.
     r isa NoRData && return nothing
 
     # When a primitive is encountered here, it means that we don't have a method of
-    # _verify_rdata_value which is specific to it, and its fdata type is not NoFData.
+    # _verify_rdata_value which is specific to it, and its rdata type is not NoRData.
     # The rest of this method assumes p is an instance of a struct type, so we must error.
     P = _typeof(p)
     isprimitivetype(P) && error("Encountered primitive $p with rdata $r")

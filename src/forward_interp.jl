@@ -578,7 +578,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # `Core.PartialStruct`/`Const` lattice element instead — widen it first, since `tangent_type` is
     # only ever defined on `Type`s and only the backing type (not the narrowed const value) matters
     # for the tangent's own type.
-    tt(@nospecialize T) = tangent_type(T isa Type ? T : CC.widenconst(T))
+    tt(@nospecialize T) = tangent_type(_widen(T))
 
     code = Any[]; types = Any[]
     emit!(ex, @nospecialize(ty)) = (push!(code, ex); push!(types, ty); Core.SSAValue(length(code)))
@@ -651,6 +651,18 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         ok, gv = gref_constval(gr)
         return ok ? Core.Typeof(gv) : Any
     end
+    # A `%new` type argument named by a module-level binding lowers to a `GlobalRef`
+    # (`%new(Main.S, …)`) rather than the type itself. Resolve it before anything downstream tests it
+    # with `<:`/`fieldtype` (which throw a raw `TypeError` on a `GlobalRef`) — used by both the
+    # unreachable-block and live-path `:new` arms below (ISSUES #60). Returns the input unchanged when
+    # unresolvable, leaving the caller's own `isa(T, Type)` check to catch it.
+    function resolve_new_type(@nospecialize T)
+        if isa(T, GlobalRef)
+            ok, gv = _globalref_val(T, iworld)
+            (ok && isa(gv, Type)) && return gv
+        end
+        return T
+    end
     # The tangent of a compile-time-constant primal is its zero tangent, computed now and embedded
     # as a literal so no call survives into the IR. `zero_tangent` handles singletons (-> the zero
     # tangent, e.g. `NoTangent()` for a function/`Int`), scalars (`0.0`), `Dual` carriers (a
@@ -697,7 +709,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     function zero_shadow(@nospecialize(Ti), @nospecialize(primal_ssa))
         T = tt(Ti)
         T === NoTangent && return NoTangent()
-        Tw = Ti isa Type ? Ti : CC.widenconst(Ti)
+        Tw = _widen(Ti)
         (Tw isa DataType && isconcretetype(Tw) && Tw <: Number) && return zero(Tw)::Tw
         return emit_invoke!(zerotang_g, T, (Tw,), primal_ssa)
     end
@@ -994,6 +1006,26 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # `PhiNode.values` is a plain `Vector`, mutable in place even though `PhiNode` is immutable.
     pending = Dict{Int,Vector{Tuple{Vector{Any},Int,Bool}}}()
 
+    # Resolve a `PhiNode`/`PhiCNode`'s `values` into parallel primal/shadow operand vectors, used by
+    # both node kinds (a `PhiCNode`'s operands are upsilon `SSAValue`s, resolved the same way as any
+    # other `SSAValue` via `primal[v.id]`/`shadow[v.id]`). An operand not yet processed in the linear
+    # walk (a loop back-edge) registers a `pending` forward-reference patch instead of resolving now.
+    function resolve_phi_values(vals)
+        k = length(vals)
+        pvals = Vector{Any}(undef, k); tvals = Vector{Any}(undef, k)
+        for j in 1:k
+            isassigned(vals, j) || continue    # mirror the primal's own unassigned slot
+            v = vals[j]
+            if isa(v, Core.SSAValue) && !isassigned(primal, v.id)
+                push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (pvals, j, true))
+                push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (tvals, j, false))
+            else
+                pvals[j] = presolve(v); tvals[j] = tresolve(v)
+            end
+        end
+        return pvals, tvals
+    end
+
     for i in 1:N
         while bidx < nblocks && i > pir.cfg.blocks[bidx].stmts.stop
             # A block whose every original statement is a pure alias (e.g. a bare `nothing`
@@ -1034,11 +1066,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # Type argument and field operands both get the same `GlobalRef` resolution as the
                 # live-path `:new` arm below (ISSUES #60) — a throw block builds exception objects,
                 # and `%new(Main.MyError, …)` is exactly the shape that trips it.
-                T = s.args[1]
-                if isa(T, GlobalRef)
-                    ok, gv = _globalref_val(T, iworld)
-                    (ok && isa(gv, Type)) && (T = gv)
-                end
+                T = resolve_new_type(s.args[1])
                 ex = Expr(:new, T, (vpresolve(a) for a in s.args[2:end])...)
                 primal[i] = emit!(ex, Ti); shadow[i] = primal[i]
             elseif isa(s, Expr) && s.head === :boundscheck
@@ -1147,11 +1175,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             # `gref_constval` applies to *field* operands: a struct name is always a constant
             # binding, and refusing one that a world-lookup happened to report otherwise would turn a
             # working case into a bail. `isa(gv, Type)` is the actual guard.
-            T = s.args[1]
-            if isa(T, GlobalRef)
-                ok, gv = _globalref_val(T, iworld)
-                (ok && isa(gv, Type)) && (T = gv)
-            end
+            T = resolve_new_type(s.args[1])
             if !isa(T, Type)
                 reason[] = "`%new` whose type argument `$(s.args[1])` is not a statically-known " *
                            "type at %$i: `$(_stmt_str(s))`"
@@ -1287,18 +1311,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         elseif isa(s, Core.GotoIfNot)
             emit!(Core.GotoIfNot(presolve(s.cond), s.dest), Any)
         elseif isa(s, Core.PhiNode)
-            k = length(s.values)
-            pvals = Vector{Any}(undef, k); tvals = Vector{Any}(undef, k)
-            for j in 1:k
-                isassigned(s.values, j) || continue    # mirror the primal's own unassigned slot
-                v = s.values[j]
-                if isa(v, Core.SSAValue) && !isassigned(primal, v.id)
-                    push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (pvals, j, true))
-                    push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (tvals, j, false))
-                else
-                    pvals[j] = presolve(v); tvals[j] = tresolve(v)
-                end
-            end
+            pvals, tvals = resolve_phi_values(s.values)
             primal[i] = emit!(Core.PhiNode(s.edges, pvals), Ti)
             shadow[i] = emit!(Core.PhiNode(s.edges, tvals), tt(Ti))
         elseif isa(s, Core.UpsilonNode)
@@ -1316,21 +1329,10 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         elseif isa(s, Core.PhiCNode)
             # Collects `UpsilonNode`s at a handler entry. Its operands are `SSAValue`s that must
             # reference upsilons (`verify_ir`), so the primal-phic references the primal upsilons and
-            # the shadow-phic the shadow ones — reusing `primal[v.id]`/`shadow[v.id]`. The same
-            # `pending` forward-ref mechanism as `PhiNode` covers a capture defined later in linear
-            # order (a try/catch inside a loop).
-            k = length(s.values)
-            pvals = Vector{Any}(undef, k); tvals = Vector{Any}(undef, k)
-            for j in 1:k
-                isassigned(s.values, j) || continue
-                v = s.values[j]
-                if isa(v, Core.SSAValue) && !isassigned(primal, v.id)
-                    push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (pvals, j, true))
-                    push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (tvals, j, false))
-                else
-                    pvals[j] = presolve(v); tvals[j] = tresolve(v)
-                end
-            end
+            # the shadow-phic the shadow ones — reusing `primal[v.id]`/`shadow[v.id]`. Same
+            # `resolve_phi_values` helper as `PhiNode`, including its `pending` forward-ref mechanism
+            # for a capture defined later in linear order (a try/catch inside a loop).
+            pvals, tvals = resolve_phi_values(s.values)
             primal[i] = emit!(Core.PhiCNode(pvals), Ti)
             shadow[i] = emit!(Core.PhiCNode(tvals), tt(Ti))
         elseif isa(s, Core.EnterNode)

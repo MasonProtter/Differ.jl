@@ -615,17 +615,39 @@ function _provenance_root(pir, iworld, @nospecialize(node))
     return nothing
 end
 
+# Does `ref_node`'s provenance root resolve to a bulk-saved argument? Shared by the comms scan and
+# both IR builders (`_scan_block_comms`, `reverse_fwds_to_ircode`, `reverse_pullback_to_ircode`),
+# which must all agree on this predicate.
+_is_bulk_saved(pir, iworld, bulk_args::Set{Int}, @nospecialize(ref_node)) = begin
+    root = _provenance_root(pir, iworld, ref_node)
+    isa(root, Core.Argument) && root.n in bulk_args
+end
+
+# `block_of[i]`: which block statement `i` belongs to. Statement indices are monotonic within a
+# block, so a single forward scan suffices. Shared by every static-analysis pass that needs a
+# stmt->block lookup but isn't otherwise threading per-block state through the same scan (compare
+# `reverse_fwds_to_ircode`'s main loop, which fuses this with live code-emission bookkeeping and so
+# keeps its own inline version).
+function _stmt_block_map(pir)
+    nb = length(pir.cfg.blocks)
+    block_of = Vector{Int}(undef, length(pir.stmts))
+    bidx = 1
+    for i in eachindex(block_of)
+        while bidx < nb && i > pir.cfg.blocks[bidx].stmts.stop
+            bidx += 1
+        end
+        block_of[i] = bidx
+    end
+    return block_of
+end
+
 # Which argument positions are bulk-saved. `arg_primal_types[k]` is argument `k`'s primal type.
 function _bulk_save_args(pir, iworld, arg_primal_types::Vector{Any})
     inloop = _loop_blocks(pir)
     bulk = Set{Int}()
-    nb = length(pir.cfg.blocks)
-    bidx = 1
+    block_of = _stmt_block_map(pir)
     for i in 1:length(pir.stmts)
-        while bidx < nb && i > pir.cfg.blocks[bidx].stmts.stop
-            bidx += 1
-        end
-        inloop[bidx] || continue          # a store executed once per call is not worth a whole copy
+        inloop[block_of[i]] || continue   # a store executed once per call is not worth a whole copy
         s = pir.stmts[i][:stmt]
         (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || continue
         fpos, actual = _call_parts(s)
@@ -1475,16 +1497,11 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
     # `builtin_rrule_comms` declares (via `ctx.bulk_saved` below).
     arg_primal_types = Any[_codual_primal_type(c) for c in codualparams]
     bulk_args = _bulk_save_args(pir, iworld, arg_primal_types)
-    bulk_saved(@nospecialize ref_node) = begin
-        root = _provenance_root(pir, iworld, ref_node)
-        isa(root, Core.Argument) && root.n in bulk_args
-    end
-    bidx = 1
+    bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
+    block_of = _stmt_block_map(pir)
     for i in 1:length(pir.stmts)
-        while bidx < nblocks && i > pir.cfg.blocks[bidx].stmts.stop
-            bidx += 1
-        end
-        unreachable[bidx] && continue
+        b = block_of[i]
+        unreachable[b] && continue
         s = pir.stmts[i][:stmt]
         if isa(s, Expr) && s.head === :new
             # A tracked mutable `%new` (see `_fdata_tracked`) needs its fresh shadow communicated
@@ -1498,8 +1515,8 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             # `Core.getfield`'s own comms rule never fires for them). Declaring one here would just be
             # dead weight on every block that allocates an array.
             if T isa DataType && !(T <: Array) && ismutabletype(T) && fdtype(T) !== NoFData
-                push!(nodes[bidx], (:fshadow, Core.SSAValue(i)))
-                push!(types[bidx], fdtype(T))
+                push!(nodes[b], (:fshadow, Core.SSAValue(i)))
+                push!(types[b], fdtype(T))
             end
             continue
         end
@@ -1523,9 +1540,9 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             for (k, a) in enumerate(actual)
                 (isa(a, Core.SSAValue) || isa(a, Core.Argument)) || continue
                 (needed === nothing || k in needed) || continue
-                any(nd -> nd == (:primal, a), nodes[bidx]) && continue
-                push!(nodes[bidx], (:primal, a))
-                push!(types[bidx], _optype(pir, a))
+                any(nd -> nd == (:primal, a), nodes[b]) && continue
+                push!(nodes[b], (:primal, a))
+                push!(types[b], _optype(pir, a))
             end
         elseif isa(f, Core.Builtin)
             # The dispatch layer (`builtins_reverse.jl`) decides everything: whether this call needs
@@ -1543,9 +1560,9 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             result === false && return nothing
             if result !== nothing
                 for (item, ty) in result
-                    any(nd -> nd == item, nodes[bidx]) && continue
-                    push!(nodes[bidx], item)
-                    push!(types[bidx], ty)
+                    any(nd -> nd == item, nodes[b]) && continue
+                    push!(nodes[b], item)
+                    push!(types[b], ty)
                 end
             end
         else
@@ -1568,8 +1585,8 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             # yet at scan time (it depends on this very comms scan), and doesn't need to be: the
             # abstract element type is enough to close the loop.
             InnerTapeT = resolved[4]
-            push!(nodes[bidx], (:subtape, Core.SSAValue(i)))
-            push!(types[bidx], InnerTapeT)
+            push!(nodes[b], (:subtape, Core.SSAValue(i)))
+            push!(types[b], InnerTapeT)
         end
     end
     return nodes, types, bulk_args
@@ -1619,10 +1636,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, block_comms_nodes)
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
-    pb_bulk_saved(@nospecialize ref_node) = begin
-        root = _provenance_root(pir, iworld, ref_node)
-        isa(root, Core.Argument) && root.n in bulk_args
-    end
+    pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
     fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
 
@@ -2212,10 +2226,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
-    pb_bulk_saved(@nospecialize ref_node) = begin
-        root = _provenance_root(pir, iworld, ref_node)
-        isa(root, Core.Argument) && root.n in bulk_args
-    end
+    pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
     fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
 
@@ -2238,15 +2249,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     end
 
     # Which block each statement belongs to (reused throughout).
-    stmt_block = Vector{Int}(undef, N)
-    let bidx = 1
-        for i in 1:N
-            while bidx < nblocks && i > pir.cfg.blocks[bidx].stmts.stop
-                bidx += 1
-            end
-            stmt_block[i] = bidx
-        end
-    end
+    stmt_block = _stmt_block_map(pir)
 
     # Every statement except a pure control marker (or one living in a throw-only block) gets a
     # `Ref` to accumulate rdata into; literal/GlobalRef/`:boundscheck`/`:loopinfo` operands never do

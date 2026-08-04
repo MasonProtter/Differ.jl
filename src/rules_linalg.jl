@@ -1,5 +1,4 @@
 # Hand-written frule!!/rrule!! for LinearAlgebra basics (dot/norm/*/tr/mul!).
-import LinearAlgebra
 #
 # `dot`/`norm`/`*` (on `Matrix`/`Vector`) all bottom out in BLAS `ccall`s once inlined, which the
 # dualization engine cannot see through. Forward mode does now have a per-target `:foreigncall` rule
@@ -19,6 +18,8 @@ import LinearAlgebra
 # Bare `Base`/`LinearAlgebra` names are qualified throughout (`Base.:*`, `LinearAlgebra.dot`, ...),
 # matching `src/rrules.jl`'s `Base.sin`/`Base.cos` qualification style — see the note at the top of
 # that file for why an unqualified name is unsafe once a rule body gets embedded elsewhere.
+
+import LinearAlgebra
 
 # ---------------------------------------------------------------------------
 # dot(x, y)

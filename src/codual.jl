@@ -80,7 +80,7 @@ function codual_type(::Type{P}) where {P}
     # dispatch — e.g. for `UnionAll(A, AbstractArray{T, A})` whose body has a
     # free `TypeVar` `T`. Without this check, touching `P` would throw
     # `UndefVarError(:P, :static_parameter)`. Same check guards the overloads
-    # below and `dual_type` in `src/tangents/dual.jl`.
+    # below and `dual_type` in `src/dual.jl`.
     @isdefined(P) || return CoDual
     return _codual_internal(P, codual_type, tangent_type)
 end
