@@ -101,3 +101,30 @@ mutable struct CommsCell{T}
     val::T
     CommsCell{T}() where {T} = new{T}()
 end
+
+# ===========================================================================
+# Nested-tape recycling (`reverse_interp.jl`'s Stage 1/2): a non-inlined callee's own tape is stored
+# as a `(:subtape, SSAValue(i))` comms item, pushed onto block `b`'s comms `Stack` by
+# `emit_epilogue!`. A `Stack` never deallocates its backing memory (above), so after the first
+# execution of that block, the slot the *next* push will land in already holds a structurally
+# identical inner tape from a previous call. Handing the callee *that* object (via its own
+# pre-allocated `Ctx{<:Tape}` prologue, which resets stack positions instead of allocating them)
+# instead of a fresh `Ctx()` is what makes a nested/recursive inner call allocation-free in steady
+# state — see `_inner_ctx`'s caller in `reverse_interp.jl` for why the peek position
+# (`st.position + 1`) is always the slot the matching push will use.
+#
+# `Base.length`/`Base.isassigned` fully qualified for the same reason as `Base.push!` above: this
+# gets inlined into synthetic carrier IR, where a bare name re-embeds as `GlobalRef(Differ, …)` and
+# trips `verify_ir`'s unbound-GlobalRef check.
+@inline function _inner_ctx(st::Stack{CommsT}, ::Val{k}, ::Type{TapeT}) where {CommsT,k,TapeT}
+    p = st.position + 1
+    mem = st.memory
+    if p <= Base.length(mem) && Base.isassigned(mem, p)
+        t = Core.getfield(@inbounds(mem[p]), k)
+        # `isa` is load-bearing only for a self-recursive edge, whose declared comms type is the
+        # bare `Tape` UnionAll (see `reverse_interp.jl`) rather than `TapeT` itself; for an ordinary
+        # callee this narrows to a no-op.
+        t isa TapeT && return Ctx(t)
+    end
+    return Ctx(_alloc_tape(TapeT))
+end

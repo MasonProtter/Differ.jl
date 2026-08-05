@@ -112,10 +112,12 @@ end
     end
     checkverify_rev(rec_self, (Float64, Int))
     # Exercises both the tape-allocating (`Ctx{Nothing}`) and pre-allocated (`Ctx{<:Tape}`) carrier
-    # specializations — the recursive edge always targets the former even when the outer call uses
-    # the latter, which is what makes this the discriminating regression: a self-recursive primal's
-    # pre-allocated carrier must actually compile the sibling it recurses into, not assume it's the
-    # literal carrier being compiled (only true when the outer carrier is *also* `Ctx{Nothing}`).
+    # specializations — the self-edge always targets the *pre-allocated* one (nested-tape-recycling
+    # plan, Stage 2: recycling the inner tape needs a recycled-typed ctx on both ends), even when the
+    # outer call is the tape-allocating carrier, which is what makes this the discriminating
+    # regression: a self-recursive primal's tape-allocating carrier must actually compile the
+    # pre-allocated sibling it recurses into, not assume it's the literal carrier being compiled (only
+    # true when the outer carrier is *already* the pre-allocated one).
     check_stack_balance(rec_self, 1.0, 3)
 
     # Accumulating self-recursion: each level contributes a distinct addend, so a wrong tape layout
@@ -330,4 +332,135 @@ end
 
     # regression: a dynamic setfield! index — Phase A only, always bails.
     @test_throws "dynamic (non-literal) field index" gradient(setdyn!, MP2(1.0, 2.0), 1, 5.0)
+end
+
+# ===========================================================================
+# Nested-tape recycling (Stages 1-2): a non-inlined/recursive inner call's tape is recycled from the
+# slot in the caller's own comms `Stack` its next `:subtape` push will land in
+# (`_inner_ctx`/`_alloc_tape`, `src/stack.jl`+`src/reverse_interp.jl`), instead of a fresh `Ctx()`
+# allocating one every call. See that plan for the full writeup; these are its verification tests.
+# ===========================================================================
+
+@testset "reverse mode: nested-tape recycling — steady-state allocation" begin
+    # Stage 1 (ordinary, non-self-recursive inner calls): once a pre-allocated context's comms slots
+    # are warm, a round trip through a non-inlined callee allocates nothing. `n=5` keeps
+    # `Base.mapreduce_impl` (which `sum`/`sum(abs2, ·)` fall through to — this test file never loads
+    # `src/rules_perf_backstop.jl`, so neither has a hand rule) below `Base.pairwise_blocksize`, so
+    # only Stage 1's machinery is exercised here; self-recursion is Stage 2, tested separately below.
+    @noinline sq_steady(x::Float64) = x * x
+    callshelper_steady(x::Float64) = sq_steady(x) + sq_steady(x + 1.0)
+
+    for (f, args) in ((x -> sum(abs2, x), (rand(5),)),
+                      (x -> sum(x), (rand(5),)),
+                      (callshelper_steady, (1.3,)))
+        ctx = build_ctx(f, map(Differ._typeof, args))
+        fcd = zero_fcodual(f)
+        argcds = map(zero_fcodual, args)
+        gradient!(ctx, fcd, argcds...)   # warm the slots
+        gradient!(ctx, fcd, argcds...)
+        @test (@allocated gradient!(ctx, fcd, argcds...)) == 0
+    end
+end
+
+@testset "reverse mode: nested-tape recycling — distinct tapes per iteration" begin
+    # Regression for the peek-position argument the recycling design rests on: `_inner_ctx` reads
+    # from `stack.position + 1`, which advances with every execution of the block — so N executions
+    # of a loop body calling a non-inlined helper must land in N distinct comms slots, never aliasing
+    # the same inner tape across iterations within one call.
+    @noinline addone_dtc(x::Float64) = x + 1.0
+    function loopcall_dtc(v::Vector{Float64})
+        s = 0.0
+        for i in eachindex(v)
+            s += addone_dtc(v[i])
+        end
+        return s
+    end
+    N = 6
+    v = collect(1.0:N)
+    pctx = build_ctx(loopcall_dtc, (Vector{Float64},))
+    gradient!(pctx, zero_fcodual(loopcall_dtc), zero_fcodual(v))
+    gradient!(pctx, zero_fcodual(loopcall_dtc), zero_fcodual(v))   # second call: slots now recycled
+
+    # Locate the block's comms `Stack` (its element type is a 1-tuple of `addone_dtc`'s own tape
+    # type) and pull out the N tapes the last forward pass used — a `Stack` never shrinks, so they're
+    # still sitting in `memory[1:N]` even though `position` is back at 0 (`check_stack_balance`
+    # covers that balance separately).
+    is_subtape_stack(s) = s isa Differ.Stack && eltype(s.memory) <: Tuple &&
+                          any(F -> F <: Differ.Tape, fieldtypes(eltype(s.memory)))
+    matches = filter(is_subtape_stack, collect(pctx.tape.comms))
+    @test length(matches) == 1
+    subtape_stack = only(matches)
+    tapes = [only(subtape_stack.memory[i]) for i in 1:N]
+    @test allunique(tapes)
+end
+
+@testset "reverse mode: nested-tape recycling — slot growth" begin
+    # A longer call through the same context must grow into slots this context has never used
+    # before (the fresh-allocation arm of `_inner_ctx`) rather than reuse/alias a shorter call's
+    # stale slot — and a subsequent short call must still get the right answer once the context has
+    # grown.
+    @noinline addone_sg(x::Float64) = x + 1.0
+    function loopcall_sg(v::Vector{Float64})
+        s = 0.0
+        for i in eachindex(v)
+            s += addone_sg(v[i])
+        end
+        return s
+    end
+    v_short = [1.0, 2.0]
+    v_long = collect(1.0:10.0)
+    ctx = build_ctx(loopcall_sg, (Vector{Float64},))
+
+    g_short = gradient!(ctx, zero_fcodual(loopcall_sg), zero_fcodual(v_short))
+    @test g_short[2] == gradient(loopcall_sg, v_short)[2]
+    g_long = gradient!(ctx, zero_fcodual(loopcall_sg), zero_fcodual(v_long))
+    @test g_long[2] == gradient(loopcall_sg, v_long)[2]
+    g_short2 = gradient!(ctx, zero_fcodual(loopcall_sg), zero_fcodual(v_short))
+    @test g_short2[2] == gradient(loopcall_sg, v_short)[2]
+end
+
+@testset "reverse mode: nested-tape recycling — self-recursion (Stage 2)" begin
+    # `Base.mapreduce_impl` splits pairwise above `Base.pairwise_blocksize`, so `sum(abs2, x)` at
+    # n=2000 reaches its self-recursive branch — the case Stage 2's `own_TapeT` self-edge retargeting
+    # (`reverse_fwds_recursive_ci`, `src/reverse_interp.jl`) is for.
+    #
+    # Gradient correctness is the hard requirement. Allocation drops by ~3 orders of magnitude
+    # relative to the fresh-`Ctx()` baseline this plan measured (111056 B / 87 allocs at this size
+    # before Stages 1-2) but is NOT literally 0, and this is not a bug: reading a recycled tape back
+    # out of a *self-recursive* comms slot still costs a small, roughly recursion-depth-proportional
+    # allocation, because that slot's declared element type is necessarily the *abstract* bare `Tape`
+    # UnionAll (never a concrete type — see `reverse_fwds_recursive_ci`'s docstring on why no fixed
+    # point is solved for a self-edge), and reading a value out of an abstractly-typed comms `Stack`
+    # allocates even when the underlying `Tape` object is genuinely being reused (confirmed directly:
+    # a `Stack{Tuple{ConcreteType,ConcreteType}}` read allocates nothing, a `Stack{Tuple{Tape,Tape}}`
+    # read allocates 16 bytes, for the exact same recycled objects). That is a distinct, narrower
+    # cost than "a tape escaping recycling" — see the plan writeup for the follow-up this motivates.
+    f_self = x -> sum(abs2, x)
+    n = 2000
+    @assert n > Base.pairwise_blocksize(abs2, Base.add_sum)
+    x = rand(n)
+
+    _, dx = gradient(f_self, x)
+    @test dx ≈ 2 .* x
+
+    ctx = build_ctx(f_self, (Vector{Float64},))
+    fcd, xcd = zero_fcodual(f_self), zero_fcodual(x)
+    gradient!(ctx, fcd, xcd)   # warm
+    gradient!(ctx, fcd, xcd)
+    bytes = @allocated gradient!(ctx, fcd, xcd)
+    @test 0 < bytes < 2_000   # was 111056 B pre-Stages-1-2 — a residual, documented above, not a regression
+end
+
+@testset "reverse mode: nested-tape recycling — hand rule callee still gets a fresh Ctx()" begin
+    # A callee with a hand-written `rrule!!` (its pullback is whatever's cheapest to remember, not a
+    # `Tape` — there is no tape to pre-allocate) must still receive a fresh `Ctx()` at its call site,
+    # never a recycled one from `_inner_ctx`.
+    plus1_hr(x) = sin(x) + 1
+    ir = code_reverse_fwds_ircode(plus1_hr, (Float64,))[1]
+    invokes_to_rrule = [stmt for stmt in ir.stmts.stmt
+                        if isa(stmt, Expr) && stmt.head === :invoke &&
+                           length(stmt.args) >= 4 && stmt.args[2] === rrule!!]
+    @test length(invokes_to_rrule) == 1
+    ctx_arg = only(invokes_to_rrule).args[4]
+    @test ctx_arg isa Differ.Ctx{Nothing}
 end

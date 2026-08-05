@@ -50,17 +50,20 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
     # `build_reverse_fwds_ir`/`build_reverse_pullback_ir` (`reverse_interp.jl`), so a mutually-
     # recursive primal (A -> B -> A) bails cleanly instead of recursing into the transform forever.
     # Keyed by the *carrier* mi, not the primal mi — the fwds carrier alone has two independent
-    # specializations per primal (`Ctx{Nothing}` fresh-tape vs `Ctx{<:Tape}` pre-allocated), and
-    # building the pre-allocated one for a self-recursive primal legitimately requires *also*
-    # compiling the `Ctx{Nothing}` sibling (a bounded, one-off nested compile, not a cycle) — a
-    # primal-keyed guard would conflate that with genuine in-progress-ness and bail incorrectly. See
-    # the comment on `build_reverse_fwds_ir` for the full reasoning.
+    # specializations per primal (`Ctx{Nothing}` fresh-tape vs `Ctx{<:Tape}` pre-allocated), and a
+    # self-recursive primal's self-edge always targets the `Ctx{<:Tape}` variant (nested-tape-
+    # recycling plan, Stage 2 — recycling the inner tape needs the recycled-typed ctx on both ends).
+    # So building the `Ctx{Nothing}` variant legitimately requires *also* compiling its `Ctx{<:Tape}`
+    # sibling (a bounded, one-off nested compile, not a cycle: that sibling's own self-edge targets
+    # itself, a literal identity, and stops) — a primal-keyed guard would conflate that with genuine
+    # in-progress-ness and bail incorrectly. See the comment on `build_reverse_fwds_ir` for the full
+    # reasoning.
     #
     # Direct self-recursion (a callee whose primal mi equals the current build's own) is a *separate*
     # question from this guard, answered locally and ctx-independently by
     # `reverse_fwds_recursive_ci`/`reverse_pullback_recursive_ci` from an explicitly-passed
     # `primal_mi` — not by consulting this field. It only reaches this guard at all when the
-    # recursive edge's target carrier differs from the one currently being built (the `Ctx{Nothing}`-
+    # recursive edge's target carrier differs from the one currently being built (the `Ctx{<:Tape}`-
     # sibling case above); a literal self-edge resolves to a static self-`:invoke` without recursing
     # into the builder at all. Mode-agnostic field (harmless, always empty, for `Forward`).
     in_progress::IdDict{MethodInstance, Nothing}

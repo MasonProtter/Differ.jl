@@ -112,11 +112,16 @@ abstract type AbstractCtx end
 
 The default differentiation context, carrying a pre-allocated tape in `tape::P`.
 
-`P === Nothing` means "allocate a fresh tape on every call" — the simple, stateless mode, and what a
-nested/recursive inner call always uses (an inner pullback is a value pushed onto the *outer* block's
-comms stack, one per execution, so there is nothing for an outer caller to pre-allocate on its
-behalf). Any other `P` is a tape the caller allocated once, whose stacks are reset and reused per
-call; that is what removes the last per-call allocations. Build one with [`build_ctx`](@ref).
+`P === Nothing` means "allocate a fresh tape on every call" — the simple, stateless mode. A
+hand-written rule's callee still always gets this (its pullback isn't a `Tape`, so there is nothing
+to pre-allocate on its behalf). A derived (non-hand-ruled) nested or recursive inner call instead
+gets a *recycled* tape: its pullback is a value pushed onto the outer block's comms `Stack`, one per
+execution, and a `Stack` never deallocates — so after the first execution the slot the next push will
+land in already holds a structurally identical tape, and the emission site hands that one to the
+callee (via `Ctx{P}` with a concrete `P`, not `Ctx{Nothing}`) rather than allocating fresh
+(`_inner_ctx`, `src/stack.jl`). Any `P` other than `Nothing` is this shape: a tape whose stacks are
+reset and reused per call — either the caller's own top-level tape (`build_ctx(...; prealloc=true)`)
+or a callee's recycled one. Build a top-level one with [`build_ctx`](@ref).
 """
 struct Ctx{P} <: AbstractCtx
     tape::P
@@ -423,14 +428,16 @@ end
 # their own from an explicitly-passed `primal_mi` — see their docstrings.
 #
 # Carrier-mi keying matters because the *fwds* carrier alone has two independent specializations per
-# primal: `Ctx{Nothing}` (fresh-tape, what a recursive inner call always targets) and `Ctx{<:Tape}`
-# (pre-allocated, what `build_ctx(...; prealloc=true)` uses). Building the pre-allocated variant of a
-# self-recursive primal genuinely requires *also* compiling the `Ctx{Nothing}` sibling (the recursive
-# edge always targets that one) — a real, bounded, one-off nested compile, not a cycle. A primal-mi-
-# keyed guard would wrongly treat that nested compile as "this primal is already in progress" and
-# bail, even though the `Ctx{Nothing}` build being triggered is a *different* carrier that has never
-# been built and terminates cleanly (its own self-edge resolves via literal carrier-mi identity, no
-# further nesting). Keying by carrier mi keeps the two independent builds from colliding.
+# primal: `Ctx{Nothing}` (fresh-tape, what `build_ctx(...; prealloc=false)`/plain `gradient` uses) and
+# `Ctx{<:Tape}` (pre-allocated, what `build_ctx(...; prealloc=true)` uses and what a self-recursive
+# edge always targets — nested-tape-recycling plan, Stage 2, so the tape it recycles from is the
+# recycled-typed one on both ends). Building the `Ctx{Nothing}` variant of a self-recursive primal
+# genuinely requires *also* compiling the `Ctx{<:Tape}` sibling (its own self-edge always targets that
+# one) — a real, bounded, one-off nested compile, not a cycle. A primal-mi-keyed guard would wrongly
+# treat that nested compile as "this primal is already in progress" and bail, even though the
+# `Ctx{<:Tape}` build being triggered is a *different* carrier that has never been built and
+# terminates cleanly (its own self-edge resolves via literal carrier-mi identity, no further nesting).
+# Keying by carrier mi keeps the two independent builds from colliding.
 function build_reverse_fwds_ir(interp::ADInterpreter, impl_mi::MethodInstance,
                                reason::Ref{String}=Ref(""), edges::Vector{Any}=Any[])
     if haskey(interp.in_progress, impl_mi)
@@ -1230,13 +1237,22 @@ end
 #   * a hand-written `rrule!!` for the callee, if one exists — invoked as `rrule!!`;
 #   * otherwise the *derived* path: the fwds carrier `reverse_fwds_impl`, invoked directly.
 #
-# Either way the emitted `:invoke` passes a fresh `Ctx()` in the ctx slot: a recursive inner call
-# always uses the tape-allocating mode — an inner pullback is a value pushed onto the *outer* block's
-# comms stack, one per execution, so there is nothing an outer caller's pre-allocated tape could
-# stand in for. (See the limitation note on `Ctx`.)
+# The ctx slot the emitted `:invoke` passes differs between the two (nested-tape-recycling plan,
+# Stages 1-2). A hand rule's pullback isn't a `Tape` — there is nothing to pre-allocate on its behalf
+# — so it always gets a fresh `Ctx()`. A derived callee's pullback *is* a `Tape`, pushed as a
+# `(:subtape, SSAValue(i))` value onto the *outer* block's comms `Stack`, one per execution — and a
+# `Stack` never deallocates, so after the first execution the slot the next push will land in already
+# holds a structurally identical tape from a previous call. The emission site hands the callee *that*
+# tape (`_inner_ctx`, `src/stack.jl`) instead of allocating fresh, which is why the `ci` this function
+# returns for a derived (non-hand-ruled, non-self-recursive) callee targets the `Ctx{InnerTapeT}`
+# pre-allocated sibling, not the `Ctx{Nothing}` variant resolved first (below) only to *learn*
+# `InnerTapeT` — there is no other way to know it before something is compiled. Self-recursion (own
+# section below) follows the identical recycling idea but needs its own resolution, since the sibling
+# it recycles from is itself, not a separately-compiled callee.
 #
 # Returns `(ci, callee_val, InnerFCoDualT, InnerPullbackT)` on success or `nothing` (with `reason[]`
-# set); the emit sites build `invoke(callee_val, ci, fcd, Ctx(), argcds...)`.
+# set); the emit sites build `invoke(callee_val, ci, fcd, ctx_val, argcds...)`, where `ctx_val` is
+# `Ctx()` for a hand rule and the `_inner_ctx`-recycled value otherwise.
 #
 # `impl_mi` is the *carrier* mi of the build this call is part of; `current_primal_mi` is that
 # build's own primal mi (passed all the way down from `build_reverse_fwds_ir`'s
@@ -1252,23 +1268,29 @@ end
 # `Ctx{<:Tape}` pre-allocated — see `_scan_block_comms`'s callers), have to agree on it or the
 # concrete `Tape` type they each separately compute would disagree.
 #
-# *Whether compiling is needed* is a narrower, ctx-dependent question, decided by comparing the
-# resolved recursive-call target `callee_impl_mi` (always `Ctx{Nothing}`, per the fixed convention
-# below) against `impl_mi` itself:
-#   * `callee_impl_mi === impl_mi` — a literal self-edge (only possible when this build's own ctx is
-#     already `Ctx{Nothing}`). No compile: `CC.typeinf_ext_toplevel` is skipped entirely, and codegen's
-#     `mi == ctx.linfo` self-recursion fast path (`src/codegen.cpp`) triggers for the emitted `:invoke`.
-#   * otherwise — same primal, different carrier (this build is the `Ctx{<:Tape}` pre-allocated
-#     variant, whose recursive edge always targets the `Ctx{Nothing}` sibling). That sibling genuinely
-#     has never been compiled, so it must be, via the ordinary `typeinf_ext_toplevel` path — but this
-#     always terminates in exactly one bounded nested compile: building it hits *its own* recursive
-#     edge, for which its own ctx *is* `Ctx{Nothing}`, so that inner resolution takes the literal-
-#     identity branch above and stops. (This is also why `interp.in_progress` stays keyed by carrier
-#     mi, not primal mi — see its docstring in `contextual.jl`: a primal-keyed guard would mistake
-#     this legitimate nested compile for the primal already being in progress and bail incorrectly.)
+# *Whether compiling is needed* is a narrower question, decided by comparing the resolved
+# recursive-call target `callee_impl_mi` against `impl_mi` itself. Stage 2 (nested-tape-recycling
+# plan) made the self-edge always target `Ctx{own_TapeT}` — `own_TapeT` is this *build's own* tape
+# type (passed by the emission loop once it is known; the scan-time default `Nothing`, giving
+# `Ctx{Nothing}`, is a placeholder scan never resolves further — see `own_TapeT`'s own note below):
+#   * `callee_impl_mi === impl_mi` — a literal self-edge. This holds whenever this build's own ctx
+#     type already *is* `Ctx{own_TapeT}` (a `Ctx{<:Tape}` pre-allocated build recursing into itself)
+#     — no compile: `CC.typeinf_ext_toplevel` is skipped entirely, and codegen's `mi == ctx.linfo`
+#     self-recursion fast path (`src/codegen.cpp`) triggers for the emitted `:invoke`.
+#   * otherwise — same primal, different carrier (this build is the `Ctx{Nothing}` tape-allocating
+#     variant, whose self-edge now targets the `Ctx{<:Tape}` sibling — the reverse of the direction
+#     before Stage 2). That sibling genuinely has never been compiled, so it must be, via the ordinary
+#     `typeinf_ext_toplevel` path — but this always terminates in exactly one bounded nested compile:
+#     building it hits *its own* self-edge, for which its own ctx *is* `Ctx{own_TapeT}` (its own tape
+#     type, computed identically since the tape shape only depends on comms structure, not ctx), so
+#     that inner resolution takes the literal-identity branch above and stops. (This is also why
+#     `interp.in_progress` stays keyed by carrier mi, not primal mi — see its docstring in
+#     `contextual.jl`: a primal-keyed guard would mistake this legitimate nested compile for the
+#     primal already being in progress and bail incorrectly.)
 function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_primal_mi::MethodInstance,
                                    @nospecialize(ftype), argtypes::Vector{Any}, @nospecialize(R),
-                                   edges::Vector{Any}, reason::Ref{String})
+                                   edges::Vector{Any}, reason::Ref{String};
+                                   @nospecialize(own_TapeT=nothing))
     argcodualtys = Any[fcodual_type(P) for P in argtypes]
     hand = hand_reverse_rule_match(interp, ftype, argtypes)
     if hand !== nothing
@@ -1283,14 +1305,31 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
             callee_primal_mi =
                 specialize_method(pmatch.method, pmatch.spec_types, pmatch.sparams)::MethodInstance
             if callee_primal_mi === current_primal_mi
-                push!(edges, tt, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
+                # Stage 2: the self-edge targets `Ctx{own_TapeT}` — this *build's own* tape type,
+                # passed by the emission loop once it is known (`reverse_fwds_to_ircode`'s own
+                # `TapeT`). At scan time `own_TapeT` isn't known yet (this very scan is what
+                # determines it) — but scan only ever reads the `Tape` marker below, never this
+                # call's own `ci`, so there is nothing to resolve yet: just report the marker.
+                #
+                # This isn't only an optimization. Resolving *something* here regardless (e.g.
+                # against a fixed `Ctx{Nothing}`, as a plausible-looking placeholder) would actively
+                # break Stage 2: the emission side now genuinely depends on compiling the
+                # `Ctx{TapeT}` sibling as a nested step of building `Ctx{Nothing}` (once, when the
+                # two differ) — so if that sibling's own *scan* eagerly tried to compile *its*
+                # apparent self-edge target too, it would recurse straight back into the
+                # `Ctx{Nothing}` build that is still mid-construction, and `interp.in_progress`
+                # would (correctly) flag that as a genuine cycle and bail the whole thing.
+                own_TapeT === nothing && return nothing, reverse_fwds_impl, CoDual{R,NoFData}, Tape
+                tt_self = Tuple{typeof(reverse_fwds_impl),CoDual{ftype,NoFData},Ctx{own_TapeT},
+                                argcodualtys...}
+                push!(edges, tt_self, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
                 # `CC.findall`, not `findsup` — see the ABI note above `helper_ci`: `findall` gives a
-                # `spec_types` already intersected with `tt`, so `specialize_method` yields a
-                # `MethodInstance` whose `specTypes` is exactly `tt`.
-                matches = CC.findall(tt, CC.method_table(interp))
+                # `spec_types` already intersected with `tt_self`, so `specialize_method` yields a
+                # `MethodInstance` whose `specTypes` is exactly `tt_self`.
+                matches = CC.findall(tt_self, CC.method_table(interp))
                 if matches === nothing || length(matches) != 1 || !matches[1].fully_covers
                     reason[] = "no reverse-mode rule resolves for recursive (self-cyclic) call " *
-                               "signature $(tt)"
+                               "signature $(tt_self)"
                     return nothing
                 end
                 callee_impl_mi = specialize_method(matches[1])::MethodInstance
@@ -1299,7 +1338,7 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
                     return callee_impl_mi, reverse_fwds_impl, CoDual{R,NoFData}, Tape
                 else
                     ci = CC.typeinf_ext_toplevel(interp, callee_impl_mi, CC.SOURCE_MODE_ABI)::CodeInstance
-                    CC.add_invoke_edge!(edges, tt, ci)
+                    CC.add_invoke_edge!(edges, tt_self, ci)
                     return ci, reverse_fwds_impl, CoDual{R,NoFData}, Tape
                 end
             end
@@ -1337,8 +1376,34 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
         return nothing
     end
     CC.add_invoke_edge!(edges, tt, ci)
+    InnerFCoDualT = InnerRT.parameters[1]
+    InnerTapeT = InnerRT.parameters[2]
+    callee_val === reverse_fwds_impl || return ci, callee_val, InnerFCoDualT, InnerTapeT
+    # Stage 1: the emission site always hands an ordinary (non-hand-ruled, non-self-recursive)
+    # derived callee a recycled tape (`_inner_ctx`, `stack.jl`), never a fresh `Ctx()` — so the
+    # `:invoke` actually needed targets the `Ctx{InnerTapeT}` pre-allocated sibling, not the
+    # `Ctx{Nothing}` variant `ci` above (which exists only to *learn* `InnerTapeT`, the callee's own
+    # tape type — there is no other way to know it before compiling something). Resolving the
+    # sibling is the same `findall` + `typeinf_ext_toplevel` two-step as above, against a different
+    # `tt`; verified in advance (see the module header) that both variants return an identical
+    # `(CoDual, Tape)` pair, so a mismatch here is an internal-error bail, not a recoverable one.
+    tt2 = Tuple{typeof(reverse_fwds_impl),CoDual{ftype,NoFData},Ctx{InnerTapeT},argcodualtys...}
+    push!(edges, tt2, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
+    matches2 = CC.findall(tt2, CC.method_table(interp))
+    if matches2 === nothing || length(matches2) != 1 || !matches2[1].fully_covers
+        reason[] = "no reverse-mode rule resolves for the pre-allocated recursive call signature $(tt2)"
+        return nothing
+    end
+    callee_impl_mi2 = specialize_method(matches2[1])::MethodInstance
+    ci2 = CC.typeinf_ext_toplevel(interp, callee_impl_mi2, CC.SOURCE_MODE_ABI)::CodeInstance
+    if ci2.rettype !== InnerRT
+        reason[] = "the pre-allocated (`Ctx{<:Tape}`) recursive build for `$(tt2)` returned " *
+                   "$(ci2.rettype), which does not match the tape-allocating variant's $(InnerRT)"
+        return nothing
+    end
+    CC.add_invoke_edge!(edges, tt2, ci2)
     # (ci, callee_val, InnerFCoDualT, InnerPullbackT)
-    return ci, callee_val, InnerRT.parameters[1], InnerRT.parameters[2]
+    return ci2, callee_val, InnerFCoDualT, InnerTapeT
 end
 
 # Mirrors `reverse_fwds_recursive_ci` for the pullback carrier: resolves
@@ -2047,7 +2112,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                 fval, ftype, argtypes = info
                 R = _widen(Ti)
                 resolved = reverse_fwds_recursive_ci(interp, impl_mi, primal_mi, ftype, argtypes, R,
-                                                     edges, reason)
+                                                     edges, reason; own_TapeT=TapeT)
                 if resolved === nothing
                     reason[] *= " — at %$i: `$(_stmt_str(s))`"
                     return nothing
@@ -2055,8 +2120,9 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                 ci, callee_val, InnerFCoDualT, InnerTapeT0 = resolved
                 # Cyclic edge: `reverse_fwds_recursive_ci` leaves this the bare `Tape` UnionAll (see
                 # its docstring); the concrete type is this build's own `TapeT`, already computed
-                # above (`:1276`) — a self-recursive callee's tape is, by construction, the same type
-                # as the caller's own.
+                # above — a self-recursive callee's tape is, by construction, the same type as the
+                # caller's own (which is also `own_TapeT`, passed into the very call above that
+                # produced `resolved`).
                 InnerTapeT = InnerTapeT0 === Tape ? TapeT : InnerTapeT0
                 FCT = CoDual{ftype,NoFData}
                 # `fval === nothing` means `_static_recursible_call` resolved `ftype` from the
@@ -2076,9 +2142,26 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                     fdata_val = fdtype(argtypes[j]) === NoFData ? NoFData() : sresolve(a)
                     push!(argcoduals, emit!(Expr(:new, Cj, presolve(a), fdata_val), Cj))
                 end
-                # Uniform layout `(fcd, ctx, argcds...)` for both callees; `Ctx()` is the fresh-tape
-                # mode every recursive inner call uses (spliced as a singleton constant).
-                pair = emit!(Expr(:invoke, ci, callee_val, fcodual, Ctx(), argcoduals...),
+                # Uniform layout `(fcd, ctx, argcds...)` for both callees. Recycle the tape sitting
+                # in the comms slot this call's own `:subtape` push will land in, instead of
+                # allocating a fresh one every call (`_inner_ctx`, `stack.jl`) — a `Stack` never
+                # deallocates, so after the first execution of this block the slot already holds a
+                # structurally identical inner tape. Applies uniformly to an ordinary derived callee
+                # and a self-recursive edge alike (`reverse_fwds_recursive_ci`'s `own_TapeT` already
+                # retargeted the self-edge `ci` above to the matching `Ctx{InnerTapeT}`, Stage 2) —
+                # only a hand rule's pullback (`callee_val !== reverse_fwds_impl`) has no `Tape` to
+                # pre-allocate at all, and keeps the fresh-tape `Ctx()`.
+                ctx_val = if callee_val === reverse_fwds_impl
+                    ST = comms_stack_ty[bidx]
+                    @assert ST <: Stack "a `:subtape` comms item must force a real `Stack` (never " *
+                                        "isbits/singleton — a `Tape` is always mutable), got $(ST)"
+                    k = findfirst(nd -> nd == (:subtape, Core.SSAValue(i)), block_comms_nodes[bidx])
+                    icall!(_inner_ctx, Ctx{InnerTapeT}, (ST, Val{k}, Type{InnerTapeT}),
+                           comms_stack_ssa[bidx], Val(k), InnerTapeT)
+                else
+                    Ctx()
+                end
+                pair = emit!(Expr(:invoke, ci, callee_val, fcodual, ctx_val, argcoduals...),
                             Tuple{InnerFCoDualT,InnerTapeT})
                 result_cd = emit!(Expr(:call, getf, pair, 1), InnerFCoDualT)
                 primal_map[i] = emit!(Expr(:call, getf, result_cd, 1), Ti)
@@ -2986,6 +3069,18 @@ function _fresh_tape_expr(@nospecialize(TapeT))
                 S <: CommsCell ? :($S()) :
                 :($S(1)) for S in CS.parameters]
     return :($TapeT($(Stack{Int32})(1), ($(slots...),), $(Vector{Any})()))
+end
+
+# Stage 1 recycling (`_inner_ctx`, `stack.jl`): allocate a fresh tape of exactly the shape `TapeT`
+# names, for when the recycled comms slot is empty or holds the wrong type (the first execution of
+# a block, or growth into a slot never written before). Plain `@generated` (unlike `_build_tape`,
+# which needs a specific `interp`/world to resolve/compile a real `CodeInstance` during
+# generation) since `_fresh_tape_expr` builds its expression from the type parameter alone.
+# `@noinline`: this is the cold path — steady state never runs it — and keeping it a real call means
+# `_inner_ctx`'s own `Stack`/comms-tuple construction isn't re-embedded (and its GlobalRefs
+# re-checked) inside whatever carrier IR `_inner_ctx` itself gets inlined into.
+@noinline @generated function _alloc_tape(::Type{TapeT}) where {TapeT<:Tape}
+    return _fresh_tape_expr(TapeT)
 end
 
 function refresh_build_tape()

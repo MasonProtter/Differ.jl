@@ -56,10 +56,37 @@ function checkverify_rev(f, at)
     checkverify_prealloc(f, at)
 end
 
+# Recursively assert every `Tape` reachable from a tape's own comms is stack-balanced: its
+# `block_stack` and every `Stack`-backed comms slot back at position 0. Walks into a `Stack`'s
+# *whole* backing memory (not just up to `position`, which is already back at 0 by the time this
+# runs) since a `Stack` never shrinks — a slot from an earlier, larger call still holds a real
+# (possibly recycled) tape. Load-bearing for the nested-tape-recycling plan (`_inner_ctx`,
+# `src/stack.jl`): a recycled inner tape left unbalanced by its own call would show up here as a
+# stale nonzero position on *that* tape, not just on the outer one `check_stack_balance` used to
+# check alone.
+function _assert_tape_balanced(tape::Differ.Tape, seen::Base.IdSet{Any}=Base.IdSet{Any}())
+    tape in seen && return nothing
+    push!(seen, tape)
+    @test tape.block_stack.position == 0
+    for s in tape.comms
+        _assert_comms_balanced(s, seen)
+    end
+    return nothing
+end
+function _assert_comms_balanced(s::Differ.Stack, seen)
+    @test s.position == 0
+    for i in eachindex(s.memory)
+        isassigned(s.memory, i) && _assert_tuple_balanced(s.memory[i], seen)
+    end
+end
+_assert_comms_balanced(::Differ.SingletonStack, seen) = nothing
+_assert_comms_balanced(s::Differ.CommsCell, seen) = isdefined(s, :val) ? _assert_tuple_balanced(s.val, seen) : nothing
+_assert_tuple_balanced(t::Tuple, seen) = foreach(v -> v isa Differ.Tape && _assert_tape_balanced(v, seen), t)
+
 # Phase D (unique-predecessor optimization): every push must still be matched by exactly one pop
 # across a full rule+pullback round trip. The pullback *is* the tape, so this just calls it and
-# confirms every `Stack`'s `position` (block stack, and every non-singleton per-block comms stack)
-# is back to 0.
+# confirms every `Stack`'s `position` (block stack, and every non-singleton per-block comms stack,
+# recursively into any recycled inner tape) is back to 0.
 #
 # Doubly load-bearing since a `build_ctx(...; prealloc=true)` context *reuses* its tape across
 # calls: balance is what makes reuse correct, so this also runs each case twice through one
@@ -69,8 +96,7 @@ function check_stack_balance(f, args...)
     fcd, argcds = zero_fcodual(f), map(zero_fcodual, args)
     ycd, pb = rrule!!(fcd, ctx, argcds...)
     pb(one(Differ.primal(ycd)))
-    @test pb.block_stack.position == 0
-    @test all(s -> !(s isa Differ.Stack) || s.position == 0, pb.comms)
+    _assert_tape_balanced(pb)
 
     # Same again through a pre-allocated (tape-reusing) context, twice.
     pctx = build_ctx(f, map(Differ._typeof, args))
@@ -78,8 +104,7 @@ function check_stack_balance(f, args...)
     g2 = gradient!(pctx, zero_fcodual(f), map(zero_fcodual, args)...)
     @test g1 == g2
     @test g1 == gradient(f, args...)
-    @test pctx.tape.block_stack.position == 0
-    @test all(s -> !(s isa Differ.Stack) || s.position == 0, pctx.tape.comms)
+    _assert_tape_balanced(pctx.tape)
     return nothing
 end
 

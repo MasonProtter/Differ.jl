@@ -5,6 +5,15 @@ using Differ: fdata_type, tangent_type, zero_tangent, fdata
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
+# `sum`/`prod`/`maximum`/`minimum`/`mapreduce(f,+,x)`'s hand rules moved to
+# `src/rules_perf_backstop.jl` (nested-tape-recycling plan, Stage 3) — a known-efficient fallback,
+# not included by `src/Differ.jl` by default, so both configurations (derived path alone vs. derived
+# path + these rules) can be benchmarked separately. This test suite exercises them directly, so load
+# the file into `Differ`'s own namespace (mirroring what `Differ.jl` would do) rather than this test
+# module's — its bodies reference plenty of `Differ`-internal names unqualified, exactly as they did
+# when the file was included from `Differ.jl` itself.
+Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backstop.jl"))))
+
 # `checkverify`/`checkverify_rev`/`check_stack_balance` build/verify the *derived* dualized/reverse
 # IR for a function's own body — that only makes sense for a genuinely dualizable composite, never
 # for a function that is itself only ever reached via a hand rule (same reason the existing test

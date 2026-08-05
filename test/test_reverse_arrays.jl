@@ -191,6 +191,8 @@ end
 
     nested_loop_write!(x::Vector{Vector{Float64}}, w::Vector{Float64}) =
         (for i in eachindex(x); x[i] = w; end; sum(x[end]))
+    write_only_nested!(x::Vector{Vector{Float64}}, w::Vector{Float64}) =
+        (for i in eachindex(x); x[i] = w; end; nothing)
     xn = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
     wn = [7.0, 8.0]
     checkverify_rev(nested_loop_write!, (Vector{Vector{Float64}}, Vector{Float64}))
@@ -198,7 +200,16 @@ end
     _, dxn, dwn = gradient(nested_loop_write!, deepcopy(xn), copy(wn))
     @test dxn == [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]   # every element overwritten before any read
     @test dwn == [1.0, 1.0]                             # only x[end] (== w, aliased) is read
-    @test !any(has_memoryref, check_tape_size(nested_loop_write!, (Vector{Vector{Float64}}, Vector{Float64})))
+    # The write loop itself still converts (matching `bulkwrite!` above): `check_tape_size` on a
+    # write-only variant of this same primal is MemoryRef-free. `sum(x[end])` legitimately keeps one,
+    # though: `sum`'s hand rule moved to `src/rules_perf_backstop.jl` (nested-tape-recycling plan,
+    # Stage 3) and is not in the default build, so this reduction now falls through to generic
+    # recursion — and `x[end]` is extracted via indexing from the *outer* argument `x`, not itself a
+    # direct function argument, so `_static_ref_derivation` has no `tape.args` entry to re-derive its
+    # ref from at pullback time. Same "untracked provenance keeps its handle" case `ts6` checks below
+    # for `f2`'s differently-sourced local array.
+    @test !any(has_memoryref, check_tape_size(write_only_nested!, (Vector{Vector{Float64}}, Vector{Float64})))
+    @test any(has_memoryref, check_tape_size(nested_loop_write!, (Vector{Vector{Float64}}, Vector{Float64})))
 
     # 6. Local (non-argument-rooted) array is unaffected: its ref can't be re-derived from
     # `tape.args`, so it keeps pushing its `MemoryRef` handle exactly as before. The point is that
