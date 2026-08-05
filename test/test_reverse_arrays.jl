@@ -127,6 +127,93 @@ end
     check_stack_balance(mat_mutate!, zeros(2, 2), 3.0)
 end
 
+@testset "reverse mode: dynamic array index re-derivation (no MemoryRef push)" begin
+    # `comms-dynamic-index-instead-of-memoryref.md`: a loop-indexed read/write over an
+    # argument-rooted array re-derives its `MemoryRef` handle in the pullback from a pushed `Int`
+    # index instead of pushing the (16-byte, GC-scanned) handle itself.
+    has_memoryref(T) = T <: Tuple && any(F -> F <: MemoryRef, fieldtypes(T))
+
+    # 1. The conversion happened: no argument-rooted access leaves a `MemoryRef` on the tape.
+    dynread(x) = (s = 0.0; for i in eachindex(x); s += x[i]; end; s)
+    @test !any(has_memoryref, check_tape_size(dynread, (Vector{Float64},)))
+    @test !any(has_memoryref, check_tape_size(x -> sum(abs2, x), (Vector{Float64},)))
+
+    # 2. Bounds: `@inbounds` and checked reads both round-trip. The re-derived shadow ref forces
+    # `boundscheck=true` regardless, so an out-of-bounds `@inbounds` primal access still throws on
+    # the shadow rather than corrupting it (pinned directly for the literal-index case in
+    # `test_reverse_mutation_aliasing.jl`; this is the loop-index analogue).
+    dynread_inbounds(x) = (s = 0.0; for i in eachindex(x); s += (@inbounds x[i]); end; s)
+    x7 = [2.0, 3.0, 5.0, 7.0]
+    checkverify_rev(dynread, (Vector{Float64},))
+    checkverify_rev(dynread_inbounds, (Vector{Float64},))
+    check_stack_balance(dynread, x7)
+    check_stack_balance(dynread_inbounds, x7)
+    _, ddr = gradient(dynread, x7)
+    _, ddri = gradient(dynread_inbounds, x7)
+    @test ddr == ones(4)
+    @test ddri == ones(4)
+
+    # 3. Two distinct dynamic indices read in the same loop.
+    twoidx(x) = (s = 0.0; for i in eachindex(x); s += x[i] * x[end - i + 1]; end; s)
+    x8 = [1.0, 2.0, 3.0, 4.0]
+    checkverify_rev(twoidx, (Vector{Float64},))
+    check_stack_balance(twoidx, x8)
+    _, dti = gradient(twoidx, x8)
+    for k in eachindex(x8)
+        xp = copy(x8); xp[k] += 1e-6
+        xm = copy(x8); xm[k] -= 1e-6
+        @test dti[k] ≈ (twoidx(xp) - twoidx(xm)) / 2e-6 rtol = 1e-5
+    end
+
+    # 4. Two accesses sharing one index SSA (`x[i]`/`y[i]`) — the case that exercises
+    # `_scan_block_comms`'s existing per-block dedupe, since both rules independently try to
+    # declare `(:primal, i)` when they land in the same block.
+    sharedidx(x, y) = (s = 0.0; for i in eachindex(x); s += x[i] * y[i]; end; s)
+    x9, y9 = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
+    checkverify_rev(sharedidx, (Vector{Float64}, Vector{Float64}))
+    check_stack_balance(sharedidx, x9, y9)
+    _, dx9, dy9 = gradient(sharedidx, x9, y9)
+    @test dx9 == y9
+    @test dy9 == x9
+
+    # 5. Writes: a bulk-saved loop (isbits eltype — the primal is restored via one whole-array
+    # copy-back, not per element) and a non-bulk-saved one (non-isbits eltype, so every element's
+    # old primal/tangent is still saved individually). The index item is declared outside the
+    # `bulk_saved` branch in `builtin_rrule_comms(::Val{Base.memoryrefset!}, ...)`, so both
+    # configurations must still push it and still balance.
+    bulkwrite!(x) = (for i in eachindex(x); x[i] = 2 * x[i]; end; sum(x))
+    xb = [1.0, 2.0, 3.0]
+    checkverify_rev(bulkwrite!, (Vector{Float64},))
+    check_stack_balance(bulkwrite!, copy(xb))
+    _, dxb = gradient(bulkwrite!, copy(xb))
+    @test dxb == fill(2.0, 3)
+    @test !any(has_memoryref, check_tape_size(bulkwrite!, (Vector{Float64},)))
+
+    nested_loop_write!(x::Vector{Vector{Float64}}, w::Vector{Float64}) =
+        (for i in eachindex(x); x[i] = w; end; sum(x[end]))
+    xn = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+    wn = [7.0, 8.0]
+    checkverify_rev(nested_loop_write!, (Vector{Vector{Float64}}, Vector{Float64}))
+    check_stack_balance(nested_loop_write!, deepcopy(xn), copy(wn))
+    _, dxn, dwn = gradient(nested_loop_write!, deepcopy(xn), copy(wn))
+    @test dxn == [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]   # every element overwritten before any read
+    @test dwn == [1.0, 1.0]                             # only x[end] (== w, aliased) is read
+    @test !any(has_memoryref, check_tape_size(nested_loop_write!, (Vector{Vector{Float64}}, Vector{Float64})))
+
+    # 6. Local (non-argument-rooted) array is unaffected: its ref can't be re-derived from
+    # `tape.args`, so it keeps pushing its `MemoryRef` handle exactly as before. The point is that
+    # this path and the converted argument-rooted path still coexist correctly in one function.
+    f2(x) = (y = similar(x); for i in eachindex(x); y[i] = x[i] * x[i]; end; sum(y))
+    xf = [1.0, 2.0, 3.0]
+    checkverify_rev(f2, (Vector{Float64},))
+    check_stack_balance(f2, copy(xf))
+    _, dxf = gradient(f2, copy(xf))
+    @test dxf == 2 .* xf
+    ts6 = check_tape_size(f2, (Vector{Float64},))
+    @test any(has_memoryref, ts6)          # y's local ref: untouched
+    @test !all(has_memoryref, ts6)         # x's argument-rooted reads: converted
+end
+
 @testset "reverse mode: recursive calls with an array argument" begin
     # Tier 7 Part 3: the recursive-call guard allows an array argument through when its identity
     # is traceable back to a function argument, threading the real fdata array through the

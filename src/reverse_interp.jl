@@ -668,12 +668,14 @@ end
 # Statically re-derivable `MemoryRef` handles.
 #
 # A `memoryrefget`/`memoryrefset!` over a `MemoryRef` built by
-# `memoryrefnew(getfield(arr, :ref), idx, boundscheck)` with `arr` an `Argument(k)` and `idx` a
-# literal `Int` can be rebuilt in the pullback from `tape.args[k]` + `idx`, so its handles need not
-# be pushed on the comms tuple (which would make it GC-tracked).
+# `memoryrefnew(getfield(arr, :ref), idx, boundscheck)` with `arr` an `Argument(k)` can be rebuilt in
+# the pullback from `tape.args[k]` + `idx`, so its handles need not be pushed on the comms tuple
+# (which would make it GC-tracked). `idx` may be a literal `Int` (pushed nowhere — it's baked into the
+# pullback) or an `Int`-typed `SSAValue` (pushed as a plain `Int` comms item instead of the 16-byte,
+# GC-scanned `MemoryRef` it replaces).
 #
-# Returns `(k::Int, idx::Int, bc::Bool)` when `node` is such a `MemoryRef` SSA, else `nothing`
-# (dynamic index, 1-arg form over a fresh allocation, or non-argument root).
+# Returns `(k::Int, idx::Union{Int,Core.SSAValue}, bc::Bool)` when `node` is such a `MemoryRef` SSA,
+# else `nothing` (1-arg form over a fresh allocation, non-`Int` index, or non-argument root).
 # ===========================================================================
 function _static_ref_derivation(pir, iworld, @nospecialize(node))
     isa(node, Core.SSAValue) || return nothing
@@ -683,7 +685,10 @@ function _static_ref_derivation(pir, iworld, @nospecialize(node))
     _calleeval(fpos, iworld) === Base.memoryrefnew || return nothing
     length(actual) >= 3 || return nothing          # need the 3-arg offsetting form
     idx = _calleeval(actual[2], iworld)
-    (idx isa Int) || return nothing                 # literal Int index only
+    if idx === nothing && isa(actual[2], Core.SSAValue) && _optype(pir, actual[2]) === Int
+        idx = actual[2]                             # dynamic index, re-derived via the tape
+    end
+    (idx isa Int || idx isa Core.SSAValue) || return nothing
     bc = _calleeval(actual[3], iworld)
     (bc isa Bool) || return nothing                 # literal Bool boundscheck
     root = _provenance_root(pir, iworld, actual[1])
@@ -2458,8 +2463,12 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             arr === nothing && return nothing        # argument carries no fdata
             reft = _optype(pir, a)
             base = emit!(Expr(:call, getf, arr, QuoteNode(:ref)), reft)
+            # A literal index is baked in directly; a dynamic one was pushed as a plain `Int` comms
+            # item and comes back through `pb_presolve` (never re-enters here — an `Int`-typed node
+            # never matches `_static_ref_derivation`'s `MemoryRef` shape).
+            idx_val = isa(idx, Core.SSAValue) ? pb_presolve(idx) : idx
             # Shadow ref forces boundscheck `true`; primal ref keeps the primal's own.
-            return emit!(Expr(:call, Base.memoryrefnew, base, idx, shadow ? true : bc), reft)
+            return emit!(Expr(:call, Base.memoryrefnew, base, idx_val, shadow ? true : bc), reft)
         end
 
         pb_fetch_shadow(@nospecialize a) =

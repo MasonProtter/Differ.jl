@@ -364,9 +364,13 @@ function builtin_rrule_comms(::Val{Base.memoryrefget}, actual, Ti, ctx)
         return false
     end
     # A statically-derivable `MemoryRef` is re-derived in the pullback, so skip pushing its
-    # shadow handle — keeps the comms tuple empty (`SingletonStack`) for static-index reads.
-    ctx.static_ref(ref_node) === nothing || return Tuple{Any,Any}[]
-    return Tuple{Any,Any}[((:shadow_ref, ref_node), ctx.optype(ref_node))]
+    # shadow handle — keeps the comms tuple empty (`SingletonStack`) for static-index reads. A
+    # dynamic (loop) index still needs its own value on the tape, as a plain `Int` rather than the
+    # 16-byte `MemoryRef` it lets us avoid.
+    d = ctx.static_ref(ref_node)
+    d === nothing && return Tuple{Any,Any}[((:shadow_ref, ref_node), ctx.optype(ref_node))]
+    idx = d[2]
+    return isa(idx, Core.SSAValue) ? Tuple{Any,Any}[((:primal, idx), Int)] : Tuple{Any,Any}[]
 end
 
 function apply_builtin_rrule_fwds!(::Val{Base.memoryrefget}, actual, Ti, ctx)
@@ -569,10 +573,16 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     end
     # A statically-derivable `MemoryRef` is re-derived in the pullback, so neither its shadow nor
     # primal handle is pushed — only the overwritten values remain (`:old_tangent` always recorded).
-    derivable = ctx.static_ref(ref_node) !== nothing
+    # A dynamic (loop) index still needs its own value on the tape; it belongs with the shadow side,
+    # which is never optional, so it's declared unconditionally here rather than inside the
+    # `bulk_saved` branch below.
+    d = ctx.static_ref(ref_node)
+    derivable = d !== nothing
     items = Tuple{Any,Any}[]
     if !derivable
         push!(items, ((:shadow_ref, ref_node), ctx.optype(ref_node)))
+    elseif isa(d[2], Core.SSAValue)
+        push!(items, ((:primal, d[2]), Int))
     end
     # The primal side — the element this store overwrote, and the `MemoryRef` to write it back
     # through — is needed only to restore the primal, and only when that restore is done one element
