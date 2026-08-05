@@ -1,5 +1,7 @@
 module Differ
 
+import ADTypes
+
 # Tangent / fdata / rdata type system (ported from Mooncake), plus the Mooncake-shaped
 # `Dual` / `CoDual` carriers that sit on top of it.
 include("tangent_utils.jl")
@@ -32,6 +34,7 @@ include("rules_indexing.jl")    # fancy/logical indexing, generic AbstractArray
 include("rules_linalg.jl")      # LinearAlgebra basics
 
 include("reflection.jl")
+include("adtypes.jl")   # AutoDifferForwards/AutoDifferReverse — DI method impls live in ext/
 
 # using PrecompileTools: @compile_workload
 # include("precomp.jl")
@@ -53,5 +56,8 @@ export Tangent, MutableTangent, PossiblyUninitTangent
 export NoFData, NoRData, FData, RData
 export fdata, rdata, zero_tangent
 export as_tangent, unit_tangent
+
+# DifferentiationInterface.jl integration (method impls in ext/DifferDifferentiationInterfaceExt.jl).
+export AutoDifferForwards, AutoDifferReverse
 
 end # module Differ

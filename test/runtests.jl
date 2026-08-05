@@ -24,3 +24,4 @@ using SafeTestsets
 @safetestset "rules: indexing" begin include("test_indexing_rules.jl") end
 @safetestset "rules: linalg" begin include("test_linalg_rules.jl") end
 @safetestset "rules: no ambiguities" begin include("test_rule_ambiguities.jl") end
+@safetestset "DifferentiationInterface.jl integration" begin include("test_differentiation_interface.jl") end
