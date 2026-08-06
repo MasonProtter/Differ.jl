@@ -753,8 +753,7 @@ end
 # to keep the stack balanced, even though its own arrival is individually unambiguous.
 # ===========================================================================
 function _unique_predecessor_info(pir, exit_blocks::Vector{Int}, unreachable::AbstractVector{Bool},
-                                  block_comms_nodes::Vector{Vector{Any}},
-                                  block_has_subtape::AbstractVector{Bool})
+                                  regions::Dict{Int,Int}, quiet::Set{Int})
     nblocks = length(pir.cfg.blocks)
     preds = [filter(!=(0), pir.cfg.blocks[b].preds) for b in 1:nblocks]
     succs = [pir.cfg.blocks[b].succs for b in 1:nblocks]
@@ -774,7 +773,10 @@ function _unique_predecessor_info(pir, exit_blocks::Vector{Int}, unreachable::Ab
     # or the checked edge into `merge` ran. `chk`/`pass` fail the plain test above for the same
     # reason `br` does (their only real successor besides a dead end is the still-ambiguous
     # `merge`), so all of `quiet` needs forcing, not just `br`.
-    regions, quiet = _collapsible_regions(pir, unreachable, block_comms_nodes, block_has_subtape)
+    #
+    # `regions`/`quiet` come from `_scan_block_comms` rather than being recomputed here: comms fusion
+    # in `_scan_block_comms` mutates the per-block comms lists that `_collapsible_regions` reads, so
+    # they must be computed before that mutation happens.
     for b in quiet
         is_unique_pred[b] = true
     end
@@ -1768,7 +1770,76 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
         types[b] = types[b][keep]
     end
 
-    return nodes, types, bulk_args, self_recursive_ssas, block_has_subtape, block_hoisted_refs
+    # Must run before the fusion loop below, which empties `nodes[b]` for fused-away blocks.
+    # `_collapsible_regions` decides "comms-free" by reading `nodes`; a block emptied by fusion would
+    # then wrongly match as a region interior (`chk`/`pass`) on a recompute, and the pullback skips a
+    # region interior's reverse processing entirely — silently dropping that block's rdata routing.
+    regions, quiet = _collapsible_regions(pir, unreachable, nodes, block_has_subtape)
+
+    # Comms fusion: if `b`'s only successor is `c` and `c`'s only predecessor is `b`, the two run the
+    # same number of times in a fixed order, so `b`'s items can ride along on `c`'s stack instead of
+    # pushing their own — one push per visit instead of two. Canonical shape: one block pushes an
+    # array index, its successor pushes the loaded element.
+    #
+    # `c`'s pop is legal to read from `b`'s reverse block because the pullback walks backwards: `c`'s
+    # reverse block runs first. `b` has exactly one successor, so `b`'s reverse block has exactly one
+    # predecessor — `c`'s — which therefore dominates it. (A leading `PhiNode` on `c` only inserts
+    # linear per-predecessor routing blocks, so dominance still holds.)
+    #
+    # Guards beyond the CFG shape: both blocks must already have items (fusing into an empty block
+    # just moves the push, no win), and both tuples must agree on `isbits`-ness (mixing a GC-tracked
+    # value into an isbits tuple would add a write barrier that wasn't there before).
+    #
+    # `block_fused_refs[b]` records, per moved item, which block's popped tuple (and which slot in it)
+    # the pullback should read instead of popping `b`'s own stack — same shape as `block_hoisted_refs`,
+    # but resolved against a `pop!` rather than a `CommsCell` `getfield`.
+    succs = [pir.cfg.blocks[b].succs for b in 1:nblocks]
+    preds = [filter(!=(0), pir.cfg.blocks[b].preds) for b in 1:nblocks]
+    # `nextb[b]`: `b`'s control-equivalent successor, or 0. Pure CFG, independent of what is declared.
+    nextb = zeros(Int, nblocks)
+    for b in 1:nblocks
+        unreachable[b] && continue
+        length(succs[b]) == 1 || continue
+        c = only(succs[b])
+        (c == b || unreachable[c]) && continue
+        (length(preds[c]) == 1 && only(preds[c]) == b) || continue
+        nextb[b] = c
+    end
+    block_fused_refs = [Tuple{Any,Int,Int}[] for _ in 1:nblocks]
+    # `host[b]`: which block's stack `b`'s items ended up on (itself, if it kept them). Resolved
+    # tail-first so a chain `a -> b -> c` puts *all three* blocks' items on `c` rather than stalling
+    # at `b` once `b` has given its own away. `host` doubles as the memo (0 = not yet resolved) and,
+    # via the provisional self-assignment, as the guard against a cycle in `nextb` (which would need
+    # a loop no edge enters or leaves — not something Julia's optimizer emits, but cheap to exclude).
+    host = zeros(Int, nblocks)
+    resolve_host!(b) = begin
+        host[b] != 0 && return host[b]
+        host[b] = b
+        c = nextb[b]
+        c == 0 && return b
+        t = resolve_host!(c)
+        (t == b || isempty(nodes[b]) || isempty(nodes[t])) && return b
+        isbitstype(Tuple{types[b]...}) == isbitstype(Tuple{types[t]...}) || return b
+        for (idx, item) in enumerate(nodes[b])
+            # Reuse `t`'s slot if it already declares the identical item.
+            slot = findfirst(==(item), nodes[t])
+            if slot === nothing
+                push!(nodes[t], item)
+                push!(types[t], types[b][idx])
+                slot = length(nodes[t])
+            end
+            push!(block_fused_refs[b], (item, t, slot))
+        end
+        empty!(nodes[b])
+        empty!(types[b])
+        return host[b] = t
+    end
+    for b in 1:nblocks
+        resolve_host!(b)
+    end
+
+    return nodes, types, bulk_args, self_recursive_ssas, block_has_subtape, block_hoisted_refs,
+           block_fused_refs, regions, quiet
 end
 
 # ===========================================================================
@@ -1808,17 +1879,15 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
     # they must agree exactly, since it decides which comms items exist.
-    # `block_hoisted_refs` (Stage 2's cross-block reads) needs no handling here: a hoisted item is
-    # simply declared in its defining block's own `nodes`/`types`, so this builder emits it exactly
-    # like any other comms item — only the pullback side needs to know it was moved.
-    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, block_has_subtape, _ = scan
+    # Neither `block_hoisted_refs` nor `block_fused_refs` needs handling here: both relocate an item
+    # into some other block's `nodes`/`types`, so this builder emits every item like any other comms
+    # item, from whichever block now owns it. A fused value is computed in the block that dominates
+    # its host, so `presolve` still finds it in `primal_map` unchanged. Only the pullback side needs
+    # to know anything moved.
+    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, _, _, _,
+        regions, quiet = scan
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
-    # Needs `block_comms_nodes` (collapsible-region detection — see `_collapsible_regions`), hence
-    # computed after the scan above rather than before it as its Phase-D-only predecessor was.
-    # `block_has_subtape` closes the same hazard for a block whose only comms need was a (now
-    # separately-stored) self-recursive call — see `_collapsible_regions`'s `comms_free`.
-    is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, block_comms_nodes,
-                                                    block_has_subtape)
+    is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions, quiet)
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
@@ -2446,15 +2515,13 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
     # they must agree exactly, since it decides which comms items exist.
-    # `block_hoisted_refs[b]`: Stage 2's cross-block reads — for each `(item, d, slot)`, block `b`
-    # reads `item` out of block `d`'s own comms slot instead of popping it locally (see the per-block
-    # comms setup below).
-    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, block_has_subtape,
-        block_hoisted_refs = scan
-    # Needs `block_comms_nodes` (collapsible-region detection — see `_collapsible_regions`), hence
-    # computed after the scan above rather than before it as its Phase-D-only predecessor was.
-    _, pred_is_unique_pred, regions = _unique_predecessor_info(pir, exit_blocks, unreachable_block, block_comms_nodes,
-                                                               block_has_subtape)
+    # `block_hoisted_refs[b]`: cross-block reads — for each `(item, d, slot)`, block `b` reads `item`
+    # out of block `d`'s own comms slot instead of popping it locally (see the per-block comms setup
+    # below). `block_fused_refs[b]`: same `(item, host, slot)` shape, but read out of the tuple the
+    # *host* block's reverse code popped rather than a `CommsCell`.
+    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, _,
+        block_hoisted_refs, block_fused_refs, regions, quiet = scan
+    _, pred_is_unique_pred, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions, quiet)
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
@@ -2493,6 +2560,12 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
 
     entry_id = ID()
     block_id = [ID() for _ in 1:nblocks]
+    # The tuple block `b`'s reverse code pops. Minted up front rather than by `emit!`, because a
+    # block whose items were fused onto a *later*-numbered host must name the host's popped tuple
+    # before the host itself is emitted. Forward references are fine — `_ids_to_line_numbers`
+    # resolves every `ID` against one map built over all blocks at once — the only real obligation is
+    # dominance, which the fusion criterion already establishes.
+    comms_popped_id = [ID() for _ in 1:nblocks]
 
     # The node each exit block returns — potentially a different one per exit (e.g. each arm of an
     # if/else returning its own value; see `_exit_blocks`).
@@ -2661,19 +2734,27 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         comms_type_id = Dict{Any,Any}()
         if !isempty(block_comms_types[b])
             ST = comms_stack_ty[b]
-            if ST <: CommsCell
-                # Unrolled single-slot read: `getfield` of `val` (field 1) — no `pop!`/`position`.
-                popped = emit!(Expr(:call, getf, comms_obj_id[b], 1), Tuple{block_comms_types[b]...})
-            else
-                popped = emit!(icall(pop_g, (ST,), comms_obj_id[b]),
-                               Tuple{block_comms_types[b]...})
-            end
+            # Unrolled single-slot read for a `CommsCell`: `getfield` of `val` (field 1) — no
+            # `pop!`/`position`. Emitted under the pre-minted `comms_popped_id[b]` so any block whose
+            # items were fused onto `b` can name this tuple (see `comms_popped_id`).
+            pop_ex = ST <: CommsCell ? Expr(:call, getf, comms_obj_id[b], 1) :
+                                       icall(pop_g, (ST,), comms_obj_id[b])
+            popped = comms_popped_id[b]
+            push!(stmts, (popped, new_inst(pop_ex, Tuple{block_comms_types[b]...}, CC.IR_FLAG_REFINED)))
             for (j, nd) in enumerate(block_comms_nodes[b])
                 comms_val_id[nd] = emit!(Expr(:call, getf, popped, j), block_comms_types[b][j])
                 comms_type_id[nd] = block_comms_types[b][j]
             end
         end
-        # Stage 2's hoisted items: not on `b`'s own comms stack at all — read straight out of the
+        # Fused items: not on `b`'s own stack — they rode along on control-equivalent successor
+        # `host`'s single push, so they come out of the tuple `host`'s reverse code popped. Legal
+        # because `host`'s reverse block is this one's sole predecessor in the pullback CFG.
+        for (item, hostb, slot) in block_fused_refs[b]
+            comms_val_id[item] = emit!(Expr(:call, getf, comms_popped_id[hostb], slot),
+                                       block_comms_types[hostb][slot])
+            comms_type_id[item] = block_comms_types[hostb][slot]
+        end
+        # Hoisted items: not on `b`'s own comms stack at all — read straight out of the
         # defining block `d`'s `CommsCell` (`comms_obj_id[d]`, already unpacked in the entry block).
         # A plain double `getfield` — no `pop!`, and safe regardless of visit order since the
         # forwards pass has already finished and `d`'s single-slot cell was written exactly once.

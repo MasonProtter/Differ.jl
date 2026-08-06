@@ -141,9 +141,15 @@ end
 #
 # `bytes` is the sum over comms stacks. Pass `isbits=true` to additionally require every stack to be
 # pointer-free.
-function check_tape_size(f, at; bytes::Union{Int,Nothing}=nothing, isbits::Union{Bool,Nothing}=nothing)
+#
+# `stacks` is the number of comms stacks — distinct from `bytes` because comms fusion
+# (`_scan_block_comms`) can merge two stacks' values onto one without changing the byte total, only
+# the push/pop count.
+function check_tape_size(f, at; bytes::Union{Int,Nothing}=nothing, isbits::Union{Bool,Nothing}=nothing,
+                         stacks::Union{Int,Nothing}=nothing)
     ts = comms_element_types(tape_type(f, at))
     isbits === nothing || @test all(isbitstype, ts) == isbits
     bytes === nothing || @test sum(sizeof, ts; init=0) == bytes
+    stacks === nothing || @test length(ts) == stacks
     return ts
 end

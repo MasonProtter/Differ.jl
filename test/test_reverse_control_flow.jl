@@ -161,7 +161,10 @@ end
     @test dv_ld ≈ [2.0, 2.0, 2.0]
     checkverify_rev(loopdot, (Float64, Vector{Float64}))
     check_stack_balance(loopdot, 2.0, [1.0, 2.0, 3.0])
-    check_tape_size(loopdot, (Float64, Vector{Float64}); bytes=16, isbits=true)
+    # `stacks=1`: the index and the loaded element are declared in different, control-equivalent
+    # blocks, so comms fusion merges them onto one `Stack{Tuple{Float64,Int64}}` — one push per
+    # iteration instead of two. `bytes` stays the same; only the push count changes.
+    check_tape_size(loopdot, (Float64, Vector{Float64}); bytes=16, isbits=true, stacks=1)
 
     # `polyloop`'s loop body reads `t` (loop-carried) and `x` (an argument); eliding `x` drops the
     # loop-body comms tuple from `Tuple{Float64,Float64}` to `Tuple{Float64}` (`t` alone).
@@ -178,7 +181,9 @@ end
     @test dx_pl ≈ central_diff(x -> polyloop(x, 4), 2.0) rtol = 1e-5
     checkverify_rev(polyloop, (Float64, Int))
     check_stack_balance(polyloop, 2.0, 4)
-    check_tape_size(polyloop, (Float64, Int); bytes=8, isbits=true)
+    # `stacks=1` is a guard, not a win: `polyloop` indexes nothing, so its loop body only ever had
+    # one stack — this pins that fusion doesn't fire when there's nothing adjacent to fuse.
+    check_tape_size(polyloop, (Float64, Int); bytes=8, isbits=true, stacks=1)
 
     # `loopinv`'s `y = x*x` is loop-invariant (defined once, outside the loop, from an argument) but
     # consumed by the loop body every iteration. Stage 2 hoists `y`'s comms item to its own defining
@@ -198,5 +203,7 @@ end
     @test dv_li ≈ [4.0, 4.0, 4.0]
     checkverify_rev(loopinv, (Float64, Vector{Float64}))
     check_stack_balance(loopinv, 2.0, [1.0, 2.0, 3.0])
-    check_tape_size(loopinv, (Float64, Vector{Float64}); bytes=16, isbits=true)
+    # Hoisting and fusion compose: `y` is hoisted out of the loop body entirely, and what remains
+    # (the index and `v[i]`) fuses onto one stack, same as `loopdot`.
+    check_tape_size(loopinv, (Float64, Vector{Float64}); bytes=16, isbits=true, stacks=1)
 end

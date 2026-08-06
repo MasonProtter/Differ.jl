@@ -187,7 +187,9 @@ end
     check_stack_balance(bulkwrite!, copy(xb))
     _, dxb = gradient(bulkwrite!, copy(xb))
     @test dxb == fill(2.0, 3)
-    @test !any(has_memoryref, check_tape_size(bulkwrite!, (Vector{Float64},)))
+    # Comms fusion drops this from 5 stacks to 4, at an unchanged 48 bytes. The 4th is the nested
+    # `mapreduce_impl` tape from the trailing `sum(x)` — a separate inner tape, not a loop-body stack.
+    @test !any(has_memoryref, check_tape_size(bulkwrite!, (Vector{Float64},); stacks=4))
 
     nested_loop_write!(x::Vector{Vector{Float64}}, w::Vector{Float64}) =
         (for i in eachindex(x); x[i] = w; end; sum(x[end]))
