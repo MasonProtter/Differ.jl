@@ -121,10 +121,25 @@ end
     mem = st.memory
     if p <= Base.length(mem) && Base.isassigned(mem, p)
         t = Core.getfield(@inbounds(mem[p]), k)
-        # `isa` is load-bearing only for a self-recursive edge, whose declared comms type is the
-        # bare `Tape` UnionAll (see `reverse_interp.jl`) rather than `TapeT` itself; for an ordinary
-        # callee this narrows to a no-op.
+        # This callee's own comms declaration always names `TapeT` concretely (a direct
+        # self-recursive edge, the one case that used to force an abstract `Tape` marker here,
+        # routes through `_inner_self_ctx` below instead) — so this `isa` narrows to a no-op.
         t isa TapeT && return Ctx(t)
+    end
+    return Ctx(_alloc_tape(TapeT))
+end
+
+# Direct self-recursion's dedicated storage (`Tape.subtapes`, `reverse_interp.jl`). Mirrors
+# `_inner_ctx` above, but simpler: the stack's own element type already *is* the recycled `Tape` —
+# every self-recursive call site in one primal shares this single field, so there is no per-site `k`
+# to multiplex, and no tuple wrapper or abstractly-typed slot to read out of (which is the entire
+# point: reading a value stored under a concrete `Tape{ArgsTT,CS}` element type costs nothing, unlike
+# the abstract bare-`Tape`-marker comms item this replaces).
+@inline function _inner_self_ctx(st::Stack{TapeT}) where {TapeT}
+    p = st.position + 1
+    mem = st.memory
+    if p <= Base.length(mem) && Base.isassigned(mem, p)
+        return Ctx(@inbounds mem[p])
     end
     return Ctx(_alloc_tape(TapeT))
 end

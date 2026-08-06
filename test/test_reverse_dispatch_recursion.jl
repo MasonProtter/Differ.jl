@@ -34,6 +34,17 @@ end
 @noinline mutA(x::Float64, n::Int) = n <= 0 ? x : mutB(x, n - 1)
 @noinline mutB(x::Float64, n::Int) = mutA(x, n - 1)
 
+# Self-recursive with two distinct static call sites in two different (mutually-exclusive) blocks,
+# unlike `rec_sum`/the `Base.mapreduce_impl` case (one shared block) — same module-level requirement.
+@noinline function evenodd(n::Int, x::Float64)
+    n <= 0 && return x
+    if iseven(n)
+        return evenodd(n - 1, x + 1.0) * 2.0
+    else
+        return evenodd(n - 1, x * 2.0) + 1.0
+    end
+end
+
 # A `const` global holding a function, passed as an *operand* of a surviving call: the operand is a
 # `GlobalRef` in the optimized IR, so its type has to come from the binding, not from the node (the
 # reverse-mode half of ISSUES #63). Module-level `const` for the same reason `dyn_g` is module-level.
@@ -424,17 +435,11 @@ end
     # n=2000 reaches its self-recursive branch — the case Stage 2's `own_TapeT` self-edge retargeting
     # (`reverse_fwds_recursive_ci`, `src/reverse_interp.jl`) is for.
     #
-    # Gradient correctness is the hard requirement. Allocation drops by ~3 orders of magnitude
-    # relative to the fresh-`Ctx()` baseline this plan measured (111056 B / 87 allocs at this size
-    # before Stages 1-2) but is NOT literally 0, and this is not a bug: reading a recycled tape back
-    # out of a *self-recursive* comms slot still costs a small, roughly recursion-depth-proportional
-    # allocation, because that slot's declared element type is necessarily the *abstract* bare `Tape`
-    # UnionAll (never a concrete type — see `reverse_fwds_recursive_ci`'s docstring on why no fixed
-    # point is solved for a self-edge), and reading a value out of an abstractly-typed comms `Stack`
-    # allocates even when the underlying `Tape` object is genuinely being reused (confirmed directly:
-    # a `Stack{Tuple{ConcreteType,ConcreteType}}` read allocates nothing, a `Stack{Tuple{Tape,Tape}}`
-    # read allocates 16 bytes, for the exact same recycled objects). That is a distinct, narrower
-    # cost than "a tape escaping recycling" — see the plan writeup for the follow-up this motivates.
+    # Steady-state allocation is exactly 0: the concrete `Tape.subtapes` field (the "concrete
+    # self-recursive Tape" follow-up plan) removed the abstract-bare-`Tape`-marker comms slot this
+    # test used to read through, which is what left a small (~16-32 B) residual here before. Dropped
+    # ~4 orders of magnitude from the original fresh-`Ctx()` baseline (111056 B / 87 allocs at this
+    # size, pre-recycling).
     f_self = x -> sum(abs2, x)
     n = 2000
     @assert n > Base.pairwise_blocksize(abs2, Base.add_sum)
@@ -448,7 +453,46 @@ end
     gradient!(ctx, fcd, xcd)   # warm
     gradient!(ctx, fcd, xcd)
     bytes = @allocated gradient!(ctx, fcd, xcd)
-    @test 0 < bytes < 2_000   # was 111056 B pre-Stages-1-2 — a residual, documented above, not a regression
+    @test bytes == 0
+
+    # Not vacuous: confirm the mechanism was genuinely exercised, not zero because nothing pushed to
+    # `subtapes` at all. Locate the innermost `Base.mapreduce_impl` tape (self-recursive primal) and
+    # assert its own `subtapes` stack actually holds recycled entries.
+    function find_self_recursive_tape(tape, seen=Base.IdSet{Any}())
+        tape in seen && return nothing
+        push!(seen, tape)
+        length(tape.subtapes.memory) > 0 && return tape
+        for s in tape.comms
+            s isa Differ.Stack || continue
+            for i in eachindex(s.memory)
+                isassigned(s.memory, i) || continue
+                for v in s.memory[i]
+                    v isa Differ.Tape || continue
+                    found = find_self_recursive_tape(v, seen)
+                    found === nothing || return found
+                end
+            end
+        end
+        return nothing
+    end
+    self_tape = find_self_recursive_tape(ctx.tape)
+    @test self_tape !== nothing
+    @test length(self_tape.subtapes.memory) > 0
+end
+
+@testset "reverse mode: nested-tape recycling — self-recursion across distinct blocks" begin
+    # `mapreduce_impl`'s two self-recursive call sites share one block. This is the complementary
+    # case the design argument (one global, `Tape`-wide `subtapes` stack, LIFO-consistent regardless
+    # of which block each entry came from) doesn't get from that alone: two self-recursive call sites
+    # in *different*, mutually-exclusive blocks of the same primal.
+    checkverify_rev(evenodd, (Int, Float64))
+    check_stack_balance(evenodd, 9, 1.0)
+
+    ctx = build_ctx(evenodd, (Int, Float64))
+    g1 = gradient!(ctx, zero_fcodual(evenodd), zero_fcodual(9), zero_fcodual(1.0))
+    g2 = gradient!(ctx, zero_fcodual(evenodd), zero_fcodual(9), zero_fcodual(1.0))
+    @test g1 == g2
+    @test g1 == gradient(evenodd, 9, 1.0)
 end
 
 @testset "reverse mode: nested-tape recycling — hand rule callee still gets a fresh Ctx()" begin

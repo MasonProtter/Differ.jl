@@ -71,6 +71,13 @@ function _assert_tape_balanced(tape::Differ.Tape, seen::Base.IdSet{Any}=Base.IdS
     for s in tape.comms
         _assert_comms_balanced(s, seen)
     end
+    # Direct self-recursion's dedicated storage (`Tape.subtapes`): same balance/recycling invariant
+    # as an ordinary comms-embedded inner tape, just reached through its own field instead of a
+    # `(:subtape, ssa)` comms item.
+    @test tape.subtapes.position == 0
+    for i in eachindex(tape.subtapes.memory)
+        isassigned(tape.subtapes.memory, i) && _assert_tape_balanced(tape.subtapes.memory[i], seen)
+    end
     return nothing
 end
 function _assert_comms_balanced(s::Differ.Stack, seen)

@@ -152,16 +152,45 @@ mutable struct Tape{ArgsTT<:Tuple,CS<:Tuple}
     # (`_bulk_save_args`). `const`: the `Vector` object is fixed for the tape's life, only its
     # contents change — which is what lets a pre-allocated context reuse the buffers instead of
     # allocating a copy per call. `_NO_BULK_BUFS` (a shared empty) when this primal saves nothing.
-    #
-    # Declared before `args` so the 3-argument constructor can leave *only* `args` undef: `bufs` is
-    # read unconditionally by the pullback and must always be assigned.
     const bufs::Vector{Any}
+    # Storage for a direct self-recursive call's own inner tape — always exactly `Tape{ArgsTT,CS}`
+    # itself, since a self-recursive callee's tape type is, by construction, identical to the
+    # caller's. Naming that here, through `Tape`'s own already-resolved parameters, is ordinary
+    # Julia recursive-struct self-reference (the same mechanism a self-referential linked-list node
+    # uses: `next::Union{Nothing,Node{T}}` inside `Node{T}`'s own body needs no fixed point, since
+    # `T` is untouched by the recursion) — not an attempt to solve `CS`'s own fixed point. Kept as
+    # its own field, outside `CS`, so `CS` never has to describe the recursive structure at all: it
+    # goes back to enumerating only genuinely non-self-recursive per-block comms.
+    #
+    # One shared stack serves every direct self-recursive call site in this primal, regardless of
+    # how many there are or which block(s) they're in: they all target this identical type, so
+    # there's no per-site heterogeneity to partition around the way ordinary per-block comms have.
+    # Pushed in the fwds pass's strict program order and popped in the pullback's exact reverse
+    # order — the same global forward/reverse ordering guarantee this whole engine already depends
+    # on — so one stack is LIFO-consistent regardless of which site or block each entry came from.
+    #
+    # Declared before `args` so the 3-argument constructor can leave *only* `args` undef: both
+    # `bufs` and `subtapes` are read unconditionally by the pullback/emission and must always be
+    # assigned. Always constructed, even for a primal with no self-recursive call at all (an empty
+    # `Stack` costs a real, if small, one-time allocation when it escapes inside a `Tape` — this is
+    # a fresh-tape-construction cost, not a steady-state recycling cost).
+    const subtapes::Stack{Tape{ArgsTT,CS}}
     args::ArgsTT
-    Tape{ArgsTT,CS}(block_stack, comms, bufs=_NO_BULK_BUFS) where {ArgsTT<:Tuple,CS<:Tuple} =
-        new{ArgsTT,CS}(block_stack, comms, bufs)    # `args` deliberately left undef
-    Tape{ArgsTT,CS}(block_stack, comms, bufs, args) where {ArgsTT<:Tuple,CS<:Tuple} =
-        new{ArgsTT,CS}(block_stack, comms, bufs, args)
+    Tape{ArgsTT,CS}(block_stack, comms, bufs=_NO_BULK_BUFS,
+                    subtapes=Stack{Tape{ArgsTT,CS}}()) where {ArgsTT<:Tuple,CS<:Tuple} =
+        new{ArgsTT,CS}(block_stack, comms, bufs, subtapes)    # `args` deliberately left undef
+    Tape{ArgsTT,CS}(block_stack, comms, bufs, subtapes, args) where {ArgsTT<:Tuple,CS<:Tuple} =
+        new{ArgsTT,CS}(block_stack, comms, bufs, subtapes, args)
 end
+
+# `Tape` is reverse-mode bookkeeping, never a differentiable primal value — it must never fall
+# through to the generic per-field `tangent_type` derivation. This was implicitly, silently true
+# before the `subtapes` field above: nothing ever actually needed `Tape`'s tangent type, and the
+# generic derivation happened to terminate anyway (every field was finite). `subtapes` makes `Tape`
+# genuinely self-referential (`Tape` contains a `Stack` containing a `Vector` containing `Tape`
+# again), so the same generic derivation, if ever reached, now recurses forever instead of
+# terminating quietly. Make the "never a primal value" fact explicit instead.
+tangent_type(::Type{<:Tape}) = NoTangent
 
 # ===========================================================================
 # Two layers, as in forward mode (`frule!!` entry / `dualized_impl` carrier):
@@ -724,7 +753,8 @@ end
 # to keep the stack balanced, even though its own arrival is individually unambiguous.
 # ===========================================================================
 function _unique_predecessor_info(pir, exit_blocks::Vector{Int}, unreachable::AbstractVector{Bool},
-                                  block_comms_nodes::Vector{Vector{Any}})
+                                  block_comms_nodes::Vector{Vector{Any}},
+                                  block_has_subtape::AbstractVector{Bool})
     nblocks = length(pir.cfg.blocks)
     preds = [filter(!=(0), pir.cfg.blocks[b].preds) for b in 1:nblocks]
     succs = [pir.cfg.blocks[b].succs for b in 1:nblocks]
@@ -744,7 +774,7 @@ function _unique_predecessor_info(pir, exit_blocks::Vector{Int}, unreachable::Ab
     # or the checked edge into `merge` ran. `chk`/`pass` fail the plain test above for the same
     # reason `br` does (their only real successor besides a dead end is the still-ambiguous
     # `merge`), so all of `quiet` needs forcing, not just `br`.
-    regions, quiet = _collapsible_regions(pir, unreachable, block_comms_nodes)
+    regions, quiet = _collapsible_regions(pir, unreachable, block_comms_nodes, block_has_subtape)
     for b in quiet
         is_unique_pred[b] = true
     end
@@ -800,11 +830,16 @@ end
 # stop pushing onto the block stack.
 # ===========================================================================
 function _collapsible_regions(pir, unreachable::AbstractVector{Bool},
-                              block_comms_nodes::Vector{Vector{Any}})
+                              block_comms_nodes::Vector{Vector{Any}},
+                              block_has_subtape::AbstractVector{Bool})
     nblocks = length(pir.cfg.blocks)
     preds = [filter(!=(0), pir.cfg.blocks[b].preds) for b in 1:nblocks]
     succs = [pir.cfg.blocks[b].succs for b in 1:nblocks]
-    comms_free(b) = isempty(block_comms_nodes[b])
+    # `block_has_subtape[b]`: does `b` contain a direct self-recursive call? Its inner tape is stored
+    # in `Tape.subtapes` (see that field's docstring), not in `block_comms_nodes[b]` — so a block
+    # whose only communicated state was that call must still count as *not* comms-free, or this
+    # function would wrongly treat its real `subtapes` push/pop as skippable.
+    comms_free(b) = isempty(block_comms_nodes[b]) && !block_has_subtape[b]
     dead_end(b) = unreachable[b] && isempty(succs[b])
     solo_pred(b, from) = length(preds[b]) == 1 && only(preds[b]) == from
     no_leading_phi(b) = !isa(pir.stmts[pir.cfg.blocks[b].stmts.start][:stmt], Core.PhiNode)
@@ -1559,6 +1594,14 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
     nblocks = length(pir.cfg.blocks)
     nodes = [Any[] for _ in 1:nblocks]
     types = [Any[] for _ in 1:nblocks]
+    # A direct self-recursive call's inner tape is routed through `Tape.subtapes` (a single, global,
+    # `Tape`-wide stack — see that field's docstring), not through a per-block comms item: every such
+    # call in this primal targets the identical concrete type, so there's no per-block heterogeneity
+    # to justify partitioning it the way ordinary comms are. `self_recursive_ssas` records which
+    # statement indices resolved this way; `block_has_subtape` records which blocks contain at least
+    # one, which `_collapsible_regions` needs so it doesn't mistake such a block for comms-free.
+    self_recursive_ssas = BitSet()
+    block_has_subtape = falses(nblocks)
     n = length(codualparams)
     fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
@@ -1650,16 +1693,22 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                 reason[] *= " — at %$i: `$(_stmt_str(s))`"
                 return nothing
             end
-            # For a cyclic edge this is the bare `Tape` UnionAll (see `reverse_fwds_recursive_ci`),
-            # which is exactly what makes the comms-tuple type finite — a concrete `TapeT` isn't known
-            # yet at scan time (it depends on this very comms scan), and doesn't need to be: the
-            # abstract element type is enough to close the loop.
+            # For a cyclic edge this is the bare `Tape` UnionAll (see `reverse_fwds_recursive_ci`) —
+            # the marker meaning "route through `Tape.subtapes`, not a comms item at all" (below).
+            # A concrete `TapeT` isn't known yet at scan time anyway (it depends on this very comms
+            # scan): that's exactly why the self-recursive case can't be folded into `CS` the way an
+            # ordinary nested call's inner tape type is.
             InnerTapeT = resolved[4]
-            push!(nodes[b], (:subtape, Core.SSAValue(i)))
-            push!(types[b], InnerTapeT)
+            if InnerTapeT === Tape
+                push!(self_recursive_ssas, i)
+                block_has_subtape[b] = true
+            else
+                push!(nodes[b], (:subtape, Core.SSAValue(i)))
+                push!(types[b], InnerTapeT)
+            end
         end
     end
-    return nodes, types, bulk_args
+    return nodes, types, bulk_args, self_recursive_ssas, block_has_subtape
 end
 
 # ===========================================================================
@@ -1699,11 +1748,14 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
     # they must agree exactly, since it decides which comms items exist.
-    block_comms_nodes, block_comms_types, bulk_args = scan
+    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, block_has_subtape = scan
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     # Needs `block_comms_nodes` (collapsible-region detection — see `_collapsible_regions`), hence
     # computed after the scan above rather than before it as its Phase-D-only predecessor was.
-    is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, block_comms_nodes)
+    # `block_has_subtape` closes the same hazard for a block whose only comms need was a (now
+    # separately-stored) self-recursive call — see `_collapsible_regions`'s `comms_free`.
+    is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, block_comms_nodes,
+                                                    block_has_subtape)
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
@@ -1777,7 +1829,10 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     PreTapeT = (CtxT isa DataType && CtxT <: Ctx) ? CtxT.parameters[1] : Nothing
     tape_ssa = nothing
     if PreTapeT === Nothing
-        # Tape-allocating mode: build the block stack and one comms stack per block.
+        # Tape-allocating mode: build the block stack, one comms stack per block, and the
+        # self-recursion `subtapes` stack (empty — a primal with no self-recursive call never
+        # pushes to it, and `_alloc_tape`'s cold path never needs one either since it's rebuilt
+        # fresh here).
         block_stack_ssa = icall!(Stack{Int32}, Stack{Int32}, ())
         for b in 1:nblocks
             ST = comms_stack_ty[b]
@@ -1785,6 +1840,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
             # `Stack{T}` takes a capacity (pre-size to 1 for a single push).
             comms_stack_ssa[b] = ST <: SingletonStack ? emit!(Expr(:new, ST), ST) : icall!(ST, ST, ())
         end
+        subtapes_ssa = icall!(Stack{TapeT}, Stack{TapeT}, ())
     else
         # Pre-allocated mode: read the caller's tape out of the `ctx` and reuse its stacks. This is
         # the whole point of `build_ctx(...; prealloc=true)` — a `Stack` is three heap objects
@@ -1801,6 +1857,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
         for b in 1:nblocks
             comms_stack_ssa[b] = emit!(Expr(:call, getf, comms_tuple_in, b), comms_stack_ty[b])
         end
+        subtapes_ssa = emit!(Expr(:call, getf, tape_ssa, 4), Stack{TapeT})
         # Reset every reusable stack to empty. Balanced push/pop already leaves them at 0 after a
         # completed round trip (the `check_stack_balance` tests cover exactly that), but resetting
         # here is what makes reuse correct unconditionally — a caller is free to run the forwards
@@ -1813,11 +1870,12 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
             # `SingletonStack` is empty.
             emit!(Expr(:call, setf, comms_stack_ssa[b], 2, 0), Any)
         end
+        emit!(Expr(:call, setf, subtapes_ssa, 2, 0), Any)
         # This call's coduals replace the previous call's. A re-used context therefore keeps the
         # *previous* call's arguments (and their shadows) alive until the next call overwrites them
         # — noted in `build_ctx`'s docstring; the field is concretely typed, so there is nothing to
-        # null it to in between.
-        emit!(Expr(:call, setf, tape_ssa, 4, args_tup_ssa), Any)
+        # null it to in between. `args` is field 5 now that `subtapes` (field 4) sits before it.
+        emit!(Expr(:call, setf, tape_ssa, 5, args_tup_ssa), Any)
     end
 
     # --- Bulk primal save. Still in the prologue — before any primal statement has run — so it
@@ -1986,7 +2044,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
             tape = tape_ssa
             if tape === nothing
                 comms_tuple = emit!(Expr(:call, ctuple, comms_stack_ssa...), Tuple{comms_stack_ty...})
-                tape = emit!(Expr(:new, TapeT, block_stack_ssa, comms_tuple, bufs_ssa, args_tup_ssa), TapeT)
+                tape = emit!(Expr(:new, TapeT, block_stack_ssa, comms_tuple, bufs_ssa, subtapes_ssa,
+                                  args_tup_ssa), TapeT)
             end
             final = emit!(Expr(:call, ctuple, result_cd, tape), Tuple{fcodual_type(R),TapeT})
             emit!(Core.ReturnNode(final), Any)
@@ -2142,30 +2201,47 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                     fdata_val = fdtype(argtypes[j]) === NoFData ? NoFData() : sresolve(a)
                     push!(argcoduals, emit!(Expr(:new, Cj, presolve(a), fdata_val), Cj))
                 end
-                # Uniform layout `(fcd, ctx, argcds...)` for both callees. Recycle the tape sitting
-                # in the comms slot this call's own `:subtape` push will land in, instead of
-                # allocating a fresh one every call (`_inner_ctx`, `stack.jl`) — a `Stack` never
+                # Uniform layout `(fcd, ctx, argcds...)` for both callees. Recycle a tape instead of
+                # allocating a fresh one every call (`_inner_ctx`/`_inner_self_ctx`, `stack.jl`) for
+                # any derived (non-hand-ruled) callee — only a hand rule's pullback
+                # (`callee_val !== reverse_fwds_impl`) has no `Tape` to pre-allocate at all, and keeps
+                # the fresh-tape `Ctx()`. A self-recursive edge (`InnerTapeT0 === Tape`) recycles from
+                # the tape's own dedicated `subtapes` stack, via `_inner_self_ctx` — simpler than the
+                # ordinary case, since every self-recursive call site in this primal shares that one
+                # stack, with no per-site `k` to multiplex. An ordinary nested callee still recycles
+                # from the comms slot its own `:subtape` push will land in — a `Stack` never
                 # deallocates, so after the first execution of this block the slot already holds a
-                # structurally identical inner tape. Applies uniformly to an ordinary derived callee
-                # and a self-recursive edge alike (`reverse_fwds_recursive_ci`'s `own_TapeT` already
-                # retargeted the self-edge `ci` above to the matching `Ctx{InnerTapeT}`, Stage 2) —
-                # only a hand rule's pullback (`callee_val !== reverse_fwds_impl`) has no `Tape` to
-                # pre-allocate at all, and keeps the fresh-tape `Ctx()`.
-                ctx_val = if callee_val === reverse_fwds_impl
+                # structurally identical inner tape.
+                is_self_edge = InnerTapeT0 === Tape
+                ctx_val = if callee_val !== reverse_fwds_impl
+                    Ctx()
+                elseif is_self_edge
+                    icall!(_inner_self_ctx, Ctx{TapeT}, (Stack{TapeT},), subtapes_ssa)
+                else
                     ST = comms_stack_ty[bidx]
                     @assert ST <: Stack "a `:subtape` comms item must force a real `Stack` (never " *
                                         "isbits/singleton — a `Tape` is always mutable), got $(ST)"
                     k = findfirst(nd -> nd == (:subtape, Core.SSAValue(i)), block_comms_nodes[bidx])
                     icall!(_inner_ctx, Ctx{InnerTapeT}, (ST, Val{k}, Type{InnerTapeT}),
                            comms_stack_ssa[bidx], Val(k), InnerTapeT)
-                else
-                    Ctx()
                 end
                 pair = emit!(Expr(:invoke, ci, callee_val, fcodual, ctx_val, argcoduals...),
                             Tuple{InnerFCoDualT,InnerTapeT})
                 result_cd = emit!(Expr(:call, getf, pair, 1), InnerFCoDualT)
                 primal_map[i] = emit!(Expr(:call, getf, result_cd, 1), Ti)
-                inner_tape_map[i] = emit!(Expr(:call, getf, pair, 2), InnerTapeT)
+                inner_tape_ssa = emit!(Expr(:call, getf, pair, 2), InnerTapeT)
+                if is_self_edge
+                    # Pushed immediately at the call site rather than deferred to `emit_epilogue!`
+                    # like ordinary comms: `_scan_block_comms` never declared a `(:subtape, ...)`
+                    # comms node for a self-recursive statement, so there is nothing for
+                    # `emit_epilogue!` to look up for it. Safe regardless of where in the block this
+                    # statement sits: `_split_ambiguous_block_pushes`/`_is_expected_block_push` only
+                    # ever classifies a block whose *primal* terminator is a `GotoIfNot`, which a call
+                    # statement never is, so this push can't be mistaken for the block-stack push.
+                    icall!(push_g, Any, (Stack{TapeT}, TapeT), subtapes_ssa, inner_tape_ssa)
+                else
+                    inner_tape_map[i] = inner_tape_ssa
+                end
             end
         elseif isa(s, Core.GotoNode)
             emit!(Core.GotoNode(s.label), Any)
@@ -2307,10 +2383,11 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
     # they must agree exactly, since it decides which comms items exist.
-    block_comms_nodes, block_comms_types, bulk_args = scan
+    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, block_has_subtape = scan
     # Needs `block_comms_nodes` (collapsible-region detection — see `_collapsible_regions`), hence
     # computed after the scan above rather than before it as its Phase-D-only predecessor was.
-    _, pred_is_unique_pred, regions = _unique_predecessor_info(pir, exit_blocks, unreachable_block, block_comms_nodes)
+    _, pred_is_unique_pred, regions = _unique_predecessor_info(pir, exit_blocks, unreachable_block, block_comms_nodes,
+                                                               block_has_subtape)
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
@@ -2369,6 +2446,10 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     seed_id = Core.Argument(3)
     block_stack_id = eemit!(Expr(:call, getf, tape_id, 1), Stack{Int32})
     comms_tuple_id = eemit!(Expr(:call, getf, tape_id, 2), CS)
+    # Direct self-recursion's dedicated storage (`Tape.subtapes`, field 4) — see the emission side's
+    # matching `subtapes_ssa`. Unconditionally unpacked (unused/DCE'd by `run_ipo_passes!` when this
+    # primal has no self-recursive call), same as `comms_obj_id` below.
+    subtapes_id = eemit!(Expr(:call, getf, tape_id, 4), Stack{TapeT})
 
     comms_obj_id = Vector{Any}(undef, nblocks)
     for b in 1:nblocks
@@ -2385,7 +2466,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # silently dropped. ---
     parg_pb = Vector{Any}(undef, n)
     farg_pb = Vector{Any}(undef, n)
-    let args_tup_id = eemit!(Expr(:call, getf, tape_id, 4), ArgsTT)
+    let args_tup_id = eemit!(Expr(:call, getf, tape_id, 5), ArgsTT)
         for k in 1:n
             Ck = codualparams[k]
             Pk = _codual_primal_type(Ck)
@@ -2738,21 +2819,23 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     info === nothing && return nothing
                     _, ftype, argtypes = info
                     acc = deref_and_zero!(ssa_ref_id[i], Ti)   # this call's own seed for the inner pullback
-                    subtape_key = (:subtape, Core.SSAValue(i))
-                    inner_tape_raw = comms_val_id[subtape_key]
-                    InnerTapeT = comms_type_id[subtape_key]
+                    # A direct self-recursive call's inner tape was pushed onto `Tape.subtapes`
+                    # (fwds side), not a per-block comms item — `comms_val_id` has no entry for it at
+                    # all (`_scan_block_comms` never declares one). Pop it back off `subtapes_id`
+                    # directly instead; since it visits statements in descending SSA order while the
+                    # fwds pass pushed in ascending order, multiple self-recursive calls sharing one
+                    # block pop in the correct (reverse) order automatically. The popped value's
+                    # declared type is already exactly `TapeT` — concrete, no `PiNode` narrowing
+                    # needed (unlike the old abstract-marker comms item this replaces).
+                    is_self = i in self_recursive_ssas
+                    InnerTapeT = is_self ? Tape : comms_type_id[(:subtape, Core.SSAValue(i))]
+                    inner_tape = is_self ? emit!(icall(pop_g, (Stack{TapeT},), subtapes_id), TapeT) :
+                                           comms_val_id[(:subtape, Core.SSAValue(i))]
                     # `zero_like_rdata_type`, not `rdtype`: `acc`'s actual type (see `deref_and_zero!`
                     # above) may include `ZeroRData` when `Ti` isn't concrete enough on its own, so the
                     # inner pullback must be resolved to accept exactly that (possibly wider) seed type
                     # — its own exit-route `increment!!` already tolerates `ZeroRData` generically.
                     SeedT = zero_like_rdata_type(_widen(Ti))
-                    # Cyclic edge: `comms_type_id` for this item is the bare `Tape` UnionAll (what the
-                    # fwds pass's `_scan_block_comms` declared it as — see `reverse_fwds_recursive_ci`).
-                    # The popped value's declared type is therefore abstract; narrow it to this build's
-                    # own concrete `TapeT` (a self-recursive callee's tape is, by construction, the same
-                    # type as the caller's own) via an unchecked `PiNode` before invoking with it.
-                    inner_tape = InnerTapeT === Tape ? emit!(Core.PiNode(inner_tape_raw, TapeT), TapeT) :
-                                                        inner_tape_raw
                     pb_resolved = reverse_pullback_recursive_ci(interp, impl_mi, TapeT, codualparams,
                                                                  InnerTapeT, SeedT, edges, reason)
                     if pb_resolved === nothing
@@ -3068,7 +3151,7 @@ function _fresh_tape_expr(@nospecialize(TapeT))
     slots = Any[S <: SingletonStack ? :($S()) :
                 S <: CommsCell ? :($S()) :
                 :($S(1)) for S in CS.parameters]
-    return :($TapeT($(Stack{Int32})(1), ($(slots...),), $(Vector{Any})()))
+    return :($TapeT($(Stack{Int32})(1), ($(slots...),), $(Vector{Any})(), $(Stack{TapeT})()))
 end
 
 # Stage 1 recycling (`_inner_ctx`, `stack.jl`): allocate a fresh tape of exactly the shape `TapeT`
