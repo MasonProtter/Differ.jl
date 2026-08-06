@@ -39,7 +39,7 @@ mutable struct MPoint; x::Float64; y::Float64; end
     end
 
     # `_nondiff_field` decides whether a shadow-`Dual` field carries the primal through: true iff
-    # the field's tangent is `NoTangent` but its slot can't hold `NoTangent`. That is *any*
+    # the field's tangent is `NoTangent` but its slot can't hold `NoTangent`. That's any
     # non-differentiable field, not only singletons — including concrete non-singletons (`Int`,
     # `Tuple{Int,Int}`) and `Type`-valued fields (which `Base.issingletontype` misreports as
     # non-singleton, a documented Julia quirk). Anything else would drop `NoTangent()` into a
@@ -108,10 +108,10 @@ end
 @testset "fcodual_type/codual_type on abstract P" begin
     # `fcodual_type`/`codual_type` (`src/codual.jl`) special-case a `UnionAll` with a free type
     # variable to the abstract fallback `CoDual`, but a plain abstract, fully-defined `P` (e.g.
-    # `Real`, `Any`) isn't a `UnionAll` at all — it falls through to `_codual_internal`'s final
+    # `Real`, `Any`) isn't a `UnionAll` at all; it falls through to `_codual_internal`'s final
     # `isconcretetype(P) ? CoDual{P,extractor(P)} : CoDual` ternary instead. This confirms that
-    # fallback already produces the correct (if loose) abstract `CoDual` for such a `P`, rather
-    # than crashing or silently returning something too specific to be a valid supertype.
+    # fallback produces the correct (if loose) abstract `CoDual` for such a `P`, rather than
+    # crashing or silently returning something too specific to be a valid supertype.
     for P in (Real, Any, AbstractFloat, Integer, Number)
         @test fcodual_type(P) === CoDual
         @test codual_type(P) === CoDual

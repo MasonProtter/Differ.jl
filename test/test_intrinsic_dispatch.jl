@@ -134,7 +134,7 @@ using Differ: Dual, NoTangent, frule!!, code_dual_ircode
         @test deriv(f_mul, 3.0, 5.0) === 5.0          # ∂/∂x (x*y) = y
         @test deriv(f_div, 3.0, 5.0) === 0.2          # ∂/∂x (x/y) = 1/y
 
-        # Allocation-free after warmup — the direct-emission path never boxes a `Dual` per op.
+        # Allocation-free after warmup: the direct-emission path never boxes a `Dual` per op.
         df = Dual(f_mul, NoTangent())
         frule!!(df, Dual(3.0, 1.0), Dual(5.0, 0.0))
         @test (@allocated frule!!(df, Dual(3.0, 1.0), Dual(5.0, 0.0))) == 0

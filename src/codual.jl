@@ -30,13 +30,11 @@ extract(x::CoDual) = primal(x), tangent(x)
 
 Equivalent to `CoDual(x, zero_tangent(x))`.
 
-For `Ptr` types, constructing a true zero tangent would require allocating new derivative
-storage and returning a pointer to it, which has unclear ownership and lifetime. Instead,
-`zero_codual(x::Ptr{P})` falls back to `uninit_codual(x)`, which uses the bitcast
-convention: the tangent pointer is produced by reinterpreting the primal address as a
-`Ptr{tangent_type(P)}`. The result must not be dereferenced as valid derivative storage —
-it is a type-correct structural placeholder. See the comment on `uninit_tangent(x::Ptr)`
-in `tangents.jl` for the full explanation of the Ptr tangent convention.
+For `Ptr` types, a true zero tangent would need newly allocated derivative storage with unclear
+ownership and lifetime. So `zero_codual(x::Ptr{P})` falls back to `uninit_codual(x)`, using the
+bitcast convention: the tangent pointer reinterprets the primal address as `Ptr{tangent_type(P)}`.
+Don't dereference it as real derivative storage — it's a type-correct placeholder. See
+`uninit_tangent(x::Ptr)` in `tangents.jl` for the full Ptr tangent convention.
 """
 zero_codual(x) = CoDual(x, zero_tangent(x))
 zero_codual(x::Ptr{P}) where {P} = uninit_codual(x)
@@ -76,11 +74,10 @@ end
 The type of the `CoDual` which contains instances of `P` and associated tangents.
 """
 function codual_type(::Type{P}) where {P}
-    # `@isdefined(P)` is false when the static parameter couldn't be bound at
-    # dispatch — e.g. for `UnionAll(A, AbstractArray{T, A})` whose body has a
-    # free `TypeVar` `T`. Without this check, touching `P` would throw
-    # `UndefVarError(:P, :static_parameter)`. Same check guards the overloads
-    # below and `dual_type` in `src/dual.jl`.
+    # @isdefined(P) is false when the static parameter couldn't be bound at dispatch, e.g. for
+    # UnionAll(A, AbstractArray{T, A}) whose body has a free TypeVar T. Without this check, touching
+    # P throws UndefVarError(:P, :static_parameter). Same check guards the overloads below and
+    # dual_type in src/dual.jl.
     @isdefined(P) || return CoDual
     return _codual_internal(P, codual_type, tangent_type)
 end
@@ -112,12 +109,11 @@ to_fwds(x::CoDual{Type{P}}) where {P} = CoDual{Type{P},NoFData}(primal(x), NoFDa
 
 Equivalent to `CoDual(x, fdata(zero_tangent(x)))`.
 
-For `Ptr` types, falls back to `uninit_fcodual(x)` for the same reason `zero_codual`
-does: constructing a true zero tangent requires allocating derivative storage, which has
-unclear ownership. Since `fdata_type(Ptr{P}) == Ptr{tangent_type(P)}` (the full tangent
-is fdata for Ptr), the fdata is produced via bitcast - same address, reinterpreted as
-`Ptr{tangent_type(P)}`. Not safe to dereference as valid derivatives. See the comment
-on `uninit_tangent(x::Ptr)` in `tangents.jl` for the full explanation.
+For `Ptr` types, falls back to `uninit_fcodual(x)` for the same reason as `zero_codual`: a true
+zero tangent needs newly allocated derivative storage with unclear ownership. Since
+`fdata_type(Ptr{P}) == Ptr{tangent_type(P)}` (the full tangent is fdata for Ptr), the fdata comes
+from a bitcast — same address, reinterpreted as `Ptr{tangent_type(P)}`. Not safe to dereference as
+real derivative storage. See `uninit_tangent(x::Ptr)` in `tangents.jl`.
 """
 zero_fcodual(p) = to_fwds(zero_codual(p))
 zero_fcodual(p::Ptr{P}) where {P} = uninit_fcodual(p)

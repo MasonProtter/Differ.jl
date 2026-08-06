@@ -1,23 +1,23 @@
 # ===========================================================================
 # Intrinsic rules — dispatch-based, direct-IR-emission handling of `Core.Intrinsics`.
 #
-# Every `Core.Intrinsics` function (`add_float`, `mul_float`, …) is an instance of the *single*
-# type `Core.IntrinsicFunction`, so ordinary dispatch on `typeof(f)` can't tell them apart — but an
-# intrinsic *value* is itself a valid type parameter, so `Val{Core.Intrinsics.add_float}` names one
+# Every `Core.Intrinsics` function (`add_float`, `mul_float`, …) is an instance of the single type
+# `Core.IntrinsicFunction`, so ordinary dispatch on `typeof(f)` can't tell them apart — but an
+# intrinsic value is itself a valid type parameter, so `Val{Core.Intrinsics.add_float}` names one
 # specific intrinsic and ordinary multiple dispatch on `Val` works.
 #
 # `apply_intrinsic_frule!(Val(f), actual, Ti, ctx)` is called from the main statement loop in
 # `dualize_to_ircode` (`forward_interp.jl`) for every intrinsic call in the primal IR. It emits the
-# primal + shadow IR *directly* into the caller's instruction stream and returns
-# `(primal_ssa, shadow_ssa)` (or `nothing` if unregistered) — there is no `Dual` boxing, no `frule!!`
-# dispatch, and no `CodeInstance` resolution/compile the way a surviving high-level call
-# (`frule_split!`, e.g. `sin`/`cos`) needs. That machinery is fine for the handful of calls that
-# survive a function's body, but *every* arithmetic op in a differentiated function is an intrinsic
-# call — routing each one through a full `frule!!`/`CodeInstance` round trip (as an earlier version of
-# this file did: wrap each intrinsic in a thin wrapper function with its own singleton type, rewrite
-# the call to it, and dispatch `frule!!` on that) bloated both compile time and the generated code.
-# Direct emission keeps intrinsics exactly as cheap as the primal computation itself, while still
-# reaching each rule via ordinary dispatch instead of a hand-rolled if-else chain.
+# primal + shadow IR directly into the caller's instruction stream and returns
+# `(primal_ssa, shadow_ssa)` (or `nothing` if unregistered) — no `Dual` boxing, no `frule!!` dispatch,
+# no `CodeInstance` resolution/compile the way a surviving high-level call (`frule_split!`, e.g.
+# `sin`/`cos`) needs. That machinery is fine for the handful of calls that survive a function's body,
+# but every arithmetic op in a differentiated function is an intrinsic call — routing each one through
+# a full `frule!!`/`CodeInstance` round trip (as an earlier version of this file did: wrap each
+# intrinsic in a thin wrapper function with its own singleton type, rewrite the call to it, and
+# dispatch `frule!!` on that) bloated both compile time and the generated code. Direct emission keeps
+# intrinsics exactly as cheap as the primal computation itself, while still reaching each rule via
+# ordinary dispatch instead of a hand-rolled if-else chain.
 #
 # `ctx` is a `NamedTuple` of the closures `dualize_to_ircode` builds once per call:
 #   * `ctx.opf(name, ty, args...)` — emit `Expr(:call, GlobalRef(Core.Intrinsics, name), args...)`
@@ -25,11 +25,11 @@
 #   * `ctx.presolve(x)`/`ctx.tresolve(x)` — resolve an operand AST node to its primal/shadow SSA
 #   * `ctx.zero_shadow(Ti, primal_ssa)` — the zero tangent of a computed non-differentiable result
 #
-# The fallback method below returns `nothing`, so an intrinsic with no registered rule bails (in
-# `dualize_to_ircode`) with a clear, located reason instead of silently miscompiling — e.g. a
-# missing derivative silently returning a wrong zero tangent. Register a
-# *differentiable* intrinsic by hand (see below); register a *non-differentiable* one (comparisons,
-# integer/bit ops, …) with `@inactive_intrinsic`, which emits the primal and its zero tangent.
+# The fallback below returns `nothing`, so an intrinsic with no registered rule bails (in
+# `dualize_to_ircode`) with a clear, located reason instead of silently miscompiling — e.g. a missing
+# derivative silently returning a wrong zero tangent. Register a differentiable intrinsic by hand (see
+# below); register a non-differentiable one (comparisons, integer/bit ops, …) with
+# `@inactive_intrinsic`, which emits the primal and its zero tangent.
 # ===========================================================================
 
 apply_intrinsic_frule!(::Val{F}, actual, Ti, ctx) where {F} = nothing
@@ -97,10 +97,10 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.abs_float}, actual, Ti, ct
 end
 
 # `max_float`/`min_float`: the tangent follows whichever operand is selected. A branchless
-# `Core.ifelse` select — not a Julia `?:`, which would require splitting the block and so break the
-# 1:1 block-topology invariant `dualize_to_ircode` relies on — picks it out. `Core.ifelse` is itself
-# dualizable (see the builtin case next to `getfield` in `forward_interp.jl`), so this remains
-# correct if re-dualized at a higher order.
+# `Core.ifelse` select picks it out — not a Julia `?:`, which would require splitting the block and so
+# break the 1:1 block-topology invariant `dualize_to_ircode` relies on. `Core.ifelse` is itself
+# dualizable (see the builtin case next to `getfield` in `forward_interp.jl`), so this stays correct
+# if re-dualized at a higher order.
 for (op, le) in ((:max_float, :le_float), (:max_float_fast, :le_float_fast))
     @eval function apply_intrinsic_frule!(::Val{Core.Intrinsics.$op}, actual, Ti, ctx)
         a, b = actual[1], actual[2]
@@ -142,9 +142,8 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.copysign_float}, actual, T
 end
 
 # Floating-point width conversions (`Float32(::Float64)` → `fptrunc`, `Float64(::Float32)` →
-# `fpext`) carry a *type* as their first argument (arg 1 has no tangent — only `ctx.presolve` is
-# ever called on it, never `ctx.tresolve`). They are linear in the value:
-# d(convert(T, a)) = convert(T, da).
+# `fpext`) carry a type as their first argument (arg 1 has no tangent — only `ctx.presolve` is ever
+# called on it, never `ctx.tresolve`). They're linear in the value: d(convert(T, a)) = convert(T, da).
 for op in (:fpext, :fptrunc)
     @eval function apply_intrinsic_frule!(::Val{Core.Intrinsics.$op}, actual, Ti, ctx)
         T, a = actual[1], actual[2]
@@ -158,17 +157,17 @@ end
 # and `add_ptr`/`sub_ptr` (`p ± k`).
 #
 # These all rest on `tangent_type(Ptr{P}) === Ptr{tangent_type(P)}` (`src/tangents.jl`): a shadow
-# pointer is a handle to *tangent* storage at the position its primal addresses, so every rule here is
-# a mirror. Two things make the mirror conditional rather than automatic:
+# pointer is a handle to tangent storage at the position its primal addresses, so every rule here is a
+# mirror. Two things make the mirror conditional rather than automatic:
 #
 #  * A shadow buffer's element type is `tangent_type(P)`, whose stride and alignment need not match
-#    `P`'s. An *element index* survives that (`pointerref` scales by the shadow pointer's own element
-#    type) but a *byte offset* does not — hence the stride check in `add_ptr`/`sub_ptr`.
-#  * A pointer with no tangent storage behind it (one built from an integer address) has no shadow
-#    at all: `Ptr` has no zero tangent (`zero_tangent(::Ptr)` throws by design), so there is nothing
-#    to fall back on and the rule declines via `ctx.reason` rather than inventing one.
+#    `P`'s. An element index survives that (`pointerref` scales by the shadow pointer's own element
+#    type) but a byte offset does not — hence the stride check in `add_ptr`/`sub_ptr`.
+#  * A pointer with no tangent storage behind it (one built from an integer address) has no shadow at
+#    all: `Ptr` has no zero tangent (`zero_tangent(::Ptr)` throws by design), so there's nothing to
+#    fall back on and the rule declines via `ctx.reason` rather than inventing one.
 #
-# NOTE (limitation, see ISSUES): a `Ptr` *field* of a struct gets the primal's own address as its
+# NOTE (limitation, see ISSUES): a `Ptr` field of a struct gets the primal's own address as its
 # tangent (`zero_tangent_internal(x::Ptr)`/`uninit_tangent(x::Ptr)` — a type-correct placeholder that
 # must not be dereferenced). `pointerset` cannot tell that apart from a genuine shadow pointer, so
 # storing through such a field writes tangent values over primal data. Pointer provenance isn't
@@ -176,16 +175,16 @@ end
 # ---------------------------------------------------------------------------
 
 # The null shadow pointer: what a rule hands back when the primal pointer addresses a buffer whose
-# *tangent* elements are `NoTangent`, i.e. there is no shadow storage to point at (`Vector{Int}`,
+# tangent elements are `NoTangent`, i.e. there is no shadow storage to point at (`Vector{Int}`,
 # `Vector{Bool}`, `collect(1:n)`). Not read off the shadow buffer — a zero-size-element `MemoryRef`
-# stores its 0-based *index* in `ptr_or_offset`, not an address (measured: element 3 of a
+# stores its 0-based index in `ptr_or_offset`, not an address (measured: element 3 of a
 # `Memory{NoTangent}` reads back `Ptr{Nothing}(0x2)`), so mirroring the read would produce a small
-# bogus address. Synthesised instead, and recognised downstream by `===`: it is a compile-time
-# literal, and `Ptr{NoTangent}` only ever arises as a tangent type, never from user code.
+# bogus address. Synthesized instead, and recognized downstream by `===`: it's a compile-time literal,
+# and `Ptr{NoTangent}` only ever arises as a tangent type, never from user code.
 #
-# Every rule that would *dereference* a shadow pointer must therefore either skip the shadow
-# operation (when the element's tangent type is `NoTangent`, so there is nothing to transfer) or
-# decline — see `pointerref`/`pointerset`/`bitcast`/`add_ptr` below and the `memmove` rule in
+# Every rule that would dereference a shadow pointer must therefore either skip the shadow operation
+# (when the element's tangent type is `NoTangent`, so there's nothing to transfer) or decline — see
+# `pointerref`/`pointerset`/`bitcast`/`add_ptr` below and the `memmove` rule in
 # `src/foreigncalls.jl`. `tangent_type(Ptr{NoTangent}) === Ptr{NoTangent}`, so the sentinel is
 # type-correct wherever `tangent_type(Ptr{Nothing})` is required, and is its own tangent (which is
 # what `const_tangent` relies on to keep IR containing it re-dualizable at order ≥ 2).
@@ -203,7 +202,7 @@ end
 # Shared gate for the dereferencing intrinsics: the primal pointer must be a concrete `Ptr{P}` (an
 # unparameterized `Ptr` has `tangent_type === NoTangent`, i.e. no shadow pointer to mirror onto), and
 # a non-default alignment must mean the same thing for the tangent's element type as for the primal's.
-# Base always passes `1` (`base/pointer.jl`), which claims nothing about either type's alignment.
+# Base always passes `1` (`base/pointer.jl`), claiming nothing about either type's alignment.
 function _ptr_deref_ok(@nospecialize(Pptr), @nospecialize(align), ctx, what::String)
     P = _ptr_eltype(Pptr)
     if P === nothing
@@ -222,7 +221,7 @@ function _ptr_deref_ok(@nospecialize(Pptr), @nospecialize(align), ctx, what::Str
     return true
 end
 
-# `bitcast(T, x)`: raw bit reinterpretation. Non-differentiable in general, *except* between pointer
+# `bitcast(T, x)`: raw bit reinterpretation. Non-differentiable in general, except between pointer
 # types, which is where `pointer(v)` ends up (`getfield(ref, :ptr_or_offset)::Ptr{Nothing}` then
 # `bitcast(Ptr{Float64}, _)`). `bitcast` preserves the address whatever the element-type label says,
 # so reinterpreting the shadow pointer the same way keeps it pointing at tangent storage — this is
@@ -238,10 +237,10 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.bitcast}, actual, Ti, ctx)
                            "no tangent storage to point at, and a `Ptr` has no zero tangent"
             return nothing
         end
-        # Relabelling a pointer with no tangent storage behind it (`NULL_SHADOW_PTR`): the address is
-        # preserved on the primal side, but there is still nothing on the shadow side, so the sentinel
-        # is carried through unchanged. It can only stay the sentinel if that is still the required
-        # tangent type — otherwise this cast is asking for a *differentiable* view of a buffer with no
+        # Relabeling a pointer with no tangent storage behind it (`NULL_SHADOW_PTR`): the address is
+        # preserved on the primal side, but there's still nothing on the shadow side, so the sentinel
+        # is carried through unchanged. It can only stay the sentinel if that's still the required
+        # tangent type — otherwise this cast is asking for a differentiable view of a buffer with no
         # shadow (`unsafe_load(Ptr{Float64}(pointer(v_int)))`), and mirroring it would launder a null
         # into a genuine dereference. Decline that.
         if ctx.tresolve(a) === NULL_SHADOW_PTR
@@ -257,7 +256,7 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.bitcast}, actual, Ti, ctx)
     p = ctx.opf(:bitcast, Ti, ctx.presolve(T), ctx.presolve(a))
     inptrspace && return p, ctx.opf(:bitcast, TT, TT, ctx.tresolve(a))
     # Non-pointer reinterpretation. `NoTangent` results (the `UInt` cast every bounds check does) are
-    # the common case. A *differentiable* non-pointer result — `bitcast(Float64, ::UInt64)`, i.e.
+    # the common case. A differentiable non-pointer result — `bitcast(Float64, ::UInt64)`, i.e.
     # `reinterpret` — gets a zero tangent, which is deliberate but not universally right: such a cast
     # is genuinely zero-derivative in some kernels (`exp`'s `reinterpret(Float64, (k+1023) << 52)`
     # scale factor) and value-carrying in others (`atanh`'s `|x|` bit trick). Differ's answer is a
@@ -267,7 +266,7 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.bitcast}, actual, Ti, ctx)
 end
 
 # `pointerref(p, i, align)` — `unsafe_load(p, i)`. Mirror the load on the shadow pointer. Mirroring
-# the *element index* (rather than computing a byte offset) is what makes a differing tangent stride
+# the element index (rather than computing a byte offset) is what makes a differing tangent stride
 # correct: `pointerref` scales by the shadow pointer's own element type, so element `i` is element `i`.
 # Matches Mooncake's rule for this intrinsic.
 function apply_intrinsic_frule!(::Val{Core.Intrinsics.pointerref}, actual, Ti, ctx)
@@ -275,9 +274,9 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.pointerref}, actual, Ti, c
     TT = ctx.tt(Ti)
     TT === NoTangent ||
         _ptr_deref_ok(ctx.optype(ptr), align, ctx, "pointerref") || return nothing
-    # Defensive: the `bitcast` rule already refuses to relabel the null sentinel into a
-    # differentiable pointer, so this should be unreachable — but a shadow load through it would be a
-    # null dereference, so never take it on trust.
+    # Defensive: the `bitcast` rule already refuses to relabel the null sentinel into a differentiable
+    # pointer, so this should be unreachable — but a shadow load through it would be a null
+    # dereference, so never take it on trust.
     if TT !== NoTangent && ctx.tresolve(ptr) === NULL_SHADOW_PTR
         ctx.reason[] = "`pointerref` of a `$Ti` through a pointer with no tangent storage behind it"
         return nothing
@@ -295,8 +294,8 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.pointerset}, actual, Ti, c
     Pptr = ctx.optype(ptr)
     _ptr_deref_ok(Pptr, align, ctx, "pointerset") || return nothing
     # `Ti` is `Ptr{P}` (the pointer is returned), so `ctx.tt(Ti)` is a `Ptr` and never `NoTangent` —
-    # gate on the stored *element*'s tangent type instead. With nothing to store, the shadow "result"
-    # is just the shadow pointer (already typed `Ptr{NoTangent} === ctx.tt(Ti)`, and the null sentinel
+    # gate on the stored element's tangent type instead. With nothing to store, the shadow "result" is
+    # just the shadow pointer (already typed `Ptr{NoTangent} === ctx.tt(Ti)`, and the null sentinel
     # when the buffer has no tangent storage), and the shadow store is skipped entirely.
     nostore = tangent_type(_ptr_eltype(Pptr)) === NoTangent
     # Defensive, as in `pointerref`: a genuine tangent store through the null sentinel would be a null
@@ -312,24 +311,24 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.pointerset}, actual, Ti, c
     p, ctx.opf(:pointerset, ctx.tt(Ti), ctx.tresolve(ptr), ctx.tresolve(val), pidx, palign)
 end
 
-# `p ± k` — byte arithmetic. In Julia 1.13 this stays *in `Ptr` space*
+# `p ± k` — byte arithmetic. In Julia 1.13 this stays in `Ptr` space
 # (`add_ptr(::Ptr{P}, ::UInt)::Ptr{P}`), so the shadow address survives and the same byte offset can
 # be applied to it — but only when a byte offset means the same thing on both sides, i.e. the tangent
 # element has the primal's stride. `> 0` is load-bearing, not pedantic: `Base.aligned_sizeof` is `0`
 # for both `Nothing` and `NoTangent`, so accepting an equal-but-zero stride would wave through
 # `Ptr{Nothing}` (void) and every `tangent_type(P) === NoTangent` element — pointers whose shadow is a
 # placeholder or a bare offset, which the `bitcast` rule above would then happily launder into a real
-# dereference at the wrong stride. Mooncake has no `frule` for these at all, so there is no reference
+# dereference at the wrong stride. Mooncake has no `frule` for these at all, so there's no reference
 # implementation to mirror here.
 for op in (:add_ptr, :sub_ptr)
     @eval function apply_intrinsic_frule!(::Val{Core.Intrinsics.$op}, actual, Ti, ctx)
         ptr, off = actual[1], actual[2]
         P = _ptr_eltype(Ti)
         T = P === nothing ? nothing : tangent_type(P)
-        # No tangent storage behind this address: there is no shadow buffer to offset into, so carry
-        # the null sentinel through unchanged rather than computing an offset from it. Must be tested
-        # *before* the stride gate below, which would otherwise reject this case outright
-        # (`NoTangent`'s stride is 0, and `> 0` is exactly what that gate demands).
+        # No tangent storage behind this address: there's no shadow buffer to offset into, so carry the
+        # null sentinel through unchanged rather than computing an offset from it. Must be tested
+        # before the stride gate below, which would otherwise reject this case outright (`NoTangent`'s
+        # stride is 0, and `> 0` is exactly what that gate demands).
         if ctx.tresolve(ptr) === NULL_SHADOW_PTR
             if ctx.tt(Ti) !== typeof(NULL_SHADOW_PTR)
                 ctx.reason[] = "`$($(QuoteNode(op)))` on `$Ti` from a pointer with no tangent storage " *
@@ -358,14 +357,13 @@ end
 # ---------------------------------------------------------------------------
 # Non-differentiable intrinsics — comparisons, integer arithmetic, bit/boolean ops, rounding to an
 # integer value, and int↔float / bit conversions. Each gets an auto-generated rule via
-# `@inactive_intrinsic`: compute the primal from the argument primals, give the result a zero
-# tangent.
+# `@inactive_intrinsic`: compute the primal from the argument primals, give the result a zero tangent.
 #
-# The conversion intrinsics (`sitofp`, `fptosi`, `bitcast`, `trunc_int`, …) carry a *type* as their
+# The conversion intrinsics (`sitofp`, `fptosi`, `bitcast`, `trunc_int`, …) carry a type as their
 # first argument too. `ctx.presolve` is called uniformly over every argument (never `ctx.tresolve`),
 # so the type argument just passes through unchanged — no special-casing needed, unlike the
-# `Dual`-boxing approach this replaced (which had to resolve a `GlobalRef` type argument to its
-# actual `DataType` value before it could be wrapped in a `Dual{DataType,NoTangent}`).
+# `Dual`-boxing approach this replaced (which had to resolve a `GlobalRef` type argument to its actual
+# `DataType` value before it could be wrapped in a `Dual{DataType,NoTangent}`).
 # ---------------------------------------------------------------------------
 macro inactive_intrinsic(name)
     intr = :(Core.Intrinsics.$name)

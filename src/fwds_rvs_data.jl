@@ -1,8 +1,7 @@
 """
     NoFData
 
-Singleton type which indicates that there is nothing to be propagated on the forwards-pass
-in addition to the primal data.
+Singleton indicating there is nothing to propagate on the forwards-pass beyond the primal data.
 """
 struct NoFData end
 
@@ -10,10 +9,10 @@ Base.copy(::NoFData) = NoFData()
 
 increment_internal!!(::IncCache, ::NoFData, ::NoFData) = NoFData()
 
-# Zeroing "no fdata" is a no-op, the same way zeroing `NoTangent` is (`set_to_zero_internal!!` in
-# `tangents.jl`). Needed by the pre-allocated `value_and_gradient!` entry point, which zeroes each
-# caller-supplied shadow uniformly — and an argument whose tangent is rdata-carried (any scalar) or
-# absent (a plain function) has `NoFData` as its shadow.
+# Zeroing NoFData is a no-op, like zeroing NoTangent (`set_to_zero_internal!!` in `tangents.jl`).
+# Needed because `value_and_gradient!` zeroes every caller-supplied shadow uniformly, and an
+# argument whose tangent is rdata-carried (any scalar) or absent (a plain function) has `NoFData`
+# as its shadow.
 set_to_zero_internal!!(::SetToZeroCache, ::NoFData) = NoFData()
 
 """
@@ -33,10 +32,9 @@ _copy(x::P) where {P<:FData} = P(_copy(x.data))
 
 fields_type(::Type{FData{T}}) where {T<:NamedTuple} = T
 
-# Recurse into the wrapped NamedTuple of fields (bottoms out on the NamedTuple/
-# PossiblyUninitTangent/MutableTangent methods in tangents.jl). Needed so
-# `set_to_zero_internal!!` can zero a struct field whose tangent carries fdata (e.g. a
-# `Core.Box`-boxed captured variable) instead of only ever seeing `NoFData` there.
+# Recurse into the wrapped NamedTuple (bottoms out in the NamedTuple/PossiblyUninitTangent/
+# MutableTangent methods in tangents.jl). Needed so `set_to_zero_internal!!` can zero a struct
+# field whose tangent carries fdata (e.g. a `Core.Box`-boxed captured variable), not just NoFData.
 set_to_zero_internal!!(c::SetToZeroCache, x::F) where {F<:FData} = F(set_to_zero_internal!!(c, x.data))
 
 function increment_internal!!(c::IncCache, x::F, y::F) where {F<:FData}
@@ -64,7 +62,7 @@ It must always hold that
 tangent(fdata(t), rdata(t)) === t
 ```
 
-The need for all of this is explained in the docs, but for now it suffices to consider our running examples again, and to see what their fdata and rdata look like.
+The need for this split is explained in the docs; for now, just look at what fdata and rdata look like for our running examples.
 
 #### Int
 
@@ -217,13 +215,13 @@ end
 
 fdata_type(::Type{T}) where {T<:Ptr} = T
 
-# `MemoryRef`/`Memory` are reference/address-identified like `Ptr` (their `tangent_type` is
-# self-typed — `tangents.jl` — since a shadow `MemoryRef`/`Memory` is a real, distinct object holding
-# tangent data, not a value embedded in a larger structure), so like `Ptr` their fdata is themselves
-# and they carry no rdata. Without these, `fdata_type`'s generic struct-derivation falls over on
-# `MemoryRef`/`Memory` (both are primitive-ish compiler types, not derivable from their fields) — this
-# was a pre-existing gap, surfaced once `tangent_type(MemoryRef)`/`tangent_type(Memory)` started
-# returning themselves instead of a bogus generic-derivation type (see `tangents.jl`).
+# MemoryRef/Memory are reference/address-identified like Ptr: their tangent_type is self-typed
+# (tangents.jl), since a shadow MemoryRef/Memory is a distinct object holding tangent data, not a
+# value embedded in a larger structure. So like Ptr, their fdata is themselves with no rdata.
+# Without these methods, fdata_type's generic struct-derivation fails on MemoryRef/Memory (they're
+# primitive-ish compiler types, not derivable from fields) — a pre-existing gap exposed once
+# tangent_type(MemoryRef)/tangent_type(Memory) started returning themselves instead of a bogus
+# generic-derivation type (see tangents.jl).
 fdata_type(::Type{T}) where {T<:MemoryRef} = T
 fdata_type(::Type{T}) where {T<:Memory} = T
 
@@ -364,16 +362,14 @@ function __verify_fdata_value(c::IdDict{Any,Nothing}, p::Array, f::Array)
 
     @static if VERSION > v"1.11-" && VERSION < v"1.12-"
         if p isa Vector && getfield(p, :size)[1] > length(p.ref.mem)
-            # Bail out of validation if the vector is in the middle of being resized,
-            # otherwise we would cause a segfault in debug mode when validating the tangent.
-            # (For example when reaching the inner function of _growend! in Julia v1.11)
+            # Bail out if the vector is mid-resize; validating the tangent here would segfault in
+            # debug mode (e.g. inside _growend!'s inner function on Julia v1.11).
             return nothing
         end
     end
 
-    # Recurse into each element and check that it is correct. Note that the elements of an
-    # Array contain the tangents, so we must check that the fdata and rdata components are
-    # correct separately.
+    # Recurse into each element. Array elements hold full tangents, so check the fdata and rdata
+    # components separately.
     for n in eachindex(p)
         if isassigned(p, n)
             _p = p[n]
@@ -398,18 +394,16 @@ end
 
 function __verify_fdata_value(c::IdDict{Any,Nothing}, p, f)
 
-    # If f is a NoFData then there are no checks needed, because we have already verified
-    # that NoFData is the correct type for fdata for p, and NoFData is a singleton type.
+    # NoFData is a singleton, and its type was already verified correct for p, so nothing more
+    # to check.
     f isa NoFData && return nothing
 
-    # When a primitive is encountered here, it means that we don't have a method of
-    # _verify_fdata_value which is specific to it, and its fdata type is not NoFData.
-    # The rest of this method assumes p is an instance of a struct type, so we must error.
+    # A primitive reaching here means no specific _verify_fdata_value method exists for it, and
+    # its fdata type isn't NoFData. The rest of this method assumes p is a struct, so error.
     P = _typeof(p)
     isprimitivetype(P) && error("Encountered primitive $p with fdata $f")
 
-    # Having excluded primitive types, we must have a (mutable) struct type. Recurse into
-    # its fields and verify each of them.
+    # Must be a (mutable) struct now. Recurse into its fields and verify each of them.
     for name in fieldnames(P)
         if isdefined(p, name)
             _p = getfield(p, name)
@@ -836,13 +830,12 @@ _verify_rdata_value(::Array, ::NoRData) = nothing
 
 function _verify_rdata_value(p, r)
 
-    # If r is a NoRData then there are no checks needed, because we have already verified
-    # that NoRData is the correct type for rdata for p, and NoRData is a singleton type.
+    # NoRData is a singleton, and its type was already verified correct for p, so nothing more
+    # to check.
     r isa NoRData && return nothing
 
-    # When a primitive is encountered here, it means that we don't have a method of
-    # _verify_rdata_value which is specific to it, and its rdata type is not NoRData.
-    # The rest of this method assumes p is an instance of a struct type, so we must error.
+    # A primitive reaching here means no specific _verify_rdata_value method exists for it, and
+    # its rdata type isn't NoRData. The rest of this method assumes p is a struct, so error.
     P = _typeof(p)
     isprimitivetype(P) && error("Encountered primitive $p with rdata $r")
 
@@ -851,8 +844,7 @@ function _verify_rdata_value(p, r)
     _get_rdata_field(r::Tuple, name) = getfield(r, name)
     _get_rdata_field(r::RData, name) = val(getfield(r.data, name))
 
-    # Having excluded primitive types, we must have a (mutable) struct type. Recurse into
-    # its fields and verify each of them.
+    # Must be a (mutable) struct now. Recurse into its fields and verify each of them.
     for name in fieldnames(P)
         if isdefined(p, name)
             verify_rdata_value(getfield(p, name), _get_rdata_field(r, name))
@@ -865,15 +857,12 @@ end
 """
     LazyZeroRData{P, Tdata}()
 
-This type is a lazy placeholder for `zero_like_rdata_from_type`. This is used to defer
-construction of zero data to the reverse pass. Calling `instantiate` on an instance of this
-will construct a zero data.
+Lazy placeholder for `zero_like_rdata_from_type`, deferring construction of the zero data to the
+reverse pass. Calling `instantiate` on an instance produces the zero data.
 
-Users should construct using `LazyZeroRData(p)`, where `p` is an value of type `P`. This
-constructor, and `instantiate`, are specialised to minimise the amount of data which must
-be stored. For example, `Float64`s do not need any data, so `LazyZeroRData(0.0)` produces
-an instance of a singleton type, meaning that various important optimisations can be
-performed in AD.
+Construct via `LazyZeroRData(p)` for `p::P`. Both the constructor and `instantiate` are specialised
+to minimise stored data — e.g. `Float64`s need none, so `LazyZeroRData(0.0)` is a singleton
+instance, enabling further optimisations in AD.
 """
 struct LazyZeroRData{P,Tdata}
     data::Tdata
@@ -888,10 +877,9 @@ _copy(x::P) where {P<:LazyZeroRData} = P(_copy(x.data))
     return LazyZeroRData{P,Tdata}
 end
 
-# Be lazy if we can compute the zero element given only the type, otherwise just store the
-# zero element and use it later. L is the precise type of `LazyZeroRData` that you wish to
-# construct -- very occassionally you need complete control over this, but don't want to
-# figure out for yourself whether or not construction can be performed lazily.
+# Lazy when the zero element can be computed from the type alone; otherwise store it now for
+# later use. L is the exact LazyZeroRData type to construct — occasionally needed when you want
+# full control without working out laziness yourself.
 @inline function lazy_zero_rdata(::Type{L}, p::P) where {S,L<:LazyZeroRData{S},P}
     return L(can_produce_zero_rdata_from_type(S) ? nothing : zero_rdata(p))
 end
@@ -1010,11 +998,11 @@ end
 @foldable tangent_type(::Type{F}, ::Type{NoRData}) where {F<:MutableTangent} = F
 
 # structs
-# Note: Union{RData{A},RData{B}} <: RData in Julia's type system, so the R<:RData and
-# F<:FData methods also match unions of RData/FData subtypes. Guard with `isa Union` so
-# those cases recurse via binary splitting rather than calling fields_type on a Union type.
-# The F<:FData,R<:RData combined case is NOT guarded: pairing two independently-ordered
-# unions of FData and RData would be unreliable; that case should not arise in valid use.
+# Note: Union{RData{A},RData{B}} <: RData in Julia's type system, so the R<:RData and F<:FData
+# methods below also match unions of RData/FData subtypes. Guard with `isa Union` so those cases
+# recurse via binary splitting instead of calling fields_type on a Union. The F<:FData,R<:RData
+# combined case is NOT guarded: pairing two independently-ordered unions would be unreliable and
+# shouldn't arise in valid use.
 @foldable function tangent_type(::Type{F}, ::Type{R}) where {F<:FData,R<:RData}
     return Tangent{tangent_type(fields_type(F), fields_type(R))}
 end
@@ -1108,10 +1096,10 @@ end
     increment_field_rdata!(dx::MutableTangent, dy_rdata, f) -> dx
 
 Increment field `f` of a mutable struct's tangent by an rdata contribution `dy_rdata`, in place.
-Ported from Mooncake's `increment_field_rdata!` (`src/rules/misc.jl`) — the mutable-struct analogue of
-`increment_field!!` (`tangents.jl`): a mutable struct has no rdata of its own (its whole tangent lives
-in fdata), so a field access routes its contribution here instead of into an object-level `RData`
-accumulator.
+Ported from Mooncake's `increment_field_rdata!` (`src/rules/misc.jl`), the mutable-struct analogue
+of `increment_field!!` (`tangents.jl`): a mutable struct has no rdata of its own (its whole tangent
+lives in fdata), so a field access routes its contribution here instead of into an object-level
+`RData` accumulator.
 """
 increment_field_rdata!(dx::MutableTangent, ::NoRData, ::Val) = dx
 increment_field_rdata!(dx::NoFData, ::NoRData, ::Val) = dx
@@ -1121,8 +1109,8 @@ function increment_field_rdata!(dx::T, dy_rdata, ::Val{f}) where {T<:MutableTang
 end
 
 # Runtime-`Int` field index, for a dynamic (non-literal) `getfield` into a *homogeneous* mutable
-# struct (every field shares one tangent type, so field `i` is well-typed regardless of which one a
-# runtime index lands on — `_bi_homog_tangent_type`, `builtins.jl`). Body identical to the `Val`
+# struct (every field shares one tangent type, so field `i` is well-typed regardless of which
+# runtime index lands there — `_bi_homog_tangent_type`, `builtins.jl`). Body identical to the `Val`
 # method above with `f` -> `i`; used by reverse mode's `Core.getfield` rule (`builtins_reverse.jl`)
 # once its comms scan has proven the object homogeneous.
 increment_field_rdata!(dx::MutableTangent, ::NoRData, ::Int) = dx

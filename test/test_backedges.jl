@@ -12,21 +12,21 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
 # `primal_of_impl`/`frule_codeinstance`/`compose`): while dualizing a primal's IR, Differ collects
 # the MethodInstances it depends on (the primal method itself, any `frule!!` resolved for a surviving
 # high-level call, an inner carrier for a composed higher-order derivative) plus mt-backedges keyed
-# on the resolution's call signature (so a *new* method — one that didn't exist, or wasn't as
-# specific, before — invalidates too, not just a redefinition of the exact same method). These are
+# on the resolution's call signature (so a new method, one that didn't exist, or wasn't as
+# specific, before, invalidates too, not just a redefinition of the exact same method). These are
 # folded into `me.src.edges` before the primal `dualized_impl` `MethodInstance`'s own `finishinfer!`
 # runs, so Julia's ordinary `compute_edges!`/`store_backedges` machinery registers them as real
-# backedges on *that* `CodeInstance` — the one whose staleness actually gates recompilation, not
+# backedges on that `CodeInstance`, the one whose staleness actually gates recompilation, not
 # merely some caller of it. Reverse mode's `_optimized_primal_ir`/`resolve_reverse_primal`/
 # `reverse_fwds_recursive_ci` (`reverse_interp.jl`) mirror this for `rrule!!`.
 #
-# Separately (last two testsets in each mode): a related but distinct bug — a callee small enough for
-# Julia's ordinary inliner to merge into its caller vanishes from the IR *before*
+# Separately (last two testsets in each mode): a related but distinct bug. A callee small enough for
+# Julia's ordinary inliner to merge into its caller vanishes from the IR before
 # `dualize_to_ircode`/`_optimized_primal_ir` ever runs, so a hand-written `frule!!`/`rrule!!` for it
 # can never be consulted, no matter the compile order or how good the backedges are.
 # `src_inlining_policy` (both files) fixes the "never consulted at all" half by refusing to inline any
 # call whose callee has a hand-written rule. `register_implicit_frule_backedge!`/
-# `register_implicit_rrule_backedge!` fix the other half — invalidation — by registering a
+# `register_implicit_rrule_backedge!` fix the other half, invalidation, by registering a
 # speculative mt-backedge on the rule resolution a hypothetical differentiation of each discovered
 # callee would use, even for callees whose call was inlined away before a rule existed for them.
 @testset "backedges: derivative invalidation" begin
@@ -43,7 +43,7 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
 
     @testset "a primal that initially errors recompiles once given a real body" begin
         # The first call bails inside the primal itself (an ordinary runtime `error`, not a
-        # dualization bail) — `frule!!` still successfully differentiates *through* it, it just
+        # dualization bail). `frule!!` still successfully differentiates through it, it just
         # throws when invoked, same as calling the primal directly would.
         placeholder_then_real(x) = error("not implemented yet")
         @test_throws ErrorException frule!!(Dual(placeholder_then_real, NoTangent()), Dual(3.0, 1.0))
@@ -57,7 +57,7 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
     @testset "a hand rule for an inlinable callee is honored, not inlined away" begin
         # Without `src_inlining_policy` (see `forward_interp.jl`), Julia's ordinary cost-based
         # inliner would merge `inlinable_callee`'s tiny body directly into `inlinable_caller`'s
-        # optimized IR before `dualize_to_ircode` ever runs, erasing the call entirely — so a
+        # optimized IR before `dualize_to_ircode` ever runs, erasing the call entirely, so a
         # hand-written `frule!!` for it could never be consulted, regardless of compile order.
         inlinable_callee(x) = x + 1
         inlinable_caller(x) = inlinable_callee(x)
@@ -88,7 +88,7 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
     @testset "a hand rule for an inlinable *vararg* callee is honored + invalidates" begin
         # Julia's compilation-signature heuristic collapses a vararg callee's trailing arguments, so
         # this callee's `MethodInstance` has `specTypes == Tuple{typeof(inlinable_vcallee), Float64,
-        # Vararg{Float64}}` — the arity isn't recorded. `implicit_frule_tt` mirrors that collapse into
+        # Vararg{Float64}}`; the arity isn't recorded. `implicit_frule_tt` mirrors that collapse into
         # an open-ended `Vararg{Dual{Float64,Float64}}` tail rather than giving up, which is what makes
         # both halves work here: `src_inlining_policy` keeps the call from being inlined away, and
         # `register_implicit_frule_backedge!` registers the mt-backedge that invalidates the already
@@ -120,8 +120,8 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
 
     @testset "reverse: a primal that initially errors recompiles once given a real body" begin
         # Unlike forward mode, this doesn't get to the point of an ordinary runtime `error`: a
-        # function whose every path throws has no reachable `return`, so reverse mode bails *at
-        # compile time* — there's no primal return value to build a pullback structure around
+        # function whose every path throws has no reachable `return`, so reverse mode bails at
+        # compile time: there's no primal return value to build a pullback structure around
         # (`reverse_error_ircode` embeds `error(msg)` as the generated carrier body). Still an
         # `ErrorException` either way, so the assertion is unchanged.
         placeholder_then_real_rev(x) = error("not implemented yet")

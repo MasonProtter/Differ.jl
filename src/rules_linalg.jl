@@ -1,23 +1,22 @@
 # Hand-written frule!!/rrule!! for LinearAlgebra basics (dot/norm/*/tr/mul!).
 #
-# `dot`/`norm`/`*` (on `Matrix`/`Vector`) all bottom out in BLAS `ccall`s once inlined, which the
-# dualization engine cannot see through. Forward mode does now have a per-target `:foreigncall` rule
-# layer (`src/foreigncalls.jl`, ISSUES #62), but that changes nothing here: it registers bulk memory
-# copies, and a BLAS kernel like `:cblas_ddot64_` is opaque native code with no rule and no prospect
-# of one, so it bails with a located reason. A hand rule is therefore still the only way to
-# differentiate these: there is no generic-recursion fallback, unlike an ordinary composite function.
-# Each rule below computes the primal via a plain, untracked call to the real function (or an
-# explicit loop) and supplies the tangent/gradient via the closed-form identity — never by trying
-# to dualize the target's actual body.
+# `dot`/`norm`/`*` (on `Matrix`/`Vector`) bottom out in BLAS `ccall`s once inlined, which the
+# dualization engine can't see through. Forward mode has a per-target `:foreigncall` rule layer
+# (`src/foreigncalls.jl`, ISSUES #62), but that doesn't help here: it registers bulk memory copies,
+# while a BLAS kernel like `:cblas_ddot64_` is opaque native code with no rule and no prospect of
+# one. A hand rule is the only way to differentiate these — there's no generic-recursion fallback
+# like an ordinary composite function gets. Each rule computes the primal via a plain untracked call
+# (or an explicit loop) and supplies the tangent/gradient via the closed-form identity, never by
+# dualizing the target's actual body.
 #
-# `transpose`/`adjoint` deliberately have NO rule here: both already differentiate correctly via
-# the existing generic struct-tangent machinery (`tangent_type(Transpose{...})` resolves to a real
-# `Tangent`), so a rule would be redundant, and risks a dispatch ambiguity with the generic
-# fallback. See `test/test_linalg_rules.jl` for regression tests proving this.
+# `transpose`/`adjoint` deliberately have no rule here: both already differentiate correctly via the
+# generic struct-tangent machinery (`tangent_type(Transpose{...})` resolves to a real `Tangent`), so
+# a rule would be redundant and risk dispatch ambiguity with the generic fallback. See
+# `test/test_linalg_rules.jl` for the regression test.
 #
 # Bare `Base`/`LinearAlgebra` names are qualified throughout (`Base.:*`, `LinearAlgebra.dot`, ...),
-# matching `src/rrules.jl`'s `Base.sin`/`Base.cos` qualification style — see the note at the top of
-# that file for why an unqualified name is unsafe once a rule body gets embedded elsewhere.
+# matching `src/rrules.jl`'s qualification style — see that file's header for why an unqualified
+# name is unsafe once a rule body gets embedded elsewhere.
 
 import LinearAlgebra
 
@@ -143,10 +142,9 @@ function rrule!!(
 end
 
 # ---------------------------------------------------------------------------
-# `*` — matrix-vector and matrix-matrix, `Matrix{Float64}`/`Vector{Float64}` only. These method
-# signatures are deliberately narrow (never `Any`) so they don't interfere with plain scalar `*`,
-# which is handled entirely by the intrinsic layer (`mul_float`) and never reaches `frule!!`/
-# `rrule!!` dispatch at all.
+# `*` — matrix-vector and matrix-matrix, `Matrix{Float64}`/`Vector{Float64}` only. Signatures are
+# deliberately narrow (never `Any`) so they don't interfere with plain scalar `*`, which the
+# intrinsic layer (`mul_float`) handles entirely and never reaches `frule!!`/`rrule!!` dispatch.
 # ---------------------------------------------------------------------------
 
 # --- matrix * vector ---
@@ -243,12 +241,12 @@ end
 
 # ---------------------------------------------------------------------------
 # mul!(C, A, B) — in-place `C = A*B`, `Matrix{Float64}`/`Vector{Float64}` only (3-arg form; the
-# `α`/`β`-scaled 5-arg form is not covered). `C` is mutated, so both modes follow the mutating-array
-# convention used by `map!` (`rules_broadcast.jl`): forward returns the same `Dual` (mutated shadow
-# in place); reverse zeroes `C`'s fdata after reading the old contents as the backward seed (`C`'s
-# previous value is overwritten, not accumulated, so whatever cotangent had built up on it before
-# this call belongs to that overwritten value, not to `A`/`B`) and restores the old fdata afterwards
-# so an earlier write to the same array (if any) still sees its own seed correctly.
+# α/β-scaled 5-arg form isn't covered). `C` is mutated, so both modes follow the mutating-array
+# convention used by `map!` (`rules_broadcast.jl`): forward returns the same `Dual` with the shadow
+# mutated in place; reverse zeroes `C`'s fdata after reading its old contents as the backward seed
+# (C's previous value is overwritten, not accumulated, so cotangent built up on it before this call
+# belongs to that overwritten value, not to A/B), then restores the old fdata so an earlier write to
+# the same array still sees its own seed correctly.
 # ---------------------------------------------------------------------------
 
 # --- mul!(y, A, x) — matrix * vector ---

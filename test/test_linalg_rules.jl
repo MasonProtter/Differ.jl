@@ -9,10 +9,10 @@ include(joinpath(@__DIR__, "testutils.jl"))
 # genuine `:invoke` for the hand rule dispatch to be exercised at all. Passing the bare
 # `LinearAlgebra` function directly asks Differ to dualize/derive *that function's own* body instead
 # (the "differentiate this function directly" entry point, unrelated to whether a hand rule exists
-# for calls to it elsewhere) — which fails for `dot`/`norm`/`*`, since their real bodies bottom out
-# in a BLAS `ccall` Differ can't see through regardless of the hand rule. Wrapping in a trivial
-# named function makes the call to the target survive as an ordinary `:invoke`, which is what
-# actually exercises the hand rule.
+# for calls to it elsewhere), which fails for `dot`/`norm`/`*` since their real bodies bottom out in
+# a BLAS `ccall` Differ can't see through regardless of the hand rule. Wrapping in a trivial named
+# function makes the call to the target survive as an ordinary `:invoke`, which is what exercises
+# the hand rule.
 dot_fn(x, y) = dot(x, y)
 norm_fn(x) = norm(x)
 tr_fn(A) = tr(A)
@@ -135,11 +135,11 @@ tr_fn(A) = tr(A)
 
         # Reverse mode: composite-recursion into a hand rule whose *result* is array-shaped
         # (fdata-carried, not rdata) isn't supported by the general derived-call engine yet (see
-        # `_static_recursible_call`'s guard #3 in `reverse_interp.jl` — unrelated to this rule being
-        # correct, a pre-existing scope limit of the composite recursion machinery, not something
+        # `_static_recursible_call`'s guard #3 in `reverse_interp.jl` — a pre-existing scope limit
+        # of the composite recursion machinery, unrelated to this rule's correctness and not
         # fixable from this file). So `A*x`'s reverse rule is exercised by calling `rrule!!` directly
-        # — exactly the shape `Differ.gradient`/`value_and_gradient!` themselves use under the hood —
-        # rather than through a wrapping scalar composite function.
+        # — the same shape `Differ.gradient`/`value_and_gradient!` use under the hood — rather than
+        # through a wrapping scalar composite function.
         dA = zeros(size(A)); dx = zeros(size(x))
         Acd, xcd = Differ.CoDual(A, dA), Differ.CoDual(x, dx)
         ycd, pb = Differ.rrule!!(Differ.zero_fcodual(*), Differ.Ctx(), Acd, xcd)
@@ -327,8 +327,8 @@ tr_fn(A) = tr(A)
     end
 
     @testset "transpose/adjoint work in forward mode with NO new rule" begin
-        # `transpose`/`adjoint` are deliberately *not* given rules: their tangent already routes
-        # through the generic struct-tangent machinery (`tangent_type(Transpose{Float64,
+        # `transpose`/`adjoint` deliberately have no rules: their tangent already routes through
+        # the generic struct-tangent machinery (`tangent_type(Transpose{Float64,
         # Matrix{Float64}})` is a real `Tangent`).
         M = [1.0 2.0; 3.0 4.0]
 
@@ -353,19 +353,20 @@ tr_fn(A) = tr(A)
         # falls through to Base's *pairwise* `mapreduce_impl`, which is self-recursive. Direct
         # self-recursion is supported (`reverse_fwds_recursive_ci`, `src/reverse_interp.jl`, ISSUES
         # #65), so this no longer bails on the `in_progress` cycle guard. It used to still bail past
-        # that, on `mapreduce_impl`'s non-recursive base case: an `@simd for` loop, which reverse mode
-        # had no `Expr(:loopinfo)` support for. Reverse mode now carries `:loopinfo` through (mirroring
-        # forward mode, dropping only `julia.ivdep` — see the comment on the fwds carrier's `:loopinfo`
-        # arm, `src/reverse_interp.jl`), so this composes correctly end to end.
+        # that, on `mapreduce_impl`'s non-recursive base case: an `@simd for` loop, which reverse
+        # mode had no `Expr(:loopinfo)` support for. Reverse mode now carries `:loopinfo` through
+        # (mirroring forward mode, dropping only `julia.ivdep` — see the comment on the fwds
+        # carrier's `:loopinfo` arm, `src/reverse_interp.jl`), so this composes correctly end to end.
         #
-        # This testset used to assert only a graceful bail, and before that (briefly) unsound working
-        # gradients: `mapreduce_impl`'s `op` operand is a `GlobalRef`, which `_static_recursible_call`
-        # used to mistype as `GlobalRef` (the node's type, not the value's — the reverse-mode half of
-        # ISSUES #63), resolving a *different*, non-self-recursive specialization and emitting
-        # `%new(CoDual{GlobalRef,NoFData}, Base.add_sum, …)`. At 2x2 that statement sits on a branch
-        # below `pairwise_blocksize` and never runs; at 40x40 it does, and the same call died with
-        # `TypeError: in new, expected GlobalRef, got a value of type typeof(Base.add_sum)`. Keep both
-        # sizes so a regression in either the base case or the pairwise-recursive branch is caught.
+        # This testset used to assert only a graceful bail, and before that (briefly) unsound
+        # working gradients: `mapreduce_impl`'s `op` operand is a `GlobalRef`, which
+        # `_static_recursible_call` used to mistype as `GlobalRef` (the node's type, not the
+        # value's — the reverse-mode half of ISSUES #63), resolving a *different*, non-self-recursive
+        # specialization and emitting `%new(CoDual{GlobalRef,NoFData}, Base.add_sum, …)`. At 2x2 that
+        # statement sits on a branch below `pairwise_blocksize` and never runs; at 40x40 it does, and
+        # the call died with `TypeError: in new, expected GlobalRef, got a value of type
+        # typeof(Base.add_sum)`. Keep both sizes so a regression in either the base case or the
+        # pairwise-recursive branch is caught.
         g_t(M) = sum(transpose(M))
 
         for n in (2, 40)   # 40x40 is the size that used to reach the illegal statement

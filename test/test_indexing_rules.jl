@@ -10,7 +10,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
     # Locks in the pre-existing, engine-native behavior (see `differ-architecture`): scalar/multi-dim
     # Int indexing on a plain `Array` lowers to `memoryrefnew`/`memoryrefget`/`memoryrefset!` and is
     # already fully supported without any rule in this file. This file's own rules (mask/index-vector
-    # indexing) never dispatch on this shape, so this is a pure regression lock, not a target this
+    # indexing) never dispatch on this shape, so it's a pure regression lock, not something this
     # file's changes could plausibly affect — kept here anyway per the task's ask.
     read2d(A, i, j) = A[i, j]
     write2d!(A, i, j, x) = (A[i, j] = x; A)
@@ -92,7 +92,7 @@ end
     checkverify(getidxvec, (Vector{Float64}, Vector{Int}))
 
     # repeated index: each occurrence independently gathers the same source element/tangent (a
-    # forward-mode gather has no accumulation to worry about — that's a reverse-mode concern, tested
+    # forward-mode gather has no accumulation to worry about; that's a reverse-mode concern, tested
     # below).
     idxrep = [1, 1, 2]
     rrep = frule!!(Dual(getidxvec, NoTangent()), Dual(v, dv), Dual(idxrep, zero_tangent(idxrep)))
@@ -136,12 +136,12 @@ end
 @testset "reverse mode: logical (mask) / index-vector getindex (direct rrule!! calls)" begin
     # `Differ.gradient` assumes a *scalar*-output primal (it seeds the pullback with `one(y)`), so
     # it can't be used directly on `getindex`, whose result is itself an array. Tested here by
-    # calling `rrule!!` directly with an explicit seed — the same style `check_stack_balance`
-    # already uses elsewhere for array-argument rules.
+    # calling `rrule!!` directly with an explicit seed, the same style `check_stack_balance` uses
+    # elsewhere for array-argument rules.
     #
     # Also only reachable this way (a direct call to `Base.getindex`'s own `rrule!!`), not through a
-    # user-defined wrapper (`f(A, m) = A[m]`) — see the NOTE above the rules in
-    # `src/rules_indexing.jl`: the array-valued getindex result trips the reverse engine's own
+    # user-defined wrapper (`f(A, m) = A[m]`): see the NOTE above the rules in
+    # `src/rules_indexing.jl`. The array-valued getindex result trips the reverse engine's own
     # (unrelated, out-of-scope-for-this-file) "recursive call with a non-trivial-fdata result" bail
     # before a hand rule is even considered.
     v = [1.0, 2.0, 3.0, 4.0]
@@ -180,8 +180,8 @@ end
         @test tangent(vcd2)[k] ≈ expected atol=1e-6
     end
 
-    # tape hygiene: a repeated call through a fresh `Ctx()` shouldn't leave anything imbalanced —
-    # this hand rule's pullback allocates no stack of its own, but confirm regardless.
+    # tape hygiene: a repeated call through a fresh `Ctx()` shouldn't leave anything imbalanced.
+    # This hand rule's pullback allocates no stack of its own, but confirm regardless.
     ycd3, pb3 = rrule!!(zero_fcodual(Base.getindex), Ctx(), zero_fcodual(v), zero_fcodual(mask))
     tangent(ycd3) .= 1.0
     pb3(NoRData())

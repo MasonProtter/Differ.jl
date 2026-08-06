@@ -19,8 +19,8 @@ function check_unary(f, xs; rtol=1e-6)
     # `checkverify`/`checkverify_rev` dualize the trivial wrapper rather than `f` directly: passing
     # `f` itself as the top-level dualization target hits an unrelated pre-existing quirk where
     # Julia's own inliner unfolds `f`'s real Base body into the generic `dualized_impl` wrapper
-    # *before* Differ's call-site hand-rule interception ever gets a look-in (confirmed harmless to
-    # this task by checking that a composite caller of `f` — the realistic scenario — gets a single
+    # before Differ's call-site hand-rule interception ever gets a look-in (confirmed harmless to
+    # this task by checking that a composite caller of `f`, the realistic scenario, gets a single
     # clean `invoke` to our hand rule instead). Wrapping one level deep, as any real caller of `f`
     # would look, sidesteps that and exercises the interception path this task actually cares about.
     wrapped(x) = f(x)

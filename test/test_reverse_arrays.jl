@@ -7,7 +7,6 @@ using Differ: ZeroRData, NoRData, increment!!
 include(joinpath(@__DIR__, "testutils.jl"))
 
 @testset "reverse mode: read-only array indexing" begin
-    # Tier 6 Part 2: read-only array indexing.
     function arr_idx3(x::Vector{Float64})                # a fixed-index read
         return x[3]
     end
@@ -59,8 +58,8 @@ include(joinpath(@__DIR__, "testutils.jl"))
 end
 
 @testset "reverse mode: array mutation (memoryrefset!)" begin
-    # Array mutation (Part 3, `memoryrefset!`): `arr_mutate!(x) = (x[1] = 2*x[1]; x[1])` — the
-    # returned value only ever sees the *overwritten* x[1], so d/dx = [2.0, 0.0].
+    # `arr_mutate!(x) = (x[1] = 2*x[1]; x[1])` — the returned value only sees the *overwritten*
+    # x[1], so d/dx = [2.0, 0.0].
     function arr_mutate!(x::Vector{Float64})
         x[1] = 2.0 * x[1]
         return x[1]
@@ -90,7 +89,7 @@ end
 
     v0 = [0.0, 0.0]
     _, dv, da = gradient(straightline!, v0, 3.0)
-    @test dv == [0.0, 0.0]     # both elements overwritten before being read back — no dependence on v0
+    @test dv == [0.0, 0.0]     # both elements overwritten before being read back, no dependence on v0
     @test da == 3.0            # d/da (a + 2a) = 3
 
     checkverify_rev(straightline!, (Vector{Float64}, Float64))
@@ -102,7 +101,7 @@ end
     # `@boundscheck` diamond underneath — collapsing the diamonds must not be mistaken for
     # collapsing the loop itself.
     # `check_stack_balance`/`check_block_stack_traffic` seed the pullback with `one(primal(ycd))`,
-    # so — unlike `bench/workloads.jl`'s `nothing`-returning version — this one returns a value
+    # so unlike `bench/workloads.jl`'s `nothing`-returning version, this one returns a value
     # (ISSUES #51: a `Nothing`-returning primal isn't drivable through those helpers at all).
     function vecloop!(v::Vector{Float64}, x::Float64)
         for i in 1:length(v)
@@ -140,7 +139,7 @@ end
 
     # 2. Bounds: `@inbounds` and checked reads both round-trip. The re-derived shadow ref forces
     # `boundscheck=true` regardless, so an out-of-bounds `@inbounds` primal access still throws on
-    # the shadow rather than corrupting it (pinned directly for the literal-index case in
+    # the shadow instead of corrupting it (pinned directly for the literal-index case in
     # `test_reverse_mutation_aliasing.jl`; this is the loop-index analogue).
     dynread_inbounds(x) = (s = 0.0; for i in eachindex(x); s += (@inbounds x[i]); end; s)
     x7 = [2.0, 3.0, 5.0, 7.0]
@@ -228,8 +227,8 @@ end
 end
 
 @testset "reverse mode: recursive calls with an array argument" begin
-    # Tier 7 Part 3: the recursive-call guard allows an array argument through when its identity
-    # is traceable back to a function argument, threading the real fdata array through the
+    # The recursive-call guard allows an array argument through when its identity is traceable
+    # back to a function argument, threading the real fdata array through the
     # recursive `:invoke` instead of a detached `NoFData()`. `arr_inner` is a plain composite
     # function (no hand-written rule) taking the array directly, so differentiating a caller of it
     # exercises the *general* engine path, not `sum`'s own hand rule.
@@ -317,11 +316,11 @@ end
     # A pullback that has to produce a zero rdata for a closure type `G` normally sees `G` bound to
     # the closure's concrete runtime type, but the derived recursion glue can resolve a rule via a
     # static call-site type that isn't concrete (`g` reached through an abstractly-typed
-    # field/container) — that binds `G` to a non-concrete type. Calling `zero_rdata_from_type(G)`
-    # there returns the `CannotProduceZeroRDataFromType()` sentinel for a `G` with real
-    # (non-`NoRData`) rdata — and `increment!!` has no method for that, so the pullback crashed with
-    # a raw `MethodError`. The fix is `zero_like_rdata_from_type(G)`, which returns `ZeroRData()`
-    # instead, and which `increment!!` handles.
+    # field/container), binding `G` to a non-concrete type. Calling `zero_rdata_from_type(G)` there
+    # returns the `CannotProduceZeroRDataFromType()` sentinel for a `G` with real (non-`NoRData`)
+    # rdata, and `increment!!` has no method for that, so the pullback crashed with a raw
+    # `MethodError`. The fix is `zero_like_rdata_from_type(G)`, which returns `ZeroRData()` instead,
+    # which `increment!!` handles.
     #
     # This was originally written against `sum(f, x)`'s hand rule (`SumMapPullback`), whose `G`
     # parameter is exactly that shape. Those `sum` rules are currently commented out in
@@ -332,7 +331,7 @@ end
     #
     # `make_sum_map_closures` returns two closures over distinct captured `Float64`s, each with
     # real (non-`NoRData`) rdata, whose common supertype is a non-concrete `Union`. Built inside a
-    # function so `a`/`b` are genuine captured closure fields, not global bindings.
+    # function so `a`/`b` are captured closure fields, not global bindings.
     function make_sum_map_closures()
         a = 1.0
         b = 2.0

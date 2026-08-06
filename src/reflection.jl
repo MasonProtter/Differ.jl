@@ -6,16 +6,16 @@
 # through `typeinf_ircode`, which would recompute from the throwing stub instead of calling
 # `CC.optimize`.
 
-# Nest a value's dual seed `order` levels deep, per the Mooncake tangent system: the leaf tangent
-# is `tangent_type(T)`, so order 1 → `Dual{T,tangent_type(T)}` (first derivative). Because a `Dual`
-# is its own tangent type (`tangent_type(Dual{P,T}) == Dual{P,T}`, see `dual.jl`), the recursive
-# step `Dual{S,tangent_type(S)}` collapses to `Dual{S,S}`, so order 2 → `Dual{Dual{T,U},Dual{T,U}}`
-# etc. — matching Differ's Option-A higher-order nesting.
+# Nest a value's dual seed `order` levels deep, per the Mooncake tangent system: the leaf tangent is
+# `tangent_type(T)`, so order 1 → `Dual{T,tangent_type(T)}` (first derivative). Because a `Dual` is
+# its own tangent type (`tangent_type(Dual{P,T}) == Dual{P,T}`, see `dual.jl`), the recursive step
+# `Dual{S,tangent_type(S)}` collapses to `Dual{S,S}`, so order 2 → `Dual{Dual{T,U},Dual{T,U}}`, etc.
+# — matching Differ's Option-A higher-order nesting.
 #
-# This is uniform for the function and every value argument (the function nests like any other value
-# — see the peel in `build_dual_ir`). A plain function `f` has `tangent_type(typeof(f)) == NoTangent`
-# (so `Dual{typeof(f),NoTangent}`); a closure has a `Tangent{…}` tangent over its captures, read in
-# the body via the struct `getfield`→`get_tangent_field` path.
+# Uniform for the function and every value argument (the function nests like any other value — see
+# the peel in `build_dual_ir`). A plain function `f` has `tangent_type(typeof(f)) == NoTangent` (so
+# `Dual{typeof(f),NoTangent}`); a closure has a `Tangent{…}` tangent over its captures, read in the
+# body via the struct `getfield`→`get_tangent_field` path.
 _nest_dual(@nospecialize(T), order::Int) =
     order <= 1 ? Dual{T,tangent_type(T)} : (S = _nest_dual(T, order - 1); Dual{S,tangent_type(S)})
 

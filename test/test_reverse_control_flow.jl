@@ -6,11 +6,11 @@ include(joinpath(@__DIR__, "testutils.jl"))
 
 @testset "reverse mode: branches" begin
     # `relu` is the multiple-reachable-`return`s shape (the common shape Julia's optimizer
-    # actually produces for an `if/else` with a value in each arm — see `_exit_blocks`'s
-    # docstring); `branch3` merges all three arms into a single `return` via one `PhiNode` with
-    # three predecessors (exercises the `Switch`-with-more-than-two-targets path). Both are checked
-    # against finite differences AND the trusted forward-mode `frule!!` (already supports control
-    # flow) as an independent cross-check of the new tape/block-stack machinery.
+    # produces for an `if/else` with a value in each arm — see `_exit_blocks`'s docstring);
+    # `branch3` merges all three arms into a single `return` via one `PhiNode` with three
+    # predecessors (exercises the `Switch`-with-more-than-two-targets path). Both are checked
+    # against finite differences and the trusted forward-mode `frule!!` (already supports control
+    # flow) as an independent cross-check of the tape/block-stack machinery.
     relu(x) = x > 0.0 ? x : -x
     function branch3(x)
         if x > 2.0
@@ -86,10 +86,10 @@ end
 @testset "reverse mode: loops" begin
     # A loop body may execute an unknown number of times, so this is the first place the block
     # stack and per-block comms `Stack`s are actually needed (not just degenerate 0-or-1-entry
-    # stacks, as in the branch-only cases) — and the first place rdata `Ref`s must correctly
+    # stacks, as in the branch-only cases), and the first place rdata `Ref`s must correctly
     # reset/accumulate across repeated visits in exact LIFO order. `sumk`/`sumk2`/`sumk_multi` are
     # the existing forward-mode loop fixtures (a single while-loop, nested while-loops, and two
-    # live loop-carried accumulators in one block, respectively) — reused here and cross-checked
+    # live loop-carried accumulators in one block, respectively), reused here and cross-checked
     # against the already-trusted `frule!!`.
     function sumk(x, k)
         s = x - x
@@ -145,8 +145,8 @@ end
     check_stack_balance(sumk2, 1.5, 3, 4)
 
     # Tape-layout regression: `_scan_block_comms` never tapes an `Argument`'s own primal value
-    # (`Tape.args` already holds every argument codual, and the pullback's `pb_presolve` already
-    # falls back to reading it from there). `loopdot`'s loop body reads `x` (an argument) and `v[i]`
+    # (`Tape.args` already holds every argument codual, and the pullback's `pb_presolve` falls
+    # back to reading it from there). `loopdot`'s loop body reads `x` (an argument) and `v[i]`
     # each iteration; eliding `x` drops the loop-body comms tuple from `Tuple{Float64,Float64}` to
     # `Tuple{Float64}` — one `Float64` (`v[i]`) plus an unrelated `Tuple{Int64}` index-tracking slot.
     function loopdot(x::Float64, v::Vector{Float64})

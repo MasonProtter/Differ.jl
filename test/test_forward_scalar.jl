@@ -146,7 +146,7 @@ end
           central_diff(t -> vsum(t, 2.0, 3.0), 1.0)
 
     # 2. EMPTY vararg slot. Base's `*(a,b,c,xs...)` has `nargs == 5`, so a 3-arg call leaves the
-    # vararg slot empty — and inference types it `Core.Const(())`, a lattice element rather than a
+    # vararg slot empty, and inference types it `Core.Const(())`, a lattice element rather than a
     # bare `Type`. Product rule: d(xyz) = dx·yz + x·dy·z + xy·dz.
     x, y, z = 2.0, 3.0, 4.0
     @test frule!!(fz(*), Dual(x,1.0), Dual(y,0.0), Dual(z,0.0)) === Dual(x*y*z, y*z)
@@ -175,7 +175,7 @@ end
     # 5. The collapse trap, directly: `vintsum` hands the *whole* all-`NoTangent` tuple to a surviving
     # call, so `frule_split!` builds `%new(Dual{Tuple{Int,Int},NoTangent}, %packed, <shadow>)`. If the
     # shadow were an emitted `Core.tuple(NoTangent(), NoTangent())` this would `TypeError` at the
-    # `%new`. This is the regression test for that rule — cases 4 and 6 never read the slot whole.
+    # `%new`. This is the regression test for that rule; cases 4 and 6 never read the slot whole.
     @test frule!!(fz(vintsum), Dual(2.0,1.0), Dual(3,NoTangent()), Dual(4,NoTangent())) ===
           Dual(14.0, 7.0)
 

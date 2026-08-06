@@ -4,38 +4,38 @@ using Differ: Dual, NoTangent, frule!!, gradient, get_tangent_field, MutableTang
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
-# A dynamic-dispatch callee (read from a non-`const` global) is not statically recursible — must
-# bail cleanly, not crash. Must be a real module-level global (not testset-local) — a local would
-# instead be captured as a closure field, a different IR shape from what this test exercises.
+# A dynamic-dispatch callee (read from a non-const global) isn't statically recursible; must bail
+# cleanly, not crash. Must be a real module-level global, not testset-local: a local would instead
+# be captured as a closure field, a different IR shape than this test exercises.
 dyn_g = sin
 dyncallee(x) = dyn_g(x)
 
-# Regression: a self-recursive `@noinline` primal has no finite `Tape` type in this design (the
-# `in_progress` cycle guard) — must bail with a clean `ErrorException`, not recurse forever /
-# stack-overflow. Must be a true top-level function, not testset-local: a *self*-recursive
-# function defined in a local scope needs to close over its own (boxed) binding to call itself,
-# which gives it a real (non-`NoTangent`) tangent type instead of the plain singleton a top-level
-# function has, defeating `gradient`'s zero-tangent seeding for `f`.
+# Regression: a self-recursive @noinline primal has no finite Tape type in this design (the
+# in_progress cycle guard), so it must bail with a clean ErrorException, not recurse forever or
+# stack-overflow. Must be a true top-level function, not testset-local: a self-recursive function
+# defined in local scope closes over its own boxed binding to call itself, which gives it a real
+# (non-NoTangent) tangent type instead of the plain singleton a top-level function has, defeating
+# gradient's zero-tangent seeding for f.
 @noinline function rec_self(x::Float64, n::Int)
     n <= 0 && return x
     return rec_self(x, n - 1)
 end
 
-# Same requirement as `rec_self` above (must be module-level, not testset-local): a genuinely
-# self-recursive primal used across several ISSUES #65 tests below (plain recursion, under a branch,
-# under a loop, and through both the tape-allocating and pre-allocated carrier specializations).
+# Same requirement as rec_self (module-level, not testset-local). Used across several ISSUES #65
+# tests below: plain recursion, under a branch, under a loop, and through both the tape-allocating
+# and pre-allocated carrier specializations.
 @noinline function rec_sum(v::Vector{Float64}, i::Int)
     i > length(v) && return 0.0
     return v[i] + rec_sum(v, i + 1)
 end
 
 # Genuine mutual recursion (A -> B -> A), also module-level for the same reason. Must still bail
-# cleanly — it needs a tape-type pre-pass across the whole SCC, out of scope for direct self-recursion.
+# cleanly: it needs a tape-type pre-pass across the whole SCC, out of scope for direct self-recursion.
 @noinline mutA(x::Float64, n::Int) = n <= 0 ? x : mutB(x, n - 1)
 @noinline mutB(x::Float64, n::Int) = mutA(x, n - 1)
 
-# Self-recursive with two distinct static call sites in two different (mutually-exclusive) blocks,
-# unlike `rec_sum`/the `Base.mapreduce_impl` case (one shared block) — same module-level requirement.
+# Self-recursive with two distinct static call sites in two different, mutually-exclusive blocks,
+# unlike rec_sum / the Base.mapreduce_impl case (one shared block). Same module-level requirement.
 @noinline function evenodd(n::Int, x::Float64)
     n <= 0 && return x
     if iseven(n)
@@ -45,26 +45,26 @@ end
     end
 end
 
-# A `const` global holding a function, passed as an *operand* of a surviving call: the operand is a
-# `GlobalRef` in the optimized IR, so its type has to come from the binding, not from the node (the
-# reverse-mode half of ISSUES #63). Module-level `const` for the same reason `dyn_g` is module-level.
+# A const global holding a function, passed as an operand of a surviving call: the operand is a
+# GlobalRef in the optimized IR, so its type must come from the binding, not the node (reverse-mode
+# half of ISSUES #63). Module-level const for the same reason dyn_g is module-level.
 const CONST_G = sin
 usecg(v) = sum(CONST_G, v)
 
-# The non-`const` twin. Its operand survives as its own `%k = Main.dyn_g` load statement typed
-# `Any`, so this must bail (reverse) or dispatch dynamically (forward) — and, before the
-# `isa(specTypes, DataType)` guard in `is_reverse_fwds_impl`/`is_dualized_impl`, it crashed the
-# compile outright with `FieldError: type UnionAll has no field parameters` from inside
-# `finishinfer!`, because inference reaches a MethodInstance whose signature has free typevars.
+# The non-const twin. Its operand survives as its own `%k = Main.dyn_g` load statement typed Any,
+# so this must bail (reverse) or dispatch dynamically (forward). Before the isa(specTypes, DataType)
+# guard in is_reverse_fwds_impl/is_dualized_impl, it crashed the compile outright with
+# `FieldError: type UnionAll has no field parameters` from finishinfer!, because inference reaches
+# a MethodInstance whose signature has free typevars.
 nonconst_g = sin
 usencg(v) = sum(nonconst_g, v)
 
 @testset "reverse mode: recursion into a hand-written rule" begin
-    # A surviving high-level call differentiates via the recursive `rrule` support below (`sin`
-    # specifically resolves to the hand-written rule in `src/rrules.jl`, not raw recursion into
-    # `Base.Math.sin`'s internals — see that file's header).
+    # A surviving high-level call differentiates via the recursive rrule support below (sin
+    # resolves to the hand-written rule in src/rrules.jl, not raw recursion into Base.Math.sin's
+    # internals; see that file's header).
     plus1(x) = sin(x) + 1
-    nest(x)  = sin(cos(x))     # composed hand rules: sin(cos(x))
+    nest(x)  = sin(cos(x))
 
     _, dx_plus1 = gradient(plus1, 1.3)
     @test dx_plus1 ≈ cos(1.3)
@@ -76,9 +76,8 @@ usencg(v) = sum(nonconst_g, v)
 end
 
 @testset "reverse mode: recursive rrule calls (statically-resolvable only)" begin
-    # Tier 5 Part 1: a genuinely separate, non-inlined callee must actually survive as a
-    # surviving `:invoke` to exercise recursion, not just fold into ordinary arithmetic — so it's
-    # `@noinline`.
+    # A genuinely separate, non-inlined callee must survive as an :invoke to exercise recursion,
+    # not fold into ordinary arithmetic, hence @noinline.
     @noinline rec_sq(x) = x * x                         # x^2, d/dx = 2x
     rec_call(x) = rec_sq(x) + x                          # d/dx = 2x + 1
     function rec_branch(x)                               # recursion combined with a branch
@@ -111,9 +110,9 @@ end
 end
 
 @testset "reverse mode: direct self-recursion (ISSUES #65)" begin
-    # `rec_self` is genuinely self-recursive: no hand `rrule!!`, and the recursive call resolves to
-    # the exact primal currently being differentiated — the case the `in_progress` cycle guard used
-    # to bail on unconditionally. `d(rec_self(x,n))/dx = 1` for every `n >= 0`.
+    # rec_self is genuinely self-recursive: no hand rrule!!, and the recursive call resolves to the
+    # exact primal currently being differentiated. This is the case the in_progress cycle guard used
+    # to bail on unconditionally. d(rec_self(x,n))/dx = 1 for every n >= 0.
     _, dx_self, dn_self = gradient(rec_self, 1.0, 3)
     @test dx_self == 1.0
     @test dn_self isa NoTangent
@@ -122,13 +121,12 @@ end
         @test dx_n == 1.0
     end
     checkverify_rev(rec_self, (Float64, Int))
-    # Exercises both the tape-allocating (`Ctx{Nothing}`) and pre-allocated (`Ctx{<:Tape}`) carrier
-    # specializations — the self-edge always targets the *pre-allocated* one (nested-tape-recycling
+    # Exercises both the tape-allocating (Ctx{Nothing}) and pre-allocated (Ctx{<:Tape}) carrier
+    # specializations. The self-edge always targets the pre-allocated one (nested-tape-recycling
     # plan, Stage 2: recycling the inner tape needs a recycled-typed ctx on both ends), even when the
-    # outer call is the tape-allocating carrier, which is what makes this the discriminating
-    # regression: a self-recursive primal's tape-allocating carrier must actually compile the
-    # pre-allocated sibling it recurses into, not assume it's the literal carrier being compiled (only
-    # true when the outer carrier is *already* the pre-allocated one).
+    # outer call is the tape-allocating carrier. That's the regression this checks: a self-recursive
+    # primal's tape-allocating carrier must actually compile the pre-allocated sibling it recurses
+    # into, not assume it's the same carrier being compiled.
     check_stack_balance(rec_self, 1.0, 3)
 
     # Accumulating self-recursion: each level contributes a distinct addend, so a wrong tape layout
@@ -170,7 +168,7 @@ end
     check_stack_balance(rec_sum_loop, v, 3)
 
     # Mutual recursion (A -> B -> A) is explicitly out of scope (needs a tape-type pre-pass across
-    # the whole SCC) and must still bail cleanly — never hang, never crash on `verify_ir`.
+    # the whole SCC) and must still bail cleanly: never hang, never crash on verify_ir.
     err_mut = try
         gradient(mutA, 1.0, 4)
         nothing
@@ -226,16 +224,16 @@ end
 
 @testset "reverse mode: dynamic (non-statically-resolvable) callee bails" begin
     @test_throws ErrorException gradient(dyncallee, 1.0)
-    # Asserting the exception is a located `ErrorException` naming the construct, not just any
-    # `ErrorException` — and explicitly not a `MethodError` or other crash, which a bare
-    # `@test_throws ErrorException` would not distinguish from.
+    # Asserting the exception is a located ErrorException naming the construct, not just any
+    # ErrorException, and specifically not a MethodError or other crash, which a bare
+    # @test_throws ErrorException wouldn't distinguish.
     #
-    # `dyn_g` is a non-`const` global, so its read has no statically-known *value* (`_calleeval`
-    # returns `nothing`) — but `_static_recursible_call` (`src/reverse_interp.jl`) now falls back to
-    # the operand's *type* instead of bailing immediately on that (this is what lets an
-    # argument-position callee like `sum(sin, v)`'s `f` recurse). Here that fallback type is itself
-    # `Any` (an unannotated mutable global has no static type either), so the call still bails, just
-    # on the next guard down: "not a concrete DataType", rather than "dynamic callee" directly.
+    # dyn_g is a non-const global, so its read has no statically-known value (_calleeval returns
+    # nothing). But _static_recursible_call (src/reverse_interp.jl) now falls back to the operand's
+    # type instead of bailing immediately (this is what lets an argument-position callee like
+    # sum(sin, v)'s f recurse). Here that fallback type is itself Any (an unannotated mutable global
+    # has no static type either), so the call still bails, just on the next guard down: "not a
+    # concrete DataType" rather than "dynamic callee" directly.
     err_dyncall = try
         gradient(dyncallee, 1.0)
         nothing
@@ -248,11 +246,11 @@ end
 end
 
 @testset "reverse mode: dynamic (non-literal) getfield index" begin
-    # Dynamic (non-literal) `getfield` index (Phase B): `for i in 1:2` does not unroll, so `t[i]`
-    # reaches the pullback as a genuine dynamic index. Before the fix, the pullback resolved the
-    # field to a raw, unresolved `SSAValue` instead of its runtime value, silently degenerating
-    # `increment_field!!`'s `Val`-based dispatch into a no-op — the gradient came back
-    # `(0.0,0.0)` instead of `(1.0,1.0)`, with no error at all. `d/dt_1 = d/dt_2 = 1`.
+    # Dynamic (non-literal) getfield index (Phase B): `for i in 1:2` doesn't unroll, so t[i] reaches
+    # the pullback as a genuine dynamic index. Before the fix, the pullback resolved the field to a
+    # raw, unresolved SSAValue instead of its runtime value, silently degenerating
+    # increment_field!!'s Val-based dispatch into a no-op: the gradient came back (0.0,0.0) instead
+    # of (1.0,1.0), with no error at all. d/dt_1 = d/dt_2 = 1.
     function tupsum_dyn(t::Tuple{Float64,Float64})
         s = 0.0
         for i in 1:2
@@ -315,8 +313,8 @@ end
     checkverify_rev(mp2get, (MP2, Int))
     checkverify_rev(mp2sum_dyn, (MP2,))
 
-    # regression: a dynamic getfield index into a HETEROGENEOUS struct is the genuinely hard case
-    # — must bail with a located error, never crash or silently return a wrong/zero gradient.
+    # regression: a dynamic getfield index into a HETEROGENEOUS struct is the genuinely hard case.
+    # Must bail with a located error, never crash or silently return a wrong/zero gradient.
     @test_throws "dynamic (non-literal) field index" gradient(hetdyn, Het2(1.0, 2), 1)
     err_het = try
         gradient(hetdyn, Het2(1.0, 2), 1)
@@ -328,9 +326,9 @@ end
     @test !(err_het isa MethodError)
     @test occursin("dynamic (non-literal) field index", err_het.msg)
 
-    # regression: the same HETEROGENEOUS case through the mutable-struct branch of `getfield`'s
-    # comms rule (`builtin_rrule_comms(::Val{Core.getfield},...)`, `src/builtins_reverse.jl`) —
-    # a separate code path from the immutable case above, must bail identically.
+    # regression: the same HETEROGENEOUS case through the mutable-struct branch of getfield's comms
+    # rule (builtin_rrule_comms(::Val{Core.getfield},...), src/builtins_reverse.jl). A separate code
+    # path from the immutable case above, must bail identically.
     err_mhet = try
         gradient(mhetdyn, MHet2(1.0, 2), 1)
         nothing
@@ -341,23 +339,23 @@ end
     @test !(err_mhet isa MethodError)
     @test occursin("dynamic (non-literal) field index", err_mhet.msg)
 
-    # regression: a dynamic setfield! index — Phase A only, always bails.
+    # regression: a dynamic setfield! index, Phase A only, always bails.
     @test_throws "dynamic (non-literal) field index" gradient(setdyn!, MP2(1.0, 2.0), 1, 5.0)
 end
 
 # ===========================================================================
 # Nested-tape recycling (Stages 1-2): a non-inlined/recursive inner call's tape is recycled from the
-# slot in the caller's own comms `Stack` its next `:subtape` push will land in
-# (`_inner_ctx`/`_alloc_tape`, `src/stack.jl`+`src/reverse_interp.jl`), instead of a fresh `Ctx()`
+# slot in the caller's own comms Stack that its next :subtape push will land in
+# (_inner_ctx/_alloc_tape, src/stack.jl + src/reverse_interp.jl), instead of a fresh Ctx()
 # allocating one every call. See that plan for the full writeup; these are its verification tests.
 # ===========================================================================
 
 @testset "reverse mode: nested-tape recycling — steady-state allocation" begin
     # Stage 1 (ordinary, non-self-recursive inner calls): once a pre-allocated context's comms slots
-    # are warm, a round trip through a non-inlined callee allocates nothing. `n=5` keeps
-    # `Base.mapreduce_impl` (which `sum`/`sum(abs2, ·)` fall through to — this test file never loads
-    # `src/rules_perf_backstop.jl`, so neither has a hand rule) below `Base.pairwise_blocksize`, so
-    # only Stage 1's machinery is exercised here; self-recursion is Stage 2, tested separately below.
+    # are warm, a round trip through a non-inlined callee allocates nothing. n=5 keeps
+    # Base.mapreduce_impl (which sum / sum(abs2, ·) fall through to; this test file never loads
+    # src/rules_perf_backstop.jl, so neither has a hand rule) below Base.pairwise_blocksize, so only
+    # Stage 1's machinery is exercised here. Self-recursion is Stage 2, tested separately below.
     @noinline sq_steady(x::Float64) = x * x
     callshelper_steady(x::Float64) = sq_steady(x) + sq_steady(x + 1.0)
 
@@ -374,10 +372,10 @@ end
 end
 
 @testset "reverse mode: nested-tape recycling — distinct tapes per iteration" begin
-    # Regression for the peek-position argument the recycling design rests on: `_inner_ctx` reads
-    # from `stack.position + 1`, which advances with every execution of the block — so N executions
-    # of a loop body calling a non-inlined helper must land in N distinct comms slots, never aliasing
-    # the same inner tape across iterations within one call.
+    # Regression for the peek-position argument the recycling design rests on: _inner_ctx reads from
+    # stack.position + 1, which advances with every execution of the block, so N executions of a
+    # loop body calling a non-inlined helper must land in N distinct comms slots, never aliasing the
+    # same inner tape across iterations within one call.
     @noinline addone_dtc(x::Float64) = x + 1.0
     function loopcall_dtc(v::Vector{Float64})
         s = 0.0
@@ -392,10 +390,10 @@ end
     gradient!(pctx, zero_fcodual(loopcall_dtc), zero_fcodual(v))
     gradient!(pctx, zero_fcodual(loopcall_dtc), zero_fcodual(v))   # second call: slots now recycled
 
-    # Locate the block's comms `Stack` (its element type is a 1-tuple of `addone_dtc`'s own tape
-    # type) and pull out the N tapes the last forward pass used — a `Stack` never shrinks, so they're
-    # still sitting in `memory[1:N]` even though `position` is back at 0 (`check_stack_balance`
-    # covers that balance separately).
+    # Locate the block's comms Stack (its element type is a 1-tuple of addone_dtc's own tape type)
+    # and pull out the N tapes the last forward pass used. A Stack never shrinks, so they're still
+    # sitting in memory[1:N] even though position is back at 0 (check_stack_balance covers that
+    # balance separately).
     is_subtape_stack(s) = s isa Differ.Stack && eltype(s.memory) <: Tuple &&
                           any(F -> F <: Differ.Tape, fieldtypes(eltype(s.memory)))
     matches = filter(is_subtape_stack, collect(pctx.tape.comms))
@@ -407,9 +405,8 @@ end
 
 @testset "reverse mode: nested-tape recycling — slot growth" begin
     # A longer call through the same context must grow into slots this context has never used
-    # before (the fresh-allocation arm of `_inner_ctx`) rather than reuse/alias a shorter call's
-    # stale slot — and a subsequent short call must still get the right answer once the context has
-    # grown.
+    # before (the fresh-allocation arm of _inner_ctx) rather than reuse/alias a shorter call's stale
+    # slot, and a subsequent short call must still get the right answer once the context has grown.
     @noinline addone_sg(x::Float64) = x + 1.0
     function loopcall_sg(v::Vector{Float64})
         s = 0.0
@@ -431,15 +428,15 @@ end
 end
 
 @testset "reverse mode: nested-tape recycling — self-recursion (Stage 2)" begin
-    # `Base.mapreduce_impl` splits pairwise above `Base.pairwise_blocksize`, so `sum(abs2, x)` at
-    # n=2000 reaches its self-recursive branch — the case Stage 2's `own_TapeT` self-edge retargeting
-    # (`reverse_fwds_recursive_ci`, `src/reverse_interp.jl`) is for.
+    # Base.mapreduce_impl splits pairwise above Base.pairwise_blocksize, so sum(abs2, x) at n=2000
+    # reaches its self-recursive branch, the case Stage 2's own_TapeT self-edge retargeting
+    # (reverse_fwds_recursive_ci, src/reverse_interp.jl) is for.
     #
-    # Steady-state allocation is exactly 0: the concrete `Tape.subtapes` field (the "concrete
-    # self-recursive Tape" follow-up plan) removed the abstract-bare-`Tape`-marker comms slot this
-    # test used to read through, which is what left a small (~16-32 B) residual here before. Dropped
-    # ~4 orders of magnitude from the original fresh-`Ctx()` baseline (111056 B / 87 allocs at this
-    # size, pre-recycling).
+    # Steady-state allocation is exactly 0: the concrete Tape.subtapes field (the "concrete
+    # self-recursive Tape" follow-up plan) removed the abstract-bare-Tape-marker comms slot this test
+    # used to read through, which is what left a small (~16-32 B) residual before. Dropped ~4 orders
+    # of magnitude from the original fresh-Ctx() baseline (111056 B / 87 allocs at this size,
+    # pre-recycling).
     f_self = x -> sum(abs2, x)
     n = 2000
     @assert n > Base.pairwise_blocksize(abs2, Base.add_sum)
@@ -456,8 +453,8 @@ end
     @test bytes == 0
 
     # Not vacuous: confirm the mechanism was genuinely exercised, not zero because nothing pushed to
-    # `subtapes` at all. Locate the innermost `Base.mapreduce_impl` tape (self-recursive primal) and
-    # assert its own `subtapes` stack actually holds recycled entries.
+    # subtapes at all. Locate the innermost Base.mapreduce_impl tape (self-recursive primal) and
+    # assert its own subtapes stack actually holds recycled entries.
     function find_self_recursive_tape(tape, seen=Base.IdSet{Any}())
         tape in seen && return nothing
         push!(seen, tape)
@@ -481,10 +478,10 @@ end
 end
 
 @testset "reverse mode: nested-tape recycling — self-recursion across distinct blocks" begin
-    # `mapreduce_impl`'s two self-recursive call sites share one block. This is the complementary
-    # case the design argument (one global, `Tape`-wide `subtapes` stack, LIFO-consistent regardless
-    # of which block each entry came from) doesn't get from that alone: two self-recursive call sites
-    # in *different*, mutually-exclusive blocks of the same primal.
+    # mapreduce_impl's two self-recursive call sites share one block. This is the complementary case
+    # the design argument (one global, Tape-wide subtapes stack, LIFO-consistent regardless of which
+    # block each entry came from) doesn't cover alone: two self-recursive call sites in different,
+    # mutually-exclusive blocks of the same primal.
     checkverify_rev(evenodd, (Int, Float64))
     check_stack_balance(evenodd, 9, 1.0)
 
@@ -496,9 +493,9 @@ end
 end
 
 @testset "reverse mode: nested-tape recycling — hand rule callee still gets a fresh Ctx()" begin
-    # A callee with a hand-written `rrule!!` (its pullback is whatever's cheapest to remember, not a
-    # `Tape` — there is no tape to pre-allocate) must still receive a fresh `Ctx()` at its call site,
-    # never a recycled one from `_inner_ctx`.
+    # A callee with a hand-written rrule!! (its pullback is whatever's cheapest to remember, not a
+    # Tape, so there is no tape to pre-allocate) must still receive a fresh Ctx() at its call site,
+    # never a recycled one from _inner_ctx.
     plus1_hr(x) = sin(x) + 1
     ir = code_reverse_fwds_ircode(plus1_hr, (Float64,))[1]
     invokes_to_rrule = [stmt for stmt in ir.stmts.stmt

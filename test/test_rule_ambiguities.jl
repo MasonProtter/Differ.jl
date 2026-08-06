@@ -1,7 +1,7 @@
 using Test
 using Differ
 
-# Two hand rules that are mutually ambiguous do NOT error at definition time — `hand_reverse_rule_match`/
+# Two hand rules that are mutually ambiguous do NOT error at definition time: `hand_reverse_rule_match`/
 # `has_hand_frule` treat "ambiguous" the same as "no match" (`Core.Compiler`'s `findsup` returns
 # `nothing` for both), so inlining suppression silently turns off and the generic derived-recursion
 # fallback runs instead, which can be silently wrong rather than loudly broken (see ISSUES.md). This is

@@ -7,10 +7,9 @@ include(joinpath(@__DIR__, "testutils.jl"))
 
 mutable struct MPoint; x::Float64; y::Float64; end   # used by several testsets below
 
-# Must be a true top-level function, not testset-local: a named function nested inside another
-# local scope gets boxed more conservatively by Julia's closure-conversion than a directly-written
-# closure literal does, which would give `r` a real (boxed) tangent type here instead of the plain
-# `Ref{Float64}` capture the test actually wants to exercise.
+# Must be top-level, not testset-local: Julia's closure-conversion boxes a named function nested in
+# local scope more conservatively than a closure literal, which would give `r` a real (boxed)
+# tangent type instead of the plain `Ref{Float64}` capture this test wants to exercise.
 function make_refmul_closure()
     r = Ref(1.0)
     g(y) = (r[] *= y; nothing)
@@ -27,8 +26,8 @@ end
 
     p1 = MPoint(2.0, 3.0)
     _, dp_setx, dv_setx = gradient(mpoint_setx!, p1, 10.0)
-    # p.x is overwritten before use, so its own gradient contribution is 0; p.y and v both flow
-    # straight through to the `+`.
+    # p.x is overwritten before use, so its own gradient contribution is 0; p.y and v flow straight
+    # through to the `+`.
     @test dp_setx == MutableTangent{@NamedTuple{x::Float64,y::Float64}}((x=0.0, y=1.0))
     @test dv_setx == 1.0
     # Cross-check against the already-trusted forward-mode `frule!!` result for the same primal.
@@ -45,8 +44,7 @@ end
 end
 
 @testset "reverse mode: array mutation combined with a full-array read" begin
-    # Array mutation combined with a full-array read, so both the mutated element and an
-    # untouched one are exercised in the same gradient: d(sum)/dx[1] = 2, d(sum)/dx[2] = 1.
+    # d(sum)/dx[1] = 2 (mutated), d(sum)/dx[2] = 1 (untouched).
     function arr_mutate_sum!(x::Vector{Float64})
         x[1] *= 2.0
         return sum(x)
@@ -66,12 +64,11 @@ end
 end
 
 @testset "reverse mode: repeated mutation in a loop (save/restore)" begin
-    # Repeated mutation in a loop — the case the save/restore machinery (`:old_primal`/
-    # `:old_tangent`) exists for; a version without restore passes the straight-line cases above
-    # and fails only here. Also the strongest available proof that the *same* `MutableTangent` is
-    # shared across every iteration's separate `getfield` access (a broken-aliasing bug here would
-    # give a numerically wrong answer, not an error): d(result)/dr = ys[1]*ys[2] = 12,
-    # d(result)/dys[1] = r*ys[2] = 8, d(result)/dys[2] = r*ys[1] = 6.
+    # The case the save/restore machinery (`:old_primal`/`:old_tangent`) exists for: a version
+    # without restore passes the straight-line cases above and fails only here. Also proves the
+    # *same* `MutableTangent` is shared across every iteration's separate `getfield` access (a
+    # broken-aliasing bug would give a numerically wrong answer, not an error): d(result)/dr =
+    # ys[1]*ys[2] = 12, d(result)/dys[1] = r*ys[2] = 8, d(result)/dys[2] = r*ys[1] = 6.
     function refprod_loop!(r::Base.RefValue{Float64}, ys::Vector{Float64})
         for y in ys
             r[] *= y
@@ -94,12 +91,11 @@ end
     # The originally-reported bug: a closure over a `Ref`, read via two separate `getfield` calls
     # (once before the mutation, once after) that must resolve to the *same* underlying
     # `MutableTangent`. An aliasing bug here (two independently-zeroed copies instead of one
-    # shared object) would silently give the wrong gradient rather than erroring, so this
-    # correctness check (not just "it doesn't throw") is what actually exercises this.
+    # shared object) would silently give the wrong gradient rather than erroring, so this checks
+    # the value, not just that it doesn't throw.
 
-    # Must simply run without erroring, must leave `r` restored after a full forward+pullback
-    # round trip, and (since the primal returns `nothing`) contributes no gradient to `y` through
-    # the return value.
+    # Must run without erroring, leave `r` restored after the round trip, and (since the primal
+    # returns `nothing`) contribute no gradient to `y` through the return value.
     g, r = make_refmul_closure()
     gcd, pb = rrule!!(zero_fcodual(g), Ctx(), Differ.CoDual(3.0, NoFData()))
     @test Differ.primal(gcd) === nothing
@@ -110,10 +106,10 @@ end
 
 @testset "reverse mode: setfield! of an array-valued field (fdata aliasing)" begin
     # `setfield!` of an array-valued field: the field's shadow is aliased to the argument's real
-    # shadow (rather than a fresh `zero_tangent`), so in-place accumulation into that shared shadow
-    # after the assignment flows back to `w`. `setbox!` itself returns `nothing` with no downstream
-    # read of `b.v`, so its own gradient is trivially zero (not a real exercise of the aliasing) —
-    # `setbox_sum!` reads `b.v` back out through the return value and is the real test.
+    # shadow (not a fresh `zero_tangent`), so in-place accumulation into that shared shadow after
+    # the assignment flows back to `w`. `setbox!` returns `nothing` with no downstream read of
+    # `b.v`, so its own gradient is trivially zero and doesn't really exercise the aliasing;
+    # `setbox_sum!` reads `b.v` back through the return value and is the real test.
     mutable struct MBox; v::Vector{Float64}; end
     setbox!(b::MBox, w::Vector{Float64}) = (b.v = w; nothing)
     setbox_sum!(b::MBox, w::Vector{Float64}) = (b.v = w; sum(b.v))
@@ -138,11 +134,11 @@ end
         @test dw_setbox[k] ≈ fwd_setbox.dx
     end
     # `setbox!` (returns `nothing`, `b.v` never read back downstream) runs to completion instead
-    # of bailing — the aliasing mechanism handles it fine, there is just nothing downstream to
-    # carry a gradient to `w`. `gradient`/`gradient!` both seed the pullback with `one(y)`, which
-    # has no method for `y === nothing` (a pre-existing, unrelated restriction of that convenience
-    # API to scalar-output primals) — so exercise `rrule!!` directly with an explicit `NoRData()`
-    # seed, exactly as `make_refmul_closure` above does for the same reason.
+    # of bailing: the aliasing mechanism handles it fine, there's just nothing downstream to carry
+    # a gradient to `w`. `gradient`/`gradient!` seed the pullback with `one(y)`, which has no
+    # method for `y === nothing` (a pre-existing, unrelated restriction of that convenience API to
+    # scalar-output primals), so exercise `rrule!!` directly with an explicit `NoRData()` seed,
+    # exactly as `make_refmul_closure` above does for the same reason.
     b0 = MBox([1.0, 2.0])
     bshadow0 = MutableTangent{@NamedTuple{v::Vector{Float64}}}((v=zeros(2),))
     w0 = [3.0, 4.0]
@@ -159,7 +155,7 @@ end
 
 @testset "reverse mode: array allocation" begin
     # Array allocation (Case 2 final step): `mutate_nested!` returns `nothing`, so `gradient`'s
-    # `one(y)` seeding doesn't apply — exercise `rrule!!` directly with an explicit `NoRData()`
+    # `one(y)` seeding doesn't apply; exercise `rrule!!` directly with an explicit `NoRData()`
     # seed, exactly as `setbox!` above. The freshly-allocated `[9.0, 9.0]` has no dependency on
     # `x`, so its aliased shadow is zero; the pullback's restore leaves `x`/its shadow as found.
     function mutate_nested!(x::Vector{Vector{Float64}})
@@ -179,10 +175,10 @@ end
     checkverify_rev(mutate_nested!, (Vector{Vector{Float64}},))
 
     # Scalar-returning allocation tests (so `gradient` applies directly): `zeros`/explicit index
-    # writes, not a `[a,b]` literal — a literal array with 2+ elements lowers through `Base.vect`'s
-    # `X::Tuple` capture, and when an element is itself differentiable that tuple is a genuine
-    # differentiable `Core.tuple` result, the one explicitly out-of-scope gap; `zeros` + explicit
-    # writes avoids it entirely.
+    # writes, not a `[a,b]` literal. A literal array with 2+ elements lowers through `Base.vect`'s
+    # `X::Tuple` capture, and when an element is differentiable that tuple is a genuine
+    # differentiable `Core.tuple` result — the one explicitly out-of-scope gap. `zeros` plus
+    # explicit writes avoids it entirely.
     #
     # `alloc_and_sum`: allocate, write both elements from `x`, read both back locally — d/dx = 3.
     alloc_and_sum(x::Float64) = (v = zeros(2); v[1] = x; v[2] = 2 * x; v[1] + v[2])
@@ -195,7 +191,7 @@ end
 
     # `alloc_store_read!`: allocate, write from `a`, store into the *argument* array `x[1]` (2b
     # aliasing), then read back through `x` — exercises allocation and argument-array aliasing
-    # together. `x`'s original `x[1]` is overwritten before ever being read, so its own gradient is
+    # together. `x`'s original `x[1]` is overwritten before being read, so its own gradient is
     # zero. d/da = 3.
     function alloc_store_read!(x::Vector{Vector{Float64}}, a::Float64)
         v = zeros(2)
@@ -212,10 +208,10 @@ end
     checkverify_rev(alloc_store_read!, (Vector{Vector{Float64}}, Float64))
     check_stack_balance(alloc_store_read!, [[1.0, 2.0], [3.0, 4.0]], 5.0)
 
-    # Adversarial: reverse mode's shadow `memoryrefnew` now forces its own boundscheck flag `true`
-    # (mirroring forward mode's identical safety note — `Dual`/`CoDual`'s constructor never checks
-    # a caller-supplied tangent array's *length* against its primal's), so a too-short shadow
-    # raises a catchable `BoundsError` instead of corrupting memory via an unchecked out-of-bounds
+    # Adversarial: reverse mode's shadow `memoryrefnew` forces its own boundscheck flag `true`
+    # (mirroring forward mode's safety note — `Dual`/`CoDual`'s constructor never checks a
+    # caller-supplied tangent array's *length* against its primal's), so a too-short shadow raises
+    # a catchable `BoundsError` instead of corrupting memory via an unchecked out-of-bounds
     # `MemoryRef`. Not allocation-specific (the checked ref is the *argument* array's own), but the
     # same `Base.memoryrefnew` rule allocation itself now depends on.
     function arr_idx3(x::Vector{Float64})
@@ -224,7 +220,7 @@ end
     @test_throws BoundsError rrule!!(zero_fcodual(arr_idx3), Ctx(),
                                      Differ.CoDual([1.0, 2.0, 3.0, 4.0], [1.0]))
 
-    # Regression: still out of scope, must bail cleanly (a located reason, not a crash) — growing
+    # Regression: still out of scope, must bail cleanly (a located reason, not a crash). Growing
     # an existing array (`push!`/`resize!`) routes through `Core.memoryrefoffset`, a distinct,
     # still-unhandled builtin (unrelated to allocation, which is now fully supported).
     growvec!(v, x) = push!(v, x)
@@ -291,8 +287,8 @@ end
     @test dx_mt == [[0.0, 0.0], [0.0, 0.0]]
     @test dw_mt == [3.0, 1.0]
 
-    # Adversarial: a pre-seeded non-zero incoming shadow on `w` must accumulate, not overwrite —
-    # exercise `rrule!!` directly with explicit shadows.
+    # Adversarial: a pre-seeded non-zero incoming shadow on `w` must accumulate, not overwrite.
+    # Exercise `rrule!!` directly with explicit shadows.
     x0 = [[1.0, 2.0], [3.0, 4.0]]
     xshadow0 = [[0.0, 0.0], [0.0, 0.0]]
     w0 = [5.0, 6.0]
@@ -328,11 +324,11 @@ end
 end
 
 @testset "reverse mode: %new of a mutable struct + recursion" begin
-    # 3a: `%new` of a mutable struct, purely locally (no cross-call boundary) — checked against
-    # finite differences. Plain local create+mutate+read gets scalar-replaced away entirely by
-    # SROA before reverse mode ever sees a `%new` — nesting the fresh `MPoint` inside a second,
+    # 3a: `%new` of a mutable struct, purely locally (no cross-call boundary), checked against
+    # finite differences. Plain local create+mutate+read gets scalar-replaced away entirely by SROA
+    # before reverse mode ever sees a `%new`; nesting the fresh `MPoint` inside a second,
     # also-freshly-created mutable wrapper forces the `MPoint`'s own `%new` to survive (the wrapper
-    # itself gets scalarized away by the optimizer, so the IR reverse mode actually sees is just
+    # itself gets scalarized away, so the IR reverse mode actually sees is just
     # `%new(MPoint,...)` + getfield/setfield!/getfield/getfield/add, no trace of the wrapper).
     mutable struct MPointBox; p::MPoint; end
     function newmut_local(x::Float64)
@@ -351,9 +347,9 @@ end
 
     # 3a + 3b together (the original target case): `%new` of a mutable struct crossing a genuine
     # `@noinline` recursive-call boundary. `p` is a genuine argument, tracked, so it threads
-    # through into the recursive `:invoke` — `p` crosses a genuine call boundary Julia's SROA
-    # can't see through, otherwise `p` never escapes and the optimizer elides the `%new` entirely
-    # before reverse mode ever sees it.
+    # through into the recursive `:invoke`. `p` crosses a call boundary Julia's SROA can't see
+    # through; otherwise `p` never escapes and the optimizer elides the `%new` before reverse mode
+    # ever sees it.
     @noinline mpoint_xy(p::MPoint) = p.x + p.y
     newmut(x::Float64) = (p = MPoint(x, 1.0); mpoint_xy(p))
 
@@ -380,13 +376,13 @@ end
 # Bulk primal save/restore (`_bulk_save_args`, `reverse_interp.jl`).
 #
 # A store's pullback restores the element it overwrote so the primal is left as the call found it.
-# For an argument array written in a *loop* that is done once for the whole array, in the forwards
-# prologue and at the very end of the pullback, instead of per element — which is sound only because
-# no pullback rule anywhere reads primal memory, so nothing observes the primal in between.
+# For an argument array written in a loop, that's done once for the whole array (in the forwards
+# prologue and at the very end of the pullback) instead of per element — sound only because no
+# pullback rule anywhere reads primal memory, so nothing observes the primal in between.
 #
 # The tests that matter here are the negative ones: bulk mode must not fire where it isn't sound,
-# and must not disturb the shadow (which, unlike the primal, genuinely *is* live during the reverse
-# sweep and is still restored one element at a time).
+# and must not disturb the shadow, which (unlike the primal) is live during the reverse sweep and
+# is still restored one element at a time.
 # ---------------------------------------------------------------------------
 @testset "reverse mode: bulk primal save/restore" begin
     h = 1e-6
@@ -411,9 +407,9 @@ end
     check_stack_balance(bulk_write_read, v, 3.0)
     @test v == [7.0, 8.0, 9.0]
 
-    # The `Memory` form of the same shape — `foo!`'s exact IR: the ref chain is rooted at a
-    # `Core.memorynew`-free `Memory` argument via the 1-arg `memoryrefnew`, no `Array.ref` hop.
-    # `Memory` can't go through `gradient` (no `zero_tangent` method), so drive `rrule!!` directly.
+    # The `Memory` form of the same shape: the ref chain is rooted at a `Core.memorynew`-free
+    # `Memory` argument via the 1-arg `memoryrefnew`, no `Array.ref` hop. `Memory` can't go through
+    # `gradient` (no `zero_tangent` method), so drive `rrule!!` directly.
     function bulk_mem!(out::Memory{Float64}, x::Float64, N::Int)
         for i in 1:N
             @inbounds out[i] = x
@@ -458,7 +454,7 @@ end
     @test all(T -> !(T <: Tuple) || all(F -> !(F <: MemoryRef), fieldtypes(T)),
               check_tape_size(straightline!, (Vector{Float64}, Float64)))
 
-    # NEGATIVE, and the one that discriminates a correct implementation from a plausible-looking
+    # NEGATIVE, and the test that discriminates a correct implementation from a plausible-looking
     # wrong one: an argument's *incoming* shadow must come back exactly as supplied. Every other
     # test in this suite starts from zero shadows (`value_and_gradient!` zeroes them), so nothing
     # else would catch a bulk scheme that wrongly swallowed the shadow too.

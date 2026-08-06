@@ -28,7 +28,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
 end
 
 @testset "DI forward: pushforward! (mutating, vector output)" begin
-    h(x) = [x, 2x, 3x]   # scalar -> vector, so the mutating `ty` buffers actually make sense
+    h(x) = [x, 2x, 3x]   # scalar -> vector, so the mutating `ty` buffers make sense
     x = 0.7
 
     prep = DI.prepare_pushforward(h, AutoDifferForwards(), x, (1.0, 2.0))

@@ -5,21 +5,21 @@ using Differ: fdata_type, tangent_type, zero_tangent, fdata
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
-# `sum`/`prod`/`maximum`/`minimum`/`mapreduce(f,+,x)`'s hand rules moved to
-# `src/rules_perf_backstop.jl` (nested-tape-recycling plan, Stage 3) — a known-efficient fallback,
-# not included by `src/Differ.jl` by default, so both configurations (derived path alone vs. derived
-# path + these rules) can be benchmarked separately. This test suite exercises them directly, so load
-# the file into `Differ`'s own namespace (mirroring what `Differ.jl` would do) rather than this test
-# module's — its bodies reference plenty of `Differ`-internal names unqualified, exactly as they did
-# when the file was included from `Differ.jl` itself.
+# sum/prod/maximum/minimum/mapreduce(f,+,x)'s hand rules moved to src/rules_perf_backstop.jl
+# (nested-tape-recycling plan, Stage 3), a known-efficient fallback not included by src/Differ.jl by
+# default, so both configurations (derived path alone vs. derived path + these rules) can be
+# benchmarked separately. This test suite exercises them directly, so load the file into Differ's
+# own namespace (mirroring what Differ.jl would do) rather than this test module's: its bodies
+# reference plenty of Differ-internal names unqualified, exactly as they did when the file was
+# included from Differ.jl itself.
 Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backstop.jl"))))
 
-# `checkverify`/`checkverify_rev`/`check_stack_balance` build/verify the *derived* dualized/reverse
-# IR for a function's own body — that only makes sense for a genuinely dualizable composite, never
-# for a function that is itself only ever reached via a hand rule (same reason the existing test
-# suite never calls `checkverify_rev(sin, ...)`/`checkverify_rev(sum, ...)` directly). So each
-# hand-ruled reduction below is exercised through a trivial wrapper for those checks, exactly like
-# `mysum`/`arr_sum`/`sinloop` elsewhere in the test suite.
+# checkverify/checkverify_rev/check_stack_balance build/verify the derived dualized/reverse IR for
+# a function's own body, which only makes sense for a genuinely dualizable composite, never for a
+# function that is itself only ever reached via a hand rule (same reason the existing test suite
+# never calls checkverify_rev(sin, ...) / checkverify_rev(sum, ...) directly). So each hand-ruled
+# reduction below is exercised through a trivial wrapper for those checks, exactly like
+# mysum/arr_sum/sinloop elsewhere in the test suite.
 
 @testset "rules: reductions" begin
 
@@ -84,7 +84,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
 
         sumsin(v) = sum(sin, v)
         sumabs2(v) = sum(abs2, v)
-        sumsq(v)  = sum(y -> y * y, v)   # a local closure operand — this shape always worked
+        sumsq(v)  = sum(y -> y * y, v)   # a local closure operand, this shape always worked
 
         _, dsin = gradient(sumsin, v)
         @test dsin ≈ cos.(v)
@@ -107,13 +107,13 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
     end
 
     @testset "sum(f, x) with a closure over a non-differentiable capture" begin
-        # `f`'s type here is a non-singleton `DataType` (a closure struct with an `Int` field), unlike
-        # `sumsin`/`sumabs2` above (top-level functions, i.e. singletons) — this exercises the other
-        # half of the argument-position-callee fix (`_static_recursible_call`, `src/reverse_interp.jl`):
-        # `tangent_type(ftype) === NoTangent` is what actually licenses recursion, not
-        # `Base.issingletontype`. `n = 3; sum(x -> x^n, v)` was the case this was designed to cover, but
-        # `^` for a non-literal integer exponent goes through `Base.Math.pow_body`, which recurses
-        # through `Core.ifelse` — reverse mode has no rule for that builtin (a separate, pre-existing
+        # f's type here is a non-singleton DataType (a closure struct with an Int field), unlike
+        # sumsin/sumabs2 above (top-level functions, i.e. singletons). This exercises the other half
+        # of the argument-position-callee fix (_static_recursible_call, src/reverse_interp.jl):
+        # tangent_type(ftype) === NoTangent is what actually licenses recursion, not
+        # Base.issingletontype. `n = 3; sum(x -> x^n, v)` was the case this was designed to cover, but
+        # ^ for a non-literal integer exponent goes through Base.Math.pow_body, which recurses
+        # through Core.ifelse. Reverse mode has no rule for that builtin (a separate, pre-existing
         # gap, unrelated to this fix), so that exact case still bails. `y -> y + n` isolates the same
         # closure-capture shape without hitting it.
         n = 3
@@ -134,11 +134,11 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
     end
 
     @testset "reverse mode: :loopinfo (@simd) is carried through" begin
-        # Mirrors forward mode's ":loopinfo (@simd) is carried through" (`test_forward_foreigncall.jl`)
-        # for the reverse-mode arm (`src/reverse_interp.jl`) — this is what the "sum"/"sum(f, x)
-        # through a composite" testsets above rely on once `sum`/`mapreduce` fall through to `Base`'s
-        # own `mapreduce_impl` (an `@simd for` loop). A hand-written `@simd` loop isolates the
-        # `:loopinfo` passthrough itself from anything about `mapreduce`'s own recursive structure.
+        # Mirrors forward mode's ":loopinfo (@simd) is carried through" (test_forward_foreigncall.jl)
+        # for the reverse-mode arm (src/reverse_interp.jl). This is what the "sum"/"sum(f, x) through
+        # a composite" testsets above rely on once sum/mapreduce fall through to Base's own
+        # mapreduce_impl (an @simd for loop). A hand-written @simd loop isolates the :loopinfo
+        # passthrough itself from anything about mapreduce's own recursive structure.
         function simdsum(x)
             s = 0.0
             @simd for i in eachindex(x)
@@ -154,9 +154,9 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         checkverify_rev(simdsum, (Vector{Float64},))
         check_stack_balance(simdsum, x)
 
-        # `@simd ivdep`: reverse mode drops the `julia.ivdep` marker (it would otherwise assert no
-        # loop-carried memory dependence, which is false of the reverse carrier's epilogue — see the
-        # comment on the fwds carrier's `:loopinfo` arm). Only affects vectorization, so the gradient
+        # @simd ivdep: reverse mode drops the julia.ivdep marker (it would otherwise assert no
+        # loop-carried memory dependence, which is false of the reverse carrier's epilogue; see the
+        # comment on the fwds carrier's :loopinfo arm). Only affects vectorization, so the gradient
         # must still be correct.
         function simdsum_ivdep(x)
             s = 0.0
@@ -254,14 +254,13 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
     end
 
     @testset "mapreduce(f, +, x)" begin
-        # `mapreduce(f, +, x)` compiles to a "dynamic invoke" whose *specialization* signature has
-        # `f`/`op` widened to abstract `Function` (Base doesn't specialize on a function argument it
-        # only passes along). That widening is in `specTypes` only — the operands themselves are a
-        # closure value and a `GlobalRef`, whose real types `_static_recursible_call` reads from the
-        # IR. It used to read the `GlobalRef` as type `GlobalRef` and never match the rule's
-        # concrete-`op` constraint, which is why this case was once documented as an engine
-        # limitation and exercised only through a direct `rrule!!` call; it now composes through
-        # `gradient` (see the composite checks below).
+        # mapreduce(f, +, x) compiles to a "dynamic invoke" whose specialization signature has f/op
+        # widened to abstract Function (Base doesn't specialize on a function argument it only passes
+        # along). That widening is in specTypes only; the operands themselves are a closure value and
+        # a GlobalRef, whose real types _static_recursible_call reads from the IR. It used to read
+        # the GlobalRef as type GlobalRef and never match the rule's concrete-op constraint, which is
+        # why this case was once documented as an engine limitation and exercised only through a
+        # direct rrule!! call. It now composes through gradient (see the composite checks below).
         g(y) = y^2 + 3y   # g'(y) = 2y + 3
         x = [1.0, 2.0, -1.5, 0.5]
         mr(x) = mapreduce(g, +, x)
@@ -301,12 +300,12 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
             @test dx[k] ≈ (mr(xp) - mr(xm)) / 2e-6 rtol = 1e-5
         end
 
-        # Reverse-mode guard: a `Union`-typed function argument (its static type can't be resolved
-        # to a concrete type) must fail with a clear, located error rather than crash deep inside
-        # (ISSUES.md #43 — reverse mode has no dynamic dispatch). Constructed directly against
-        # `rrule!!`, mirroring `SumMapPullback`'s own non-concrete-`G` test in
-        # `test_reverse_arrays.jl` (the actual call-site route into this state needs reverse-mode
-        # dynamic dispatch, not yet implemented — see ISSUES.md #43).
+        # Reverse-mode guard: a Union-typed function argument (its static type can't be resolved to
+        # a concrete type) must fail with a clear, located error rather than crash deep inside
+        # (ISSUES.md #43: reverse mode has no dynamic dispatch). Constructed directly against
+        # rrule!!, mirroring SumMapPullback's own non-concrete-G test in test_reverse_arrays.jl (the
+        # actual call-site route into this state needs reverse-mode dynamic dispatch, not yet
+        # implemented; see ISSUES.md #43).
         h1 = y -> y^2
         h2 = y -> 2y
         G2 = Union{typeof(h1),typeof(h2)}
@@ -345,16 +344,16 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         @test d2.x ≈ cumsum_wrap(x)
         checkverify(cumsum_wrap, (Vector{Float64},))
 
-        # Reverse mode: `y = cumsum(x)` is array-valued, so (like every array-valued primal here)
-        # its rdata is `NoRData` — real gradient information flows through its *fdata* (see the
-        # comment on the rule in `rules_reductions.jl`). Reading `y[i]` back out of a hand-ruled
-        # call's result inside a larger differentiated function needs the surrounding call's result
-        # to be recognized as a differentiable-array provenance root, which the current static
-        # provenance scan (`_fdata_tracked`, `reverse_interp.jl`) does not do for arbitrary calls
-        # (only for specific known operations: `%new`, `memorynew`/`memoryrefnew`/`memoryrefget`) —
-        # a separate, pre-existing engine limitation, not fixable from a rules file. So the rule is
-        # exercised directly: seed the output fdata `dy` and confirm the pullback computes the
-        # reverse cumulative sum into `dx`.
+        # Reverse mode: y = cumsum(x) is array-valued, so (like every array-valued primal here) its
+        # rdata is NoRData; real gradient information flows through its fdata (see the comment on
+        # the rule in rules_reductions.jl). Reading y[i] back out of a hand-ruled call's result
+        # inside a larger differentiated function needs the surrounding call's result to be
+        # recognized as a differentiable-array provenance root, which the current static provenance
+        # scan (_fdata_tracked, reverse_interp.jl) does not do for arbitrary calls (only for specific
+        # known operations: %new, memorynew/memoryrefnew/memoryrefget). That's a separate,
+        # pre-existing engine limitation, not fixable from a rules file. So the rule is exercised
+        # directly: seed the output fdata dy and confirm the pullback computes the reverse
+        # cumulative sum into dx.
         dx = zeros(length(x))
         ycd, pb = rrule!!(zero_fcodual(cumsum), Ctx(), CoDual(x, dx))
         @test primal(ycd) == cumsum(x)

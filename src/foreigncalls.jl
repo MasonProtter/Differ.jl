@@ -2,17 +2,17 @@
 # Foreigncall rules — dispatch-based handling of `Expr(:foreigncall)` (i.e. `ccall`).
 #
 # `apply_foreigncall_frule!(Val(name), fc, Ti, ctx)` is called from the main statement loop in
-# `dualize_to_ircode` (`forward_interp.jl`) for every foreigncall in the primal IR, dispatching on
-# the *target symbol* the same way `apply_intrinsic_frule!` dispatches on `Val(intrinsic)`. A rule
-# emits the primal + shadow IR directly into the caller's instruction stream and returns
-# `(primal_ssa, shadow_ssa)`; the fallback method returns `nothing`, so an unregistered target bails
-# with a located reason rather than silently miscompiling.
+# `dualize_to_ircode` (`forward_interp.jl`) for every foreigncall in the primal IR, dispatching on the
+# target symbol the same way `apply_intrinsic_frule!` dispatches on `Val(intrinsic)`. A rule emits the
+# primal + shadow IR directly into the caller's instruction stream and returns `(primal_ssa,
+# shadow_ssa)`; the fallback returns `nothing`, so an unregistered target bails with a located reason
+# instead of silently miscompiling.
 #
 # Bailing is the only safe default here, more so than for intrinsics. Native code can write through
-# any pointer it is handed, so "compute the primal, hand back a zero tangent" — the treatment a
-# non-differentiable intrinsic gets — is *not* a sound fallback: a `memmove` given that treatment
-# would leave the destination's tangent stale rather than zero. Each target has to be understood
-# individually before it can be registered.
+# any pointer it's handed, so "compute the primal, hand back a zero tangent" — the treatment a
+# non-differentiable intrinsic gets — isn't sound: a `memmove` given that treatment would leave the
+# destination's tangent stale rather than zero. Each target has to be understood individually before
+# it can be registered.
 #
 # Statement layout (Julia 1.13, `Compiler/src/tfuncs.jl`'s `FOREIGNCALL_ARG_START`):
 #
@@ -20,13 +20,13 @@
 #   #                   1     2    3                 4     5      6:5+length(ATs)   rest
 #
 # `name` is `Expr(:tuple, QuoteNode(:memmove))` (optionally with a library operand), or an
-# `SSAValue`/`Argument` for a runtime function pointer — the latter names nothing that can be
-# dispatched on, and `_fc_parse` rejects it.
+# `SSAValue`/`Argument` for a runtime function pointer — the latter names nothing dispatchable, and
+# `_fc_parse` rejects it.
 #
 # `ctx` is the `foreigncall_ctx` `NamedTuple` `dualize_to_ircode` builds once per call. It carries the
 # same closures the builtin rules get (`emit!`/`opf`/`presolve`/`tresolve`/`optype`/`tt`/
 # `zero_shadow`/`emit_invoke!`/`reason`) plus two the provenance walk below needs: `pstmt(x)`, the
-# *primal* statement node behind an old `SSAValue`, and `calleeval(x)`, the resolved callee value.
+# primal statement node behind an old `SSAValue`, and `calleeval(x)`, the resolved callee value.
 # ===========================================================================
 
 apply_foreigncall_frule!(::Val{F}, fc, Ti, ctx) where {F} = nothing
@@ -70,15 +70,15 @@ _fc_stmt(fc, args, roots) =
 
 # Walk the *primal* IR back from a pointer operand to the `Memory`/`MemoryRef` its address was read
 # out of, returning `(P, ref_operand)` — the buffer's element type and the (old-numbered) operand
-# naming the buffer itself. `nothing` if the chain is anything else.
+# naming the buffer. `nothing` if the chain is anything else.
 #
-# Only `PiNode` and a `Ptr`→`Ptr` `bitcast` are followed. `add_ptr`/`sub_ptr` deliberately end the
-# walk: the address they produce would still be fine, but the extent check below is expressed
-# relative to the originating ref, and an offset pointer breaks that relationship. (The real
-# `copyto!`/broadcast IR never has one — the offset is baked into the `memoryrefnew` upstream.)
+# Only `PiNode` and a `Ptr`→`Ptr` `bitcast` are followed. `add_ptr`/`sub_ptr` end the walk
+# deliberately: the address they produce is still fine, but the extent check below is relative to the
+# originating ref, and an offset pointer breaks that relationship. (Real `copyto!`/broadcast IR never
+# has one — the offset is baked into the `memoryrefnew` upstream.)
 #
 # `ctx.optype` reads the *primal* `IRCode` in its own numbering (`_optype(pir, x)`), so this is safe
-# to run from a rule, after the pass has already emitted interleaved shadow statements.
+# to call from a rule after the pass has already emitted interleaved shadow statements.
 function _fc_ptr_origin(@nospecialize(x), ctx, depth::Int = 0)
     depth > 8 && return nothing
     isa(x, Core.SSAValue) || return nothing
@@ -108,27 +108,26 @@ end
 
 # Whether a *byte* count means the same thing for `P`'s tangent storage as for `P` itself.
 #
-# Note this is keyed on the element type recovered by the provenance walk, **not** on the pointer's
-# own declared `Ptr{…}` parameter — deliberately the opposite of `add_ptr`'s gate
-# (`src/intrinsics.jl`), and what makes order ≥2 work: there the shadow pointer is a `Ptr{NoTangent}`
-# (stride 0) reached by `bitcast` from a `MemoryRef{Float64}`, and it is the `Float64` that governs.
-# Don't "harmonise" the two gates.
+# Keyed on the element type recovered by the provenance walk, **not** the pointer's own declared
+# `Ptr{…}` parameter — deliberately the opposite of `add_ptr`'s gate (`src/intrinsics.jl`), and what
+# makes order ≥2 work: there the shadow pointer is a `Ptr{NoTangent}` (stride 0) reached by `bitcast`
+# from a `MemoryRef{Float64}`, and the `Float64` is what governs. Don't unify the two gates.
 function _fc_same_stride(@nospecialize(P))
     T = tangent_type(P)
     return isbitstype(P) && isbitstype(T) && Base.aligned_sizeof(P) == Base.aligned_sizeof(T) > 0
 end
 
-# Raises a catchable `BoundsError` when a shadow buffer is shorter than the bulk copy about to be
-# performed on it. `Dual`'s constructor only checks `tangent_type(P) == T`, never that a caller's
-# tangent array has its primal's *length*, and a raw `memmove` has no bounds check of its own — a
-# short destination tangent segfaults and a short source tangent silently reads uninitialised heap.
+# Raises a catchable `BoundsError` when a shadow buffer is shorter than the bulk copy about to run on
+# it. `Dual`'s constructor only checks `tangent_type(P) == T`, never that a caller's tangent array has
+# its primal's *length*, and a raw `memmove` has no bounds check of its own — a short destination
+# tangent segfaults, and a short source tangent silently reads uninitialised heap.
 #
 # The literal `true` boundscheck argument is what forces the check: Julia's own `@boundscheck` guards
-# in `unsafe_copyto!` sit inside an `@inbounds` block and are elided under the default
-# `--check-bounds=auto`, so they cannot be relied on.
+# in `unsafe_copyto!` sit inside an `@inbounds` block and get elided under the default
+# `--check-bounds=auto`, so they can't be relied on.
 #
-# `@noinline` for the usual reason (`__pop_blk_stack!`, `_rr_get_tangent_field`, …): the branch has to
-# live inside a helper, since emitting one inline would split a basic block and break the 1:1
+# `@noinline` for the usual reason (`__pop_blk_stack!`, `_rr_get_tangent_field`, …): the branch must
+# live inside a helper, since emitting it inline would split a basic block and break the 1:1
 # block-topology invariant `dualize_to_ircode` relies on.
 @noinline function _fc_check_extent(ref::MemoryRef, nelem::Int)
     if nelem > 0
@@ -146,10 +145,10 @@ end
 # ---------------------------------------------------------------------------
 # Bulk memory copies: `memmove`/`memcpy`.
 #
-# This is the target that blocks real code: `copyto!`, `copy` and `Base.unsafe_copyto!` — hence
-# broadcast — all bottom out in one. A copy is linear and structure-preserving, so performing the
-# identical copy between the two shadow buffers is exactly the tangent of performing it between the
-# primals; the whole rule is that mirror plus the preconditions that make it meaningful.
+# This is the target that blocks real code: `copyto!`, `copy`, `Base.unsafe_copyto!` — hence
+# broadcast — all bottom out in one. A copy is linear and structure-preserving, so the identical copy
+# between the two shadow buffers is exactly the tangent of copying the primals; the rule is that
+# mirror plus the preconditions that make it meaningful.
 # ---------------------------------------------------------------------------
 
 const _FC_COPY_ATS = Core.svec(Ptr{Cvoid}, Ptr{Cvoid}, Csize_t)
@@ -174,8 +173,8 @@ for op in (:memmove, :memcpy)
         dstx, srcx, nx = fc.args[1], fc.args[2], fc.args[3]
 
         # The byte count is consumed unchanged by the shadow copy, so it must already be in the
-        # declared `Csize_t` representation (`ccall` lowering converts before the foreigncall).
-        # Widen first: a const-propagated count carries a `Core.Const`, not a bare `Type`.
+        # declared `Csize_t` representation (`ccall` lowering converts before the foreigncall). Widen
+        # first: a const-propagated count carries a `Core.Const`, not a bare `Type`.
         Pn = ctx.optype(nx)
         if (Pn isa Type ? Pn : CC.widenconst(Pn)) !== Csize_t
             ctx.reason[] = "`$what` whose byte count is declared `$Pn`, not `$(Csize_t)`"
@@ -183,16 +182,16 @@ for op in (:memmove, :memcpy)
         end
 
         # Both addresses must trace back to a `Memory`/`MemoryRef` this pass gave a real shadow
-        # buffer, and the tangent element must have the primal's stride — a byte count is only
-        # transferable when a byte offset means the same thing on both sides.
+        # buffer, and the tangent element must have the primal's stride — a byte count only transfers
+        # when a byte offset means the same thing on both sides.
         #
-        # Exception, settled first: when a buffer's elements have no tangent (`copy(::Vector{Int})`,
-        # a `Bool` mask, `collect(1:n)`) there is no shadow storage to copy *into or out of*, and the
-        # pass hands out `NULL_SHADOW_PTR` for its address. Copying nothing is exactly the tangent of
-        # copying non-differentiable data, so the primal call is emitted alone — no shadow copy, and
-        # no extent guards either, since a `Memory{NoTangent}` holds nothing that could be overrun.
-        # Both sides must agree: a byte copy between a shadowed and an unshadowed buffer is a
-        # reinterpreting copy whose tangent this rule cannot express.
+        # Exception, settled first: when a buffer's elements have no tangent (`copy(::Vector{Int})`, a
+        # `Bool` mask, `collect(1:n)`) there's no shadow storage to copy into or out of, and the pass
+        # hands out `NULL_SHADOW_PTR` for its address. Copying nothing is exactly the tangent of
+        # copying non-differentiable data, so the primal call is emitted alone — no shadow copy, no
+        # extent guards either, since a `Memory{NoTangent}` holds nothing that could be overrun. Both
+        # sides must agree: a byte copy between a shadowed and an unshadowed buffer is a reinterpreting
+        # copy whose tangent this rule can't express.
         sides = ((dstx, "destination"), (srcx, "source"))
         walked = Any[_fc_ptr_origin(x, ctx) for (x, _) in sides]
         nulls = Bool[]
@@ -256,8 +255,8 @@ for op in (:memmove, :memcpy)
         pdst, psrc, pn = ctx.presolve(dstx), ctx.presolve(srcx), ctx.presolve(nx)
 
         # Guard each shadow buffer's extent, so a caller-supplied short tangent raises a
-        # `BoundsError` instead of corrupting the heap. See `_fc_check_extent`. Emitted ahead of
-        # *both* copies so a failure leaves the primal untouched too.
+        # `BoundsError` instead of corrupting the heap. See `_fc_check_extent`. Emitted before both
+        # copies so a failure leaves the primal untouched too.
         for (P, refx, Tref) in origins
             stride = Base.aligned_sizeof(P)
             nelem = ctx.opf(:bitcast, Int, Int,
@@ -277,7 +276,7 @@ for op in (:memmove, :memcpy)
         # The shadow statement must be *declared* `tangent_type(Ti)` even though the mirrored call
         # produces the same `Ptr{Cvoid}` the primal does (verify gotcha #6) — reconcile with a no-op
         # `bitcast`, as the `MemoryRef` `getfield` branch does. The value is a genuine tangent pointer
-        # (it addresses the shadow destination); in practice every observed IR discards it.
+        # (it addresses the shadow destination); every observed IR discards it in practice.
         TT = ctx.tt(Ti)
         t = TT === NoTangent ? NoTangent() :
             TT === fc.RT ? sh :

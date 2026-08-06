@@ -1,20 +1,18 @@
-# Hand-written frule!!/rrule!! for scalar math functions (Base.Math transcendentals plus
-# reverse-only rules for functions that reduce to LLVM intrinsics before rrule!! dispatch would
-# otherwise get a chance). See ISSUES.md #20.
+# Hand-written frule!!/rrule!! for scalar math functions: Base.Math transcendentals, plus
+# reverse-only rules for functions that inline to LLVM intrinsics before rrule!! dispatch can fire.
+# See ISSUES.md #20.
 #
-# Every rule below uses the textbook closed-form derivative directly. Rules are never written to
-# rely on the engine differentiating through Base's actual internal implementation of the target
-# function — some of those internals (e.g. the `asin` kernel's `bitcast`/`and_int` precision trick)
-# use intrinsics on the `@inactive_intrinsic` list (`src/intrinsics.jl`) and would silently produce
-# a zero tangent in that branch rather than erroring.
+# Every rule uses the closed-form derivative directly, never by differentiating through Base's
+# actual implementation. Some of those internals (e.g. asin's bitcast/and_int precision trick) use
+# intrinsics on the `@inactive_intrinsic` list (`src/intrinsics.jl`), which would silently produce a
+# zero tangent rather than error.
 #
-# As in `rrules.jl`, Base calls inside `rrule!!` bodies and pullback call operators are qualified
-# (`Base.sin`, not `sin`) because those bodies get inlined into synthetic carrier IR where a bare
-# name re-embeds as an implicit-`using` GlobalRef that `Core.Compiler.verify_ir` rejects. `frule!!`
-# bodies are ordinary compiled methods (not synthetic IR), so they keep bare names, matching
-# `frules.jl`. Plain arithmetic/comparison operators are left unqualified everywhere (they lower to
-# intrinsics, not generic-function GlobalRefs), matching `SumPullback`/`SumMapPullback` in
-# `rrules.jl`.
+# As in `rrules.jl`, Base calls inside `rrule!!` bodies and pullback closures are qualified
+# (`Base.sin`, not `sin`): these bodies get inlined into synthetic carrier IR, where a bare name
+# re-embeds as an implicit-`using` GlobalRef that `Core.Compiler.verify_ir` rejects. `frule!!` bodies
+# are ordinary compiled methods, not synthetic IR, so they keep bare names, matching `frules.jl`.
+# Arithmetic/comparison operators stay unqualified everywhere since they lower to intrinsics, not
+# generic-function GlobalRefs, matching `SumPullback`/`SumMapPullback` in `rrules.jl`.
 
 # ===========================================================================
 # exp
@@ -421,9 +419,9 @@ function frule!!(::Dual{typeof(sqrt)}, dz::Dual{ComplexF64})
     Dual(y, build_tangent(ComplexF64, real(dy), imag(dy)))
 end
 
-# Reverse mode for a holomorphic scalar map f: given the output rdata seed s = sr + i*si (read
-# straight off the (re, im) fields, no conjugation), the vjp onto the input's (re, im) rdata is
-# conj(f'(z)) * s — the standard adjoint of the real 2x2 Jacobian of a holomorphic map.
+# Reverse mode for a holomorphic scalar map f: the output rdata seed s = sr + i*si (read straight
+# off the (re, im) fields, no conjugation) pulls back via conj(f'(z)) * s — the standard adjoint of
+# the real 2x2 Jacobian of a holomorphic map.
 struct SqrtComplexPullback
     z::ComplexF64
     y::ComplexF64
@@ -444,9 +442,8 @@ function rrule!!(
 end
 
 # ===========================================================================
-# Reverse-only rules — these normally inline straight to an LLVM intrinsic before a call-level
-# rrule!! would otherwise get a chance to fire. Forward mode already handles them correctly via
-# `src/intrinsics.jl`.
+# Reverse-only rules — these inline straight to an LLVM intrinsic before a call-level rrule!! gets
+# a chance to fire. Forward mode already handles them via `src/intrinsics.jl`.
 # ===========================================================================
 
 struct AbsPullback

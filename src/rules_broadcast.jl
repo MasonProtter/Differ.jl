@@ -1,39 +1,38 @@
 # Hand-written frule!!/rrule!! for map/map! and (where feasible) broadcast. See ISSUES.md #31.
 #
 # Same motivation as `sum`/`sum(f, ·)` in `rrules.jl`: Base's real `map`/`map!`/broadcast
-# implementations use IR constructs Differ's dualization engine does not support (self-recursive
-# pairwise reduction, chiefly). Every rule below is an explicit per-element loop calling
-# `frule!!`/`rrule!!` on the user's function `f`, never touching Base's actual `map`/`broadcast`
-# internals.
+# implementations use IR constructs the dualization engine doesn't support (chiefly self-recursive
+# pairwise reduction). Every rule here is an explicit per-element loop calling `frule!!`/`rrule!!`
+# on the user's function `f`, never touching Base's actual `map`/`broadcast` internals.
 #
-# The broadcast half of that motivation has narrowed a lot: the `Expr(:gc_preserve_begin)`/
-# `:gc_preserve_end` pair inside `copy`/`copyto!` gained forward-mode support on 2026-07-31, and the
-# `Expr(:foreigncall)` `memmove` it wraps (plus `@simd`'s `Expr(:loopinfo)`) on 2026-08-01
-# (`src/foreigncalls.jl`, ISSUES #62). Unmodified `.`-syntax now dualizes in forward mode for a
-# single array argument (`sin.(x)`) and for array-with-scalar forms (`x .* 2.0`); *two-array*
-# broadcast (`x .* y`) is the remaining gap, blocked by ISSUES #60 rather than by anything here.
-# These rules still matter — they cover reverse mode, `map`/`map!` proper, and the two-array case.
+# The broadcast half of that motivation has narrowed a lot: `copy`/`copyto!`'s `gc_preserve_begin`/
+# `gc_preserve_end` pair gained forward-mode support on 2026-07-31, and the `memmove` foreigncall it
+# wraps (plus `@simd`'s `loopinfo`) on 2026-08-01 (`src/foreigncalls.jl`, ISSUES #62). Unmodified
+# `.`-syntax now dualizes in forward mode for a single array argument (`sin.(x)`) and array-with-
+# scalar forms (`x .* 2.0`); two-array broadcast (`x .* y`) is the remaining gap, blocked by
+# ISSUES #60 rather than anything here. These rules still matter for reverse mode, `map`/`map!`
+# proper, and the two-array case.
 #
 # Reverse-mode rules follow `SumMapPullback`'s structure exactly (`rrules.jl`): call `rrule!!` on
-# each element, collect the per-element pullbacks in a `Vector`, and replay them in reverse in the
-# rule's own pullback, accumulating both the array argument(s)' tangent(s) and `f`'s own gradient
-# contribution via `zero_like_rdata_from_type` (not `zero_rdata_from_type` — see the comment on
-# `SumMapPullback` for why: `G` is usually concrete, but the derived recursion glue can resolve this
-# hand rule via a non-concrete static call-site type for `f`).
+# each element, collect the per-element pullbacks in a `Vector`, and replay them in reverse,
+# accumulating both the array argument(s)' tangent(s) and `f`'s own gradient contribution via
+# `zero_like_rdata_from_type` (not `zero_rdata_from_type` — see the comment on `SumMapPullback`: `G`
+# is usually concrete, but the derived recursion glue can resolve this hand rule via a non-concrete
+# static call-site type for `f`).
 #
-# Every reverse-mode rule below carries the ISSUES.md #43 guard: reverse mode has no dynamic
-# dispatch, so a `map`/`map!` call whose function argument's static type is not concrete (e.g. a
-# `Union` of two different closures reached through an abstractly-typed field) cannot be
-# differentiated — the per-element `rrule!!(gcd, Ctx(), ...)` call would need to resolve a rule for
-# a non-concrete callee type, which is exactly what #43 says is unsupported. Forward mode has no
-# such restriction (`frule!!` dispatches on a genuine `Dual`, and a non-concrete function type simply
-# routes to `dynamic_frule` like any other dynamic call), so no guard is needed there.
+# Every reverse-mode rule carries the ISSUES.md #43 guard: reverse mode has no dynamic dispatch, so
+# a `map`/`map!` call whose function argument's static type isn't concrete (e.g. a `Union` of
+# closures reached through an abstractly-typed field) can't be differentiated — the per-element
+# `rrule!!(gcd, Ctx(), ...)` call would need to resolve a rule for a non-concrete callee type, which
+# is exactly what #43 rules out. Forward mode has no such restriction: `frule!!` dispatches on a
+# genuine `Dual`, and a non-concrete function type just routes to `dynamic_frule` like any other
+# dynamic call.
 #
 # Scope: unary and binary `map`/`map!` over same-shape `Array`s. Reverse-mode rules are further
-# restricted to `Array{<:IEEEFloat}` element types (matching `SumMapPullback`): a reverse-mode
-# per-element result must have `rdata_type(tangent_type(Y)) == tangent_type(Y)` (a "pure rdata"
-# type) for the "read the array's own accumulated fdata straight back out as the per-element seed"
-# trick below to be valid, and every `IEEEFloat` satisfies this.
+# restricted to `Array{<:IEEEFloat}` element types (matching `SumMapPullback`): the "read the
+# array's own accumulated fdata back out as the per-element seed" trick below requires
+# `rdata_type(tangent_type(Y)) == tangent_type(Y)` (a "pure rdata" type) for the per-element result,
+# and every `IEEEFloat` satisfies this.
 
 # ===========================================================================
 # map(f, x) — unary
@@ -65,10 +64,10 @@ struct MapPullback{G,PB,Dx<:Array,Dy<:Array}
 end
 function (pb::MapPullback{G})(seed) where {G}
     pbs, dx, dy = pb.pbs, pb.dx, pb.dy
-    # `dy` is `y`'s own fdata array (fresh, zero-initialised at construction below): by the time this
-    # pullback runs, every downstream use of `y` has already accumulated its cotangent into `dy` in
-    # place (fdata semantics — see the header comment on `SumMapPullback`), so `dy[i]` *is* the full
-    # backward-accumulated seed for element `i`.
+    # `dy` is `y`'s own fdata array (fresh, zero-initialised below). By the time this pullback runs,
+    # every downstream use of `y` has accumulated its cotangent into `dy` in place (fdata semantics
+    # — see the header comment on `SumMapPullback`), so `dy[i]` is the full backward-accumulated
+    # seed for element `i`.
     grdata = zero_like_rdata_from_type(G)
     for i in length(pbs):-1:1
         gi_r, xi_r = pbs[i](dy[i])
@@ -210,10 +209,10 @@ function (pb::MapBangPullback{G})(seed) where {G}
         gi_r, xi_r = pbs[i](ddest[i])
         grdata = increment!!(grdata, gi_r)
         dx[i] = increment!!(dx[i], xi_r)
-        # Restore whatever was in `ddest[i]` before this call, mirroring the `memoryrefset!` builtin
-        # rule's old-tangent restore (`builtins_reverse.jl`): `dest[i]` is overwritten (not
-        # accumulated into) by `map!`, so anything that was there before is genuinely gone from the
-        # primal's perspective and must not receive gradient contributions from after this call.
+        # Restore what was in `ddest[i]` before this call, mirroring the `memoryrefset!` builtin
+        # rule's old-tangent restore (`builtins_reverse.jl`): `map!` overwrites `dest[i]` rather
+        # than accumulating into it, so whatever was there before is gone from the primal's
+        # perspective and must not receive gradient contributions from after this call.
         ddest[i] = old[i]
     end
     return (NoRData(), grdata, NoRData(), NoRData())

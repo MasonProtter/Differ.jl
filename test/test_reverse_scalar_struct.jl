@@ -5,9 +5,9 @@ using Differ: Dual, NoTangent, frule!!, gradient
 include(joinpath(@__DIR__, "testutils.jl"))
 
 @testset "reverse mode: scalar intrinsics" begin
-    # Tier 1: scalar float intrinsics only (add_float/mul_float/div_float), checked two ways:
-    # finite differences, and a cross-check against the already-trusted forward-mode `frule!!`
-    # (one seed direction per argument) — independent verification of the new reverse engine.
+    # Scalar float intrinsics only (add_float/mul_float/div_float), checked two ways: finite
+    # differences, and a cross-check against the already-trusted forward-mode `frule!!` (one seed
+    # direction per argument), independent verification of the new reverse engine.
     rprod(x, y) = x*y + x                             # ∂/∂x = y+1, ∂/∂y = x
     rquot(x, y) = (x*y + x) / y                        # mul/add/div composed
 
@@ -26,7 +26,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
 end
 
 @testset "reverse mode: immutable struct (%new/getfield, RData)" begin
-    # Tier 2: immutable struct via `%new`/`getfield`, exercising `RData`/`increment_field!!`.
+    # Immutable struct via `%new`/`getfield`, exercising `RData`/`increment_field!!`.
     # rstruct(a,b) = a*b + a  =>  ∂/∂a = b+1, ∂/∂b = a
     struct V2; a::Float64; b::Float64; end
     function rstruct(a, b)
@@ -43,7 +43,7 @@ end
 
 @testset "reverse mode: conversion intrinsics (sitofp/fpext/fptrunc)" begin
     # `sitofp` (Int->Float promotion) is the INACTIVE bucket: its result carries a real tangent but
-    # its operands don't, so its pullback consumes the seed and contributes `NoRData` — d/dx
+    # its operands don't, so its pullback consumes the seed and contributes `NoRData`, d/dx
     # (x·(1+2+3)) = 6. `fpext`/`fptrunc` (Float32<->Float64) is the LINEAR bucket: genuinely
     # differentiable, d/dx (Float64(Float32(x)·2) + x) = 3. Before these rules existed, either
     # bailed with "no reverse rule for intrinsic `sitofp`/`fptrunc`". Cross-checked against forward

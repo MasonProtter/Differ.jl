@@ -10,14 +10,14 @@
 # STATUS: FIXED. `_split_ambiguous_block_pushes` (`src/reverse_interp.jl`) is wired into
 # `reverse_fwds_to_ircode` (the one-line call before `CC.verify_ir(ir)`), paired with the per-edge
 # `pred_is_unique_pred` formula (`length(preds[b]) <= 1`) in `_unique_predecessor_info` that stops the
-# pullback's single-predecessor balance-pop. The two changes are coupled — neither is correct alone
+# pullback's single-predecessor balance-pop. The two changes are coupled; neither is correct alone
 # (see ISSUES.md #52). The direct unit tests below cover the surgery itself; the `gradient`-level
 # testsets exercise the live fix across the disambiguation boundary (N=0,1,2,3,5,50), and the
 # `memloop!` traffic test asserts the 3N+2 → 2N+3 reduction (the remaining 2/iter are irreducible).
 #
 # A second, *fallthrough*-ambiguous shape (the mirror insertion case: the ambiguous arm is the
 # implicit fallthrough rather than the explicit `dest`) is exercised too, but not via a real Julia
-# primal — see the comment above `_raw_mixed_candidates` for why: every structured-control-flow
+# primal — see the comment above `_raw_mixed_candidates` for why. Every structured-control-flow
 # shape tried (if/else in every polarity, `||`/ternary, `for`/`while` in both directions, `break`/
 # `continue`, `try`/`catch`, if/elseif chains, multi-exit loops) reliably produces the "skip" arm as
 # `GotoIfNot`'s `dest`, never as the fallthrough — Julia's own `if`/`while`/`for` lowering always
@@ -69,9 +69,9 @@ end
     @test !isempty(cs)
     @test any(c -> c[2] === :dest, cs)
     b, side, target = only(filter(c -> c[2] === :dest, cs))
-    # The ambiguous target must carry a `PhiNode` for this to exercise the edge-fixup path (the
-    # correctness gap found during planning): redirecting `b`'s edge through a relay changes the
-    # target's real predecessor, and a `PhiNode` there is exactly what goes stale if that's missed.
+    # The ambiguous target must carry a `PhiNode` for this to exercise the edge-fixup path:
+    # redirecting `b`'s edge through a relay changes the target's real predecessor, and a `PhiNode`
+    # there is exactly what goes stale if that's missed.
     target_stmts = pir.cfg.blocks[target].stmts
     @test isa(pir.stmts[target_stmts.start][:stmt], Core.PhiNode)
 end
@@ -102,10 +102,10 @@ _is_relay(b::CFGBlock) = length(b) == 2 && terminator(b) isa IDGotoNode && _has_
 
 @testset "_split_ambiguous_block_pushes: direct unit test, dest-ambiguous case (loopsum-shaped)" begin
     # Hand-built mirror of loopsum's own block-13-style shape (see the file header): `pre` stands in
-    # for the "did we skip the whole loop" check (both its own arms are already ambiguous -- exactly
-    # like loopsum's block 9 -- so it is *not* itself a candidate). `chk` mirrors block 13: it
-    # branches to `exitb` (dest, ambiguous -- also reached directly from `pre`) or `body`
-    # (fallthrough, unambiguous), and `exitb` carries a `PhiNode` -- the edge-fixup path.
+    # for the "did we skip the whole loop" check (both its own arms are already ambiguous, exactly
+    # like loopsum's block 9, so it is *not* itself a candidate). `chk` mirrors block 13: it
+    # branches to `exitb` (dest, ambiguous, also reached directly from `pre`) or `body`
+    # (fallthrough, unambiguous), and `exitb` carries a `PhiNode`, the edge-fixup path.
     template_ir = first(only(Base.code_ircode(x -> x, (Bool,))))
 
     pre, chk, body, exitb = ID(), ID(), ID(), ID()
@@ -146,8 +146,8 @@ _is_relay(b::CFGBlock) = length(b) == 2 && terminator(b) isa IDGotoNode && _has_
 
     # `ID`s minted by `lower_cfg_blocks_to_ir`'s own round trip don't survive being converted back to
     # a real `IRCode` and re-read via `_ircode_to_cfg_blocks` (fresh `ID`s are assigned from block
-    # *position*, same as `_split_ambiguous_block_pushes` itself does internally) -- so blocks in
-    # `result` are identified structurally below, not by reusing the `pre`/`chk`/... variables above.
+    # *position*, same as `_split_ambiguous_block_pushes` does internally), so blocks in `result`
+    # are identified structurally below, not by reusing the `pre`/`chk`/... variables above.
     rblks = _ircode_to_cfg_blocks(result)
     relay = only(filter(_is_relay, rblks))
     gotoifnot_blks = filter(b -> terminator(b) isa IDGotoIfNot, rblks)
@@ -165,10 +165,10 @@ _is_relay(b::CFGBlock) = length(b) == 2 && terminator(b) isa IDGotoNode && _has_
 end
 
 @testset "_split_ambiguous_block_pushes: direct unit test, fallthrough-ambiguous case" begin
-    # The mirror shape: block `chk`'s *fallthrough* (not `dest`) is the ambiguous arm -- `merge`
+    # The mirror shape: block `chk`'s *fallthrough* (not `dest`) is the ambiguous arm. `merge`
     # carries a `PhiNode` and is reached both as `chk`'s fallthrough and via a back-edge from `body`.
     # `chk`'s `dest` goes straight to a single-predecessor `ret` block. No source-level Julia function
-    # was found that produces this polarity (see the file header) -- built directly via `cfg_ir.jl`.
+    # was found that produces this polarity (see the file header), so it's built directly via `cfg_ir.jl`.
     template_ir = first(only(Base.code_ircode(x -> x, (Bool,))))
 
     chk, merge, ret, body = ID(), ID(), ID(), ID()
@@ -228,8 +228,8 @@ end
 @testset "memloop!: block-stack traffic scales 2N+3, not 3N+2 (ISSUES #52)" begin
     # Same shape as `bench/workloads.jl`'s `memloop!` benchmark, redefined locally rather than
     # `include`d (the bench project pulls in `BenchmarkTools`, not a `test/Project.toml` dependency).
-    # `Memory` has no `zero_tangent` method (ISSUES #50), so its `CoDual` is built by hand, exactly as
-    # the benchmark does.
+    # `Memory` has no `zero_tangent` method (ISSUES #50), so its `CoDual` is built by hand, as the
+    # benchmark does.
     memloop!(o::Memory{Float64}, x::Float64, N::Int) = (for i in 1:N; @inbounds o[i] = x; end; nothing)
 
     function run_memloop(N)
@@ -247,7 +247,7 @@ end
     end
 
     # The fix removes the wasteful loop-exit-diamond per-block push (ISSUES #49): traffic drops from
-    # 3N+2 to 2N+3. The remaining 2/iteration are genuinely irreducible (the loop header's two real
+    # 3N+2 to 2N+3. The remaining 2/iteration are irreducible (the loop header's two real
     # predecessors, and the loop-body→merge edge's two real predecessors, both need runtime
     # disambiguation — see the ISSUES #52 writeup), so this asserts the *reduction*, not flatness.
     # Measured: N=2→7, N=3→9, N=5→13, N=100→203, N=10_000→20_003.

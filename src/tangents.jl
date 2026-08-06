@@ -13,7 +13,7 @@ struct NoTangent end
 """
     PossiblyUninitTangent{T}
 
-Represents a `T` which maybe or may not be present. Does not distinguish between 0 and
+Represents a `T` that may or may not be present. Does not distinguish between zero and
 not being present.
 """
 struct PossiblyUninitTangent{T}
@@ -77,11 +77,8 @@ const PossiblyMutableTangent{T} = Union{MutableTangent{T},Tangent{T}}
 """
     get_tangent_field(t::Union{MutableTangent, Tangent}, i::Int)
 
-Gets the `i`th field of data in `t`.
-
-Has the same semantics that `getfield!` would have if the data in the `fields` field of `t`
-were actually fields of `t`. This is the moral equivalent of `getfield` for
-[`MutableTangent`](@ref).
+Gets the `i`th field of data in `t`. The moral equivalent of `getfield` for
+[`MutableTangent`](@ref), treating `t.fields` as if its entries were fields of `t` directly.
 """
 @inline get_tangent_field(t::PossiblyMutableTangent, i::Int) = val(
     getfield(t.fields, i)
@@ -96,11 +93,8 @@ end
 """
     set_tangent_field!(t::MutableTangent{Tfields}, i::Int, x) where {Tfields}
 
-Sets the value of the `i`th field of the data in `t` to value `x`.
-
-Has the same semantics that `setfield!` would have if the data in the `fields` field of `t`
-were actually fields of `t`. This is the moral equivalent of `setfield!` for
-[`MutableTangent`](@ref).
+Sets the `i`th field of the data in `t` to `x`. The moral equivalent of `setfield!` for
+[`MutableTangent`](@ref), treating `t.fields` as if its entries were fields of `t` directly.
 """
 @inline function set_tangent_field!(t::MutableTangent{Tfields}, i::Int, x) where {Tfields}
     fields = t.fields
@@ -127,8 +121,7 @@ function tangent_field_types_exprs(P::Type)
     return tangent_type_exprs
 end
 
-# It is essential that this gets inlined. If it does not, then we run into performance
-# issues with the recursion to compute tangent types for nested types.
+# Must be inlined, or the recursion to compute nested tangent types gets slow.
 @generated function tangent_field_types(::Type{P}) where {P}
     return Expr(:call, :tuple, tangent_field_types_exprs(P)...)
 end
@@ -174,34 +167,31 @@ end
 """
     tangent_type(P)
 
-There must be a single type used to represents tangents of primals of type `P`, and it must
-be given by `tangent_type(P)`.
+Each primal type `P` has a single tangent type, given by `tangent_type(P)`.
 
-Warning: this function assumes the effects `:removable` and `:consistent`. This is necessary
-to ensure good performance, but imposes precise constraints on your implementation. If
-adding new methods to `tangent_type`, you should consult the extended help of
-`Base.@assume_effects` to see what this imposes upon your implementation.
+Warning: this function assumes the effects `:removable` and `:consistent`, which is necessary
+for performance but imposes precise constraints on your implementation. If adding new methods
+to `tangent_type`, consult the extended help of `Base.@assume_effects` to see what this
+imposes.
 
 # Extended help
 
-The tangent types which Mooncake.jl uses are quite similar in spirit to ChainRules.jl.
-For example, tangent "vectors" for
+Mooncake.jl's tangent types are similar in spirit to ChainRules.jl. For example, tangent
+"vectors" for
 1. `Float64`s are `Float64`s,
 1. `Vector{Float64}`s are `Vector{Float64}`s, and
-1. `struct`s are other another (special) `struct` with field types specified recursively.
+1. `struct`s are another (special) `struct` with field types specified recursively.
 
-There are, however, some major differences.
-Firstly, while it is certainly true that the above tangent types are permissible in
-ChainRules.jl, they are not the uniquely permissible types. For example, `ZeroTangent` is
-also a permissible type of tangent for any of them, and `Float32` is permissible for
-`Float64`. This is a general theme in ChainRules.jl -- it intentionally declines to place
-restrictions on what type can be used to represent the tangent of a given type.
+There are major differences, though. Those tangent types are permissible in ChainRules.jl,
+but not uniquely so: `ZeroTangent` is also a valid tangent for any of them, and `Float32` is
+valid for `Float64`. ChainRules.jl intentionally declines to restrict what type can represent
+the tangent of a given type.
 
 Mooncake.jl differs from this.
 **It insists that each primal type is associated to a _single_ tangent type.**
 Furthermore, this type is _always_ given by the function `Mooncake.tangent_type(primal_type)`.
 
-Consider some more worked examples.
+Some worked examples.
 
 #### Int
 
@@ -219,8 +209,8 @@ julia> tangent_type(Tuple{Float64, Vector{Float64}, Int})
 Tuple{Float64, Vector{Float64}, NoTangent}
 ```
 
-There is one edge case to be aware of: if all of the field of a `Tuple` are
-non-differentiable, then the tangent type is `NoTangent`. For example,
+Edge case: if all fields of a `Tuple` are non-differentiable, the tangent type is
+`NoTangent`. For example,
 ```jldoctest; setup = :(using Mooncake: tangent_type)
 julia> tangent_type(Tuple{Int, Int})
 NoTangent
@@ -228,19 +218,17 @@ NoTangent
 
 #### Structs
 
-As with `Tuple`s, the tangent type of a struct is, by default, given recursively.
-In particular, the tangent type of a `struct` type is [`Tangent`](@ref).
-This type contains a `NamedTuple` containing the tangent to each field in the primal `struct`.
+As with `Tuple`s, the tangent type of a struct is given recursively by default: it's
+[`Tangent`](@ref), which wraps a `NamedTuple` containing the tangent for each field.
 
 As with `Tuple`s, if all field types are non-differentiable, the tangent type of the entire
 struct is `NoTangent`.
 
-There are a couple of additional subtleties to consider over `Tuple`s though. Firstly, not
-all fields of a `struct` have to be defined. Fortunately, Julia makes it easy to determine
-how many of the fields might possibly not be defined. The tangent associated to any field
-which might possibly not be defined is wrapped in a `PossiblyUninitTangent`.
+Two subtleties beyond `Tuple`s. First, not all fields of a `struct` have to be defined; Julia
+tracks how many fields are always defined, and the tangent for any field that might not be is
+wrapped in a `PossiblyUninitTangent`.
 
-Furthermore, `struct`s can have fields whose static type is abstract. For example
+Second, `struct`s can have fields with abstract static types. For example
 ```jldoctest foo; setup = :(using Mooncake: tangent_type)
 julia> struct Foo
            x
@@ -251,23 +239,16 @@ If you ask for the tangent type of `Foo`, you will see that it is
 julia> tangent_type(Foo)
 Tangent{@NamedTuple{x}}
 ```
-Observe that the field type associated to `x` is `Any`. The way to understand this result is
-to observe that
-1. `x` could have literally any type at runtime, so we know nothing about what its tangent
-    type must be until runtime, and
-1. we require that the tangent type of `Foo` be unique.
-The consequence of these two considerations is that the tangent type of `Foo` must be able
-to contain any type of tangent in its `x` field. It follows that the fieldtype of the `x`
-field of `Foo`s tangent must be `Any`.
-
-
+The field type for `x` is `Any`, because: `x` could have any type at runtime, so its tangent
+type isn't known until runtime; and the tangent type of `Foo` must be unique. Together these
+mean `Foo`'s tangent must be able to hold any tangent type in its `x` field, so that field's
+type has to be `Any`.
 
 #### Mutable Structs
 
-The tangent type for `mutable struct`s have the same set of considerations as `struct`s.
-The only difference is that they must themselves be mutable.
-Consequently, we use a type called [`MutableTangent`](@ref) to represent their tangents.
-It is a `mutable struct` with the same structure as `Tangent`.
+The tangent type for `mutable struct`s follows the same considerations as `struct`s, except
+it must itself be mutable. We use [`MutableTangent`](@ref), a `mutable struct` with the same
+shape as `Tangent`.
 
 For example, if you ask for the `tangent_type` of
 ```jldoctest bar; setup = :(using Mooncake: tangent_type)
@@ -281,11 +262,10 @@ julia> tangent_type(Bar)
 MutableTangent{@NamedTuple{x::Float64}}
 ```
 
-
 #### Primitive Types
 
-We've already seen a couple of primitive types (`Float64` and `Int`).
-All primitive types require an explicit specification of what their tangent type must be.
+We've already seen two primitive types (`Float64` and `Int`). Every primitive type requires
+an explicit `tangent_type` method.
 
 The tangent type of a `Ptr{P}` is `Ptr{T}`, where `T = tangent_type(P)`.
 For example
@@ -302,11 +282,9 @@ tangent_type(x) = throw(error("$x is not a type. Perhaps you meant typeof(x)?"))
 # The "Bottom" type.
 @foldable tangent_type(::Type{Union{}}) = Union{}
 
-# This is essential for DataType, as the recursive definition always recurses infinitely,
-# because one of the fieldtypes is itself always a DataType. In particular, we'll always
-# eventually hit `Any`, whose `super` field is `Any`.
-# This makes it clear that we can't recursively construct tangents for data structures which
-# refer to themselves...
+# Needed because the recursive definition would otherwise recurse infinitely: one of
+# DataType's fieldtypes is itself always a DataType, and we'll eventually hit `Any`, whose
+# `super` field is `Any`. Recursive tangent construction can't handle self-referential types.
 tangent_type(::Type{<:Type}) = NoTangent
 
 tangent_type(::Type{<:TypeVar}) = NoTangent
@@ -351,12 +329,12 @@ tangent_type(::Type{String}) = NoTangent
 
 tangent_type(::Type{<:Array{P,N} where {P}}) where {N} = Array
 
-# A `MemoryRef`'s (and bare `Memory`'s) tangent is the same wrapper over the shadow `Memory`: the
-# array-indexing dualization in `forward_interp.jl` never builds these by hand, it always mirrors
-# the identical `memoryrefnew`/`getfield(:ref)` operation onto a genuine `Array{tangent_type(P),N}`
-# shadow array. Only matches the default `MemoryRef{P}`/`Memory{P}` (`:not_atomic`, CPU) aliases; a
-# `GenericMemoryRef` with a different `Kind`/`AddrSpace` (e.g. atomic memory) falls through to the
-# generic struct derivation below instead — a known, undocumented-elsewhere sharp edge.
+# A `MemoryRef`'s (and bare `Memory`'s) tangent is the same wrapper over the shadow `Memory`.
+# The array-indexing dualization in `forward_interp.jl` never builds these by hand; it mirrors
+# the primal's `memoryrefnew`/`getfield(:ref)` onto a genuine `Array{tangent_type(P),N}` shadow
+# array. Only matches the default `MemoryRef{P}`/`Memory{P}` (`:not_atomic`, CPU) aliases. A
+# `GenericMemoryRef` with a different `Kind`/`AddrSpace` (e.g. atomic memory) falls through to
+# the generic struct derivation below instead. This is a known sharp edge, undocumented elsewhere.
 @foldable tangent_type(::Type{<:MemoryRef{P}}) where {P} = MemoryRef{tangent_type(P)}
 @foldable tangent_type(::Type{<:Memory{P}}) where {P} = Memory{tangent_type(P)}
 
@@ -422,12 +400,12 @@ isconcrete_or_union(p) = p isa Union || isconcretetype(p)
     P isa Union && return :(Union{tangent_type($(P.a)),tangent_type($(P.b))})
 
     # Determine whether P isa a Tuple with a Vararg, e.g, Tuple, or Tuple{Float64, Vararg}.
-    # Need to exclude `UnionAll`s from this, by checking `isa(P, DataType)`, in order to
-    # ensure that `Base.datatype_fieldcount(P)` will run successfully.
+    # Exclude `UnionAll`s by checking `isa(P, DataType)` first, so `Base.datatype_fieldcount(P)`
+    # doesn't fail below.
     isa(P, DataType) && !(@isdefined(N)) && return Any
 
-    # Tuple{} can only have `NoTangent` as its tangent type. As before, verify we don't have
-    # a UnionAll before running to ensure that datatype_fieldcount will run.
+    # Tuple{} can only have `NoTangent` as its tangent type. Again check for `UnionAll` first
+    # so datatype_fieldcount doesn't fail.
     isa(P, DataType) && N == 0 && return NoTangent
 
     # Expression to construct `Tuple` type containing tangent type for all fields.
@@ -518,13 +496,12 @@ anything other than that which this function returns.
 """
 zero_tangent(x)
 function zero_tangent(x::P) where {P}
-    # `require_tangent_cache`, not a bare `isbitstype(P)`: the cache exists only to handle circular
-    # references and aliasing, and `require_tangent_cache` is this system's declared authority on
-    # when a tangent can contain either (it is what `set_to_zero!!` already consults). The bare
-    # `isbitstype` test is strictly cruder — it allocates an `IdDict` for *every* `Array`, including
-    # `Array{<:IEEEFloat}`, whose tangent is provably tree-like. That `IdDict` (plus its backing
-    # `Vector{Any}`) was showing up on every `gradient` call, purely to build an argument's zero
-    # shadow.
+    # Use `require_tangent_cache`, not a bare `isbitstype(P)`. The cache exists only to handle
+    # circular references and aliasing, and `require_tangent_cache` is this system's authority on
+    # when a tangent can contain either (`set_to_zero!!` consults the same thing). `isbitstype`
+    # is cruder: it allocates an `IdDict` for every `Array`, including `Array{<:IEEEFloat}`, whose
+    # tangent is provably tree-like. That allocation was showing up on every `gradient` call, just
+    # to build an argument's zero shadow.
     return zero_tangent_internal(x, _tangent_cache(require_tangent_cache(P)))
 end
 @inline _tangent_cache(::Val{true}) = IdDict()
@@ -611,21 +588,18 @@ unit_tangent(x) = primal_to_tangent!!(zero_tangent(x), oneunit(x))::tangent_type
 """
     zero_tangent_internal(x, d::MaybeCache)
 
-Implementation of [`zero_tangent`](@ref). Makes use of `d` in the same way that
-`Base.deepcopy_internal` makes use of an `IdDict` (see the docstring for `Base.deepcopy` for
-information).
+Implementation of [`zero_tangent`](@ref). Uses `d` the way `Base.deepcopy_internal` uses an
+`IdDict` (see `Base.deepcopy`'s docstring).
 
-In particular, it should be used to ensure that aliasing relationships are respected,
-meaning that if in the tuple `x = (a, b)`, `a === b`, then in
-`(da, db) = zero_tangent((a, b))` it must hold that should have that `da === db`.
-You may want to consult the method of `zero_tangent_internal` for `struct` and
-`mutable struct` types for inspiration if implementing this for your own type.
+`d` ensures aliasing is respected: if `x = (a, b)` with `a === b`, then in
+`(da, db) = zero_tangent((a, b))` it must hold that `da === db`. See the `struct`/
+`mutable struct` methods of `zero_tangent_internal` for reference if implementing this for
+your own type.
 
-Similarly, if `x` contains a one or more circular, its tangent will probably need to contain
-similar circular references (unless it is something trivial like [`NoTangent`](@ref)). Again,
-consult existing implementations for inspiration.
+Similarly, if `x` contains circular references, its tangent generally needs matching circular
+references (unless the tangent is trivial, e.g. [`NoTangent`](@ref)).
 
-If `d` is a `NoCache` assume that `x` contains neither aliasing nor circular references.
+If `d` is a `NoCache`, assume `x` contains neither aliasing nor circular references.
 """
 zero_tangent_internal(::Union{Int8,Int16,Int32,Int64,Int128}, ::MaybeCache) = NoTangent()
 zero_tangent_internal(x::IEEEFloat, ::MaybeCache) = zero(x)
@@ -712,18 +686,18 @@ end
 """
     uninit_tangent(x)
 
-Related to [`zero_tangent`](@ref), but a bit different. Check current implementation for
-details -- this docstring is intentionally non-specific in order to avoid becoming outdated.
+Related to [`zero_tangent`](@ref), but a bit different. Check the implementation for details;
+this docstring is intentionally non-specific so it doesn't go stale.
 """
 @inline uninit_tangent(x) = zero_tangent(x)
-# The tangent of Ptr{P} is a Ptr{tangent_type(P)} — a pointer to derivative storage for
-# whatever the primal pointer addresses. Gradients accumulate through dereferenced values,
-# not the address itself (hence rdata_type(Ptr) = NoRData).
+# The tangent of Ptr{P} is a Ptr{tangent_type(P)}, pointing to derivative storage for whatever
+# the primal pointer addresses. Gradients accumulate through dereferenced values, not the
+# address itself (hence rdata_type(Ptr) = NoRData).
 #
-# When no derivative storage exists yet (e.g. before a rule fills it in), we bitcast the
-# primal address to Ptr{tangent_type(P)}. The result must NOT be dereferenced — it is a
-# type-correct placeholder only. single-arg zero_tangent(x::Ptr) throws because allocating
-# fresh storage would have unclear ownership; use zero_tangent(primal, fdata) instead.
+# When no derivative storage exists yet (e.g. before a rule fills it in), bitcast the primal
+# address to Ptr{tangent_type(P)}. The result must NOT be dereferenced; it's a type-correct
+# placeholder only. Single-arg zero_tangent(x::Ptr) throws instead, since allocating fresh
+# storage there would have unclear ownership; use zero_tangent(primal, fdata) instead.
 @inline uninit_tangent(x::Ptr{P}) where {P} = bitcast(Ptr{tangent_type(P)}, x)
 
 """
@@ -813,14 +787,13 @@ end
 """
     require_tangent_cache(::Type{P}) where {P}
 
-Determines whether operations on tangents of primal type `P` require a cache to handle potential 
-circular references or aliasing. Returns `Val{true}()` if caching is required (the default),
-or `Val{false}()` if tangents of type [`tangent_type(P)`](@ref) are guaranteed to be free of circular references,
-uninitialized fields that could create circular references, and aliasing.
+Whether operations on tangents of primal type `P` need a cache to handle circular references
+or aliasing. Returns `Val{true}()` if caching is required (the default), or `Val{false}()` if
+tangents of type [`tangent_type(P)`](@ref) are guaranteed free of circular references,
+uninitialized fields that could create them, and aliasing.
 
-This function is used internally by operations like `set_to_zero!!`. Returning `Val{false}()` 
-can improve performance by avoiding cache overhead, but is only safe when the memory layout
-of the tangent type is provably tree-like. 
+Used internally by operations like `set_to_zero!!`. `Val{false}()` avoids cache overhead but
+is only safe when the tangent type's memory layout is provably tree-like.
 
 !!! warning
     The default (`Val{true}()`) is always correct. Only override it after proving the tangent
@@ -870,8 +843,8 @@ true
 
 #### Example 2: Aliasing in Tangent Structures
 
-When a primal contains aliased references, the tangent must preserve this aliasing for correctness.
-Without caching, operations would incorrectly process aliased tangents multiple times:
+When a primal contains aliased references, the tangent must preserve that aliasing. Without
+caching, operations would process the aliased tangents twice:
 
 ```jldoctest; setup = :(using Mooncake: zero_tangent)
 julia> # Create a mutable primal with aliased references
@@ -929,12 +902,12 @@ Add `x` to `y`. If `ismutabletype(T)`, then `increment!!(x, y) === x` must hold.
 That is, `increment!!` will mutate `x`.
 This must apply recursively if `T` is a composite type whose fields are mutable.
 """
-# Consult `require_tangent_cache` for the aliasing/circular-reference cache decision, exactly as
-# `zero_tangent` (`_tangent_cache`) and `set_to_zero!!` do — keyed on the tangent type `T` here, the
-# same way `set_to_zero!!(x) = set_to_zero!!(x, require_tangent_cache(typeof(x)))` keys on a tangent.
-# A bare `isbitstype(T)` is strictly cruder: it allocates an `IdDict` for every non-bits tangent,
-# including provably tree-like ones like `Vector{<:IEEEFloat}` (whose `require_tangent_cache` says
-# `NoCache`). This keeps `increment!!` and `zero_tangent` from disagreeing on when a cache is needed.
+# Use `require_tangent_cache` for the aliasing/circular-reference cache decision, same as
+# `zero_tangent` (`_tangent_cache`) and `set_to_zero!!`, keyed here on the tangent type `T`.
+# A bare `isbitstype(T)` is cruder: it allocates an `IdDict` for every non-bits tangent,
+# including provably tree-like ones like `Vector{<:IEEEFloat}` (`require_tangent_cache` says
+# `NoCache` for those). This keeps `increment!!` and `zero_tangent` agreeing on when a cache
+# is needed.
 @inline _inc_cache(::Val{true}) = IdDict{Any,Bool}()
 @inline _inc_cache(::Val{false}) = NoCache()
 function increment!!(x::T, y::T) where {T}
@@ -981,12 +954,12 @@ end
 
 Set `x` to its zero element (`x` should be a tangent, so the zero must exist).
 """
-# `set_to_zero!!` uses a more permissive cache decision than `require_tangent_cache`:
-# zeroing is idempotent, so the `Vector{UInt}` visited-cache is only a perf optimization
-# (skips re-zeroing aliased mutable subtrees), never needed for correctness. `increment!!`
-# shares `require_tangent_cache` and does need the `IdDict` cache (it double-counts on
-# aliasing). Skip the per-call `Vector{UInt}()` allocation whenever the tangent's reachable
-# substructure has no `MutableTangent` — i.e. a `MutableTangent{Tfields}` with isbits `Tfields`.
+# `set_to_zero!!` uses a more permissive cache decision than `require_tangent_cache`. Zeroing
+# is idempotent, so the `Vector{UInt}` visited-cache is only a perf optimization (skips
+# re-zeroing aliased mutable subtrees), never needed for correctness. `increment!!` shares
+# `require_tangent_cache` because it does need the `IdDict` cache: it double-counts on aliasing.
+# Skip the per-call `Vector{UInt}()` allocation whenever the tangent's reachable substructure
+# has no `MutableTangent`, i.e. a `MutableTangent{Tfields}` with isbits `Tfields`.
 @inline _set_to_zero_cache(::Type{MutableTangent{Tfields}}) where {Tfields<:NamedTuple} =
     Val{!isbitstype(Tfields)}()
 @inline _set_to_zero_cache(@nospecialize T) = require_tangent_cache(T)
@@ -1037,8 +1010,8 @@ end
 Required for testing.
 Should be defined for all standard tangent types.
 
-Multiply tangent `t` by scalar `a`. Always possible because any given tangent type must
-correspond to a vector field. Not using `*` in order to avoid piracy.
+Multiply tangent `t` by scalar `a`. Always possible since any tangent type corresponds to a
+vector field. Not using `*`, to avoid piracy.
 """
 _scale(a::Float64, t) = _scale_internal(IdDict{Any,Any}(), a, t)
 
@@ -1110,11 +1083,10 @@ end
 
 Adds `t` to `p`, returning a `P`. It must be the case that `tangent_type(P) == T`.
 
-If `unsafe` is `true` and `P` is a composite type, then `_add_to_primal` will construct a
-new instance of `P` by directly invoking the `:new` instruction for `P`, rather than
-attempting to use the default constructor for `P`. This is fine if you are confident that
-the new `P` constructed by adding `t` to `p` will always be a valid instance of `P`, but
-could cause problems if you are not confident of this.
+If `unsafe` is `true` and `P` is a composite type, `_add_to_primal` constructs the new
+instance by invoking the `:new` instruction directly, instead of `P`'s default constructor.
+Fine if you're confident the perturbed value will always be a valid `P`; can cause problems
+otherwise.
 
 This is, for example, fine for the following type:
 ```julia
@@ -1232,10 +1204,9 @@ function _add_to_primal_internal(
         throw(ArgumentError("p of type $P has tangent_type $Tt, but t is of type $T"))
     end
 
-    # For all const fields, it is safe to immediately recurse and construct the primal, as
-    # it is not possible to have a field marked as const which contains a circular reference
-    # to `p`. Other (defined) fields are given placeholder values, and revisited in a second
-    # pass over the data structure.
+    # Safe to recurse immediately for const fields, since a const field can't contain a
+    # circular reference back to `p`. Other (defined) fields get placeholder values and are
+    # revisited in a second pass.
     init_fields = map(fieldnames(P)) do f
         tf = getfield(t.fields, f)
         if isdefined(p, f) && is_init(tf) && isconst(P, f)
@@ -1249,13 +1220,11 @@ function _add_to_primal_internal(
         end
     end
 
-    # Construct an initial version of perturbed `p`, in which all (defined) constants fields
-    # are perturbed, but all fields which are not marked as const are the same as in `p`.
+    # Construct an initial perturbed `p`: const fields perturbed, non-const fields unchanged.
     p′ = __construct_type(P, unsafe, init_fields...)
     c[key] = p′
 
-    # Now that we are protected against circular references in `p`, perturb each defined
-    # mutable field in `p′`.
+    # `c[key]` now guards against circular references, so perturb each defined mutable field.
     map(fieldnames(P)) do f
         tf = getfield(t.fields, f)
         if isdefined(p, f) && is_init(tf) && !isconst(P, f)
@@ -1275,11 +1244,10 @@ end
     return Expr(:tuple, exprs...)
 end
 
-# Optimal for homogeneously-typed Tuples with dynamic field choice. Implementation using
-# `ifelse` chosen to ensure that the entire function comprises a single basic block. If
-# instead one wrote `n -> n == i ? v : x[n]` we would get one basic block per element of
-# `x`. This is fine for small-medium `x`, but causes a great deal of trouble for large `x`
-# (certainly for length > 1_000, but probably also for smaller sizes than that).
+# Optimal for homogeneously-typed Tuples with dynamic field choice. Uses `ifelse` to keep the
+# whole function a single basic block; `n -> n == i ? v : x[n]` would produce one basic block
+# per element of `x`, fine for small-medium `x` but bad for large `x` (length > 1_000, and
+# probably smaller too).
 function increment_field!!(x::Tuple, y, i::Int)
     v = increment!!(x[i], y)
     return ntuple(n -> ifelse(n == i, v, x[n]), Val(length(x)))

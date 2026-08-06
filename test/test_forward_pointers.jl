@@ -12,7 +12,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
 # *tangent* storage at the position its primal addresses, so each rule mirrors the operation onto it.
 # Two dualization-specific properties are worth stating, because they're what these tests protect:
 #
-#  * `GC.@preserve` must root the **shadow** object as well as the primal — the dualized code holds an
+#  * `GC.@preserve` must root the **shadow** object as well as the primal: the dualized code holds an
 #    interior pointer into both, so rooting only the primal would let the shadow array be collected
 #    while a live shadow `Ptr` still points into it.
 #  * A mirror is only valid when a position means the same thing on both sides. An element *index*
@@ -46,7 +46,7 @@ end
     checkverify(f, (Float64,))
 
     # The shadow array must be rooted by the *same* `gc_preserve_begin` as the primal, and the store
-    # must be mirrored. (The IR does still contain one `frule!!` invoke — for `sum`, a hand-ruled
+    # must be mirrored. (The IR does still contain one `frule!!` invoke, for `sum`, a hand-ruled
     # callee. That the *pointer* ops need no such round trip is asserted in the pointer-only testset
     # below, where nothing else survives to muddy the count.)
     ir, _ = code_dual_ircode(f, (Float64,))
@@ -73,7 +73,7 @@ end
 
 @testset "pointer arithmetic (`p + k`)" begin
     # `p + k` stays in `Ptr` space (`add_ptr(::Ptr{P}, ::UInt)::Ptr{P}`), so the same byte offset
-    # applies to the shadow pointer — `Float64`'s tangent has `Float64`'s stride.
+    # applies to the shadow pointer: `Float64`'s tangent has `Float64`'s stride.
     f(x) = begin
         v = [x, 2x]
         p = pointer(v)
@@ -113,7 +113,7 @@ end
     @test D(offs, 2.0) == 4.0
     checkverify(offs, (Float64,))
 
-    # No shadow pointer traffic is emitted at all — one `pointerset`, not the mirrored pair the
+    # No shadow pointer traffic is emitted at all: one `pointerset`, not the mirrored pair the
     # `Float64` testsets above assert.
     ir, _ = code_dual_ircode(store, (Float64,))
     stmts = string.(ir.stmts.stmt)
@@ -122,7 +122,7 @@ end
 
 @testset "caller-supplied shadow pointer, allocation-free" begin
     # Pointers in, pointers out: no array allocation of its own, so this isolates the pointer rules.
-    # The tangent pointer is the caller's shadow buffer — exactly the contract `Dual{Ptr{P},Ptr{P}}`
+    # The tangent pointer is the caller's shadow buffer, exactly the contract `Dual{Ptr{P},Ptr{P}}`
     # describes.
     roundtrip(p::Ptr{Float64}, x) = (Base.unsafe_store!(p, 3x); Base.unsafe_load(p) * 2)
     control(::Ptr{Float64}, x) = x * 2                  # same signature, no pointer traffic
@@ -168,7 +168,7 @@ struct StridePair
 end
 
 @testset "graceful bails (located reason, no miscompile)" begin
-    # A `Vector{Int}`'s shadow is a `Memory{NoTangent}` — zero-size elements, so there is no tangent
+    # A `Vector{Int}`'s shadow is a `Memory{NoTangent}`: zero-size elements, so there is no tangent
     # storage its data pointer could address and the `getfield` branch hands out `NULL_SHADOW_PTR`.
     # Relabelling that as a `Ptr{Float64}` asks for a *differentiable* view of a buffer with no
     # shadow, which the Ptr->Ptr `bitcast` rule would otherwise launder into a real dereference.

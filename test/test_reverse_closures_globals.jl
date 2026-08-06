@@ -37,7 +37,7 @@ using Differ: Dual, NoTangent, frule!!, gradient, primal, tangent, zero_tangent
     end
 
     # A second, independent call must not observe state left over from the first (each call
-    # starts from `y = 1.0` again via a fresh `let`) — not a load-bearing aliasing check, just
+    # starts from `y = 1.0` again via a fresh `let`). Not a load-bearing aliasing check, just
     # confirming the boxed capture itself is per-closure-instance.
     let y = 10.0
         f = x -> (y += x; x * y)

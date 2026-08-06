@@ -142,14 +142,13 @@ function Base.getproperty(d::Dual, s::Symbol)
 end
 Base.propertynames(::Dual) = (:primal, :tangent, :x, :y, :z, :dx, :dy, :dz)
 
-# A `Dual` is its own tangent type, which preserves Differ's higher-order (Option A) nesting
-# under the Mooncake tangent system: after the engine peels one `Dual` level
-# off a primal that is itself a `Dual`, the tangent it must produce is again a `Dual` — because we
-# define it to be. This reproduces every documented order-≥2 seed and satisfies Mooncake's
-# invariant `Dual{P,T} ⟹ T == tangent_type(P)` (checked, e.g. `tangent_type(Dual{Float64,Float64})
-# == Dual{Float64,Float64}`, `tangent_type(Dual{typeof(sin),NoTangent}) == Dual{typeof(sin),
-# NoTangent}`). A `Dual` therefore keeps *same-typed-shadow* semantics, unlike a general struct
-# (which strips to a `Tangent`/`MutableTangent`).
+# A `Dual` is its own tangent type. This preserves Differ's higher-order (Option A) nesting under
+# the Mooncake tangent system: after the engine peels one `Dual` level off a primal that is itself
+# a `Dual`, the tangent it produces must again be a `Dual` — by definition. This reproduces every
+# documented order-≥2 seed and satisfies Mooncake's invariant `Dual{P,T} ⟹ T == tangent_type(P)`
+# (e.g. `tangent_type(Dual{Float64,Float64}) == Dual{Float64,Float64}`,
+# `tangent_type(Dual{typeof(sin),NoTangent}) == Dual{typeof(sin),NoTangent}`). So a `Dual` keeps
+# same-typed-shadow semantics, unlike a general struct, which strips to a `Tangent`/`MutableTangent`.
 tangent_type(::Type{P}) where {P<:Dual} = P
 
 # Type-level field accessors used by the dualization engine (replacing the old
@@ -158,22 +157,22 @@ _dual_primal_type(::Type{Dual{P,T}}) where {P,T} = P
 _dual_tangent_type(::Type{Dual{P,T}}) where {P,T} = T
 
 # Same-typed zero tangent for a `Dual` carrier: differentiable leaves are zeroed, while
-# non-differentiable singletons (functions, `NoTangent`) are carried through unchanged so the
-# result stays a value of the (self) tangent type `typeof(d)`. This mirrors the old `struct_zero`
-# behavior for `Dual`s; it is rarely reached (Duals are constructed by the transform, not present
-# as primal constants), but keeps `zero_tangent` coherent if a `Dual`-typed value ever flows into
-# the engine's constant / non-differentiable path.
+# non-differentiable singletons (functions, `NoTangent`) pass through unchanged, so the result
+# stays a value of the same tangent type `typeof(d)`. Mirrors the old `struct_zero` behavior for
+# `Dual`s. Rarely reached — Duals are built by the transform, not present as primal constants — but
+# keeps `zero_tangent` coherent if a `Dual`-typed value ever flows into the engine's constant /
+# non-differentiable path.
 _carrier_zero(x::IEEEFloat) = zero(x)
 _carrier_zero(::NoTangent) = NoTangent()
 _carrier_zero(x::Dual) = zero_tangent_internal(x, NoCache())
-# For any other carried field: a singleton (function/constant) carries through; a self-tangent type
-# (`tangent_type(X) === X`, e.g. `Vector{Float64}`) takes its ordinary `zero_tangent`. A non-self-
+# For any other carried field: a singleton (function/constant) passes through; a self-tangent type
+# (`tangent_type(X) === X`, e.g. `Vector{Float64}`) gets its ordinary `zero_tangent`. A non-self-
 # tangent type (`tangent_type(X) !== X`, e.g. a struct/closure with a `Float64` field, whose tangent
-# is a `Tangent`) *cannot* be represented in a `Dual`'s same-typed field, so a same-typed zero does
-# not exist. This is a fundamental limit of the self-tangent `Dual` scheme used for higher-order
-# forward mode — surface it as a clear error rather than the cryptic `%new` `TypeError` it would
-# otherwise become downstream. (Differentiating such a value at order ≥2 — e.g. a closure with
-# differentiable captures under a nested `D` — is what lands here.)
+# is a `Tangent`) can't be represented in a `Dual`'s same-typed field, so no same-typed zero exists.
+# That's a fundamental limit of the self-tangent `Dual` scheme for higher-order forward mode; error
+# clearly here instead of surfacing a cryptic `%new` `TypeError` downstream. (Differentiating such a
+# value at order ≥2 — e.g. a closure with differentiable captures under a nested `D` — is what
+# lands here.)
 _carrier_zero(x::X) where {X} =
     Base.issingletontype(X) ? x :
     tangent_type(X) === X    ? zero_tangent(x) :

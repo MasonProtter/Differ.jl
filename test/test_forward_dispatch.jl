@@ -4,25 +4,25 @@ using Differ: Dual, NoTangent, frule!!, primal, tangent, code_dual_ircode
 
 # Dynamic dispatch (`apply_generic`): reading a non-`const` global always infers as `Any`
 # (regardless of the concrete type of the value it holds), so any call whose argument flows
-# through it — here `getindex` on the `Ref`, then `+` — is a genuine `apply_generic`-style
+# through it (here `getindex` on the `Ref`, then `+`) is a genuine `apply_generic`-style
 # dynamic dispatch. These are handled by deferring the surviving call to the runtime
 # `dynamic_frule` dispatcher, which rebuilds concrete `Dual`s from the runtime values and
-# dispatches `frule!!` dynamically. Must be real module-level globals (not testset-local
-# variables) — a local would instead be captured as a closure field, a different IR shape
+# dispatches `frule!!` dynamically. Must be real module-level globals, not testset-local
+# variables: a local would instead be captured as a closure field, a different IR shape
 # entirely from what this test exercises.
 dyn_ref = Ref{Any}(1.0)
 dyncall(x) = x + dyn_ref[]         # `dyncall` holds the `Ref` constant, so d/dx (x + c) = 1
 dyn_g = sin
 dyncallee(x) = dyn_g(x)            # callee itself is dynamic (read from a non-const global)
-# A dynamic value that *carries a tangent*: box `x` in a `Ref{Any}`, read it back, and use it —
-# the tangent must propagate, so d/dx (r[] * x) = 2x. SROA proves `r[] === x` and folds the read
-# away, leaving `*(x, x)` with concrete args but an already-widened `::Any` result — that stays on
+# A dynamic value that carries a tangent: box `x` in a `Ref{Any}`, read it back, and use it.
+# The tangent must propagate, so d/dx (r[] * x) = 2x. SROA proves `r[] === x` and folds the read
+# away, leaving `*(x, x)` with concrete args but an already-widened `::Any` result, which stays on
 # the static `:invoke` path (result annotated `dual_type(R)` = abstract `Dual`), exercising the
 # invariant-`Dual` typing rule rather than the `dynamic_frule` trampoline.
 dynbox(x) = (r = Ref{Any}(x); r[] * x)
 # A `Union`-typed return (a single `ReturnNode` whose value is a `PhiNode` typed
 # `Union{Float64,Int}`): the packed `Dual` must be a concrete leaf (`Dual{Float64,Float64}` on
-# this input), not the frozen `Dual{Union{Float64,Int},…}` a `%new` would build — which is *not*
+# this input), not the frozen `Dual{Union{Float64,Int},…}` a `%new` would build, which is not
 # `<: dual_type(Union{…})`.
 dynret(x) = (x > 0 ? x*x : 1)
 
@@ -47,11 +47,11 @@ end
 
 # A `const` global `Ref`, unlike `dyn_ref` above, resolves to a concrete type at compile time, so
 # reading it (`Core.getfield` on a bare `GlobalRef` in value position) stays on the static
-# per-statement dualization path instead of falling to `dynamic_frule` — this used to crash with
-# `MethodError: get_tangent_field(::NoTangent, ::Symbol)`, because the tangent of the *value* the
+# per-statement dualization path instead of falling to `dynamic_frule`. This used to crash with
+# `MethodError: get_tangent_field(::NoTangent, ::Symbol)`, because the tangent of the value the
 # global names was computed as the tangent of the `GlobalRef` struct itself (always `NoTangent`)
 # rather than the tangent of the `Ref`. Exercised for both a concrete-eltype and an `Any`-eltype
-# `Ref`, since the bug isn't a type-instability issue — both go through the identical code path.
+# `Ref`, since the bug isn't a type-instability issue: both go through the identical code path.
 # Must be real `const` module-level globals for the same reason as `dyn_ref` above.
 const constref_float = Ref(2.0)
 constref_float_use(x) = x * constref_float[]
@@ -80,7 +80,7 @@ end
 # A surviving call whose result Julia's own inference proves is a compile-time constant is
 # annotated `Core.Const(v)` in `:type` rather than a plain `Type`. This shows up for an ordinary
 # `@noinline` helper that has a genuine side effect (so the call can't be folded away entirely) but
-# whose *return value* is nonetheless provably fixed for these argument — e.g. a usage-counter/
+# whose return value is nonetheless provably fixed for these arguments, e.g. a usage-counter/
 # telemetry call guarding a fixed config value, or a feature-flag check guarding a branch. This used
 # to crash with `MethodError: no method matching dual_type(::Core.Const)` inside `frule_split!`. A
 # provably-constant result's derivative is definitionally zero regardless of what the callee
@@ -104,7 +104,7 @@ scaled(z) = debug_mode_enabled() ? 2z : z   # d/dz = 1 (branch resolves statical
     Core.Compiler.verify_ir(ir1)
     rate_lookup_count[] = 0
     d1 = frule!!(Dual(apply_rate, NoTangent()), Dual(3.0, 1.0))
-    @test primal(d1) ≈ 3.0 * 0.05        # not `apply_rate(3.0)` — that would double-count the effect
+    @test primal(d1) ≈ 3.0 * 0.05        # not apply_rate(3.0), that would double-count the effect
     @test tangent(d1) ≈ 0.05
     @test rate_lookup_count[] == 1        # the side effect still ran exactly once
 

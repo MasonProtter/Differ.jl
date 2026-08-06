@@ -9,7 +9,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
     # `v[i]`/`v[i]=x` lower to `Expr(:boundscheck)` + `memoryrefnew`/`memoryrefget`/
     # `memoryrefset!`. An element read differentiates like a per-element `getfield`; a write
     # mirrors the same builtin onto the shadow array (itself a real same-shape
-    # `Array{tangent_type(P),N}` — no wrapper needed).
+    # `Array{tangent_type(P),N}`, no wrapper needed).
     getidx(v, i) = v[i]
     setidx!(v::Vector{Float64}, i::Int, x::Float64) = (v[i] = x; v)   # element write (memoryrefset!)
     function mysum(v::Vector{Float64})   # eachindex reduction: 3-arg getfield + `===` + memoryref chain
@@ -21,7 +21,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
     end
     tupfirst(t::Tuple{Float64,Float64}) = t[1]   # boundschecked tuple getfield (3-arg getfield forwarding)
     # Dynamic (non-literal) `getfield` index: `for i in 1:2` does not unroll, so this lowers to
-    # `getfield(t, i)` with `i` a genuine SSAValue, not a literal — the homogeneous-tuple/NamedTuple
+    # `getfield(t, i)` with `i` a genuine SSAValue, not a literal. The homogeneous-tuple/NamedTuple
     # same-shape case (Phase B). d/dt_1 = d/dt_2 = 1.
     function tupsum_dyn(t::Tuple{Float64,Float64})
         s = 0.0
@@ -41,18 +41,17 @@ include(joinpath(@__DIR__, "testutils.jl"))
     # types differ) that must always bail, never miscompile.
     struct Het2; a::Float64; b::Int; end
     hetdyn(h::Het2, i::Int) = Core.getfield(h, i)
-    # Dynamic `setfield!` index — Phase A only (no same-shape support for writes).
+    # Dynamic `setfield!` index, Phase A only (no same-shape support for writes).
     mutable struct MP2; x::Float64; y::Float64; end
     function setdyn!(m::MP2, i::Int, v::Float64)
         Core.setfield!(m, i, v)
         return m.x + m.y
     end
-    # Homogeneous MUTABLE struct, dynamic `getfield` READ index (Part 2b — the tractable gap,
-    # reusing the homogeneous mutable `MP2` above). Every field shares one tangent type, so a
-    # runtime index selects a validly-typed field whichever one it lands on; the contribution
-    # routes through the object's own `MutableTangent` via the runtime-`Int`
-    # `increment_field_rdata!`. The index is a genuine `Argument`/`SSAValue` (confirmed via
-    # `Base.code_ircode`), NOT const-folded to a literal.
+    # Homogeneous MUTABLE struct, dynamic `getfield` READ index (Part 2b, the tractable gap, reusing
+    # the homogeneous mutable `MP2` above). Every field shares one tangent type, so a runtime index
+    # selects a validly-typed field whichever one it lands on; the contribution routes through the
+    # object's own `MutableTangent` via the runtime-`Int` `increment_field_rdata!`. The index is a
+    # genuine `Argument`/`SSAValue` (confirmed via `Base.code_ircode`), NOT const-folded to a literal.
     mp2get(m::MP2, i::Int) = Core.getfield(m, i)     # index is a genuine `Argument` (`_3`)
     function mp2sum_dyn(m::MP2)                       # loop index is a genuine `SSAValue` (a phi)
         s = 0.0
@@ -77,7 +76,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
 
     # dynamic (non-literal) getfield index (Phase B, forward): `for i in 1:2` does not unroll,
     # so `t[i]` reaches `dualize_to_ircode` as a genuine dynamic index. Raw (unresolved) before
-    # the fix, this crashed with a TypeError — the primal index referenced the primal IR's own
+    # the fix, this crashed with a TypeError: the primal index referenced the primal IR's own
     # (stale) SSA numbering once shadow instructions were interleaved.
     for seed in ((1.0, 0.0), (0.0, 1.0))
         d = frule!!(Dual(tupsum_dyn, NoTangent()), Dual((3.0, 4.0), seed))
@@ -92,13 +91,13 @@ include(joinpath(@__DIR__, "testutils.jl"))
     checkverify(ntupsum_dyn, (@NamedTuple{a::Float64,b::Float64},))
 
     # regression: a dynamic getfield index into a HETEROGENEOUS struct (fields with different
-    # tangent types) is the genuinely hard case — must bail with a located error, never crash or
+    # tangent types) is the genuinely hard case. Must bail with a located error, never crash or
     # silently return a wrong/zero derivative.
     @test_throws "no dualization rule for builtin `getfield`" frule!!(
         Dual(hetdyn, NoTangent()),
         Dual(Het2(1.0, 2), build_tangent(Het2, 1.0, NoTangent())), Dual(1, NoTangent()))
 
-    # regression: a dynamic setfield! index — Phase A only, always bails (no same-shape support
+    # regression: a dynamic setfield! index, Phase A only, always bails (no same-shape support
     # for writes).
     @test_throws ErrorException frule!!(
         Dual(setdyn!, NoTangent()),
@@ -106,7 +105,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
         Dual(1, NoTangent()), Dual(5.0, 1.0))
 
     # dynamic getfield index into a homogeneous MUTABLE struct (Part 2b): the runtime index is a
-    # genuine `Argument` (`_3`), not a const-folded literal — assert that, then differentiate. The
+    # genuine `Argument` (`_3`), not a const-folded literal. Assert that, then differentiate. The
     # one-hot tangent seed (dx=1, dy=0) picks out exactly the selected field's derivative.
     @test !(Base.code_ircode(mp2get, (MP2, Int))[1][1].stmts.stmt[1].args[3] isa Union{Int,Symbol,QuoteNode})
     dmp1 = frule!!(Dual(mp2get, NoTangent()), Dual(MP2(3.0, 4.0), build_tangent(MP2, 1.0, 0.0)), Dual(1, NoTangent()))
@@ -141,7 +140,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
 end
 
 @testset "nothing-returning primal (forward mode, ISSUES #53)" begin
-    # A mutator that ends in `return nothing` — the ordinary way to write an in-place function.
+    # A mutator that ends in `return nothing`, the ordinary way to write an in-place function.
     # `return nothing` survives optimization as a bare `GlobalRef` (`Main.nothing`), which used to
     # (1) leak into value position (verify_ir rejects a non-Core/Base GlobalRef there) and (2) get
     # typed `GlobalRef` instead of `Nothing`. Fixed: the result is a `Dual{Nothing,NoTangent}` and
@@ -201,7 +200,7 @@ newconstuse(x) = NEWCONST[1] * x
     # Reading through the same binding. Resolving its *type* has to happen at the interpreter's
     # inference world, not the ambient one: inside the generated `frule!!` body the ambient world
     # predates the `const` declaration, and answering "not constant" there degrades the operand to
-    # `Any` and sends the `getfield` rule down its general-struct branch — a `MethodError` at run
+    # `Any` and sends the `getfield` rule down its general-struct branch, a `MethodError` at run
     # time, which `code_dual_ircode` (running at the ambient world) would not reproduce.
     @test frule!!(Dual(newconstuse, NoTangent()), Dual(3.0, 1.0)) === Dual(4.5, 1.5)
     checkverify(newconstuse, (Float64,))
@@ -209,7 +208,7 @@ end
 
 @testset "mutable-struct field mutation (setfield!, forward mode)" begin
     # setfield! mutates the primal in place and its `MutableTangent` shadow via
-    # `set_tangent_field!` — the mutation-side counterpart of the existing getfield/
+    # `set_tangent_field!`, the mutation-side counterpart of the existing getfield/
     # get_tangent_field read path.
     mutable struct MPoint; x::Float64; y::Float64; end
     mpoint_read(p::MPoint) = p.x + p.y                    # read-only control for the setfield! test below
@@ -259,7 +258,7 @@ end
     checkverify(alloccomp, (Float64, Int))
 
     # Still out of scope: growing an existing array (`push!`/`resize!`), which calls
-    # `Core.memoryrefoffset` directly — a distinct, still-unhandled builtin (unrelated to
+    # `Core.memoryrefoffset` directly, a distinct, still-unhandled builtin (unrelated to
     # allocation). Should bail gracefully with an `ErrorException`.
     growvec!(v, x) = push!(v, x)
     err = try

@@ -4,9 +4,9 @@ using Differ: Dual, NoTangent, frule!!, build_tangent, zero_tangent, unit_tangen
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
-# Must be a true top-level function: a *self*-recursive function defined in a local scope needs to
-# close over its own (boxed) binding to call itself, which gives it a real (non-`NoTangent`)
-# tangent type instead of the plain singleton a top-level function has.
+# Must be top-level: a self-recursive function defined in local scope needs to close over its own
+# (boxed) binding to call itself, which gives it a real (non-`NoTangent`) tangent type instead of
+# the plain singleton a top-level function has.
 @noinline function rec_self(x::Float64, n::Int)
     n <= 0 && return x
     return rec_self(x, n - 1)
@@ -109,10 +109,10 @@ end
     @test frule!!(fseed3(p4), s3(2.0)).dx.dx.dx ≈ 24*2.0
 
     # the 2nd-order transform produces valid IR, including sin/cos and through control flow (the
-    # tuple-aware vararg prologue composes with phi/goto re-dualization), and over a *vararg primal*
+    # tuple-aware vararg prologue composes with phi/goto re-dualization), and over a vararg primal
     # (`vfun`, and Base's 3-arg `*(a,b,c,xs...)`): `compose(0)` re-dualizes the order-1 carrier,
-    # whose own argtypes are already flat, so the primal's vararg-ness is fully absorbed one level
-    # down and never reaches the higher-order branch.
+    # whose argtypes are already flat, so the primal's vararg-ness is fully absorbed one level down
+    # and never reaches the higher-order branch.
     for (f, at) in ((sqr,(Float64,)), (mul3,(Float64,)), (p4,(Float64,)), (sincosp,(Float64,)),
                     (relu,(Float64,)), (branch3,(Float64,)), (sumk,(Float64,Int)),
                     (vfun,(Float64,Float64,Float64)), (*,(Float64,Float64,Float64)))
@@ -154,7 +154,7 @@ end
     # pass re-dualizes it (the function slot `Dual{typeof(dualized_impl),NoTangent}` is dropped
     # and the remaining nested value args peel down to the inner order-1 carrier).
     #
-    # Higher-order AD written the natural way — a differentiation operator composed with itself —
+    # Higher-order AD written the natural way, as a differentiation operator composed with itself,
     # rather than by hand-nesting `Dual` seeds. `Dop(f, x)` is `f'(x)` via one `frule!!`; nesting
     # `Dop` gives `f''` etc.
     Dop(f, x)  = frule!!(Dual(f, zero_tangent(f)), Dual(x, unit_tangent(x))).dx
@@ -189,17 +189,16 @@ end
 
     # Regression: forward-mode dualization of a self-recursive `@noinline` primal must bail
     # cleanly rather than stack-overflow. This exercises the `dualized_impl_in_progress` cycle
-    # guard, whose forward-mode twist is that the recursion crosses *fresh* `ADInterpreter`
-    # instances via the `frule!!` `@generated` boundary — so the guard is task-local (shared
-    # across those instances) rather than a per-`interp` field like reverse mode's `in_progress`.
-    # `rec_self` must be a true top-level function, not testset-local: a *self*-recursive function
-    # defined in a local scope needs to close over its own (boxed) binding to call itself, which
-    # gives it a real (non-`NoTangent`) tangent type instead of the plain singleton a top-level
-    # function has — defeating the `Dual(rec_self, NoTangent())` call below.
+    # guard, whose forward-mode twist is that the recursion crosses fresh `ADInterpreter`
+    # instances via the `frule!!` `@generated` boundary, so the guard is task-local (shared across
+    # those instances) rather than a per-`interp` field like reverse mode's `in_progress`.
+    # `rec_self` must be top-level, not testset-local, for the same reason as the top of this file:
+    # a testset-local self-recursive function boxes its own binding, giving it a real
+    # (non-`NoTangent`) tangent type that would defeat the `Dual(rec_self, NoTangent())` call below.
     @test_throws ErrorException frule!!(Dual(rec_self, NoTangent()), Dual(1.0, 1.0), Dual(3, NoTangent()))
 
-    # Previously a limitation: a closure/struct with *differentiable fields* could not be
-    # differentiated at order ≥2. The blocker was its shadow being built by a `build_tangent` call —
+    # Previously a limitation: a closure/struct with differentiable fields could not be
+    # differentiated at order ≥2. The blocker was its shadow being built by a `build_tangent` call,
     # an opaque `@generated` function the outer dualization pass couldn't re-dualize, so it bailed.
     # Now that a `Tangent`/`MutableTangent` shadow is emitted as plain `%new`s (which re-dualize like
     # any other struct construction), this composes cleanly. `mkquad(3.0)` is a closure with a

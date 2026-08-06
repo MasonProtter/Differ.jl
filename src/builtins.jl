@@ -17,7 +17,7 @@
 #   * `ctx.tt(T)`                  — tangent type of primal type `T`
 #   * `ctx.zero_shadow(Ti, primal_ssa)` — the zero tangent of a computed non-differentiable result
 #
-# The fallback method below returns `nothing`, so a builtin with no registered rule (e.g.
+# The fallback below returns `nothing`, so a builtin with no registered rule (e.g.
 # `Core.memoryrefoffset`, used by `push!`/`resize!`) bails in `dualize_to_ircode` with a clear,
 # located reason instead of silently miscompiling.
 # ===========================================================================
@@ -33,16 +33,15 @@ _bi_literal_index(@nospecialize(x)) = isa(x, QuoteNode) || isa(x, Symbol) || isa
 # concrete or its fields don't all share one tangent type. A dynamic (runtime-computed) field index
 # only has a single well-defined tangent type when this holds — used both to allow a dynamic index
 # into a homogeneous same-shape aggregate (Tuple/NamedTuple/Array/Dual, or a homogeneous mutable
-# struct — both `builtins.jl` and reverse mode's `builtins_reverse.jl` share this one helper rather
-# than duplicating the check) and to recognize an object that's entirely non-differentiable (every
-# field's tangent type is `NoTangent`) regardless of which field a dynamic index happens to hit.
+# struct — `builtins.jl` and reverse mode's `builtins_reverse.jl` share this one helper rather than
+# duplicating the check) and to recognize an object that's entirely non-differentiable (every field's
+# tangent type is `NoTangent`) regardless of which field a dynamic index happens to hit.
 #
-# A HETEROGENEOUS object (differing per-field tangent types) always fails this check and so always
-# bails on a dynamic index — a deliberate scope limit, not an unfinished TODO: it mirrors Mooncake's
-# own restriction of dynamic `getfield` to homogeneous immutable structures (see
-# `is_homogeneous_and_immutable`, `Mooncake.jl/src/rules/builtins.jl:1069`). A generated-unrolling
-# path that dispatched per-field for the heterogeneous case would be fragile and type-unstable, and
-# is out of scope even in the mature reference implementation.
+# A heterogeneous object (differing per-field tangent types) always fails this check and so always
+# bails on a dynamic index — a deliberate scope limit, not a TODO: mirrors Mooncake's own restriction
+# of dynamic `getfield` to homogeneous immutable structures (`is_homogeneous_and_immutable`,
+# Mooncake.jl/src/rules/builtins.jl:1069). A generated-unrolling path that dispatched per-field for
+# the heterogeneous case would be fragile and type-unstable, and is out of scope even there.
 function _bi_homog_tangent_type(P)
     (P isa DataType && isconcretetype(P)) || return nothing
     nf = fieldcount(P)
@@ -57,7 +56,7 @@ end
 # For a general-struct field access whose object primal type is `Pobj` and whose field is named by
 # the compile-time literal `name` (a `Symbol`/`Int`/`QuoteNode`): return `(NT, i)` — the object's
 # tangent-backing `NamedTuple` type and the 1-based field index into it — or `nothing` when the
-# direct-emission preconditions don't hold. Callers then fall back to the generic
+# direct-emission preconditions don't hold, in which case callers fall back to the generic
 # `get_tangent_field`/`set_tangent_field!` helper. Bails on: a non-concrete primal, a tangent that
 # isn't a concrete `Tangent`/`MutableTangent`, an unknown/out-of-range field name, or a
 # `PossiblyUninitTangent` slot — whose `val`-unwrap (read) / `Ti(x)`-wrap (write) a plain
@@ -84,18 +83,18 @@ function _bi_field_index(@nospecialize(Pobj), @nospecialize(name))
     return (i isa Int && 1 <= i <= fieldcount(Pobj)) ? i : nothing
 end
 
-# `MemoryRef.ptr_or_offset` / `Memory.ptr` hold a real *address* only when the buffer's element layout
+# `MemoryRef.ptr_or_offset` / `Memory.ptr` hold a real address only when the buffer's element layout
 # is inline and non-empty. Otherwise the field is an offset — for a bits-union element (`arrayelem == 2`)
-# or a zero-size one (`layoutsize == 0`), where a `MemoryRef` stores its 0-based *index* there. Base's
+# or a zero-size one (`layoutsize == 0`), where a `MemoryRef` stores its 0-based index there. Base's
 # own `unsafe_convert(::Type{Ptr{Cvoid}}, ::GenericMemoryRef)` branches on exactly this pair of
 # conditions.
 #
-# The catch: a shadow buffer's element type is `tangent_type(P)`, which can sit in a *different* regime
+# The catch: a shadow buffer's element type is `tangent_type(P)`, which can sit in a different regime
 # than `P`. Classify the mirrored read rather than allowing/refusing it outright:
 #
 #   `:null`    — the shadow's elements are `NoTangent` (`Vector{Int}`, `Vector{Bool}`): zero-size, so
 #                there is no tangent storage to address at all. The caller hands back
-#                `NULL_SHADOW_PTR` (`src/intrinsics.jl`) — *not* a mirrored read, which would yield the
+#                `NULL_SHADOW_PTR` (`src/intrinsics.jl`) — not a mirrored read, which would yield the
 #                shadow ref's index dressed up as an address — and every downstream pointer rule
 #                either skips the shadow operation (nothing to transfer) or declines.
 #   `:address` — both buffers store their elements inline, so mirroring the read gives a genuine
@@ -133,22 +132,21 @@ const _ifelseg    = GlobalRef(Core, :ifelse)
 # `Tangent`/`MutableTangent` field read has no atomicity/boundscheck concept.
 #
 # `actual[2]` (the field name/index) is usually a literal `Symbol`/`Int`/`QuoteNode`, for which
-# `presolve` is a no-op — but a dynamic index (`t[i]` inside a loop, lowered to
-# `getfield(t, i)` with `i` a genuine `SSAValue`/`Argument`) must be resolved to this pass's own
-# numbering like any other operand, not embedded as a dangling reference into the primal's numbering
-# (embedding it raw crashed with a `TypeError`, since the two numberings diverge once shadow
-# instructions are interleaved).
+# `presolve` is a no-op — but a dynamic index (`t[i]` inside a loop, lowered to `getfield(t, i)` with
+# `i` a genuine `SSAValue`/`Argument`) must be resolved to this pass's own numbering like any other
+# operand, not embedded as a dangling reference into the primal's numbering (embedding it raw crashed
+# with a `TypeError`, since the two numberings diverge once shadow instructions are interleaved).
 function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
     Pobj = ctx.optype(actual[1])
     idx = ctx.presolve(actual[2])
     TT = ctx.tt(Ti)
     if !_bi_literal_index(actual[2]) && TT !== NoTangent
         # Dynamic index into a differentiable field: only safe when every field of the object shares
-        # one tangent type (a homogeneous Tuple/NamedTuple/Array/Dual, or a homogeneous mutable
-        # struct — the common tuple-iteration pattern plus its mutable-struct analogue), so the
-        # runtime index always selects a validly-typed shadow value regardless of which field it
-        # lands on. A heterogeneous struct has no such guarantee (different fields could need
-        # different tangent types); bail rather than guess.
+        # one tangent type (a homogeneous Tuple/NamedTuple/Array/Dual, or a homogeneous mutable struct
+        # — the common tuple-iteration pattern plus its mutable-struct analogue), so the runtime index
+        # always selects a validly-typed shadow value regardless of which field it lands on. A
+        # heterogeneous struct has no such guarantee (different fields could need different tangent
+        # types); bail rather than guess.
         if !(Pobj <: Dual || Pobj <: Tuple || Pobj <: NamedTuple || Pobj <: Array ||
              (Pobj isa DataType && ismutabletype(Pobj))) ||
            _bi_homog_tangent_type(Pobj) !== TT
@@ -156,10 +154,11 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
         end
     end
     # `MemoryRef`/`Memory` are same-shape too (`tangent_type(MemoryRef{P}) === MemoryRef{tangent_type(P)}`),
-    # but their shadow field types don't all match the primal's, so they need their own branch — settled
-    # here, before anything is emitted. Deliberately *not* `GenericMemoryRef`/`GenericMemory`: only the
-    # `:not_atomic`/`Core.CPU` aliases have same-shape `tangent_type` methods (`src/tangents.jl`), and an
-    # `AtomicMemoryRef`'s tangent is an ordinary `Tangent`, which a mirrored `getfield` would not find.
+    # but their shadow field types don't all match the primal's, so they need their own branch —
+    # settled here, before anything is emitted. Deliberately not `GenericMemoryRef`/`GenericMemory`:
+    # only the `:not_atomic`/`Core.CPU` aliases have same-shape `tangent_type` methods
+    # (`src/tangents.jl`), and an `AtomicMemoryRef`'s tangent is an ordinary `Tangent`, which a
+    # mirrored `getfield` would not find.
     memfield = nothing
     nullshadow = false
     if TT !== NoTangent && Pobj isa DataType && (Pobj <: MemoryRef || Pobj <: Memory)
@@ -180,7 +179,7 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
             # "shadow is typed `tangent_type(primal)`" invariant — a value that violates it can reach a
             # `%new(Dual{P,tangent_type(P)}, …)`, which type-checks its fields at run time. Reconcile
             # honestly with a no-op `bitcast` (what `Base.convert(::Type{Ptr{T}}, ::Ptr)` compiles to)
-            # rather than by mis-declaring the read.
+            # instead of mis-declaring the read.
             if !(TT isa DataType && TT <: Ptr)
                 ctx.reason[] = "reading `$Pobj`'s `Ptr` field, whose tangent type `$TT` is not a `Ptr`"
                 return nothing
@@ -201,14 +200,14 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
                            "the required tangent type `$TT` nor a `Ptr` that can be reinterpreted"
             return nothing
         end
-        nullshadow || (memfield = Fsh)     # `memfield !== nothing` ⇒ mirror the read
+        nullshadow || (memfield = Fsh)     # memfield !== nothing => mirror the read
     end
     p = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(actual[1]), idx,
                        (ctx.presolve(a) for a in actual[3:end])...), Ti)
     t = if TT === NoTangent
         NoTangent()
     elseif nullshadow
-        # No tangent storage behind the primal's address (`:null` regime above) — synthesise the null
+        # No tangent storage behind the primal's address (`:null` regime above) — synthesize the null
         # sentinel instead of mirroring the read.
         NULL_SHADOW_PTR
     elseif memfield !== nothing
@@ -222,11 +221,11 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
     else
         # General struct (including a homogeneous mutable struct admitted by the dynamic-index gate
         # above): read the field's tangent out of the Tangent/MutableTangent's `fields` NamedTuple.
-        # With a literal field and an always-initialised slot, emit it as two builtin `getfield`s
+        # With a literal field and an always-initialized slot, emit it as two builtin `getfield`s
         # (`getfield(shadow, :fields)` then `getfield(_, i)`) — no `get_tangent_field` call to
         # dynamic-dispatch, and SROA removes the intermediate. Otherwise (a dynamic homogeneous-mutable
         # index, or a `PossiblyUninitTangent` slot needing a `val`-unwrap) fall back to the generic
-        # helper, which is type-stable over both cases exactly when the gate above allowed us here.
+        # helper, type-stable over both cases exactly when the gate above allowed us here.
         slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(Pobj, actual[2]) : nothing
         if slot === nothing
             # Fallback (dynamic homogeneous-mutable index, or a PossiblyUninitTangent slot): emit the
@@ -246,12 +245,12 @@ end
 # genuinely mutable primal, whose shadow is therefore always a MutableTangent. A 4th (atomic-ordering)
 # arg is forwarded to the primal call only; `set_tangent_field!` has no atomics concept.
 #
-# `actual[2]` gets the same always-resolve treatment as `getfield` above. Unlike `getfield`, a
-# dynamic *write* index gets no same-shape support (Phase B): `set_tangent_field!` needs a
-# statically-known field to place the new value into the right `NamedTuple` slot type, and a
-# same-shape aggregate is never itself mutable, so there's no tractable common case to support. Bail
-# unless the object is entirely non-differentiable (every field's tangent type is `NoTangent`), in
-# which case no field a dynamic index could hit carries a tangent anyway.
+# `actual[2]` gets the same always-resolve treatment as `getfield` above. Unlike `getfield`, a dynamic
+# write index gets no same-shape support (Phase B): `set_tangent_field!` needs a statically-known
+# field to place the new value into the right `NamedTuple` slot type, and a same-shape aggregate is
+# never itself mutable, so there's no tractable common case to support. Bail unless the object is
+# entirely non-differentiable (every field's tangent type is `NoTangent`), in which case no field a
+# dynamic index could hit carries a tangent anyway.
 function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
     idx = ctx.presolve(actual[2])
     Pobj = ctx.optype(actual[1])
@@ -271,9 +270,9 @@ function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
                              ctx.tresolve(actual[1]), idx, newtan)
         return p, t
     end
-    # Direct emission — what `set_tangent_field!` compiles to, minus the dynamic-dispatched call:
-    # read the shadow MutableTangent's `fields` NamedTuple, rebuild it with slot `fi` replaced by the
-    # new tangent (other slots read back verbatim), and `setfield!` it back. The per-write NamedTuple
+    # Direct emission — what `set_tangent_field!` compiles to, minus the dynamic-dispatched call: read
+    # the shadow MutableTangent's `fields` NamedTuple, rebuild it with slot `fi` replaced by the new
+    # tangent (other slots read back verbatim), and `setfield!` it back. The per-write NamedTuple
     # allocation stays (a MutableTangent is mutable identity), but boxing the call's result is gone.
     NT, fi = slot
     shadow = ctx.tresolve(actual[1])
@@ -303,7 +302,7 @@ end
 # ref yields the correctly-typed shadow handle directly.
 #
 # SAFETY: the trailing boundscheck flag (3-arg ref-offsetting form) is NOT mirrored from the primal —
-# always forced to `true` on the shadow ref, so a mismatched-length tangent raises a catchable
+# always forced `true` on the shadow ref, so a mismatched-length tangent raises a catchable
 # `BoundsError` instead of corrupting memory via an unchecked out-of-bounds `MemoryRef`. `Dual`'s
 # constructor only checks `tangent_type(P) == T`, never that a user tangent array matches its primal's
 # length, so this check is the only thing catching that mismatch.
@@ -364,9 +363,10 @@ end
 # Same-shape tangent tuple: a non-differentiable slot holds NoTangent(), a differentiable slot holds
 # its resolved tangent.
 #
-# `Ti` needs widening before `fieldtype`: a tuple whose elements inference partly pinned down (e.g.
-# the `Broadcasted` argument tuple in `x .+ 1.0`) carries a `Core.PartialStruct` lattice element, not
-# a bare `Type`, and `fieldtype` throws a `TypeError` on one. Same trap `tt` already guards against.
+# `Ti` needs widening before `fieldtype`: a tuple whose elements inference only partly pinned down
+# (e.g. the `Broadcasted` argument tuple in `x .+ 1.0`) carries a `Core.PartialStruct` lattice
+# element, not a bare `Type`, and `fieldtype` throws a `TypeError` on one. Same trap `tt` already
+# guards against.
 function apply_builtin_frule!(::Val{Core.tuple}, actual, Ti, ctx)
     p = ctx.emit!(Expr(:call, _ctupleg, (ctx.presolve(a) for a in actual)...), Ti)
     TT = ctx.tt(Ti)

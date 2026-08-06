@@ -10,16 +10,16 @@ include(joinpath(@__DIR__, "testutils.jl"))
 # Only bulk memory copies (`memmove`/`memcpy`) have a rule. That is not a placeholder: a copy is
 # linear and structure-preserving, so performing the identical copy between the two *shadow* buffers
 # is exactly the tangent of performing it between the primals. Native code in general can write
-# through any pointer it is handed, so an unregistered target has no safe default — "primal plus a
+# through any pointer it is handed, so an unregistered target has no safe default: "primal plus a
 # zero tangent", the treatment a non-differentiable intrinsic gets, would leave a destination's
 # tangent stale rather than zero. Unregistered targets bail, and the last testset pins one located
 # reason per gate.
 #
 # The single most important property here is the *length* check. `Dual`'s constructor only checks
 # `tangent_type(P) == T`, never that a caller's tangent array is as long as its primal, and a raw
-# `memmove` has no bounds check of its own — an unguarded mirror segfaults on a short destination
+# `memmove` has no bounds check of its own: an unguarded mirror segfaults on a short destination
 # tangent and silently reads uninitialised heap on a short source. Julia's own `@boundscheck` guards
-# in `unsafe_copyto!` do *not* cover this: they sit inside an `@inbounds` block and are elided under
+# in `unsafe_copyto!` do not cover this: they sit inside an `@inbounds` block and are elided under
 # the default `--check-bounds=auto`. So the "short shadow" testset must be run under the default,
 # which is why the suite is invoked as `julia --project=test test/runtests.jl` rather than through
 # `Pkg.test()` (which passes `--check-bounds=yes` and would mask exactly this).
@@ -56,7 +56,7 @@ end
 @testset "elements with no tangent: the copy is primal-only" begin
     # `copy(::Vector{Int})` and friends. The shadow of a `Vector{Int}` is a `Memory{NoTangent}` with
     # no addressable storage, so the pass hands out `NULL_SHADOW_PTR` for its data pointer and this
-    # rule emits the primal `memmove` alone — copying nothing is exactly the tangent of copying
+    # rule emits the primal `memmove` alone: copying nothing is exactly the tangent of copying
     # non-differentiable data. (Before this, the whole path bailed one statement earlier, in the
     # `MemoryRef` data-pointer layout gate.)
     ints(v::Vector{Int}) = copy(v)
@@ -75,7 +75,7 @@ end
     checkverify(w -> copy(w), (Vector{Bool},))
     checkverify(n -> collect(1:n), (Int,))
 
-    # No shadow copy and — unlike the mirrored case above — no extent guards either: a
+    # No shadow copy and, unlike the mirrored case above, no extent guards either: a
     # `Memory{NoTangent}` holds nothing that could be overrun.
     ir, _ = code_dual_ircode(ints, (Vector{Int},))
     stmts = ir.stmts.stmt
@@ -84,7 +84,7 @@ end
                     occursin("_fc_check_extent", string(s.args[2])), stmts)
 
     # Re-dualizable: the null sentinel is a `Ptr` literal in the emitted IR, and `zero_tangent(::Ptr)`
-    # throws by design — `const_tangent` has to recognise it (a null shadow's shadow is again null).
+    # throws by design: `const_tangent` has to recognise it (a null shadow's shadow is again null).
     checkverify2(scale, (Vector{Int}, Float64); order=2)
 end
 
@@ -98,7 +98,7 @@ end
     @test count(s -> s isa Expr && s.head === :foreigncall, stmts) == 2
 
     # One extent check per shadow buffer, and each is a static `:invoke` to a resolved
-    # `CodeInstance` — a `CallInfo`-less `Expr(:call)` would survive as a runtime dynamic dispatch
+    # `CodeInstance`. A `CallInfo`-less `Expr(:call)` would survive as a runtime dynamic dispatch
     # (see the perf gotcha in the dualization skill), which on a bulk-copy path is exactly what we
     # do not want to pay.
     checks = filter(s -> s isa Expr && s.head === :invoke &&
@@ -123,7 +123,7 @@ end
     @test D(g, x, dx) ≈ exp.(x) .* dx
 
     # Array-with-scalar forms. These need the `Core.tuple` rule to widen a `Core.PartialStruct`
-    # before `fieldtype` (`src/builtins.jl`) — inference partly pins down `Broadcasted`'s argument
+    # before `fieldtype` (`src/builtins.jl`): inference partly pins down `Broadcasted`'s argument
     # tuple here, which it does not for the single-array case above.
     @test D(x -> x .+ 1.0, x, dx) ≈ dx
     @test D(x -> x .* 2.0, x, dx) ≈ 2 .* dx
@@ -141,7 +141,7 @@ end
 
 @testset "a short shadow buffer raises BoundsError, not memory corruption" begin
     # Both directions. Without the emitted extent checks the destination case segfaults and the
-    # source case returns garbage read out of uninitialised heap — neither of which a test can catch,
+    # source case returns garbage read out of uninitialised heap, neither of which a test can catch,
     # which is why these are asserted rather than left to the pointer rules' own gates.
     cp!(y, x) = (copyto!(y, x); y[1])
     x, dx = [1.0, 2.0, 3.0, 4.0], [1.0, 0.0, 0.0, 0.0]
@@ -173,7 +173,7 @@ end
 
 @testset "a ccall on a throw-only path does not block dualization" begin
     # An unreachable (throw-terminated) block is reconstructed primal-only, so a foreigncall there
-    # never needs a rule — the derivative just has to raise the same error on the same inputs.
+    # never needs a rule: the derivative just has to raise the same error on the same inputs.
     function f(x)
         if x < 0.0
             ccall(:abort, Cvoid, ())
@@ -244,8 +244,8 @@ end
     @test r !== nothing
     @test occursin("unrecognised signature", r)
 
-    # A copy between buffers in *different* tangent regimes — one side has shadow storage and the
-    # other does not — is a reinterpreting copy whose tangent this rule cannot express.
+    # A copy between buffers in different tangent regimes, one side has shadow storage and the
+    # other does not, is a reinterpreting copy whose tangent this rule cannot express.
     r = bail_reason(mixedcopy!, (Vector{Float64}, Vector{Int}))
     @test r !== nothing
     @test occursin("different tangent regimes", r)

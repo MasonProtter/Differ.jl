@@ -1,31 +1,28 @@
 # Hand-written reverse-mode *primitive* rules — methods of `rrule!!`. Mirrors `frules.jl` for forward
-# mode: a hand-written rule for a specific callee overrides the derived (IR-transformed) path through
-# ordinary Julia multiple dispatch, because the recursion glue in `reverse_interp.jl`
-# (`reverse_fwds_recursive_ci`) looks for an applicable `rrule!!` method *first* and only builds a
-# derived rule when there isn't one. Exactly like `frule!!(::Dual{typeof(sin)}, ...)` overriding
-# forward mode's generated composite fallback.
+# mode: a hand-written rule for a callee overrides the derived (IR-transformed) path via ordinary
+# multiple dispatch, since the recursion glue in `reverse_interp.jl` (`reverse_fwds_recursive_ci`)
+# looks for an applicable `rrule!!` method first and only builds a derived rule when there isn't one.
+# Same as `frule!!(::Dual{typeof(sin)}, ...)` overriding forward mode's generated fallback.
 #
-# A rule returns `(ycd, pullback)`, and **the pullback closure is the tape** — there is no separate
-# tape value. It is entirely opaque to the glue in `reverse_interp.jl` (never inspected, only threaded
-# through `:invoke`s and then called), so unlike the derived path — always a `Stack`-based
-# `Tape{ArgsTT,CS}`, sized for arbitrary control flow — a hand rule is free to remember whatever is
-# cheapest. Each rule gets its own dedicated pullback type (rather than reusing a bare primal type
-# like `Float64`) so pullback dispatch, keyed on that type, can't collide between unrelated rules that
-# happen to need the same primal value remembered.
+# A rule returns `(ycd, pullback)`, and **the pullback closure is the tape** — there's no separate
+# tape value. It's opaque to the glue in `reverse_interp.jl` (never inspected, only threaded through
+# `:invoke`s and called), so unlike the derived path — always a `Stack`-based `Tape{ArgsTT,CS}` sized
+# for arbitrary control flow — a hand rule can remember whatever's cheapest. Each rule gets its own
+# pullback type (not a bare primal type like `Float64`) so pullback dispatch, keyed on that type,
+# can't collide between unrelated rules remembering the same primal value.
 #
-# NOTE on fully-qualified `Base.sin`/`Base.cos` below: these bodies get inlined into synthetic carrier
-# IR, where a bare name resolves against *this* module and re-embeds as `GlobalRef(Differ, :sin)` — an
-# implicit `using Base` binding that `Core.Compiler.verify_ir` rejects in value position. The emitted
-# pullback-recursion `:invoke` is additionally flagged `IR_FLAG_NOINLINE` for the same reason (see
-# `reverse_pullback_recursive_ci`); qualifying here is a second, redundant safeguard against the
-# same problem.
+# `Base.sin`/`Base.cos` are fully qualified below because these bodies get inlined into synthetic
+# carrier IR, where a bare name resolves against *this* module and re-embeds as
+# `GlobalRef(Differ, :sin)` — an implicit `using Base` binding that `Core.Compiler.verify_ir` rejects
+# in value position. The emitted pullback-recursion `:invoke` is also flagged `IR_FLAG_NOINLINE` for
+# the same reason (see `reverse_pullback_recursive_ci`); qualifying here is a second, redundant
+# safeguard against the same problem.
 
-# NOTE on the `::AbstractCtx` slot: a hand rule takes the differentiation context as its second
-# argument (right after `fcd`), matching the uniform `rrule!!(fcd, ctx, argcds...)` convention. A
-# primitive like `sin` needs no tape, so it ignores the context — but the slot **must** be declared
-# `::AbstractCtx` (never a concrete `Ctx{…}`): that dispatch-neutrality is what keeps a hand rule
-# unambiguous against the `@generated` derived fallback (see the note above the type definitions in
-# `reverse_interp.jl`).
+# The `::AbstractCtx` slot: a hand rule takes the differentiation context as its second argument
+# (right after `fcd`), matching the uniform `rrule!!(fcd, ctx, argcds...)` convention. A primitive
+# like `sin` needs no tape and ignores the context, but the slot **must** be declared `::AbstractCtx`
+# (never a concrete `Ctx{…}`) — that dispatch-neutrality is what keeps a hand rule unambiguous against
+# the `@generated` derived fallback (see the note above the type definitions in `reverse_interp.jl`).
 
 struct SinPullback
     x::Float64
@@ -48,7 +45,7 @@ function rrule!!(::CoDual{typeof(cos),NoFData}, ::AbstractCtx, xcd::CoDual{Float
 end
 
 
-# `sum`/`sum(f, ·)` moved to `src/rules_perf_backstop.jl` (not included by `src/Differ.jl`) — see
-# that file's header. They exist only as a known-efficient fallback, not for correctness: the derived
-# path now composes through Base's `mapreduce`/`_mapreduce`/`mapreduce_impl` machinery correctly at
-# any array size (ISSUES #65).
+# `sum`/`sum(f, ·)` moved to `src/rules_perf_backstop.jl` (not included by `src/Differ.jl`) — see that
+# file's header. They're a known-efficient fallback only, not needed for correctness: the derived path
+# now composes through Base's `mapreduce`/`_mapreduce`/`mapreduce_impl` machinery correctly at any
+# array size (ISSUES #65).
