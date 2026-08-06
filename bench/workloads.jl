@@ -5,8 +5,7 @@
 #
 # Each workload names what it exercises, because the point of the set is *coverage*, not a single
 # headline number: an optimization that helps array mutation should show up here as helping the
-# mutation workloads and leaving the rest alone. The `:guard` workloads exist to be unchanged — they
-# are how a per-call regression (something added to every tape, say) gets caught.
+# mutation workloads and leaving the rest alone.
 #
 # Where a primal is shared between the two modes (`readonly`, `wrloop`, `structloop`, `scalarcf`,
 # `straightline!`) that is deliberate: the same function measured both ways is the only honest way
@@ -78,6 +77,22 @@ function readonly(v::Vector{Float64})
     return s
 end
 
+# Indexed *read* in a loop with as little else per iteration as possible: one multiply-add, no
+# transcendental, no mutation. Every other reverse workload here is a write loop (`memloop!`,
+# `vecloop!`, `wrloop`'s first half), a scalar loop (`scalarcf`, `structloop`), or `readonly` —
+# whose `sin` costs more than everything the tape does, burying tape-level changes below the noise
+# floor.
+#
+# That matters because a read and a write produce *different tape shapes*. A write, `v[i] = x`, has
+# its index and its stored value in one block, so it declares one comms stack. A read, `s += x*v[i]`,
+# declares the index in one block and the loaded element in its successor — two stacks, two pushes
+# per iteration. Any optimization that acts on the number of comms stacks is therefore invisible to a
+# write-only suite: it will report "flat" for a change it structurally cannot see, which is exactly
+# what happened when the stack-fusion change (2026-08-06) moved only 1 of the 6 benched workloads
+# and was briefly misread as a null result.
+loopdot(x::Float64, v::Vector{Float64}) =
+    (s = 0.0; for i in eachindex(v); s += x * v[i]; end; s)
+
 function scalarcf(x::Float64, N::Int)
     s = 0.0
     for i in 1:N
@@ -121,11 +136,10 @@ cpoly(z::ComplexF64, N::Int) = (s = z; for _ in 1:N; s = s * z + z; end; real(s)
 struct WorkloadMeta
     f::Any
     argtypes::Tuple
-    kind::Symbol          # :mutation (expected to move) | :guard (expected not to) | :primal
     note::String
     mode::Symbol          # :reverse | :forward
 end
-WorkloadMeta(f, argtypes, kind, note) = WorkloadMeta(f, argtypes, kind, note, :reverse)
+WorkloadMeta(f, argtypes, note) = WorkloadMeta(f, argtypes, note, :reverse)
 
 # --- primal baselines -------------------------------------------------------
 # Every workload also registers the *same call, undifferentiated*, under `"$k $PRIMAL_SUFFIX"`. That
@@ -144,7 +158,7 @@ is_primal_key(k) = endswith(k, PRIMAL_SUFFIX)
 function primal!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMeta}, k::String, b)
     m = meta[k]
     suite[primal_key(k)] = b
-    meta[primal_key(k)] = WorkloadMeta(m.f, m.argtypes, :primal, "undifferentiated `$k`", m.mode)
+    meta[primal_key(k)] = WorkloadMeta(m.f, m.argtypes, "undifferentiated `$k`", m.mode)
     return nothing
 end
 
@@ -191,7 +205,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 ctx = build_ctx(memloop!, (Memory{Float64}, Float64, Int))
                 y0, pb0 = rrule!!(fcd, ctx, ocd, xcd, ncd); pb0(NoRData())
             end)
-        meta[k] = WorkloadMeta(memloop!, (Memory{Float64}, Float64, Int), :mutation,
+        meta[k] = WorkloadMeta(memloop!, (Memory{Float64}, Float64, Int),
                                "cleanest array-mutation shape: ref chain rooted directly at the " *
                                "argument via 1-arg `memoryrefnew`, no `Array.ref` hop")
         # Same primal as the pre-allocated row above, measured again rather than shared: the two
@@ -220,7 +234,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 ctx = build_ctx(vecloop!, (Vector{Float64}, Float64))
                 y0, pb0 = rrule!!(fcd, ctx, vcd, xcd); pb0(NoRData())
             end)
-        meta[k] = WorkloadMeta(vecloop!, (Vector{Float64}, Float64), :mutation,
+        meta[k] = WorkloadMeta(vecloop!, (Vector{Float64}, Float64),
                                "same, through an Array: adds the `getfield(a, :ref)` hop")
         primal!(suite, meta, k, @benchmarkable(
             vecloop!(v, x),
@@ -244,7 +258,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 ctx = build_ctx(wrloop, (Vector{Float64}, Float64))
                 y0, pb0 = rrule!!(fcd, ctx, vcd, acd); pb0(1.0)
             end)
-        meta[k] = WorkloadMeta(wrloop, (Vector{Float64}, Float64), :mutation,
+        meta[k] = WorkloadMeta(wrloop, (Vector{Float64}, Float64),
                                "write loop + read-back loop; diluted by reads nothing here optimizes")
         primal!(suite, meta, k, @benchmarkable(
             wrloop(v, a),
@@ -270,7 +284,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 ctx = build_ctx(straightline!, (Vector{Float64}, Float64))
                 y0, pb0 = rrule!!(fcd, ctx, vcd, acd); pb0(1.0)
             end, evals = 200)
-        meta[k] = WorkloadMeta(straightline!, (Vector{Float64}, Float64), :mutation,
+        meta[k] = WorkloadMeta(straightline!, (Vector{Float64}, Float64),
                                "no loop, so bulk save must NOT fire: isolates per-store pullback cost")
         # A couple of stores and an add: at this size the eval count has to be large enough that the
         # timer's own resolution is not the measurement.
@@ -296,7 +310,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 ctx = build_ctx(structloop, (BenchPoint, Float64, Int))
                 y0, pb0 = rrule!!(fcd, ctx, pcd, acd, ncd); pb0(1.0)
             end)
-        meta[k] = WorkloadMeta(structloop, (BenchPoint, Float64, Int), :mutation,
+        meta[k] = WorkloadMeta(structloop, (BenchPoint, Float64, Int),
                                "mutable-struct setfield! in a loop; dominated by the tangent-field " *
                                "accessor invokes, which nothing has optimized yet")
         primal!(suite, meta, k, @benchmarkable(
@@ -321,13 +335,38 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 ctx = build_ctx(readonly, (Vector{Float64},))
                 y0, pb0 = rrule!!(fcd, ctx, vcd); pb0(1.0)
             end)
-        meta[k] = WorkloadMeta(readonly, (Vector{Float64},), :guard,
+        meta[k] = WorkloadMeta(readonly, (Vector{Float64},),
                                "read-only array reduction: no mutation machinery at all")
         primal!(suite, meta, k, @benchmarkable(
             readonly(v),
             setup = begin
                 v = rand($N)
                 readonly(v)
+            end, evals = 100))
+    end
+
+    let k = "loopdot Vector[$N]"
+        suite[k] = @benchmarkable(
+            begin
+                vcd.dx .= 0
+                y, pb = rrule!!(fcd, ctx, xcd, vcd)
+                pb(1.0)
+            end,
+            setup = begin
+                v = rand($N); dv = zeros($N)
+                vcd = CoDual(v, dv)
+                xcd = zero_fcodual(2.0)
+                fcd = zero_fcodual(loopdot)
+                ctx = build_ctx(loopdot, (Float64, Vector{Float64}))
+                y0, pb0 = rrule!!(fcd, ctx, xcd, vcd); pb0(1.0)
+            end)
+        meta[k] = WorkloadMeta(loopdot, (Float64, Vector{Float64}),
+                               "indexed read in a loop, minimal arithmetic: the read-side tape shape")
+        primal!(suite, meta, k, @benchmarkable(
+            loopdot(2.0, v),
+            setup = begin
+                v = rand($N)
+                loopdot(2.0, v)
             end, evals = 100))
     end
 
@@ -343,7 +382,7 @@ function reverse_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 ctx = build_ctx(scalarcf, (Float64, Int))
                 y0, pb0 = rrule!!(fcd, ctx, xcd, ncd); pb0(1.0)
             end)
-        meta[k] = WorkloadMeta(scalarcf, (Float64, Int), :guard,
+        meta[k] = WorkloadMeta(scalarcf, (Float64, Int),
                                "scalar arithmetic + a branch in a loop: block stack and rdata routing only")
         primal!(suite, meta, k, @benchmarkable(
             scalarcf(x, n),
@@ -383,7 +422,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 fd = fdual(polychain); xd = Dual(2.0, 1.0); nd = fdual($N)
                 frule!!(fd, xd, nd)
             end)
-        meta[k] = WorkloadMeta(polychain, (Float64, Int), :guard,
+        meta[k] = WorkloadMeta(polychain, (Float64, Int),
                                "branch-free scalar chain: pure `Dual` arithmetic, the per-operation floor",
                                :forward)
         primal!(suite, meta, k, @benchmarkable(
@@ -404,7 +443,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 fd = fdual(scalarcf); xd = Dual(1.5, 1.0); nd = fdual($N)
                 frule!!(fd, xd, nd)
             end)
-        meta[k] = WorkloadMeta(scalarcf, (Float64, Int), :guard,
+        meta[k] = WorkloadMeta(scalarcf, (Float64, Int),
                                "scalar arithmetic + a branch in a loop; the reverse twin of this key",
                                :forward)
         primal!(suite, meta, k, @benchmarkable(
@@ -423,7 +462,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 vd = Dual(rand($N), ones($N))
                 frule!!(fd, vd)
             end)
-        meta[k] = WorkloadMeta(readonly, (Vector{Float64},), :guard,
+        meta[k] = WorkloadMeta(readonly, (Vector{Float64},),
                                "read-only array reduction: one shadow `memoryrefget` per element",
                                :forward)
         primal!(suite, meta, k, @benchmarkable(
@@ -444,7 +483,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 vd = Dual(zeros($N), zeros($N)); xd = Dual(3.0, 1.0)
                 frule!!(fd, vd, xd)
             end)
-        meta[k] = WorkloadMeta(vecloop!, (Vector{Float64}, Float64), :mutation,
+        meta[k] = WorkloadMeta(vecloop!, (Vector{Float64}, Float64),
                                "write loop onto the shadow array, `nothing`-returning (ISSUES #53 fixed)",
                                :forward)
         primal!(suite, meta, k, @benchmarkable(
@@ -466,7 +505,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 vd = Dual(zeros($N), zeros($N)); xd = Dual(3.0, 1.0)
                 frule!!(fd, vd, xd)
             end)
-        meta[k] = WorkloadMeta(vecloop_ret!, (Vector{Float64}, Float64), :mutation,
+        meta[k] = WorkloadMeta(vecloop_ret!, (Vector{Float64}, Float64),
                                "write loop returning a scalar; retained baseline next to `fwd vecloop!`",
                                :forward)
         primal!(suite, meta, k, @benchmarkable(
@@ -485,7 +524,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 vd = Dual(zeros($N), zeros($N)); ad = Dual(3.0, 1.0)
                 frule!!(fd, vd, ad)
             end)
-        meta[k] = WorkloadMeta(wrloop, (Vector{Float64}, Float64), :mutation,
+        meta[k] = WorkloadMeta(wrloop, (Vector{Float64}, Float64),
                                "write loop + read-back loop; the reverse twin of this key",
                                :forward)
         primal!(suite, meta, k, @benchmarkable(
@@ -505,7 +544,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 pd = Dual(p, zero_tangent(p)); ad = Dual(0.5, 1.0); nd = fdual($N)
                 frule!!(fd, pd, ad, nd)
             end)
-        meta[k] = WorkloadMeta(structloop, (BenchPoint, Float64, Int), :mutation,
+        meta[k] = WorkloadMeta(structloop, (BenchPoint, Float64, Int),
                                "mutable-struct `setfield!` in a loop: the shadow is a `MutableTangent`, " *
                                "so each store goes through the tangent-field accessors",
                                :forward)
@@ -527,7 +566,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 vd = Dual([1.0, 2.0], zeros(2)); ad = Dual(4.0, 1.0)
                 frule!!(fd, vd, ad)
             end, evals = 500)
-        meta[k] = WorkloadMeta(straightline!, (Vector{Float64}, Float64), :mutation,
+        meta[k] = WorkloadMeta(straightline!, (Vector{Float64}, Float64),
                                "no loop: isolates the per-call cost of entering the dual carrier",
                                :forward)
         primal!(suite, meta, k, @benchmarkable(
@@ -550,7 +589,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 xd = Dual(2.0, 1.0); nd = fdual($N)
                 frule!!(fd, gd, xd, nd)
             end)
-        meta[k] = WorkloadMeta(applyN, (Any, Float64, Int), :guard,
+        meta[k] = WorkloadMeta(applyN, (Any, Float64, Int),
                                "higher-order: closure-with-capture applied per iteration",
                                :forward)
         primal!(suite, meta, k, @benchmarkable(
@@ -571,7 +610,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 zd = Dual(0.5 + 0.25im, build_tangent(ComplexF64, 1.0, 0.0)); nd = fdual($N)
                 frule!!(fd, zd, nd)
             end)
-        meta[k] = WorkloadMeta(cpoly, (ComplexF64, Int), :guard,
+        meta[k] = WorkloadMeta(cpoly, (ComplexF64, Int),
                                "struct-shaped tangent (`Tangent{@NamedTuple{re,im}}`) built and " *
                                "destructured per operation, with no array involved",
                                :forward)
@@ -593,7 +632,7 @@ function forward_workloads!(suite::BenchmarkGroup, meta::Dict{String,WorkloadMet
                 fd = nest2(polychain); xd = seed2(2.0); nd = nest2($N)
                 frule!!(fd, xd, nd)
             end)
-        meta[k] = WorkloadMeta(polychain, (Float64, Int), :guard,
+        meta[k] = WorkloadMeta(polychain, (Float64, Int),
                                "order-2 nested duals: the composed transform's run-time cost",
                                :forward)
         # Same primal as `fwd polychain`: the ratio on this row is order-2-vs-primal, so it is the

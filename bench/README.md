@@ -27,9 +27,9 @@ relative to the other on a given shape.
 
 **Use `--seconds=2` when the result matters.** At the 1 s default the sub-microsecond workload
 (`straightline!`) has measured anywhere from −14% to −39% for the same change; it settles by 2 s.
-On a noisy machine the `guard` workloads can swing ±6%, in which case raise `--tolerance`
-rather than ignoring the flag — and check whether the sign is stable across runs before believing
-any single number.
+On a noisy machine any workload can swing a few percent run to run, in which case raise
+`--tolerance` rather than ignoring the flag — and check whether the sign is stable across runs
+before believing any single number.
 
 ## Layout
 
@@ -44,13 +44,13 @@ any single number.
 ## Reading the table
 
 ```
-┌──────────────────────────────────┬──────┬───────────┬────────┬───────────┬───────────────┬────────┬─────────┬────────┬──────────┐
-│ workload                         │ mode │       min │ allocs │    primal │ primal allocs │      × │ comms B │ isbits │ kind     │
-├──────────────────────────────────┼──────┼───────────┼────────┼───────────┼───────────────┼────────┼─────────┼────────┼──────────┤
-│ fwd wrloop Vector[1000]          │ fwd  │  1.282 μs │      0 │ 671.560ns │             0 │   1.9× │       — │      — │ mutation │
-│ memloop! Memory[1000]            │ rev  │ 16.501 μs │  79624 │ 52.990 ns │             0 │ 311.4× │      24 │     no │ mutation │
-│ memloop! Memory[1000] (prealloc) │ rev  │  4.509 μs │      0 │ 52.690 ns │             0 │  85.6× │      24 │     no │ mutation │
-└──────────────────────────────────┴──────┴───────────┴────────┴───────────┴───────────────┴────────┴─────────┴────────┴──────────┘
+┌──────────────────────────────────┬──────┬───────────┬────────┬───────────┬───────────────┬────────┬─────────┬────────┐
+│ workload                         │ mode │       min │ allocs │    primal │ primal allocs │      × │ comms B │ isbits │
+├──────────────────────────────────┼──────┼───────────┼────────┼───────────┼───────────────┼────────┼─────────┼────────┤
+│ fwd wrloop Vector[1000]          │ fwd  │  1.282 μs │      0 │ 671.560ns │             0 │   1.9× │       — │      — │
+│ memloop! Memory[1000]            │ rev  │ 16.501 μs │  79624 │ 52.990 ns │             0 │ 311.4× │      24 │     no │
+│ memloop! Memory[1000] (prealloc) │ rev  │  4.509 μs │      0 │ 52.690 ns │             0 │  85.6× │      24 │     no │
+└──────────────────────────────────┴──────┴───────────┴────────┴───────────┴───────────────┴────────┴─────────┴────────┘
 ```
 
 - **mode** — `rev` (`rrule!!` + pullback) or `fwd` (`frule!!`).
@@ -83,10 +83,6 @@ any single number.
   write barrier on every push. Note `commsB` is a **whole-function sum over all blocks**, not a
   per-iteration figure — for a loop workload the loop block dominates it, but for a straight-line one
   it counts blocks that run once. Blank (`—`) on forward rows: the forward carrier has no tape.
-- **kind** — `mutation` workloads are expected to move when mutation costs change. **`guard`
-  workloads are expected not to move at all**: they exercise no mutation machinery, so they are how
-  a per-call regression (something added to every tape, say) gets caught. `compare.jl` flags a guard
-  that moves.
 
 ### Pre-allocated vs fresh tape
 
@@ -125,8 +121,8 @@ verification (`ISSUES.md` #53), so `vecloop_ret!` returns an element instead.
 
 The three allocating workloads are also the **noisy** ones — GC lands in the samples, so their minima
 need a longer budget than the rest. At `--seconds=0.3`, `fwd applyN closure` measured −11% against an
-identical tree (a spurious `GUARD MOVED`); across runs at 1–2 s it holds to ~2%. Use `--seconds=2`
-before believing any movement in those three rows.
+identical tree, purely from noise; across runs at 1–2 s it holds to ~2%. Use `--seconds=2` before
+believing any movement in those three rows.
 
 ## Writing a workload
 
@@ -183,10 +179,11 @@ in: it's `using`d from `enzyme_workloads.jl`, which is only `include`d when the 
 plain `run.jl` invocation never pays Enzyme's first-run precompile (~60-90s the first time its
 manifest entry is instantiated).
 
-The comparison covers the **core workload set** — the 7 primals whose shape maps directly onto
+The comparison covers the **core workload set** — the 8 primals whose shape maps directly onto
 Enzyme's activity annotations (`readonly`, `vecloop!`, `wrloop`, `straightline!`, `structloop`,
-`scalarcf`, `memloop!`), in both modes, plus `fwd polychain`. **Not covered**, and not planned without
-further investigation:
+`scalarcf`, `memloop!`, `loopdot`), in both modes where Differ has a forward twin (`memloop!` and
+`loopdot` are reverse-only, like the Differ side), plus `fwd polychain`. **Not covered**, and not
+planned without further investigation:
 
 - `cpoly` — Enzyme's activity annotations for a `ComplexF64`-typed argument need their own look; this
   isn't the same as an `isbits` struct field-by-field.
@@ -200,5 +197,5 @@ no tape and no comparable fresh-vs-reused-context distinction, so its natural st
 fair comparison against Differ's pre-allocated-context path.
 
 The `Differ/Enzyme` column is minimum-time ratio; above 1× means Differ is slower on that workload.
-Unlike `compare.jl` this isn't a regression check against history, so there's no noise tolerance or
-guard-movement tracking — just the two numbers next to each other.
+Unlike `compare.jl` this isn't a regression check against history, so there's no noise tolerance —
+just the two numbers next to each other.

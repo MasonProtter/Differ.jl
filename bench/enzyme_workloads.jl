@@ -1,6 +1,6 @@
 # Enzyme timings for the "core" workload set shared with workloads.jl — same primal functions
-# (memloop!, vecloop!, wrloop, straightline!, structloop, readonly, scalarcf, polychain), same keys,
-# so bench/run.jl --vs-enzyme can pair Differ's and Enzyme's results up by name.
+# (memloop!, vecloop!, wrloop, straightline!, structloop, readonly, loopdot, scalarcf, polychain),
+# same keys, so bench/run.jl --vs-enzyme can pair Differ's and Enzyme's results up by name.
 #
 # Not covered: cpoly (ComplexF64 struct tangent), applyN (closure-valued callee), and polychain
 # order-2 (nested duals) — each needs its own Enzyme activity-annotation investigation, and order-2
@@ -84,6 +84,15 @@ function enzyme_reverse_workloads!(suite::BenchmarkGroup, N::Int)
         begin
             dv .= 0
             Enzyme.autodiff(Reverse, readonly, Active, Duplicated(v, dv))
+        end,
+        setup = begin
+            v = rand($N); dv = zeros($N)
+        end)
+
+    suite["loopdot Vector[$N]"] = @benchmarkable(
+        begin
+            dv .= 0
+            Enzyme.autodiff(Reverse, loopdot, Active, Active(2.0), Duplicated(v, dv))
         end,
         setup = begin
             v = rand($N); dv = zeros($N)
