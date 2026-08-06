@@ -143,4 +143,60 @@ end
     check_stack_balance(sumk, 2.0, 5)
     check_stack_balance(sumk, 2.0, 0)   # zero iterations
     check_stack_balance(sumk2, 1.5, 3, 4)
+
+    # Tape-layout regression: `_scan_block_comms` never tapes an `Argument`'s own primal value
+    # (`Tape.args` already holds every argument codual, and the pullback's `pb_presolve` already
+    # falls back to reading it from there). `loopdot`'s loop body reads `x` (an argument) and `v[i]`
+    # each iteration; eliding `x` drops the loop-body comms tuple from `Tuple{Float64,Float64}` to
+    # `Tuple{Float64}` — one `Float64` (`v[i]`) plus an unrelated `Tuple{Int64}` index-tracking slot.
+    function loopdot(x::Float64, v::Vector{Float64})
+        s = 0.0
+        for i in eachindex(v)
+            s += x * v[i]
+        end
+        s
+    end
+    _, dx_ld, dv_ld = gradient(loopdot, 2.0, [1.0, 2.0, 3.0])
+    @test dx_ld ≈ 6.0
+    @test dv_ld ≈ [2.0, 2.0, 2.0]
+    checkverify_rev(loopdot, (Float64, Vector{Float64}))
+    check_stack_balance(loopdot, 2.0, [1.0, 2.0, 3.0])
+    check_tape_size(loopdot, (Float64, Vector{Float64}); bytes=16, isbits=true)
+
+    # `polyloop`'s loop body reads `t` (loop-carried) and `x` (an argument); eliding `x` drops the
+    # loop-body comms tuple from `Tuple{Float64,Float64}` to `Tuple{Float64}` (`t` alone).
+    function polyloop(x::Float64, n::Int)
+        s = 0.0
+        t = 1.0
+        for i in 1:n
+            t = t * x
+            s = s + t
+        end
+        s
+    end
+    _, dx_pl = gradient(polyloop, 2.0, 4)
+    @test dx_pl ≈ central_diff(x -> polyloop(x, 4), 2.0) rtol = 1e-5
+    checkverify_rev(polyloop, (Float64, Int))
+    check_stack_balance(polyloop, 2.0, 4)
+    check_tape_size(polyloop, (Float64, Int); bytes=8, isbits=true)
+
+    # `loopinv`'s `y = x*x` is loop-invariant (defined once, outside the loop, from an argument) but
+    # consumed by the loop body every iteration. Stage 2 hoists `y`'s comms item to its own defining
+    # (non-loop) block, once, instead of re-pushing it per iteration — the loop-body comms tuple
+    # drops from `Tuple{Float64,Float64}` (`y`, `v[i]`) to `Tuple{Float64}` (`v[i]` alone), same as
+    # `loopdot` above.
+    function loopinv(x::Float64, v::Vector{Float64})
+        y = x * x
+        s = 0.0
+        for i in eachindex(v)
+            s += y * v[i]
+        end
+        s
+    end
+    _, dx_li, dv_li = gradient(loopinv, 2.0, [1.0, 2.0, 3.0])
+    @test dx_li ≈ central_diff(x -> loopinv(x, [1.0, 2.0, 3.0]), 2.0) rtol = 1e-5
+    @test dv_li ≈ [4.0, 4.0, 4.0]
+    checkverify_rev(loopinv, (Float64, Vector{Float64}))
+    check_stack_balance(loopinv, 2.0, [1.0, 2.0, 3.0])
+    check_tape_size(loopinv, (Float64, Vector{Float64}); bytes=16, isbits=true)
 end

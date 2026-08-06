@@ -1605,6 +1605,18 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
     n = length(codualparams)
     fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
     arg_tracked = _arg_fdata_tracked(n, codualparams)
+    # A `Core.Argument`'s primal value never needs a comms slot: `Tape.args` already holds every
+    # argument codual (stored by the forwards pass in its prologue), and the pullback's own
+    # `pb_presolve` already falls back to `parg_pb[a.n]` — unpacked from that same tape in its entry
+    # block — whenever no comms item was declared for it. Applied at both `(:primal, a)` declaration
+    # sites below: the intrinsic-operand loop, and the loop absorbing `builtin_rrule_comms` results
+    # (e.g. `setfield!`'s own object operand, `builtins_reverse.jl:462`). Guarded on type: a declared
+    # item's type can be narrower than `parg_pb[a.n]`'s (`_codual_primal_type(codualparams[a.n])`)
+    # when the primal's own const-prop narrowed `pir.argtypes[a.n]` past the argument's nominal type
+    # — eliding in that case would hand a rule a too-wide value where a narrower one was expected.
+    elide_argument_primal(item, @nospecialize(ty)) =
+        item[1] === :primal && isa(item[2], Core.Argument) &&
+        _widen(ty) === _codual_primal_type(codualparams[item[2].n])
     # Bulk-saved arguments, decided before any item is declared: a store into one of them needs
     # neither its old value nor the primal `MemoryRef` to put it back through, so this changes what
     # `builtin_rrule_comms` declares (via `ctx.bulk_saved` below).
@@ -1653,9 +1665,12 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             for (k, a) in enumerate(actual)
                 (isa(a, Core.SSAValue) || isa(a, Core.Argument)) || continue
                 (needed === nothing || k in needed) || continue
-                any(nd -> nd == (:primal, a), nodes[b]) && continue
-                push!(nodes[b], (:primal, a))
-                push!(types[b], _optype(pir, a))
+                item = (:primal, a)
+                any(nd -> nd == item, nodes[b]) && continue
+                ty = _optype(pir, a)
+                elide_argument_primal(item, ty) && continue
+                push!(nodes[b], item)
+                push!(types[b], ty)
             end
         elseif isa(f, Core.Builtin)
             # The dispatch layer (`builtins_reverse.jl`) decides everything: whether this call needs
@@ -1674,6 +1689,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             if result !== nothing
                 for (item, ty) in result
                     any(nd -> nd == item, nodes[b]) && continue
+                    elide_argument_primal(item, ty) && continue
                     push!(nodes[b], item)
                     push!(types[b], ty)
                 end
@@ -1708,7 +1724,51 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             end
         end
     end
-    return nodes, types, bulk_args, self_recursive_ssas, block_has_subtape
+
+    # Stage 2: hoist a loop-invariant `(:primal, %v)` item out of a looped consumer block `b` into
+    # `%v`'s own defining block `d`'s comms slot, instead of re-declaring it on `b`'s repeatedly-
+    # pushed stack. All three must hold: (1) `inloop[b]` — the push actually repeats, so there's
+    # something to win; (2) `!inloop[d]` — `d` runs at most once per call, so `%v` is invariant
+    # w.r.t. every loop (SSA already guarantees `d` dominates `b`, no extra check needed); (3) `%v`'s
+    # type, and every item already declared in `d`, are `isbits` — what keeps `d`'s slot a
+    # `CommsCell` rather than a `Stack`. A `Stack` would break this: in reverse order `d` is replayed
+    # *after* `b`, so a stack pop by `d`'s own reverse code would come too late for `b`'s (earlier)
+    # reverse code to have already read it. A `CommsCell`, by contrast, is a plain `getfield` — safe
+    # to read from any block, any number of times, in any order, once the (single, once-per-call)
+    # forwards write has happened. `block_hoisted_refs[b]` records, per hoisted item, which block's
+    # slot (and which position in that slot's tuple) the pullback should read it from instead of
+    # popping it out of `b`'s own comms stack.
+    inloop = _loop_blocks(pir)
+    block_hoisted_refs = [Tuple{Any,Int,Int}[] for _ in 1:nblocks]
+    d_all_isbits = Bool[all(isbitstype, types[d]) for d in 1:nblocks]
+    for b in 1:nblocks
+        (inloop[b] && !isempty(nodes[b])) || continue
+        keep = trues(length(nodes[b]))
+        for (idx, item) in enumerate(nodes[b])
+            item[1] === :primal || continue
+            node = item[2]
+            isa(node, Core.SSAValue) || continue
+            d = block_of[node.id]
+            (d == b || inloop[d]) && continue
+            ty = types[b][idx]
+            (isbitstype(ty) && d_all_isbits[d]) || continue
+            # Reuse `%v`'s own slot in `d` if `d` already declares it natively (e.g. `%v` is also
+            # used by a later statement inside `d` itself); otherwise give it a fresh one.
+            slot = findfirst(==(item), nodes[d])
+            if slot === nothing
+                push!(nodes[d], item)
+                push!(types[d], ty)
+                slot = length(nodes[d])
+            end
+            push!(block_hoisted_refs[b], (item, d, slot))
+            keep[idx] = false
+        end
+        all(keep) && continue
+        nodes[b] = nodes[b][keep]
+        types[b] = types[b][keep]
+    end
+
+    return nodes, types, bulk_args, self_recursive_ssas, block_has_subtape, block_hoisted_refs
 end
 
 # ===========================================================================
@@ -1748,7 +1808,10 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
     # they must agree exactly, since it decides which comms items exist.
-    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, block_has_subtape = scan
+    # `block_hoisted_refs` (Stage 2's cross-block reads) needs no handling here: a hoisted item is
+    # simply declared in its defining block's own `nodes`/`types`, so this builder emits it exactly
+    # like any other comms item — only the pullback side needs to know it was moved.
+    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, block_has_subtape, _ = scan
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     # Needs `block_comms_nodes` (collapsible-region detection — see `_collapsible_regions`), hence
     # computed after the scan above rather than before it as its Phase-D-only predecessor was.
@@ -2383,7 +2446,11 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
     # they must agree exactly, since it decides which comms items exist.
-    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, block_has_subtape = scan
+    # `block_hoisted_refs[b]`: Stage 2's cross-block reads — for each `(item, d, slot)`, block `b`
+    # reads `item` out of block `d`'s own comms slot instead of popping it locally (see the per-block
+    # comms setup below).
+    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, block_has_subtape,
+        block_hoisted_refs = scan
     # Needs `block_comms_nodes` (collapsible-region detection — see `_collapsible_regions`), hence
     # computed after the scan above rather than before it as its Phase-D-only predecessor was.
     _, pred_is_unique_pred, regions = _unique_predecessor_info(pir, exit_blocks, unreachable_block, block_comms_nodes,
@@ -2605,6 +2672,15 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                 comms_val_id[nd] = emit!(Expr(:call, getf, popped, j), block_comms_types[b][j])
                 comms_type_id[nd] = block_comms_types[b][j]
             end
+        end
+        # Stage 2's hoisted items: not on `b`'s own comms stack at all — read straight out of the
+        # defining block `d`'s `CommsCell` (`comms_obj_id[d]`, already unpacked in the entry block).
+        # A plain double `getfield` — no `pop!`, and safe regardless of visit order since the
+        # forwards pass has already finished and `d`'s single-slot cell was written exactly once.
+        for (item, d, slot) in block_hoisted_refs[b]
+            dslot = emit!(Expr(:call, getf, comms_obj_id[d], 1), Tuple{block_comms_types[d]...})
+            comms_val_id[item] = emit!(Expr(:call, getf, dslot, slot), block_comms_types[d][slot])
+            comms_type_id[item] = block_comms_types[d][slot]
         end
         # --- Comms resolvers. Every pullback-side read of a forwards-recorded value goes through
         # one of these three, rather than indexing `comms_val_id` directly. They are the single
