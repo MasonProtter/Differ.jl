@@ -1,3 +1,6 @@
+# Portions of this file are derived from Mooncake.jl (https://github.com/chalk-lab/Mooncake.jl),
+# Copyright (c) 2024 Will Tebbutt and Hong Ge, licensed under the MIT License.
+
 # A stack specialised for reverse-mode AD control flow: the block stack (which basic blocks were
 # visited on the forwards pass, replayed in reverse on the pullback pass) and the per-block "comms"
 # stacks (forward-computed values the pullback needs back, one push per execution of that block).

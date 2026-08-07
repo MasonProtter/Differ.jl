@@ -1,3 +1,6 @@
+# Portions of this file are derived from Mooncake.jl (https://github.com/chalk-lab/Mooncake.jl),
+# Copyright (c) 2024 Will Tebbutt and Hong Ge, licensed under the MIT License.
+
 macro outline(args...)
     fargs = esc.(args[1:end-1])
     body = args[end]
