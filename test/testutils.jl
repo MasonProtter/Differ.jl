@@ -98,12 +98,17 @@ _assert_tuple_balanced(t::Tuple, seen) = foreach(v -> v isa Differ.Tape && _asse
 # Doubly load-bearing since a `build_ctx(...; prealloc=true)` context *reuses* its tape across
 # calls: balance is what makes reuse correct, so this also runs each case twice through one
 # pre-allocated context and checks the answers agree.
-function check_stack_balance(f, args...)
+#
+# `seed` overrides the default `one(y)` seed, for a primal whose result has no `one` — a
+# tuple-valued `f` (`test_reverse_tuples.jl`). That also skips the pre-allocated half below, which
+# reaches the pullback through `rev_gradient!` and so seeds with `one(y)` itself.
+function check_stack_balance(f, args...; seed=nothing)
     ctx = build_ctx(f, map(Differ._typeof, args); prealloc=false)
     fcd, argcds = zero_fcodual(f), map(zero_fcodual, args)
     ycd, pb = rrule!!(fcd, ctx, argcds...)
-    pb(one(Differ.primal(ycd)))
+    pb(seed === nothing ? one(Differ.primal(ycd)) : seed)
     _assert_tape_balanced(pb)
+    seed === nothing || return nothing
 
     # Same again through a pre-allocated (tape-reusing) context, twice.
     pctx = build_ctx(f, map(Differ._typeof, args))

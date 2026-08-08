@@ -175,10 +175,11 @@ end
     checkverify_rev(mutate_nested!, (Vector{Vector{Float64}},))
 
     # Scalar-returning allocation tests (so `rev_gradient` applies directly): `zeros`/explicit index
-    # writes, not a `[a,b]` literal. A literal array with 2+ elements lowers through `Base.vect`'s
-    # `X::Tuple` capture, and when an element is differentiable that tuple is a genuine
-    # differentiable `Core.tuple` result — the one explicitly out-of-scope gap. `zeros` plus
-    # explicit writes avoids it entirely.
+    # writes, not a `[a,b]` literal. A literal array lowers through `Base.vect`'s `X::Tuple` capture,
+    # which is now differentiable (`Core.tuple` got a reverse rule, `test_reverse_tuples.jl`) for
+    # scalar elements — a *dynamic*-index `getfield` into an fdata-carrying (array-valued) tuple
+    # field is still out of scope, a separate limitation of `getfield`'s own dynamic-index rule, not
+    # of `Core.tuple`. `zeros` plus explicit writes keeps this testset about allocation specifically.
     #
     # `alloc_and_sum`: allocate, write both elements from `x`, read both back locally — d/dx = 3.
     alloc_and_sum(x::Float64) = (v = zeros(2); v[1] = x; v[2] = 2 * x; v[1] + v[2])

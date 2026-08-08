@@ -1217,6 +1217,21 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
                 # scalar (bits) result carries no fdata of its own, so is deliberately left untracked
                 # here — its gradient flows via rdata routing, not shadow aliasing.
                 fdtype(pir.stmts[i][:type]) !== NoFData && (tracked[i] = true)
+            elseif f === Core.tuple && !isempty(actual)
+                # Mirrors `builtin_rrule_comms(::Val{Core.tuple}, ...)`'s own scope gate
+                # (`builtins_reverse.jl`): only a concrete, non-vararg Tuple type with one field per
+                # operand is tracked, and only when every fdata-carrying operand's own provenance is
+                # itself tracked. This is what lets a later `getfield` on the tuple resolve the
+                # element's shadow via `_get_fdata_field` (the generic `getfield` arm above already
+                # covers the non-`Array` object case).
+                Ti = pir.stmts[i][:type]
+                T = _widen(Ti)
+                if fdtype(Ti) !== NoFData && T isa DataType && T <: Tuple && isconcretetype(T) &&
+                   !(!isempty(T.parameters) && isa(last(T.parameters), Core.TypeofVararg)) &&
+                   fieldcount(T) == length(actual)
+                    tracked[i] = all(j -> fdtype(fieldtype(T, j)) === NoFData || provenance_tracked(actual[j]),
+                                     eachindex(actual))
+                end
             end
         end
     end
@@ -2276,8 +2291,10 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
             ret_val = presolve(s.val)
             # `_optype` has no world to resolve a bare `GlobalRef` with (unlike `presolve` above), so a
             # `GlobalRef`-valued return (`return nothing` at `Main` scope, say) needs its type read off
-            # the already-resolved `ret_val` instead of the unresolved node.
-            R = isa(s.val, GlobalRef) ? Core.Typeof(ret_val) : _optype(pir, s.val)
+            # the already-resolved `ret_val` instead of the unresolved node. `_widen`: `_optype` is
+            # lattice-faithful and can return a `Core.PartialStruct` (e.g. a tuple return narrowed by
+            # const-prop), but `fcodual_type` below needs a bare `Type`.
+            R = isa(s.val, GlobalRef) ? Core.Typeof(ret_val) : _widen(_optype(pir, s.val))
             result_cd = icall!(zerofcodual_g, fcodual_type(R), (R,), ret_val)
             # Pre-allocated mode returns the caller's own tape object; otherwise `%new` one around the
             # stacks the prologue just built.
@@ -2767,8 +2784,9 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             # `zero_like_rdata_type`, not `rdtype`: `target`'s actual declared element type (set in the
             # `arg_ref_id`/`ssa_ref_id` prologue above) may be `Union{R,ZeroRData}`, and `cur`'s declared
             # type here must agree with that or the `icall` below could resolve to (and statically
-            # `:invoke`) a method compiled for the too-narrow `R` alone.
-            RT = zero_like_rdata_type(_optype(pir, exit_ret_node[b]))
+            # `:invoke`) a method compiled for the too-narrow `R` alone. `_widen`: `_optype` is
+            # lattice-faithful and can return a `Core.PartialStruct`.
+            RT = zero_like_rdata_type(_widen(_optype(pir, exit_ret_node[b])))
             cur = remit!(Expr(:call, getf, target, 1), RT)
             new = remit!(icall(increment_g, (RT, PullbackSeedT), cur, seed_id), RT)
             remit!(Expr(:call, setf, target, 1, new), Any)

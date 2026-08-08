@@ -6,6 +6,17 @@ struct CoDual{Tx,Tdx}
     dx::Tdx
 end
 
+function Base.getproperty(d::CoDual, s::Symbol)
+    if s === :x || s === :y || s === :z || s === :primal
+        getfield(d, :x)
+    elseif s === :dx || s === :dy || s === :dz || s === :tangent
+        getfield(d, :dx)
+    else
+        getfield(d, s)
+    end
+end
+Base.propertynames(::CoDual) = (:primal, :tangent, :x, :y, :z, :dx, :dy, :dz)
+
 # Always sharpen the first thing if it's a type so static dispatch remains possible.
 function CoDual(x::Type{P}, dx::NoFData) where {P}
     return CoDual{@isdefined(P) ? Type{P} : typeof(x),NoFData}(P, dx)

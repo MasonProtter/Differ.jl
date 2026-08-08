@@ -15,6 +15,7 @@ using SafeTestsets
 @safetestset "reverse: dispatch & recursion" begin include("test_reverse_dispatch_recursion.jl") end
 @safetestset "reverse: arrays" begin include("test_reverse_arrays.jl") end
 @safetestset "reverse: mutation & aliasing" begin include("test_reverse_mutation_aliasing.jl") end
+@safetestset "reverse: tuples" begin include("test_reverse_tuples.jl") end
 @safetestset "reverse: closures & globals" begin include("test_reverse_closures_globals.jl") end
 @safetestset "backedges: derivative invalidation" begin include("test_backedges.jl") end
 @safetestset "cfg / IR" begin include("test_cfg_ir.jl") end

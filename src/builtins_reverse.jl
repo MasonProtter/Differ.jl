@@ -282,6 +282,83 @@ function apply_builtin_rrule!(::Val{Core.getfield}, actual, Ti, ctx)
 end
 
 # ---------------------------------------------------------------------------
+# `Core.tuple` — a tuple's rdata is a bare `Tuple` (`rdata_type(::Type{P}) where {P<:Tuple}`,
+# `fwds_rvs_data.jl`), not an `RData{NamedTuple}` wrapper, so the pullback is the same shape as the
+# immutable `%new` arm (`reverse_pullback_to_ircode`'s `:new` case) minus the `fields_type`/
+# `getfield(acc, 1)` unwrap step. A tuple is immutable, so no comms items are ever needed: the rdata
+# accumulator `Ref` is allocated generically by the pullback prologue (`needs_ref`), and the shadow
+# tuple (when tracked) is only ever consumed on the forwards side via `sresolve` by a later `getfield`.
+#
+# All three methods return `nothing` (unregistered) when `tangent_type` collapses the whole tuple to
+# `NoTangent` (e.g. `Tuple{Int,Symbol}`), so the pre-existing primal-replay fallbacks (the
+# `tangent_type(...) === NoTangent` arms right after each dispatch call in `reverse_interp.jl`) keep
+# handling that case exactly as before this rule existed.
+# ---------------------------------------------------------------------------
+
+function builtin_rrule_comms(::Val{Core.tuple}, actual, Ti, ctx)
+    tangent_type(_widen(Ti)) === NoTangent && return nothing
+    T = _widen(Ti)
+    ok = T isa DataType && T <: Tuple && isconcretetype(T) &&
+         !(!isempty(T.parameters) && isa(last(T.parameters), Core.TypeofVararg)) &&
+         fieldcount(T) == length(actual)
+    if !ok
+        ctx.reason[] = "reverse mode `tuple` requires a concrete, non-vararg Tuple type with one " *
+                       "field per operand, got $(T) for $(length(actual)) operand(s) at " *
+                       "%$(ctx.ssa.id)"
+        return false
+    end
+    FT = fdtype(T)
+    if FT !== NoFData
+        if !(FT isa DataType && FT <: Tuple)
+            ctx.reason[] = "reverse mode `tuple` requires a concrete fdata type, got $(FT) at " *
+                           "%$(ctx.ssa.id)"
+            return false
+        end
+        for j in eachindex(actual)
+            fdtype(fieldtype(T, j)) === NoFData && continue
+            _bi_tracked(actual[j], ctx) && continue
+            ctx.reason[] = "reverse mode `tuple` operand $(j) (type $(fieldtype(T, j))) carries " *
+                           "fdata but has no provenance traceable to a function argument at " *
+                           "%$(ctx.ssa.id)"
+            return false
+        end
+    end
+    return Tuple{Any,Any}[]
+end
+
+function apply_builtin_rrule_fwds!(::Val{Core.tuple}, actual, Ti, ctx)
+    tangent_type(_widen(Ti)) === NoTangent && return nothing
+    p = ctx.emit!(Expr(:call, _ctupleg, (ctx.presolve(a) for a in actual)...), Ti)
+    shadow = nothing
+    if _bi_tracked(ctx.ssa, ctx)
+        T = _widen(Ti)
+        FT = fdtype(T)
+        shadow = ctx.emit!(Expr(:call, _ctupleg,
+                     (fdtype(fieldtype(T, j)) === NoFData ? NoFData() : ctx.sresolve(actual[j])
+                      for j in eachindex(actual))...), FT)
+    end
+    return p, shadow, Dict{Any,Any}()
+end
+
+function apply_builtin_rrule!(::Val{Core.tuple}, actual, Ti, ctx)
+    tangent_type(_widen(Ti)) === NoTangent && return nothing
+    nores = ntuple(_ -> nothing, length(actual))
+    rdtype(Ti) === NoRData && return nores
+    T = _widen(Ti)
+    acc = ctx.deref_and_zero!(Ti)
+    RDataT = rdtype(T)
+    real_acc = ctx.emit!(
+        ctx.icall(_rr_realize_rdata, (zero_like_rdata_type(_widen(Ti)), Type{RDataT}), acc, RDataT),
+        RDataT)
+    contribs = Vector{Any}(undef, length(actual))
+    for j in eachindex(actual)
+        Fty = rdtype(fieldtype(T, j))
+        contribs[j] = Fty === NoRData ? nothing : ctx.emit!(Expr(:call, _getfieldg, real_acc, j), Fty)
+    end
+    return Tuple(contribs)
+end
+
+# ---------------------------------------------------------------------------
 # `Core.memorynew` — array allocation step 1: `Core.memorynew(Memory{P}, n)` allocates a fresh,
 # uninitialized `Memory{P}`. Its own rdata is always `NoRData` (a `Memory` handle, not a
 # differentiable value — mirrors `Base.memoryrefnew` below); the shadow allocates a same-length,
