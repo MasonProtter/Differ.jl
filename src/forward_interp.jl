@@ -333,40 +333,89 @@ function _build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::
     # return shape is referenced elsewhere.
     pmethod = primal_mi.def::Method
     primal_nfixed = pmethod.isva ? Int(pmethod.nargs) - 1 : nothing
-    # Optimized primal IR, computed by hand (mirroring `Core.Compiler.typeinf_ircode`'s own body)
-    # rather than calling that function directly, so we can also read off `frame.edges` below.
-    # Compiled with `interp` itself, not a bare `NativeInterpreter`: that's what makes our
-    # `src_inlining_policy` override apply, so a callee with a hand-written `frule!!` isn't inlined
-    # away before `dualize_to_ircode` gets a chance to route it through that rule — the same reason
-    # `sin`/`cos` and other hand-ruled functions already survived as `:invoke`s even before that
-    # override existed (their bodies simply weren't cheap enough to inline by ordinary cost
-    # heuristics; the override now makes that hold regardless of cost for anything hand-ruled).
-    frame = CC.typeinf_frame(interp, primal_mi, false)
-    if frame === nothing
-        reason[] = "inference failed to produce optimized IR for the primal method $(primal_mi)"
-        return nothing
-    end
-    opt = CC.OptimizationState(frame, interp)
-    pir = CC.run_passes_ipo_safe(opt.src, opt, nothing)
-    # Pre-inlining call-graph edges: the plain `add_inlining_edge!(edges, primal_mi)` `primal_of_impl`
-    # already added isn't enough on its own — if the primal inlines a callee (common, e.g.
-    # `bar(x) = foo(x)` inlining `foo`), that callee's identity is gone from `pir` by the time we see
-    # it, so we could never discover it by walking `pir` ourselves. But `frame.edges` was already
-    # populated by ordinary inference (`compute_edges!`, from `finishinfer!`) before the optimizer
-    # ran, from each call site's `CallInfo`, independent of what the later inlining pass does to the
-    # IR — and the inlining pass (`InliningState(frame, interp)` aliases `frame.edges` as
-    # `opt.inlining.edges`) appends to that same array as it inlines. So `frame.edges` after
-    # `run_passes_ipo_safe` is exactly the primal's real dependency set, including everything it
-    # inlined away.
-    append!(edges, frame.edges)
-    # For every concrete callee discovered above, whether its call survived or was inlined away, also
-    # register the mt-backedge a hand-written `frule!!` for it would need — see
-    # `register_implicit_frule_backedge!`. `ForwardToBackedgeIterator` decodes the same variable-width
-    # edge encoding `store_backedges` understands, so this walks `frame.edges` correctly regardless of
-    # which entry shape (plain MI/CI, invoke pair, mt-backedge pair, multi-match record) each
-    # dependency took.
-    for (_, item) in CC.ForwardToBackedgeIterator(Core.svec(frame.edges...))
-        isa(item, MethodInstance) && register_implicit_frule_backedge!(edges, item)
+
+    # Forward-over-reverse: `primal_mi` can itself be a reverse-mode carrier
+    # (`reverse_fwds_impl`/`reverse_pullback_impl`, `reverse_interp.jl`) rather than an ordinary user
+    # method — reached when forward-differentiating a `gradient`/`value_and_gradient!`/`Tape` pullback
+    # call. Dualizing such a call surfaces `rrule!!`'s generated body, whose one real statement is an
+    # `invoke` against an already-compiled `CodeInstance`; re-dualizing that surviving invoke is what
+    # lands here with `primal_mi` resolved to the carrier stub method. Ordinary `CC.typeinf_frame`
+    # under `ADInterpreter{Forward}` would just recompile the untransformed stub, since only
+    # `ADInterpreter{Reverse}` recognizes these mi's — so fetch the real reverse-mode optimized IR
+    # instead, via a nested `ADInterpreter{Reverse}` sharing this build's world age.
+    #
+    # `nested_forward=true` makes that nested interpreter's own `src_inlining_policy` also protect
+    # forward hand rules (`reverse_interp.jl`) — without it, something like `Stack`'s `push!`/`pop!`
+    # (which only has a forward hand rule, `rules_ad_runtime.jl`) would be inlined away by the
+    # reverse-mode optimizer before this dualizer ever got to see it as a call.
+    #
+    # Cycle guard: this branch always constructs a fresh `ADInterpreter{Reverse}`, so its own
+    # `in_progress` field starts empty every time and can't alias `dualized_impl_in_progress()` (the
+    # forward guard above, keyed by a differently-shaped mi) — a legitimate nested build here is never
+    # mistaken for a forward-mode cycle, and a genuine reverse-mode cycle is still caught by the reverse
+    # guard, scoped to just this nested build.
+    if is_reverse_fwds_impl(primal_mi)
+        # The forwards and pullback passes share the tape, so their shadow tapes must be `===` too.
+        # With `Ctx{Nothing}` (fresh tape — `reverse_fwds_impl`'s own prologue allocates it) this is
+        # automatic: the tape is an explicit value `reverse_fwds_impl` returns and `(t::Tape)(seed)`
+        # receives, so the shadow tape rides along as that value's tangent through ordinary
+        # split-shadow SSA tracking, no extra plumbing needed (confirmed against the independent
+        # forward-over-forward oracle, `code_dual_ircode(...; order=2)`). `Ctx{<:Tape}` (pre-allocated)
+        # is different: `reverse_fwds_impl`'s prologue reads the tape out of `ctx`, supplied from
+        # outside by ordinary code, so there's no shadow tape to ride along with — not implemented.
+        # Bail cleanly here rather than an opaque internal `TypeError` deeper in the transform.
+        CtxT = primal_mi.specTypes.parameters[3]
+        if !(CtxT isa DataType && CtxT <: Ctx && CtxT.parameters[1] === Nothing)
+            reason[] = "forward-over-reverse only supports the fresh-tape context (`Ctx()`/" *
+                       "`Ctx{Nothing}`, what `gradient` and `build_ctx(...; prealloc=false)` use) — " *
+                       "a pre-allocated context (`build_ctx(...; prealloc=true)`, ctx type `$(CtxT)`) " *
+                       "is not yet supported: its tape is supplied from outside this build, with no " *
+                       "shadow tape to alias it to"
+            return nothing
+        end
+        rinterp = ADInterpreter{Reverse}(; world=interp.world, nested_forward=true)
+        pir = optimized_reverse_fwds_ir(rinterp, primal_mi, reason, edges)
+        pir === nothing && return nothing
+    elseif is_reverse_pullback_impl(primal_mi)
+        rinterp = ADInterpreter{Reverse}(; world=interp.world, nested_forward=true)
+        pir = optimized_reverse_pullback_ir(rinterp, primal_mi, reason, edges)
+        pir === nothing && return nothing
+    else
+        # Optimized primal IR, computed by hand (mirroring `Core.Compiler.typeinf_ircode`'s own body)
+        # rather than calling that function directly, so we can also read off `frame.edges` below.
+        # Compiled with `interp` itself, not a bare `NativeInterpreter`: that's what makes our
+        # `src_inlining_policy` override apply, so a callee with a hand-written `frule!!` isn't inlined
+        # away before `dualize_to_ircode` gets a chance to route it through that rule — the same reason
+        # `sin`/`cos` and other hand-ruled functions already survived as `:invoke`s even before that
+        # override existed (their bodies simply weren't cheap enough to inline by ordinary cost
+        # heuristics; the override now makes that hold regardless of cost for anything hand-ruled).
+        frame = CC.typeinf_frame(interp, primal_mi, false)
+        if frame === nothing
+            reason[] = "inference failed to produce optimized IR for the primal method $(primal_mi)"
+            return nothing
+        end
+        opt = CC.OptimizationState(frame, interp)
+        pir = CC.run_passes_ipo_safe(opt.src, opt, nothing)
+        # Pre-inlining call-graph edges: the plain `add_inlining_edge!(edges, primal_mi)`
+        # `primal_of_impl` already added isn't enough on its own — if the primal inlines a callee
+        # (common, e.g. `bar(x) = foo(x)` inlining `foo`), that callee's identity is gone from `pir` by
+        # the time we see it, so we could never discover it by walking `pir` ourselves. But
+        # `frame.edges` was already populated by ordinary inference (`compute_edges!`, from
+        # `finishinfer!`) before the optimizer ran, from each call site's `CallInfo`, independent of
+        # what the later inlining pass does to the IR — and the inlining pass (`InliningState(frame,
+        # interp)` aliases `frame.edges` as `opt.inlining.edges`) appends to that same array as it
+        # inlines. So `frame.edges` after `run_passes_ipo_safe` is exactly the primal's real dependency
+        # set, including everything it inlined away.
+        append!(edges, frame.edges)
+        # For every concrete callee discovered above, whether its call survived or was inlined away,
+        # also register the mt-backedge a hand-written `frule!!` for it would need — see
+        # `register_implicit_frule_backedge!`. `ForwardToBackedgeIterator` decodes the same
+        # variable-width edge encoding `store_backedges` understands, so this walks `frame.edges`
+        # correctly regardless of which entry shape (plain MI/CI, invoke pair, mt-backedge pair,
+        # multi-match record) each dependency took.
+        for (_, item) in CC.ForwardToBackedgeIterator(Core.svec(frame.edges...))
+            isa(item, MethodInstance) && register_implicit_frule_backedge!(edges, item)
+        end
     end
     return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=false, primal_nfixed, reason, edges)
 end
@@ -386,20 +435,29 @@ function optimized_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reaso
     end
 end
 
-# Resolve and compile the `frule!!(Dual{typeof(f),NoTangent}, dualargs...)` rule for a surviving
+# Resolve and compile the `frule!!(Dual{typeof(f),ftangty}, dualargs...)` rule for a surviving
 # high-level call to an invoke-able `CodeInstance`, so the dualized IR can emit a static `:invoke`
 # (mirroring how the primal IR keeps `sin`/`cos` as `:invoke`s to a `CodeInstance`). `:invoke` targets
 # must be `CodeInstance`s: `collectinvokes!` only JITs those, so a bare `MethodInstance` would fall
 # back to a boxed dynamic call. Returns `nothing` if unresolved.
+#
+# `ftangty` is the callee's own tangent *type* (`tt(ftype)` at the call site) — `NoTangent` for a
+# plain function, but a real `Tangent{…}`/`Dual`/… for a closure or a dynamically-computed callee with
+# actual captures (e.g. a hand-rule pullback closure popped off a `Tape`'s comms under
+# forward-over-reverse). Must exactly match the tangent type `frule_split!`'s own `dual!(ftype,
+# tt(ftype), fcallee, ftang)` builds the callee `Dual` with: `Dual` is invariant, so resolving against
+# a mismatched tangent type picks a different specialization of the `@generated` fallback than the one
+# actually built and `:invoke`d — `verify_ir` doesn't catch it, but codegen crashes with "Unreachable
+# reached" at run time.
 #
 # `edges` collects the backedges this resolution depends on: an unconditional mt-backedge on
 # `frule_tt` (a new user `frule!!` method — one that didn't exist, or wasn't as specific, when this
 # was built, e.g. someone hand-writing a rule for a function that previously fell through to the
 # generated fallback — invalidates this dual IR), plus, when a rule is found, a direct invoke edge to
 # the resolved `CodeInstance` (this call is emitted as a static `:invoke` to it).
-function frule_codeinstance(interp::ADInterpreter, @nospecialize(ftype), dual_argtypes,
-                            edges::Vector{Any}=Any[])
-    frule_tt = Tuple{typeof(frule!!), Dual{ftype,NoTangent}, dual_argtypes...}
+function frule_codeinstance(interp::ADInterpreter, @nospecialize(ftype), @nospecialize(ftangty),
+                            dual_argtypes, edges::Vector{Any}=Any[])
+    frule_tt = Tuple{typeof(frule!!), Dual{ftype,ftangty}, dual_argtypes...}
     push!(edges, frule_tt, Core.methodtable)   # mt-backedge: a new/more-specific frule!! must invalidate
     fm, _ = CC.findsup(frule_tt, CC.method_table(interp))
     fm === nothing && return nothing
@@ -914,7 +972,12 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             return emit!(Expr(:call, getf, dd, 1), R),
                    emit!(Expr(:call, getf, dd, 2), tt(R))
         end
-        fd = dual!(ftype, NoTangent, fcallee, NoTangent())
+        # `ftang` (computed above) is the callee's real tangent for a dynamic callee (read out of a
+        # container, e.g. a pullback closure popped off a `Tape`'s comms) and `NoTangent()` for a
+        # statically-known one. Use it here too, not just on the dynamic-dispatch path below —
+        # previously dropped in favor of a hardcoded `NoTangent()`, silently zeroing a dynamic callee's
+        # capture derivatives whenever the call was concrete enough to take this static path.
+        fd = dual!(ftype, tt(ftype), fcallee, ftang)
         # Each argument dual is `Dual{P, tangent_type(P)}` (the Mooncake invariant). For scalar
         # primals `tangent_type(P) == P`, so this matches the old `Dual{P,P}`. A statically-known
         # operand (a `GlobalRef` to a defined binding, or a `QuoteNode`) must be embedded as its
@@ -945,7 +1008,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # and the abstract `Dual` when `R` is non-concrete — the concrete `Dual` the rule actually
         # returns is a subtype of the latter (whereas the invariant `Dual{Any,Any}` would be unsound
         # and miscompile).
-        ci = frule_codeinstance(interp, ftype, dualtys, edges)
+        ci = frule_codeinstance(interp, ftype, tt(ftype), dualtys, edges)
         DR = dual_type(R)
         dd = ci === nothing ? emit!(Expr(:call, fruleg, fd, duals...), DR) :
                               emit!(Expr(:invoke, ci, fruleg, fd, duals...), DR)
@@ -1193,6 +1256,17 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 tf = Any[_nondiff_field(fieldtype(T, j)) ? vpresolve(args[j]) : tresolve(args[j])
                          for j in eachindex(args)]
                 shadow[i] = emit!(Expr(:new, T, tf...), Ti)
+            elseif T <: Stack || T <: SingletonStack || T <: CommsCell || T <: Tape
+                # Self-similar-shadow bookkeeping types (`stack.jl`/`reverse_interp.jl`) — reached
+                # under forward-over-reverse: the reverse-mode carrier's own constructor calls for these
+                # get inlined into raw `%new`s before this dualizer ever sees them. Same shape as the
+                # `Dual` arm above, generalized per field via `_bi_selfsim_shadow_field` (`builtins.jl`)
+                # — the same predicate `getfield`/`setfield!` use, so a `%new`'s shadow and a later
+                # `getfield`'s shadow never disagree on which fields mirror. A field it declines carries
+                # the primal value through instead, like a non-differentiable `Dual` field above.
+                tf = Any[_bi_selfsim_shadow_field(T, j) === nothing ? vpresolve(args[j]) : tresolve(args[j])
+                         for j in eachindex(args)]
+                shadow[i] = emit!(Expr(:new, TT, tf...), TT)
             elseif TT === NoTangent
                 # Whole aggregate is non-differentiable (e.g. `Tuple{Int,Int}`, a fieldless struct).
                 shadow[i] = NoTangent()

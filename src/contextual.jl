@@ -81,10 +81,18 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
     # of this field. Entries can go stale after invalidation, but that's fine: they're only ever read
     # when a build has in fact bailed, and a rebuild overwrites the entry before anything reads it.
     bail_reasons::IdDict{MethodInstance, String}
+    # True only for a `Reverse` interpreter built to compile `reverse_fwds_impl`/`reverse_pullback_impl`
+    # on behalf of an outer forward-mode dualization (forward-over-reverse, `forward_interp.jl`).
+    # `src_inlining_policy` (`reverse_interp.jl`) consults it to also protect calls with a hand
+    # `frule!!` from inlining, so forward mode still gets to see them as calls rather than finding them
+    # already inlined away by the reverse-mode optimizer. Always `false` for `Forward` and for an
+    # ordinary `Reverse` interpreter, so plain `gradient` is unaffected.
+    nested_forward::Bool
     function ADInterpreter{M}(world::UInt,
                               ip::InferenceParams,
                               op::OptimizationParams,
-                              bail_reasons::IdDict{MethodInstance, String}=IdDict{MethodInstance, String}()) where {M<:ADMode}
+                              bail_reasons::IdDict{MethodInstance, String}=IdDict{MethodInstance, String}();
+                              nested_forward::Bool=false) where {M<:ADMode}
         @assert world <= Base.get_world_counter()
         return new{M}(
             InferenceResult[],
@@ -96,21 +104,24 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
             IdDict{MethodInstance, Vector{Any}}(),
             IdDict{MethodInstance, Nothing}(),
             bail_reasons,
+            nested_forward,
         )
     end
 end
 function ADInterpreter{M}(;world=Base.get_world_counter(),
                           inf_params=InferenceParams(),
-                          opt_params=OptimizationParams()) where {M<:ADMode}
-    ADInterpreter{M}(world, inf_params, opt_params)
+                          opt_params=OptimizationParams(),
+                          nested_forward::Bool=false) where {M<:ADMode}
+    ADInterpreter{M}(world, inf_params, opt_params; nested_forward)
 end
 
 # Shared across every `ADInterpreter{Reverse}` instance — see the `bail_reasons` field comment above.
 const REVERSE_BAIL_REASONS = IdDict{MethodInstance, String}()
 function ADInterpreter{Reverse}(;world=Base.get_world_counter(),
                                 inf_params=InferenceParams(),
-                                opt_params=OptimizationParams())
-    ADInterpreter{Reverse}(world, inf_params, opt_params, REVERSE_BAIL_REASONS)
+                                opt_params=OptimizationParams(),
+                                nested_forward::Bool=false)
+    ADInterpreter{Reverse}(world, inf_params, opt_params, REVERSE_BAIL_REASONS; nested_forward)
 end
 
 Core.Compiler.InferenceParams(interp::ADInterpreter) = interp.inf_params

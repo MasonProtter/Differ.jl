@@ -146,3 +146,72 @@ end
     end
     return Ctx(_alloc_tape(TapeT))
 end
+
+# ===========================================================================
+# Tangent types for the reverse-mode runtime's own bookkeeping types (`Tape` itself is in
+# `reverse_interp.jl`, next to its definition).
+#
+# Each shadow is self-similar: the tangent of a `Stack{T}` is a `Stack{tangent_type(T)}`, not a
+# `MutableTangent` — so primal and shadow can be pushed/popped independently, in lockstep, using the
+# very same `push!`/`pop!` methods (hand `frule!!`s in `rules_ad_runtime.jl`), and a fresh shadow tape
+# can be built by the same `_fresh_tape_expr`/`_alloc_tape` code that builds a fresh primal one. Falling
+# through to the generic per-field derivation would produce a `MutableTangent` here instead, which
+# breaks that symmetry: its constructor doesn't take zero arguments, so `_alloc_tape`'s `$S()`/`$S(1)`
+# construction wouldn't even type-check against it.
+#
+# Self-typed collapse when `T` itself has no tangent: the shadow is `Stack{T}` (same `T`, not
+# `Stack{NoTangent}`). This is what makes `Tape`'s per-field invariant `tangent_type(fieldtype(Tape,f))
+# === fieldtype(tangent_type(Tape),f)` hold for `block_stack::Stack{Int32}` (`reverse_interp.jl`):
+# that field is hardcoded `Stack{Int32}` regardless of `Tape`'s type parameters, so a shadow `Tape`'s
+# `block_stack` is always `Stack{Int32}`, never `Stack{NoTangent}` — the collapse matches that exactly,
+# so every field of `Tape` mirrors the same way with no carve-out (see `_bi_selfsim_shadow_field`,
+# `builtins.jl`, which encodes this invariant directly).
+#
+# `SingletonStack`/`CommsCell` get the identical treatment for consistency, and because it's the
+# common case for `SingletonStack`: it's only chosen for a genuinely singleton comms type, and every
+# singleton type has `NoTangent` tangent here, so its shadow is self-typed almost always.
+# ===========================================================================
+
+@foldable tangent_type(::Type{Stack{T}}) where {T} =
+    tangent_type(T) === NoTangent ? Stack{T} : Stack{tangent_type(T)}
+@foldable tangent_type(::Type{SingletonStack{T}}) where {T} =
+    tangent_type(T) === NoTangent ? SingletonStack{T} : SingletonStack{tangent_type(T)}
+@foldable tangent_type(::Type{CommsCell{T}}) where {T} =
+    tangent_type(T) === NoTangent ? CommsCell{T} : CommsCell{tangent_type(T)}
+
+# `zero_tangent`/`set_to_zero!!` for these three: never delegate to the generic per-field
+# derivation (which assumes the `MutableTangent`/`Tangent` shell with a `.fields::NamedTuple` these
+# self-typed shadows don't have — see above), build/mutate the wrapper directly instead.
+#
+# No `increment!!`: a `Stack`/`CommsCell` is append-only bookkeeping, not an additive quantity, and
+# nothing in the engine asks to "sum" two of them — add a real method if a genuine call site turns up.
+#
+# Each constructs `tangent_type(...)` directly rather than re-deriving `Stack{tangent_type(T)}`/etc
+# itself, so the self-typed-collapse rule above lives in exactly one place — duplicating it here
+# would silently drift the moment that rule changes.
+
+function zero_tangent_internal(x::Stack{T}, d::MaybeCache) where {T}
+    ST = tangent_type(Stack{T})
+    haskey(d, x) && return d[x]::ST
+    s = ST()
+    d[x] = s
+    return s
+end
+zero_tangent_internal(::SingletonStack{T}, ::MaybeCache) where {T} = tangent_type(SingletonStack{T})()
+function zero_tangent_internal(x::CommsCell{T}, d::MaybeCache) where {T}
+    CT = tangent_type(CommsCell{T})
+    haskey(d, x) && return d[x]::CT
+    c = CT()
+    d[x] = c
+    return c
+end
+
+# Resetting a shadow `Stack`/`CommsCell` means putting it back in the state a fresh one starts in
+# (position 0 / undef `val`), not reallocating — mirrors the raw `setfield!(stack, :position, 0)`
+# reset `reverse_fwds_to_ircode` emits when a pre-allocated primal tape is reused across calls.
+set_to_zero_internal!!(::SetToZeroCache, x::Stack) = (x.position = 0; x)
+set_to_zero_internal!!(::SetToZeroCache, x::SingletonStack) = x
+function set_to_zero_internal!!(c::SetToZeroCache, x::CommsCell)
+    isdefined(x, :val) && (x.val = set_to_zero_internal!!(c, x.val))
+    return x
+end

@@ -41,6 +41,67 @@ end
     Core.Compiler.verify_ir(code_dual_ircode(g, (Float64,))[1])
 end
 
+@testset "dynamically-selected closure callee, non-inlined" begin
+    # Regression pin for two bugs in shared forward-mode code (`frule_split!` and
+    # `frule_codeinstance`, `src/forward_interp.jl`), both only ever exercised before this test via
+    # forward-over-reverse (a callee's own tangent flowing through `frule_split!` when the callee is a
+    # pullback closure popped off a `Tape`). Reproduced here with no reverse-mode machinery involved: a
+    # concretely-typed callee whose value is chosen at run time (by a branch) and carries a real
+    # differentiable capture, called as a surviving (non-inlined) call — `frule_split!`'s static path
+    # (as opposed to the `dynamic_frule` trampoline, which only fires for a non-concrete
+    # callee/argument type).
+    #
+    # `mkscale` makes a closure over a captured `Float64`; its type is fixed by the method, so both
+    # branches below produce the *same* concrete closure type with *different* captured values —
+    # `ftype` is concrete (`_conc(ftype)` true), but the callee is a genuine `SSAValue`/`PhiNode`
+    # result, not something `_calleeval` can resolve to a compile-time constant. `@noinline` is on
+    # `scale`, not `pick_scale`: `pick_scale` is cheap and inlines away, leaving `f` as a two-way
+    # phi merging `%new(closureT, a)`/`%new(closureT, b)`; the closure *call* `f(x)` is what must
+    # survive as a static `:invoke`.
+    function mkscale(a::Float64)
+        @noinline scale(x::Float64) = a * x
+        return scale
+    end
+    pick_scale(branch::Bool, a::Float64, b::Float64) = branch ? mkscale(a) : mkscale(b)
+    call_dynamic_scale(branch::Bool, a::Float64, b::Float64, x::Float64) =
+        pick_scale(branch, a, b)(x)
+
+    # Evidence this hits the intended path rather than some other one: the dualized IR still
+    # contains exactly one `:invoke` of `frule!!`, and its callee operand's declared type is
+    # `Dual{closureT, Tangent{...}}` — a real capture tangent, not the `NoTangent` bug 1 hardcoded
+    # (which would also mismatch the `CodeInstance` bug 2 resolves, crashing at codegen — see below).
+    ir, _ = code_dual_ircode(call_dynamic_scale, (Bool, Float64, Float64, Float64))
+    Core.Compiler.verify_ir(ir)
+    invokes = [stmt for stmt in ir.stmts.stmt
+               if isa(stmt, Expr) && stmt.head === :invoke && length(stmt.args) >= 3 &&
+                  stmt.args[2] === frule!!]
+    @test length(invokes) == 1
+    callee_op = only(invokes).args[3]
+    @test callee_op isa Core.SSAValue
+    callee_dualty = ir.stmts.type[callee_op.id]
+    @test callee_dualty <: Dual
+    @test Differ._dual_tangent_type(callee_dualty) != NoTangent
+
+    # Numerical correctness: f(x) = a·x if branch, b·x otherwise; only the selected capture's
+    # derivative should be nonzero. Actually *running* the call matters for bug 2: it fails at
+    # codegen ("Unreachable reached"), which `verify_ir` above does not catch.
+    seed(v, dv) = Dual(v, dv)
+    r_da = frule!!(Dual(call_dynamic_scale, NoTangent()), seed(true, NoTangent()),
+                   seed(2.0, 1.0), seed(3.0, 0.0), seed(5.0, 0.0))
+    @test r_da.x ≈ 10.0
+    @test r_da.dx ≈ 5.0                 # d/da (a·x) = x, branch picks `a`
+    r_db = frule!!(Dual(call_dynamic_scale, NoTangent()), seed(true, NoTangent()),
+                   seed(2.0, 0.0), seed(3.0, 1.0), seed(5.0, 0.0))
+    @test r_db.dx ≈ 0.0                 # `b` unused when branch picks `a`
+    r_dx = frule!!(Dual(call_dynamic_scale, NoTangent()), seed(true, NoTangent()),
+                   seed(2.0, 0.0), seed(3.0, 0.0), seed(5.0, 1.0))
+    @test r_dx.dx ≈ 2.0                 # d/dx (a·x) = a
+    r_false = frule!!(Dual(call_dynamic_scale, NoTangent()), seed(false, NoTangent()),
+                       seed(2.0, 0.0), seed(3.0, 1.0), seed(5.0, 0.0))
+    @test r_false.x ≈ 15.0
+    @test r_false.dx ≈ 5.0              # branch flips: now `b`'s derivative (= x) is live
+end
+
 @testset "higher-order forward mode (uniform nesting)" begin
     # A second derivative differentiates the first-order dualized function itself (Option A —
     # compose the transform): the primal for a nested-dual request is the order-(k-1) dual IR,

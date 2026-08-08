@@ -26,6 +26,8 @@ include("intrinsics_reverse.jl")   # dispatch-based intrinsic vjp rules (apply_i
 include("builtins_reverse.jl")     # dispatch-based Core.Builtin vjp rules (apply_builtin_rrule!/etc.)
 include("reverse_interp.jl")
 include("rrules.jl")               # hand-written reverse-mode rules (mirrors frules.jl)
+include("rules_ad_runtime.jl")     # forward-mode frule!!s for the reverse-mode runtime's own
+                                    # primitives (Stack push!/pop!/etc) — forward-over-reverse support
 
 include("rules_math.jl")        # scalar math (transcendentals + intrinsic-backed functions)
 include("rules_reductions.jl")  # sum/prod/maximum/minimum/mapreduce/cumsum/extrema

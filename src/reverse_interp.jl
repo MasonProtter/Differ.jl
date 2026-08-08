@@ -181,14 +181,54 @@ mutable struct Tape{ArgsTT<:Tuple,CS<:Tuple}
         new{ArgsTT,CS}(block_stack, comms, bufs, subtapes, args)
 end
 
-# `Tape` is reverse-mode bookkeeping, never a differentiable primal value, so it must never fall
-# through to the generic per-field `tangent_type` derivation. That was implicitly true before the
-# `subtapes` field above: nothing needed `Tape`'s tangent type, and the generic derivation happened to
-# terminate anyway (every field was finite). `subtapes` makes `Tape` genuinely self-referential
-# (`Tape` contains a `Stack` containing a `Vector` containing `Tape` again), so the same generic
-# derivation would now recurse forever instead of terminating quietly. Make the "never a primal value"
-# fact explicit instead.
-tangent_type(::Type{<:Tape}) = NoTangent
+# `Tape` bookkeeping is differentiable under forward-over-reverse: it's where the forward pass's saved
+# primal values live, so a `Tape` flowing through an outer `D` needs a real shadow, not `NoTangent`
+# (which would silently zero the second derivative). The generic per-field derivation can't be used
+# directly: `subtapes::Stack{Tape{ArgsTT,CS}}` makes `Tape` self-referential, so generic derivation
+# (deriving `Tape`'s tangent type by re-deriving it) doesn't terminate.
+#
+# Map the type parameters instead: the shadow of `Tape{ArgsTT,CS}` is `Tape{ArgsTT',CS'}`, each mapped
+# element-wise through `tangent_type`. This terminates the same way `Tape`'s own struct definition
+# does — `subtapes`'s element type is `Tape{ArgsTT,CS}` itself, ordinary recursive-struct self-
+# reference, so its shadow's element type is just this method's own result, no further recursion.
+#
+# Payoff: the shadow of a `Tape` *is* a `Tape` and the shadow of a `Stack` *is* a `Stack`, so a fresh
+# shadow tape can be built by the same `_alloc_tape`/`_fresh_tape_expr` code that builds a fresh primal
+# one (see `zero_tangent_internal` below) — no new construction path needed.
+#
+# `_tuple_tangent_types` (not the ordinary tuple-of-*values* `tangent_type` in `tangents.jl`, which
+# collapses an all-`NoTangent` tuple to a bare `NoTangent`) maps both `ArgsTT` and `CS` element-wise
+# unconditionally: `Tape{ArgsTT<:Tuple,CS<:Tuple}` bounds both to `<:Tuple`, and an all-non-
+# differentiable-argument primal (e.g. `gradient(f, 3)` for `f(::Int)`) is exactly the all-`NoTangent`
+# case the ordinary collapse would break.
+_tuple_tangent_types(::Type{T}) where {T<:Tuple} = Tuple{(tangent_type(t) for t in T.parameters)...}
+
+@foldable tangent_type(::Type{Tape{ArgsTT,CS}}) where {ArgsTT<:Tuple,CS<:Tuple} =
+    Tape{_tuple_tangent_types(ArgsTT),_tuple_tangent_types(CS)}
+
+# A fresh shadow tape is exactly what `_alloc_tape` already builds from a `Tape` *type* alone (see
+# `_alloc_tape`/`_fresh_tape_expr`, near the bottom of this file) — nothing in `x`'s current state is
+# worth copying into its zero tangent, since every stack in a `Tape` starts empty regardless of what
+# the primal's stacks currently hold. Cached like `MutableTangent`'s `zero_tangent_internal` so the
+# same primal `Tape` object reached twice (aliased through a larger structure) gets the same shadow
+# instance both times.
+function zero_tangent_internal(x::Tape, d::MaybeCache)
+    TapeT = tangent_type(typeof(x))
+    haskey(d, x) && return d[x]::TapeT
+    t = _alloc_tape(TapeT)
+    d[x] = t
+    return t
+end
+
+# Resetting a shadow tape means resetting every stack's `position` to 0 in place (mirrors the raw
+# `setfield!` reset `reverse_fwds_to_ircode` emits for a reused pre-allocated primal tape), not
+# reallocating — `zero_tangent_internal` above is for building a fresh one from scratch.
+function set_to_zero_internal!!(c::SetToZeroCache, x::Tape)
+    x.block_stack.position = 0
+    tuple_map(s -> set_to_zero_internal!!(c, s), x.comms)
+    x.subtapes.position = 0
+    return x
+end
 
 # ===========================================================================
 # Two layers, as in forward mode (`frule!!` entry / `dualized_impl` carrier):
@@ -231,6 +271,31 @@ is_reverse_pullback_impl(mi) = isa(mi.def, Method) && isa(mi.specTypes, DataType
                               length(mi.specTypes.parameters) >= 2 &&
                               mi.specTypes.parameters[1] === typeof(reverse_pullback_impl) &&
                               mi.specTypes.parameters[2] <: Tape
+
+# Two unsupported compositions, both non-goals: reverse-mode differentiation of a forward-mode call
+# (`frule!!`/`dualized_impl`) or of a reverse-mode call (`rrule!!`/`reverse_fwds_impl`/
+# `reverse_pullback_impl`). Recognized as soon as a callee's primal function type is known, at the two
+# chokepoints reverse mode resolves a callee's primal from (`has_hand_reverse_rule` and
+# `resolve_reverse_primal` below) — before a `Dual` argument reaches `fcodual_type`/`fdata_type` (an
+# unlocated "Unhandled type `Dual{...}`" otherwise) and before the derived path tries to differentiate
+# through `rrule!!`'s own `(ycd, pullback)` return (an unlocated bail naming `Core.tuple` otherwise).
+_forward_entry_name(@nospecialize(ftype)) =
+    ftype === typeof(frule!!)      ? "frule!!" :
+    ftype === typeof(dualized_impl) ? "dualized_impl" : nothing
+_reverse_entry_name(@nospecialize(ftype)) =
+    ftype === typeof(rrule!!)              ? "rrule!!" :
+    ftype === typeof(reverse_fwds_impl)     ? "reverse_fwds_impl" :
+    ftype === typeof(reverse_pullback_impl) ? "reverse_pullback_impl" : nothing
+
+function _composition_bail_message(@nospecialize(ftype))
+    fname = _forward_entry_name(ftype)
+    fname !== nothing && return "reverse-over-forward is not supported: encountered a call to " *
+        "`Differ.$(fname)` (forward-mode differentiation) while building a reverse-mode pass"
+    rname = _reverse_entry_name(ftype)
+    rname !== nothing && return "reverse-over-reverse is not supported: encountered a call to " *
+        "`Differ.$(rname)` (reverse-mode differentiation) while building a reverse-mode pass"
+    return nothing
+end
 
 # The `@generated` derived fallback — the least-specific `rrule!!` method (see the note above the
 # type definitions). Recognized by its exact signature so `hand_reverse_rule_match` can tell "matched
@@ -290,6 +355,11 @@ end
 # Mirrors `has_hand_frule` (`forward_interp.jl`): used by `src_inlining_policy` below to keep such a
 # call from being inlined away before it reaches `_static_recursible_call`'s recursion dispatch,
 # regardless of how cheap the callee looks to Julia's ordinary cost heuristic.
+#
+# Composition check here too: called from `src_inlining_policy`, which has no `reason::Ref` to bail
+# through, so an unsupported composition throws directly instead of returning `false` — a `Dual`
+# argument would otherwise reach `fcodual_type` inside `hand_reverse_rule_match` and crash with an
+# unrelated, unlocated "Unhandled type" error.
 function has_hand_reverse_rule(interp::ADInterpreter, callee_mi::MethodInstance)
     isa(callee_mi.def, Method) || return false
     isa(callee_mi.specTypes, DataType) || return false     # `UnionAll` sig — see `is_reverse_fwds_impl`
@@ -297,8 +367,18 @@ function has_hand_reverse_rule(interp::ADInterpreter, callee_mi::MethodInstance)
     isempty(params) && return false
     ftype = params[1]
     (ftype isa Type && isconcretetype(ftype)) || return false
+    msg = _composition_bail_message(ftype)
+    msg === nothing || error(msg)
     argtypes = params[2:end]
     all(P -> P isa Type && isconcretetype(P), argtypes) || return false
+    # A `Dual` argument (not just a `Dual` callee) is reverse-over-forward too, and the more common
+    # shape in practice: `frule!!`'s hand rules are small enough that ordinary inlining absorbs the
+    # `frule!!` call itself before this function ever sees it as a callee, leaving a surviving call
+    # (e.g. `getproperty(::Dual{Float64,Float64}, :x)`, pulling `.x` back out) whose *argument* is the
+    # `Dual`. Caught here, before `hand_reverse_rule_match` reaches `fcodual_type` on it below.
+    any(P -> P isa Type && P <: Dual, argtypes) &&
+        error("reverse-over-forward is not supported: encountered a `Dual` (forward-mode carrier) " *
+              "argument while building a reverse-mode pass")
     return hand_reverse_rule_match(interp, ftype, argtypes) !== nothing
 end
 
@@ -330,9 +410,18 @@ _is_reverse_carrier_mi(mi::MethodInstance) = isa(mi.def, Method) && isa(mi.specT
 # hand-written reverse-mode rule (so it survives into the primal IR for `_static_recursible_call`'s
 # recursion dispatch to route to that rule via ordinary method-table resolution), and never inline a
 # recursive reverse-mode carrier invoke once emitted (see `_is_reverse_carrier_mi` above).
+#
+# `interp.nested_forward` (`contextual.jl`) adds a third condition, active only when this interp was
+# built to compile a reverse-mode carrier on behalf of an outer forward-mode dualization
+# (`forward_interp.jl`): also never inline a call whose callee has a hand-written forward-mode
+# `frule!!`. Reverse mode itself has no reason to protect such a call, but the outer forward-mode
+# dualizer needs it to still be a surviving call by the time it sees this IR. `has_hand_frule` is
+# forward mode's own predicate, mode-agnostic in signature, so it's callable directly from here. Always
+# `false` for the ordinary (non-nested) reverse path.
 function CC.src_inlining_policy(interp::ADInterpreter{Reverse}, mi::MethodInstance,
                                 @nospecialize(src), @nospecialize(info::CC.CallInfo), stmt_flag::UInt32)
     (_is_reverse_carrier_mi(mi) || has_hand_reverse_rule(interp, mi)) && return false
+    interp.nested_forward && has_hand_frule(interp, mi) && return false
     return @invoke CC.src_inlining_policy(interp::CC.AbstractInterpreter, mi::MethodInstance,
                                           src::Any, info::CC.CallInfo, stmt_flag::UInt32)
 end
@@ -400,6 +489,14 @@ function resolve_reverse_primal(interp::ADInterpreter, codualparams::Vector{Any}
                                 reason::Ref{String}, edges::Vector{Any})
     if !all(P -> P isa Type && P <: CoDual, codualparams)
         reason[] = "not every codual argument type is a `CoDual` (a vararg call?)"
+        return nothing
+    end
+    # Every path that resolves what's actually being reverse-differentiated funnels through here (the
+    # top-level primal, every recursive call via `reverse_fwds_recursive_ci`), so the composition check
+    # belongs here too — reverse-over-reverse reaches this with `ftype === typeof(rrule!!)`.
+    msg = _composition_bail_message(_codual_primal_type(codualparams[1]))
+    if msg !== nothing
+        reason[] = msg
         return nothing
     end
     primal_tt = Base.to_tuple_type(Any[_codual_primal_type(P) for P in codualparams])
@@ -1179,6 +1276,16 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
         reason[] = "callee type $(ftype) is not a concrete DataType at %$i: `$(_stmt_str(s))`"
         return nothing
     end
+    # A *composite* inner function (`gradient(y -> y*y, x)`, unlike a hand-ruled primitive like `sin`)
+    # survives dualization as a genuine recursive call to `rrule!!`, not caught by
+    # `has_hand_reverse_rule` during inlining (no hand rule to check for) — so it reaches here.
+    # Checked before every other rejection so reverse-over-reverse gets this message regardless of
+    # whether the inner `gradient` call is a hand rule or composite.
+    msg = _composition_bail_message(ftype)
+    if msg !== nothing
+        reason[] = "$(msg) at %$i: `$(_stmt_str(s))`"
+        return nothing
+    end
     if ftype === DataType
         # "Some Type value, identity erased" — mirrors the argument-side rejection below
         # (`P === DataType`): a genuinely concrete singleton type value (`Type{Float64}`) is handled
@@ -1318,6 +1425,18 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
                                    @nospecialize(ftype), argtypes::Vector{Any}, @nospecialize(R),
                                    edges::Vector{Any}, reason::Ref{String};
                                    @nospecialize(own_TapeT=nothing))
+    # `has_hand_reverse_rule` already rejects a surviving call with a `Dual` callee/argument during
+    # inlining, so this shouldn't be reachable — kept as a `reason[]`-based fallback in case some path
+    # reaches recursion without going through that check, rather than crashing in `fcodual_type` below.
+    msg = _composition_bail_message(ftype)
+    if msg === nothing && any(P -> P isa Type && P <: Dual, argtypes)
+        msg = "reverse-over-forward is not supported: encountered a `Dual` (forward-mode carrier) " *
+              "argument while building a reverse-mode pass"
+    end
+    if msg !== nothing
+        reason[] = msg
+        return nothing
+    end
     argcodualtys = Any[fcodual_type(P) for P in argtypes]
     hand = hand_reverse_rule_match(interp, ftype, argtypes)
     if hand !== nothing

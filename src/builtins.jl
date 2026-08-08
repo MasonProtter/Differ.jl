@@ -83,6 +83,20 @@ function _bi_field_index(@nospecialize(Pobj), @nospecialize(name))
     return (i isa Int && 1 <= i <= fieldcount(Pobj)) ? i : nothing
 end
 
+# For a `Stack`/`CommsCell`/`Tape` field index `fi` (already validated by `_bi_field_index`): the
+# shadow's own field type there when it's sound to mirror `getfield`/`setfield!` directly, or
+# `nothing` when the field carries no tangent. These types are self-similar shadows (own `tangent_type`
+# maps the type parameter directly), but not every field matches: `Tape.block_stack` is always declared
+# `Stack{Int32}` regardless of `Tape`'s type parameters, so a shadow `Tape`'s `block_stack` is also
+# `Stack{Int32}`, not `Stack{NoTangent}` — bookkeeping with nothing to differentiate, same status as a
+# plain `Int` field. Independent of `Ti`: re-deriving from `Pobj` alone keeps `getfield` and
+# `setfield!` agreeing on the same field.
+function _bi_selfsim_shadow_field(@nospecialize(Pobj), fi::Int)
+    FT = tangent_type(fieldtype(Pobj, fi))
+    Fsh = fieldtype(tangent_type(Pobj), fi)
+    return (Fsh === FT && FT !== NoTangent) ? Fsh : nothing
+end
+
 # `MemoryRef.ptr_or_offset` / `Memory.ptr` hold a real address only when the buffer's element layout
 # is inline and non-empty. Otherwise the field is an offset — for a bits-union element (`arrayelem == 2`)
 # or a zero-size one (`layoutsize == 0`), where a `MemoryRef` stores its 0-based index there. Base's
@@ -152,6 +166,22 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
            _bi_homog_tangent_type(Pobj) !== TT
             return nothing
         end
+    end
+    # `Stack`/`CommsCell`/`Tape` self-similar shadows (forward-over-reverse) — needs its own per-field
+    # check via `_bi_selfsim_shadow_field`, independent of `Ti`/`TT`.
+    if Pobj isa DataType && (Pobj <: Stack || Pobj <: CommsCell || Pobj <: Tape)
+        fi = _bi_field_index(Pobj, actual[2])
+        if fi === nothing
+            ctx.reason[] = "dynamic field index into `$Pobj` — its fields do not share one tangent type"
+            return nothing
+        end
+        p = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(actual[1]), idx,
+                           (ctx.presolve(a) for a in actual[3:end])...), Ti)
+        Fsh = _bi_selfsim_shadow_field(Pobj, fi)
+        Fsh === nothing && return p, NoTangent()
+        t = ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), idx,
+                           (ctx.presolve(a) for a in actual[3:end])...), Fsh)
+        return p, t
     end
     # `MemoryRef`/`Memory` are same-shape too (`tangent_type(MemoryRef{P}) === MemoryRef{tangent_type(P)}`),
     # but their shadow field types don't all match the primal's, so they need their own branch —
@@ -259,6 +289,23 @@ function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
     end
     p = ctx.emit!(Expr(:call, _setfieldg, ctx.presolve(actual[1]), idx, ctx.presolve(actual[3]),
                        (ctx.presolve(a) for a in actual[4:end])...), Ti)
+
+    # `Stack`/`CommsCell`/`Tape` (see `getfield`'s branch above). `Ti` is useless here too: the
+    # reverse-mode carrier's own `setfield!`s on these declare statement type `Any` regardless of field
+    # (hand-built IR, not inferred), so decide purely from `Pobj`'s own field type.
+    if Pobj isa DataType && (Pobj <: Stack || Pobj <: CommsCell || Pobj <: Tape)
+        fi = _bi_field_index(Pobj, actual[2])
+        if fi === nothing
+            ctx.reason[] = "dynamic field index into `$Pobj` — its fields do not share one tangent type"
+            return nothing
+        end
+        Fsh = _bi_selfsim_shadow_field(Pobj, fi)
+        Fsh === nothing && return p, NoTangent()
+        newtan = ctx.tresolve(actual[3])
+        ctx.emit!(Expr(:call, _setfieldg, ctx.tresolve(actual[1]), idx, newtan), Fsh)
+        return p, newtan
+    end
+
     TT = ctx.tt(Ti)
     TT === NoTangent && return p, NoTangent()
     newtan = ctx.tresolve(actual[3])
