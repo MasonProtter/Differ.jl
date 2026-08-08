@@ -20,7 +20,7 @@
 # `CodeInstance`s and the shared state is an explicit `Tape` value: `reverse_fwds_impl` returns it,
 # `reverse_pullback_impl` takes it as an argument. No `OpaqueClosure` anywhere in this engine.
 #
-# `rrule`/`gradient` (bottom of this file) are plain, uncompiled Julia: they hold the original
+# `rrule`/`rev_gradient` (bottom of this file) are plain, uncompiled Julia: they hold the original
 # argument fdata (from `zero_fcodual`) and combine it with the rdata the pullback carrier returns via
 # `tangent(fdata, rdata)` — the pullback carrier itself only ever returns rdata.
 #
@@ -199,7 +199,7 @@ end
 # `_tuple_tangent_types` (not the ordinary tuple-of-*values* `tangent_type` in `tangents.jl`, which
 # collapses an all-`NoTangent` tuple to a bare `NoTangent`) maps both `ArgsTT` and `CS` element-wise
 # unconditionally: `Tape{ArgsTT<:Tuple,CS<:Tuple}` bounds both to `<:Tuple`, and an all-non-
-# differentiable-argument primal (e.g. `gradient(f, 3)` for `f(::Int)`) is exactly the all-`NoTangent`
+# differentiable-argument primal (e.g. `rev_gradient(f, 3)` for `f(::Int)`) is exactly the all-`NoTangent`
 # case the ordinary collapse would break.
 _tuple_tangent_types(::Type{T}) where {T<:Tuple} = Tuple{(tangent_type(t) for t in T.parameters)...}
 
@@ -551,7 +551,7 @@ end
 # own from an explicitly-passed `primal_mi` — see their docstrings.
 #
 # Carrier-mi keying matters because the fwds carrier alone has two independent specializations per
-# primal: `Ctx{Nothing}` (fresh-tape, what `build_ctx(...; prealloc=false)`/plain `gradient` uses) and
+# primal: `Ctx{Nothing}` (fresh-tape, what `build_ctx(...; prealloc=false)`/plain `rev_gradient` uses) and
 # `Ctx{<:Tape}` (pre-allocated, what `build_ctx(...; prealloc=true)` uses and what a self-recursive
 # edge always targets — nested-tape-recycling plan, Stage 2, so the tape it recycles from is the
 # recycled-typed one on both ends). Building the `Ctx{Nothing}` variant of a self-recursive primal
@@ -1276,11 +1276,11 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
         reason[] = "callee type $(ftype) is not a concrete DataType at %$i: `$(_stmt_str(s))`"
         return nothing
     end
-    # A *composite* inner function (`gradient(y -> y*y, x)`, unlike a hand-ruled primitive like `sin`)
+    # A *composite* inner function (`rev_gradient(y -> y*y, x)`, unlike a hand-ruled primitive like `sin`)
     # survives dualization as a genuine recursive call to `rrule!!`, not caught by
     # `has_hand_reverse_rule` during inlining (no hand rule to check for) — so it reaches here.
     # Checked before every other rejection so reverse-over-reverse gets this message regardless of
-    # whether the inner `gradient` call is a hand rule or composite.
+    # whether the inner `rev_gradient` call is a hand rule or composite.
     msg = _composition_bail_message(ftype)
     if msg !== nothing
         reason[] = "$(msg) at %$i: `$(_stmt_str(s))`"
@@ -3337,7 +3337,7 @@ refresh_pullback_entry()
 
 Build a reusable differentiation context for `f` applied to arguments of types `argtypes` — a
 [`Ctx`](@ref) wrapping a tape sized for `f`'s derived rule (obtained by transforming `f`'s optimized
-IR). Pass it to [`rrule!!`](@ref) / [`value_and_gradient!`](@ref) / [`gradient!`](@ref).
+IR). Pass it to [`rrule!!`](@ref) / [`value_and_gradient!`](@ref) / [`rev_gradient!`](@ref).
 
 With `prealloc=true` (the default) the tape is allocated once, and its stacks are reset and reused on
 every call — the whole point of holding onto a context rather than differentiating afresh. That makes
@@ -3435,13 +3435,14 @@ end
 refresh_build_tape()
 
 """
-    gradient(f, args...) -> (df, dx1, dx2, ...)
+    rev_gradient(f, args...) -> (df, dx1, dx2, ...)
 
 Reverse-mode gradient of `f(args...)` for scalar output. Allocates everything it needs (zero shadows
-for each argument, and a tape); see [`gradient!`](@ref) for the pre-allocated form and
-[`build_ctx`](@ref) to hold onto a reusable context.
+for each argument, and a tape); see [`rev_gradient!`](@ref) for the pre-allocated form and
+[`build_ctx`](@ref) to hold onto a reusable context. `public`, not exported — DifferentiationInterface
+is the primary user-facing entry point, this is the direct one.
 """
-function gradient(f, args...)
+function rev_gradient(f, args...)
     y, grads = value_and_gradient!(Ctx(), zero_fcodual(f), map(zero_fcodual, args)...)
     return grads
 end
@@ -3449,9 +3450,9 @@ end
 # ---------------------------------------------------------------------------
 # Pre-allocated entry points.
 #
-# `gradient` above calls `zero_fcodual` on `f` and every argument, allocating a fresh shadow per call
-# (for an `Array` argument: the shadow array itself). These variants instead take the caller's own
-# `CoDual`s, so the shadow buffers are owned and reused by the caller. Pair them with a
+# `rev_gradient` above calls `zero_fcodual` on `f` and every argument, allocating a fresh shadow per
+# call (for an `Array` argument: the shadow array itself). These variants instead take the caller's
+# own `CoDual`s, so the shadow buffers are owned and reused by the caller. Pair them with a
 # `build_ctx(...; prealloc=true)` context and a steady-state call allocates essentially nothing.
 #
 # The gradient w.r.t. an argument arrives one of two ways, decided by the argument's type, not by
@@ -3463,9 +3464,9 @@ end
 #   * rdata-carried (a scalar): nothing to pre-allocate; returned by value.
 #
 # The supplied fdata is zeroed on entry (`set_to_zero!!`, allocation-free for arrays), so one of these
-# calls means the same thing as the equivalent `gradient` call — the caller owns the buffer, not the
-# accumulation history. Pass `zero_fcodual(f)` for the function slot unless differentiating w.r.t. a
-# closure's captures.
+# calls means the same thing as the equivalent `rev_gradient` call — the caller owns the buffer, not
+# the accumulation history. Pass `zero_fcodual(f)` for the function slot unless differentiating w.r.t.
+# a closure's captures.
 # ---------------------------------------------------------------------------
 
 """
@@ -3486,7 +3487,7 @@ y, (_, gx) = value_and_gradient!(ctx, zero_fcodual(f), CoDual(x, dx))
 gx === dx   # true — accumulated in place
 ```
 
-See also [`gradient!`](@ref) and [`gradient`](@ref).
+See also [`rev_gradient!`](@ref) and [`rev_gradient`](@ref).
 """
 function value_and_gradient!(ctx::AbstractCtx, fcd::CoDual, argcds::CoDual...)
     set_to_zero!!(tangent(fcd))
@@ -3496,18 +3497,18 @@ function value_and_gradient!(ctx::AbstractCtx, fcd::CoDual, argcds::CoDual...)
     all_cds = (fcd, argcds...)
     # A derived pullback can hand back `ZeroRData` for an argument whose concrete type has an
     # abstractly-typed field (or is itself non-concrete) — see the `zero_like_rdata_type` machinery in
-    # `reverse_pullback_to_ircode`. This is the one place `gradient`/`gradient!` funnel through, so
-    # instantiate a real zero here rather than ever handing a `ZeroRData` back to the user.
+    # `reverse_pullback_to_ircode`. This is the one place `rev_gradient`/`rev_gradient!` funnel
+    # through, so instantiate a real zero here rather than ever handing a `ZeroRData` back to the user.
     rdatas = map((cd, r) -> r isa ZeroRData ? zero_rdata(primal(cd)) : r, all_cds, pb(one(y)))
     fdatas = (tangent(fcd), map(tangent, argcds)...)
     return y, map(tangent, fdatas, rdatas)
 end
 
 """
-    gradient!(ctx::AbstractCtx, fcd::CoDual, argcds::CoDual...) -> (df, dx1, dx2, ...)
+    rev_gradient!(ctx::AbstractCtx, fcd::CoDual, argcds::CoDual...) -> (df, dx1, dx2, ...)
 
-Pre-allocated form of [`gradient`](@ref). See [`value_and_gradient!`](@ref) for the full description;
-this drops the primal value.
+Pre-allocated form of [`rev_gradient`](@ref). See [`value_and_gradient!`](@ref) for the full
+description; this drops the primal value.
 """
-gradient!(ctx::AbstractCtx, fcd::CoDual, argcds::CoDual...) =
+rev_gradient!(ctx::AbstractCtx, fcd::CoDual, argcds::CoDual...) =
     value_and_gradient!(ctx, fcd, argcds...)[2]

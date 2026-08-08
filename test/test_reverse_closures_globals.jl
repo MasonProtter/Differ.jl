@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: Dual, NoTangent, frule!!, gradient, primal, tangent, zero_tangent
+using Differ: Dual, NoTangent, frule!!, rev_gradient, primal, tangent, zero_tangent
 
 @testset "boxed captured variable (reassigned closure variable)" begin
     # Reassigning a captured variable inside a closure forces Julia to box it (`Core.Box`, with
@@ -11,7 +11,7 @@ using Differ: Dual, NoTangent, frule!!, gradient, primal, tangent, zero_tangent
     # `setfield!` of a field whose tangent carries fdata — Phase 2 territory, out of scope here).
     err = try
         let y = 1.0
-            gradient(1.0) do x
+            rev_gradient(1.0) do x
                 y += x
                 x * y
             end

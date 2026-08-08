@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, AbstractCtx, primal
+using Differ: Dual, NoTangent, frule!!, rev_gradient, CoDual, NoFData, NoRData, AbstractCtx, primal
 
 # Tests that Differ attaches real Julia backedges to a compiled derivative, so redefining a primal
 # method (or filling in a `frule!!`/`rrule!!` for something that previously errored) invalidates and
@@ -109,12 +109,12 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
 
     @testset "reverse: redefining a differentiated primal invalidates its derivative" begin
         redefinable_rsqr(x) = x * x
-        _, d1 = gradient(redefinable_rsqr, 2.0)
+        _, d1 = rev_gradient(redefinable_rsqr, 2.0)
         @test d1 == 4.0                                       # d/dx(x^2) at 2 = 4
 
         redefinable_rsqr(x) = (x * x) * x                     # redefine: same signature, x^3 now
 
-        _, d2 = gradient(redefinable_rsqr, 2.0)
+        _, d2 = rev_gradient(redefinable_rsqr, 2.0)
         @test d2 == 12.0                                      # d/dx(x^3) at 2 = 12, not the stale 4
     end
 
@@ -125,11 +125,11 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
         # (`reverse_error_ircode` embeds `error(msg)` as the generated carrier body). Still an
         # `ErrorException` either way, so the assertion is unchanged.
         placeholder_then_real_rev(x) = error("not implemented yet")
-        @test_throws ErrorException gradient(placeholder_then_real_rev, 3.0)
+        @test_throws ErrorException rev_gradient(placeholder_then_real_rev, 3.0)
 
         placeholder_then_real_rev(x) = (x * x) * (x * x)      # redefine: x^4
 
-        _, d = gradient(placeholder_then_real_rev, 3.0)
+        _, d = rev_gradient(placeholder_then_real_rev, 3.0)
         @test d == 108.0                                      # d/dx(x^4) at 3 = 4*27 = 108
     end
 
@@ -145,7 +145,7 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
             return CoDual(x + 10, NoFData()), Returns((NoRData(), 10.0))
         end
 
-        _, d = gradient(inlinable_rcaller, 1.0)
+        _, d = rev_gradient(inlinable_rcaller, 1.0)
         @test d == 10.0                                       # the hand rule, not the inlined d/dx(x+1)=1
     end
 
@@ -153,7 +153,7 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
         inlinable_rcallee2(x) = x + 1
         inlinable_rcaller2(x) = inlinable_rcallee2(x)
 
-        _, d1 = gradient(inlinable_rcaller2, 1.0)
+        _, d1 = rev_gradient(inlinable_rcaller2, 1.0)
         @test d1 == 1.0                                       # no rule yet: plain d/dx(x+1) = 1
 
         function Differ.rrule!!(::CoDual{typeof(inlinable_rcallee2),NoFData}, ::AbstractCtx,
@@ -162,7 +162,7 @@ using Differ: Dual, NoTangent, frule!!, gradient, CoDual, NoFData, NoRData, Abst
             return CoDual(x + 10, NoFData()), Returns((NoRData(), 10.0))
         end
 
-        _, d2 = gradient(inlinable_rcaller2, 1.0)
+        _, d2 = rev_gradient(inlinable_rcaller2, 1.0)
         @test d2 == 10.0                                      # recompiled + honors the new hand rule
     end
 end

@@ -1,6 +1,6 @@
 # Hand-written frule!! for the reverse-mode runtime's own primitives (`Stack`/`SingletonStack`
 # push!/pop!, the tape-recycling/bulk-save helpers) — what makes forward-over-reverse
-# (`D(x -> gradient(f, x), v)`) possible without forward mode supporting growable-array mutation.
+# (`D(x -> rev_gradient(f, x), v)`) possible without forward mode supporting growable-array mutation.
 #
 # Mooncake differentiates `push!`/`pop!` structurally (its `Stack.memory` is an ordinary `Vector`,
 # grown by the same dualized `push!` running on both primal and shadow), which needs growable-array

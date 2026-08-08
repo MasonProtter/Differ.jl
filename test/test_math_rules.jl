@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: Dual, NoTangent, frule!!, gradient, build_tangent
+using Differ: Dual, NoTangent, frule!!, rev_gradient, build_tangent
 using Differ: CoDual, NoFData, RData, Ctx, rrule!!, zero_fcodual, primal, tangent
 
 include(joinpath(@__DIR__, "testutils.jl"))
@@ -13,7 +13,7 @@ function check_unary(f, xs; rtol=1e-6)
         @test d.x ≈ f(x)
         @test d.dx ≈ central_diff(f, x) rtol = rtol
 
-        _, gx = Differ.gradient(f, x)
+        _, gx = Differ.rev_gradient(f, x)
         @test gx ≈ central_diff(f, x) rtol = rtol
     end
     # `checkverify`/`checkverify_rev` dualize the trivial wrapper rather than `f` directly: passing
@@ -38,7 +38,7 @@ function check_binary(f, xys; rtol=1e-6)
         dy = frule!!(Dual(f, NoTangent()), Dual(x, 0.0), Dual(y, 1.0))
         @test dy.dx ≈ central_diff(f, x, y, 2) rtol = rtol
 
-        _, gx, gy = Differ.gradient(f, x, y)
+        _, gx, gy = Differ.rev_gradient(f, x, y)
         @test gx ≈ central_diff(f, x, y, 1) rtol = rtol
         @test gy ≈ central_diff(f, x, y, 2) rtol = rtol
     end
@@ -71,7 +71,7 @@ function check_ternary(f, xyzs; rtol=1e-6)
         dz = frule!!(Dual(f, NoTangent()), Dual(x, 0.0), Dual(y, 0.0), Dual(z, 1.0))
         @test dz.dx ≈ central_diff3(f, x, y, z, 3) rtol = rtol
 
-        _, gx, gy, gz = Differ.gradient(f, x, y, z)
+        _, gx, gy, gz = Differ.rev_gradient(f, x, y, z)
         @test gx ≈ central_diff3(f, x, y, z, 1) rtol = rtol
         @test gy ≈ central_diff3(f, x, y, z, 2) rtol = rtol
         @test gz ≈ central_diff3(f, x, y, z, 3) rtol = rtol
@@ -146,7 +146,7 @@ end
         end
 
         # Reverse: call the hand rule directly (sqrt(::Complex) isn't a scalar loss, so
-        # `Differ.gradient`'s `one(y)` seeding convention doesn't apply here) and cross-check the
+        # `Differ.rev_gradient`'s `one(y)` seeding convention doesn't apply here) and cross-check the
         # vjp against the forward-mode Jacobian for each of the two real seed directions.
         ycd, pb = rrule!!(zero_fcodual(sqrt), Ctx(), CoDual(z, NoFData()))
         @test primal(ycd) == sqrt(z)

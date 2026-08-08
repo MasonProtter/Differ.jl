@@ -336,7 +336,7 @@ function _build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::
 
     # Forward-over-reverse: `primal_mi` can itself be a reverse-mode carrier
     # (`reverse_fwds_impl`/`reverse_pullback_impl`, `reverse_interp.jl`) rather than an ordinary user
-    # method — reached when forward-differentiating a `gradient`/`value_and_gradient!`/`Tape` pullback
+    # method — reached when forward-differentiating a `rev_gradient`/`value_and_gradient!`/`Tape` pullback
     # call. Dualizing such a call surfaces `rrule!!`'s generated body, whose one real statement is an
     # `invoke` against an already-compiled `CodeInstance`; re-dualizing that surviving invoke is what
     # lands here with `primal_mi` resolved to the carrier stub method. Ordinary `CC.typeinf_frame`
@@ -367,7 +367,7 @@ function _build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::
         CtxT = primal_mi.specTypes.parameters[3]
         if !(CtxT isa DataType && CtxT <: Ctx && CtxT.parameters[1] === Nothing)
             reason[] = "forward-over-reverse only supports the fresh-tape context (`Ctx()`/" *
-                       "`Ctx{Nothing}`, what `gradient` and `build_ctx(...; prealloc=false)` use) — " *
+                       "`Ctx{Nothing}`, what `rev_gradient` and `build_ctx(...; prealloc=false)` use) — " *
                        "a pre-allocated context (`build_ctx(...; prealloc=true)`, ctx type `$(CtxT)`) " *
                        "is not yet supported: its tape is supplied from outside this build, with no " *
                        "shadow tape to alias it to"

@@ -4,7 +4,7 @@
 using Test
 using Differ
 using Differ: code_dual_ircode, code_reverse_fwds_ircode, code_reverse_pullback_ircode
-using Differ: build_ctx, rrule!!, gradient, gradient!, zero_fcodual
+using Differ: build_ctx, rrule!!, rev_gradient, rev_gradient!, zero_fcodual
 using Differ: tape_type, comms_element_types
 
 # Central finite difference, one argument.
@@ -107,10 +107,10 @@ function check_stack_balance(f, args...)
 
     # Same again through a pre-allocated (tape-reusing) context, twice.
     pctx = build_ctx(f, map(Differ._typeof, args))
-    g1 = gradient!(pctx, zero_fcodual(f), map(zero_fcodual, args)...)
-    g2 = gradient!(pctx, zero_fcodual(f), map(zero_fcodual, args)...)
+    g1 = rev_gradient!(pctx, zero_fcodual(f), map(zero_fcodual, args)...)
+    g2 = rev_gradient!(pctx, zero_fcodual(f), map(zero_fcodual, args)...)
     @test g1 == g2
-    @test g1 == gradient(f, args...)
+    @test g1 == rev_gradient(f, args...)
     _assert_tape_balanced(pctx.tape)
     return nothing
 end

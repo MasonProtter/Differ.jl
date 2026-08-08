@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: gradient, MutableTangent, rdata_type, tangent_type, NoTangent
+using Differ: rev_gradient, MutableTangent, rdata_type, tangent_type, NoTangent
 using Differ: zero_rdata_from_type, zero_like_rdata_from_type, CannotProduceZeroRDataFromType
 using Differ: ZeroRData, NoRData, increment!!
 
@@ -22,18 +22,18 @@ include(joinpath(@__DIR__, "testutils.jl"))
     end
 
     x4 = [1.0, 2.0, 3.0, 4.0]
-    _, dx_i3 = gradient(arr_idx3, x4)
+    _, dx_i3 = rev_gradient(arr_idx3, x4)
     @test dx_i3 == [0.0, 0.0, 1.0, 0.0]
 
     x2 = [1.0, 2.0]
-    _, dx_ib_t, dp_t = gradient(arr_idx_branch, x2, true)
+    _, dx_ib_t, dp_t = rev_gradient(arr_idx_branch, x2, true)
     @test dx_ib_t == [1.0, 0.0]
     @test dp_t === NoTangent()
-    _, dx_ib_f, = gradient(arr_idx_branch, x2, false)
+    _, dx_ib_f, = rev_gradient(arr_idx_branch, x2, false)
     @test dx_ib_f == [0.0, 1.0]
 
     x3 = [1.0, 2.0, 3.0]
-    _, dx_sum = gradient(arr_sum, x3)
+    _, dx_sum = rev_gradient(arr_sum, x3)
     @test dx_sum == ones(3)
     # Cross-check every element individually against central differences.
     for k in eachindex(x3)
@@ -65,7 +65,7 @@ end
         return x[1]
     end
 
-    _, dx_mut = gradient(arr_mutate!, [1.0, 2.0])
+    _, dx_mut = rev_gradient(arr_mutate!, [1.0, 2.0])
     @test dx_mut == [2.0, 0.0]
     h = 1e-6
     xp = [1.0 + h, 2.0]; xm = [1.0 - h, 2.0]
@@ -88,7 +88,7 @@ end
     end
 
     v0 = [0.0, 0.0]
-    _, dv, da = gradient(straightline!, v0, 3.0)
+    _, dv, da = rev_gradient(straightline!, v0, 3.0)
     @test dv == [0.0, 0.0]     # both elements overwritten before being read back, no dependence on v0
     @test da == 3.0            # d/da (a + 2a) = 3
 
@@ -119,7 +119,7 @@ end
         A[1, 1] = a
         return A[1, 1]
     end
-    _, dA, dmat_a = gradient(mat_mutate!, zeros(2, 2), 3.0)
+    _, dA, dmat_a = rev_gradient(mat_mutate!, zeros(2, 2), 3.0)
     @test dA == [0.0 0.0; 0.0 0.0]
     @test dmat_a == 1.0
     checkverify_rev(mat_mutate!, (Matrix{Float64}, Float64))
@@ -147,8 +147,8 @@ end
     checkverify_rev(dynread_inbounds, (Vector{Float64},))
     check_stack_balance(dynread, x7)
     check_stack_balance(dynread_inbounds, x7)
-    _, ddr = gradient(dynread, x7)
-    _, ddri = gradient(dynread_inbounds, x7)
+    _, ddr = rev_gradient(dynread, x7)
+    _, ddri = rev_gradient(dynread_inbounds, x7)
     @test ddr == ones(4)
     @test ddri == ones(4)
 
@@ -157,7 +157,7 @@ end
     x8 = [1.0, 2.0, 3.0, 4.0]
     checkverify_rev(twoidx, (Vector{Float64},))
     check_stack_balance(twoidx, x8)
-    _, dti = gradient(twoidx, x8)
+    _, dti = rev_gradient(twoidx, x8)
     for k in eachindex(x8)
         xp = copy(x8); xp[k] += 1e-6
         xm = copy(x8); xm[k] -= 1e-6
@@ -171,7 +171,7 @@ end
     x9, y9 = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
     checkverify_rev(sharedidx, (Vector{Float64}, Vector{Float64}))
     check_stack_balance(sharedidx, x9, y9)
-    _, dx9, dy9 = gradient(sharedidx, x9, y9)
+    _, dx9, dy9 = rev_gradient(sharedidx, x9, y9)
     @test dx9 == y9
     @test dy9 == x9
 
@@ -184,7 +184,7 @@ end
     xb = [1.0, 2.0, 3.0]
     checkverify_rev(bulkwrite!, (Vector{Float64},))
     check_stack_balance(bulkwrite!, copy(xb))
-    _, dxb = gradient(bulkwrite!, copy(xb))
+    _, dxb = rev_gradient(bulkwrite!, copy(xb))
     @test dxb == fill(2.0, 3)
     # Comms fusion drops this from 5 stacks to 4, at an unchanged 48 bytes. The 4th is the nested
     # `mapreduce_impl` tape from the trailing `sum(x)` — a separate inner tape, not a loop-body stack.
@@ -198,7 +198,7 @@ end
     wn = [7.0, 8.0]
     checkverify_rev(nested_loop_write!, (Vector{Vector{Float64}}, Vector{Float64}))
     check_stack_balance(nested_loop_write!, deepcopy(xn), copy(wn))
-    _, dxn, dwn = gradient(nested_loop_write!, deepcopy(xn), copy(wn))
+    _, dxn, dwn = rev_gradient(nested_loop_write!, deepcopy(xn), copy(wn))
     @test dxn == [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]   # every element overwritten before any read
     @test dwn == [1.0, 1.0]                             # only x[end] (== w, aliased) is read
     # The write loop itself still converts (matching `bulkwrite!` above): `check_tape_size` on a
@@ -219,7 +219,7 @@ end
     xf = [1.0, 2.0, 3.0]
     checkverify_rev(f2, (Vector{Float64},))
     check_stack_balance(f2, copy(xf))
-    _, dxf = gradient(f2, copy(xf))
+    _, dxf = rev_gradient(f2, copy(xf))
     @test dxf == 2 .* xf
     ts6 = check_tape_size(f2, (Vector{Float64},))
     @test any(has_memoryref, ts6)          # y's local ref: untouched
@@ -270,16 +270,16 @@ end
 
     # The general engine path (no hand rule): a plain composite function taking the array
     # directly, one level and two levels of recursion.
-    _, dx_outer = gradient(arr_outer, x5)
+    _, dx_outer = rev_gradient(arr_outer, x5)
     @test dx_outer == [2 * x5[1], 2 * x5[2]]
-    _, dx_nest = gradient(arr_nest, x5)
+    _, dx_nest = rev_gradient(arr_nest, x5)
     @test dx_nest == [2 * x5[1], 2 * x5[2]]
 
-    _, dx_alias = gradient(arr_alias, x5)
+    _, dx_alias = rev_gradient(arr_alias, x5)
     @test dx_alias == [4 * x5[1], 4 * x5[2]]
 
     x6 = [1.0, 2.0]
-    _, dx_sumdo = gradient(f_sumdo, x6)
+    _, dx_sumdo = rev_gradient(f_sumdo, x6)
     @test dx_sumdo == 2 .* x6 .+ 2
     for k in eachindex(x6)
         xp = copy(x6); xp[k] += 1e-6
@@ -289,15 +289,15 @@ end
 
     # Plain `sum(x)`, also via the hand-written rule.
     x7 = [1.0, 2.0, 3.0, 4.0]
-    _, dx_plainsum = gradient(sum, x7)
+    _, dx_plainsum = rev_gradient(sum, x7)
     @test dx_plainsum == ones(4)
 
-    _, dvs_avb = gradient(arr_via_box, [[1.0, 2.0]])
+    _, dvs_avb = rev_gradient(arr_via_box, [[1.0, 2.0]])
     @test dvs_avb == [[1.0, 1.0]]
     checkverify_rev(arr_via_box, (Vector{Vector{Float64}},))
     check_stack_balance(arr_via_box, [[1.0, 2.0]])
 
-    _, dp_avm = gradient(arr_via_mut, MPoint(1.0, 2.0))
+    _, dp_avm = rev_gradient(arr_via_mut, MPoint(1.0, 2.0))
     @test dp_avm == MutableTangent{@NamedTuple{x::Float64,y::Float64}}((x=1.0, y=1.0))
 
     checkverify_rev(arr_outer, (Vector{Float64},))

@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: Dual, NoTangent, NoRData, NoFData, frule!!, gradient, gradient!
+using Differ: Dual, NoTangent, NoRData, NoFData, frule!!, rev_gradient, rev_gradient!
 using Differ: MutableTangent, get_tangent_field, zero_tangent, zero_fcodual, rrule!!, Ctx
 
 include(joinpath(@__DIR__, "testutils.jl"))
@@ -21,11 +21,11 @@ end
     mpoint_setx!(p::MPoint, v) = (p.x = v; p.x + p.y)     # mutable-struct field mutation (setfield!)
 
     p0 = MPoint(2.0, 3.0)
-    _, dp_read = gradient(mpoint_read, p0)
+    _, dp_read = rev_gradient(mpoint_read, p0)
     @test dp_read == MutableTangent{@NamedTuple{x::Float64,y::Float64}}((x=1.0, y=1.0))
 
     p1 = MPoint(2.0, 3.0)
-    _, dp_setx, dv_setx = gradient(mpoint_setx!, p1, 10.0)
+    _, dp_setx, dv_setx = rev_gradient(mpoint_setx!, p1, 10.0)
     # p.x is overwritten before use, so its own gradient contribution is 0; p.y and v flow straight
     # through to the `+`.
     @test dp_setx == MutableTangent{@NamedTuple{x::Float64,y::Float64}}((x=0.0, y=1.0))
@@ -51,7 +51,7 @@ end
     end
 
     x8 = [3.0, 4.0]
-    _, dx_mutsum = gradient(arr_mutate_sum!, x8)
+    _, dx_mutsum = rev_gradient(arr_mutate_sum!, x8)
     @test dx_mutsum == [2.0, 1.0]
     for k in eachindex(x8)
         xp = copy(x8); xp[k] += 1e-6
@@ -78,7 +78,7 @@ end
 
     r0 = Ref(2.0)
     ys0 = [3.0, 4.0]
-    _, dr_loop, dys_loop = gradient(refprod_loop!, r0, ys0)
+    _, dr_loop, dys_loop = rev_gradient(refprod_loop!, r0, ys0)
     @test get_tangent_field(dr_loop, 1) ≈ 12.0
     @test dys_loop == [8.0, 6.0]
     @test r0[] == 2.0   # forward-replay mutates r0; the pullback's restore leaves it as found
@@ -116,7 +116,7 @@ end
 
     b1 = MBox([1.0, 2.0])
     w1 = [3.0, 4.0]
-    _, db_setbox, dw_setbox = gradient(setbox_sum!, b1, w1)
+    _, db_setbox, dw_setbox = rev_gradient(setbox_sum!, b1, w1)
     @test db_setbox == MutableTangent{@NamedTuple{v::Vector{Float64}}}((v=[0.0, 0.0],))
     @test dw_setbox == [1.0, 1.0]
     h2 = 1e-6
@@ -135,7 +135,7 @@ end
     end
     # `setbox!` (returns `nothing`, `b.v` never read back downstream) runs to completion instead
     # of bailing: the aliasing mechanism handles it fine, there's just nothing downstream to carry
-    # a gradient to `w`. `gradient`/`gradient!` seed the pullback with `one(y)`, which has no
+    # a gradient to `w`. `rev_gradient`/`rev_gradient!` seed the pullback with `one(y)`, which has no
     # method for `y === nothing` (a pre-existing, unrelated restriction of that convenience API to
     # scalar-output primals), so exercise `rrule!!` directly with an explicit `NoRData()` seed,
     # exactly as `make_refmul_closure` above does for the same reason.
@@ -154,7 +154,7 @@ end
 end
 
 @testset "reverse mode: array allocation" begin
-    # Array allocation (Case 2 final step): `mutate_nested!` returns `nothing`, so `gradient`'s
+    # Array allocation (Case 2 final step): `mutate_nested!` returns `nothing`, so `rev_gradient`'s
     # `one(y)` seeding doesn't apply; exercise `rrule!!` directly with an explicit `NoRData()`
     # seed, exactly as `setbox!` above. The freshly-allocated `[9.0, 9.0]` has no dependency on
     # `x`, so its aliased shadow is zero; the pullback's restore leaves `x`/its shadow as found.
@@ -174,7 +174,7 @@ end
     @test xmshadow0 == [[0.0, 0.0], [0.0, 0.0]]
     checkverify_rev(mutate_nested!, (Vector{Vector{Float64}},))
 
-    # Scalar-returning allocation tests (so `gradient` applies directly): `zeros`/explicit index
+    # Scalar-returning allocation tests (so `rev_gradient` applies directly): `zeros`/explicit index
     # writes, not a `[a,b]` literal. A literal array with 2+ elements lowers through `Base.vect`'s
     # `X::Tuple` capture, and when an element is differentiable that tuple is a genuine
     # differentiable `Core.tuple` result — the one explicitly out-of-scope gap. `zeros` plus
@@ -182,7 +182,7 @@ end
     #
     # `alloc_and_sum`: allocate, write both elements from `x`, read both back locally — d/dx = 3.
     alloc_and_sum(x::Float64) = (v = zeros(2); v[1] = x; v[2] = 2 * x; v[1] + v[2])
-    _, dx_aas = gradient(alloc_and_sum, 3.0)
+    _, dx_aas = rev_gradient(alloc_and_sum, 3.0)
     @test dx_aas ≈ 3.0
     h = 1e-6
     @test dx_aas ≈ (alloc_and_sum(3.0 + h) - alloc_and_sum(3.0 - h)) / 2h rtol = 1e-5
@@ -200,7 +200,7 @@ end
         x[1] = v
         return x[1][1] + x[1][2]
     end
-    _, dx_asr, da_asr = gradient(alloc_store_read!, [[1.0, 2.0], [3.0, 4.0]], 5.0)
+    _, dx_asr, da_asr = rev_gradient(alloc_store_read!, [[1.0, 2.0], [3.0, 4.0]], 5.0)
     @test dx_asr == [[0.0, 0.0], [0.0, 0.0]]
     @test da_asr ≈ 3.0
     @test da_asr ≈ (alloc_store_read!([[1.0, 2.0], [3.0, 4.0]], 5.0 + h) -
@@ -224,7 +224,7 @@ end
     # an existing array (`push!`/`resize!`) routes through `Core.memoryrefoffset`, a distinct,
     # still-unhandled builtin (unrelated to allocation, which is now fully supported).
     growvec!(v, x) = push!(v, x)
-    @test_throws ErrorException gradient(growvec!, [1.0, 2.0], 3.0)
+    @test_throws ErrorException rev_gradient(growvec!, [1.0, 2.0], 3.0)
 end
 
 @testset "reverse mode: nested-array aliasing" begin
@@ -259,7 +259,7 @@ end
         return w[1] + w[2]
     end
 
-    _, dx_nr = gradient(nested_read, [[1.0, 2.0], [3.0, 4.0]])
+    _, dx_nr = rev_gradient(nested_read, [[1.0, 2.0], [3.0, 4.0]])
     @test dx_nr == [[1.0, 1.0], [0.0, 0.0]]
     h = 1e-6
     for k in 1:2
@@ -268,7 +268,7 @@ end
         @test dx_nr[1][k] ≈ (nested_read(xp) - nested_read(xm)) / 2h rtol = 1e-5
     end
 
-    _, dx_nwe, dw_nwe = gradient(nested_write_existing, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
+    _, dx_nwe, dw_nwe = rev_gradient(nested_write_existing, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
     @test dx_nwe == [[0.0, 0.0], [0.0, 0.0]]   # x[1] overwritten before use — zero, not aliased
     @test dw_nwe == [1.0, 1.0]
     for k in 1:2
@@ -279,11 +279,11 @@ end
         @test dw_nwe[k] ≈ fd rtol = 1e-5
     end
 
-    _, dx_rb, dw_rb = gradient(nested_write_read_both, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
+    _, dx_rb, dw_rb = rev_gradient(nested_write_read_both, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
     @test dx_rb == [[0.0, 0.0], [0.0, 0.0]]
     @test dw_rb == [2.0, 2.0]
 
-    _, dx_mt, dw_mt = gradient(nested_write_mutate_through, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
+    _, dx_mt, dw_mt = rev_gradient(nested_write_mutate_through, [[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0])
     @test dx_mt == [[0.0, 0.0], [0.0, 0.0]]
     @test dw_mt == [3.0, 1.0]
 
@@ -317,7 +317,7 @@ end
         m = MArrBox(vs[1])
         return arrbox_inner(m)
     end
-    _, dvs_abu = gradient(arrbox_untraced, [[1.0, 2.0], [3.0, 4.0]])
+    _, dvs_abu = rev_gradient(arrbox_untraced, [[1.0, 2.0], [3.0, 4.0]])
     @test dvs_abu == [[1.0, 1.0], [0.0, 0.0]]
     checkverify_rev(arrbox_untraced, (Vector{Vector{Float64}},))
     check_stack_balance(arrbox_untraced, [[1.0, 2.0], [3.0, 4.0]])
@@ -338,7 +338,7 @@ end
         return box.p.x + box.p.y
     end
 
-    _, dx_nml = gradient(newmut_local, 3.0)
+    _, dx_nml = rev_gradient(newmut_local, 3.0)
     @test dx_nml ≈ 1.0
     h = 1e-6
     @test dx_nml ≈ (newmut_local(3.0 + h) - newmut_local(3.0 - h)) / 2h rtol = 1e-5
@@ -353,7 +353,7 @@ end
     @noinline mpoint_xy(p::MPoint) = p.x + p.y
     newmut(x::Float64) = (p = MPoint(x, 1.0); mpoint_xy(p))
 
-    _, dx_nm = gradient(newmut, 5.0)
+    _, dx_nm = rev_gradient(newmut, 5.0)
     @test dx_nm ≈ 1.0
     @test dx_nm ≈ (newmut(5.0 + h) - newmut(5.0 - h)) / 2h rtol = 1e-5
     checkverify_rev(newmut, (Float64,))
@@ -365,7 +365,7 @@ end
     @noinline mpoint_mutate!(p::MPoint) = (p.x = p.x + 5.0; p.x + p.y)
     newmut_recursive_mutate(x::Float64) = mpoint_mutate!(MPoint(x, 1.0))
 
-    _, dx_nmr = gradient(newmut_recursive_mutate, 2.0)
+    _, dx_nmr = rev_gradient(newmut_recursive_mutate, 2.0)
     @test dx_nmr ≈ 1.0
     @test dx_nmr ≈ (newmut_recursive_mutate(2.0 + h) - newmut_recursive_mutate(2.0 - h)) / 2h rtol = 1e-5
     checkverify_rev(newmut_recursive_mutate, (Float64,))
@@ -399,7 +399,7 @@ end
         return s
     end
     v = [7.0, 8.0, 9.0]
-    _, _, da = gradient(bulk_write_read, v, 3.0)
+    _, _, da = rev_gradient(bulk_write_read, v, 3.0)
     @test da ≈ 6.0
     @test da ≈ central_diff(a -> bulk_write_read(copy(v), a), 3.0) rtol = 1e-5
     @test v == [7.0, 8.0, 9.0]          # primal restored by the bulk copy-back
@@ -409,7 +409,7 @@ end
 
     # The `Memory` form of the same shape: the ref chain is rooted at a `Core.memorynew`-free
     # `Memory` argument via the 1-arg `memoryrefnew`, no `Array.ref` hop. `Memory` can't go through
-    # `gradient` (no `zero_tangent` method), so drive `rrule!!` directly.
+    # `rev_gradient` (no `zero_tangent` method), so drive `rrule!!` directly.
     function bulk_mem!(out::Memory{Float64}, x::Float64, N::Int)
         for i in 1:N
             @inbounds out[i] = x
@@ -437,7 +437,7 @@ end
         return x[length(x)]
     end
     xs = [1.0, 2.0, 3.0, 4.0]
-    _, _, das = gradient(bulk_shift!, xs, 5.0)
+    _, _, das = rev_gradient(bulk_shift!, xs, 5.0)
     @test das ≈ 8.0
     @test das ≈ central_diff(a -> bulk_shift!(copy(xs), a), 5.0) rtol = 1e-5
     @test xs == [1.0, 2.0, 3.0, 4.0]
@@ -448,7 +448,7 @@ end
     # `straightline!` contains a GC-tracked `MemoryRef`.
     straightline!(v::Vector{Float64}, a::Float64) = (v[1] = a; v[2] = 2a; v[1] + v[2])
     vsl = [1.0, 2.0]
-    _, _, dasl = gradient(straightline!, vsl, 4.0)
+    _, _, dasl = rev_gradient(straightline!, vsl, 4.0)
     @test dasl ≈ 3.0
     @test vsl == [1.0, 2.0]
     @test all(T -> !(T <: Tuple) || all(F -> !(F <: MemoryRef), fieldtypes(T)),
@@ -477,7 +477,7 @@ end
         (for i in 1:length(v); @inbounds v[i] = a * i; end; v[1])
     bulk_outer(v::Vector{Float64}, a::Float64) = bulk_inner!(v, a) + bulk_inner!(v, 2a)
     vr = [3.0, 4.0]
-    _, _, dar = gradient(bulk_outer, vr, 2.0)
+    _, _, dar = rev_gradient(bulk_outer, vr, 2.0)
     @test dar ≈ 3.0
     @test dar ≈ central_diff(a -> bulk_outer(copy(vr), a), 2.0) rtol = 1e-5
     @test vr == [3.0, 4.0]

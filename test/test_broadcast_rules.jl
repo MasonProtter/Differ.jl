@@ -12,14 +12,14 @@ include(joinpath(@__DIR__, "testutils.jl"))
 # array, and Differ's reverse-mode engine has two pre-existing, general (not `map`-specific)
 # limitations that this uncovers:
 #
-#   1. `gradient`/`value_and_gradient!` seed the top-level return with `one(y)` (ISSUES.md #51),
-#      which doesn't exist for a `Vector`, so `gradient(map, f, x)` can't be called at all,
+#   1. `rev_gradient`/`value_and_gradient!` seed the top-level return with `one(y)` (ISSUES.md #51),
+#      which doesn't exist for a `Vector`, so `rev_gradient(map, f, x)` can't be called at all,
 #      regardless of `map`'s own rule.
 #   2. The general recursive-call dispatcher (`_static_recursible_call` in `reverse_interp.jl`)
 #      unconditionally bails on any call whose result carries fdata (an array): "the fwds pass
 #      has nowhere to route a result shadow today". This means a composite function that calls
 #      `map`/`map!` internally (e.g. `f(x) = sum(map(sin, x))`) cannot be differentiated in reverse
-#      mode via `gradient(f, x)` today: the `map(sin, x)` call site bails before the engine ever
+#      mode via `rev_gradient(f, x)` today: the `map(sin, x)` call site bails before the engine ever
 #      gets to consult `map`'s hand rule. Confirmed empirically below (last testset): a clean,
 #      located `ErrorException`, not a crash. Fixing this is out of scope here; it's a general
 #      engine limitation in `reverse_interp.jl`, not specific to `map`/`map!`.
@@ -121,7 +121,7 @@ end
 
 # ---------------------------------------------------------------------------
 # Reverse mode. Direct `rrule!!` calls throughout: see the module-level note on why. `map`'s
-# return is an array, which neither `gradient` (scalar-seed-only, ISSUES.md #51) nor the general
+# return is an array, which neither `rev_gradient` (scalar-seed-only, ISSUES.md #51) nor the general
 # recursive-call dispatcher (ISSUES.md-adjacent, `_static_recursible_call`'s result-fdata guard)
 # currently support composing.
 # ---------------------------------------------------------------------------
@@ -246,7 +246,7 @@ end
     @test occursin("map!", err2.value.msg)
 end
 
-@testset "reverse mode: composing map inside gradient bails cleanly (documented engine gap)" begin
+@testset "reverse mode: composing map inside rev_gradient bails cleanly (documented engine gap)" begin
     # See the module-level note: `map`'s hand rule is correct (tested directly above), but a `map`
     # call result is an array with no provenance traceable to a function argument, which the
     # engine has no way to thread a real shadow for. So composing `map` inside a differentiated
@@ -261,7 +261,7 @@ end
     # gap, caught one guard later.
     f(x) = sum(map(sin, x))
     e = try
-        Differ.gradient(f, [0.3, 1.2, -0.7])
+        Differ.rev_gradient(f, [0.3, 1.2, -0.7])
         nothing
     catch e
         e

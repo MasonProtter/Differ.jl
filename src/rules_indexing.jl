@@ -122,13 +122,13 @@ end
 # index can repeat (e.g. `A[[1,1,2]]`) — a later occurrence must accumulate into `dA[i]`, not
 # overwrite an earlier one's contribution.
 #
-# NOTE: reachable only via a direct top-level `gradient(Base.getindex, A, mask_or_idxvec)` call, not
+# NOTE: reachable only via a direct top-level `rev_gradient(Base.getindex, A, mask_or_idxvec)` call, not
 # through a user-defined wrapper (`f(A, m) = A[m]`) — `_static_recursible_call`'s static eligibility
 # gate (reverse_interp.jl) rejects any surviving high-level call whose result carries non-trivial
 # fdata ("array-valued results from a recursive call are a separate, not-yet-supported feature")
 # before hand-rule resolution is even attempted. That gate lives outside this file's scope, so a
 # wrapped call bails with that message regardless of the rule below. Tested here by calling
-# `gradient`/`rrule!!` on `Base.getindex` directly.
+# `rev_gradient`/`rrule!!` on `Base.getindex` directly.
 # ===========================================================================
 
 struct MaskGetindexPullback{DA<:Array,M<:AbstractArray{Bool},DY<:Array}

@@ -1,12 +1,12 @@
 using Test
 using Differ
 using Differ: Dual, NoTangent, frule!!, zero_tangent, code_dual_ircode
-using Differ: fcodual_type, Ctx, build_ctx, gradient, value_and_gradient!, zero_fcodual
+using Differ: fcodual_type, Ctx, build_ctx, rev_gradient, value_and_gradient!, zero_fcodual
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
-# Forward-over-reverse: `D(x -> gradient(f, x), v)`, i.e. dualizing a call to `gradient` (or
-# `value_and_gradient!`/a `Tape` pullback) itself. `gradient`'s generated body is
+# Forward-over-reverse: `D(x -> rev_gradient(f, x), v)`, i.e. dualizing a call to `rev_gradient` (or
+# `value_and_gradient!`/a `Tape` pullback) itself. `rev_gradient`'s generated body is
 # `invoke(reverse_fwds_impl, cinst, ...)`/`invoke(reverse_pullback_impl, cinst, ...)` against an
 # already-compiled `CodeInstance`, and re-dualizing that surviving invoke needs forward mode to see the
 # real reverse-mode-optimized IR for those carriers rather than their generic error-stub bodies (the
@@ -31,7 +31,7 @@ D(f, x) = frule!!(Dual(f, zero_tangent(f)), Dual(x, one(x))).dx
 @testset "staging 1: scalar straight-line" begin
     # g(x) = x² + sin(x), g'(x) = 2x + cos(x), g''(x) = 2 - sin(x).
     g(x) = x*x + sin(x)
-    val = D(x -> gradient(g, x)[2], 2.0)
+    val = D(x -> rev_gradient(g, x)[2], 2.0)
     @test val ≈ 2 - sin(2.0)
 
     # Cross-check against the independent forward-over-forward oracle: `code_dual_ircode(g, ...;
@@ -42,7 +42,7 @@ D(f, x) = frule!!(Dual(f, zero_tangent(f)), Dual(x, one(x))).dx
     fof = frule!!(Dual(Dual(g, NoTangent()), Dual(g, NoTangent())), dd)
     @test val ≈ fof.dx.dx
 
-    checkverify(x -> gradient(g, x)[2], (Float64,))
+    checkverify(x -> rev_gradient(g, x)[2], (Float64,))
 end
 
 @testset "staging 2: scalar with a loop" begin
@@ -54,14 +54,14 @@ end
         end
         return s
     end
-    val = D(x -> gradient(h, x)[2], 2.0)
+    val = D(x -> rev_gradient(h, x)[2], 2.0)
     @test val ≈ 6.0
 
     dd = Dual(Dual(2.0, 1.0), Dual(1.0, 0.0))
     fof = frule!!(Dual(Dual(h, NoTangent()), Dual(h, NoTangent())), dd)
     @test val ≈ fof.dx.dx
 
-    checkverify(x -> gradient(h, x)[2], (Float64,))
+    checkverify(x -> rev_gradient(h, x)[2], (Float64,))
 end
 
 # f(v) = Σ vᵢ² has Hessian 2I — constant and diagonal. A forward-over-reverse implementation could
@@ -96,18 +96,18 @@ end
     Core.Compiler.verify_ir(ir)
 
     # The full nested closure (`D`'s target) also verifies on its own.
-    checkverify(x -> gradient(sumsq, [x, 2x, 3x])[2], (Float64,))
+    checkverify(x -> rev_gradient(sumsq, [x, 2x, 3x])[2], (Float64,))
 
-    # Numerical: gradient(sumsq, v) == 2v, so d/dx gradient(sumsq, [x,2x,3x]) == [2,4,6].
+    # Numerical: rev_gradient(sumsq, v) == 2v, so d/dx rev_gradient(sumsq, [x,2x,3x]) == [2,4,6].
     val = D(1.0) do x
-        gradient(sumsq, [x, 2x, 3x])[2]
+        rev_gradient(sumsq, [x, 2x, 3x])[2]
     end
     @test val ≈ [2.0, 4.0, 6.0]
 
     # Finite-difference backstop, general-purpose (works for any shape): differentiate
-    # `gradient(sumsq, v(x))` w.r.t. x directly via central differences, independent of the closed
+    # `rev_gradient(sumsq, v(x))` w.r.t. x directly via central differences, independent of the closed
     # form above.
-    vecgrad(x) = gradient(sumsq, [x, 2x, 3x])[2]
+    vecgrad(x) = rev_gradient(sumsq, [x, 2x, 3x])[2]
     fd = (vecgrad(1.0 + 1e-6) .- vecgrad(1.0 - 1e-6)) ./ 2e-6
     @test val ≈ fd atol=1e-6
 end
@@ -118,11 +118,11 @@ end
     # is not constant, so a formula that mishandles either would be caught here (unlike `sumsq`'s
     # constant, diagonal 2I).
     val = D(1.0) do x
-        gradient(nontrivial, [x, 2x, 3x])[2]
+        rev_gradient(nontrivial, [x, 2x, 3x])[2]
     end
 
     fd_oracle(x) = begin
-        vecgrad(t) = gradient(nontrivial, [t, 2t, 3t])[2]
+        vecgrad(t) = rev_gradient(nontrivial, [t, 2t, 3t])[2]
         h = 1e-6
         (vecgrad(x + h) .- vecgrad(x - h)) ./ 2h
     end
@@ -137,7 +137,7 @@ end
     # constant.
     @test val ≈ [8.0, 28.0, 56.0]
 
-    checkverify(x -> gradient(nontrivial, [x, 2x, 3x])[2], (Float64,))
+    checkverify(x -> rev_gradient(nontrivial, [x, 2x, 3x])[2], (Float64,))
 end
 
 @testset "not `sum`: sum(abs2, v) bails on a recycled inner tape (Ctx{<:Tape})" begin
@@ -149,7 +149,7 @@ end
     # located bail — not a silent zero and not a crash.
     e = try
         D(1.0) do x
-            gradient(v -> sum(abs2, v), [x, 2x, 3x])[2]
+            rev_gradient(v -> sum(abs2, v), [x, 2x, 3x])[2]
         end
         nothing
     catch err
@@ -163,8 +163,8 @@ end
 @testset "Ctx{<:Tape} (pre-allocated context) bails cleanly" begin
     # Same underlying restriction as the `sum` case above, triggered directly: a pre-allocated
     # (`build_ctx(...; prealloc=true)`) context's tape is supplied from outside `reverse_fwds_impl`,
-    # so forward-over-reverse has no shadow tape to alias it to. `gradient`/`build_ctx(...;
-    # prealloc=false)` (what plain `gradient` and the staging tests above use) are unaffected — this
+    # so forward-over-reverse has no shadow tape to alias it to. `rev_gradient`/`build_ctx(...;
+    # prealloc=false)` (what plain `rev_gradient` and the staging tests above use) are unaffected — this
     # is specifically about the pre-allocated path.
     ctx = build_ctx(sumsq, (Vector{Float64},); prealloc=true)
     inner(x) = value_and_gradient!(ctx, zero_fcodual(sumsq), zero_fcodual([x, 2x, 3x]))[2]
@@ -179,15 +179,15 @@ end
 end
 
 @testset "reverse-over-forward and reverse-over-reverse bail, not crash or silently zero" begin
-    # Both compositions are non-goals: `gradient` of a function that itself calls `frule!!`
-    # (reverse-over-forward) or calls `gradient` (reverse-over-reverse). Both must fail cleanly (a
+    # Both compositions are non-goals: `rev_gradient` of a function that itself calls `frule!!`
+    # (reverse-over-forward) or calls `rev_gradient` (reverse-over-reverse). Both must fail cleanly (a
     # located `ErrorException`, not a `MethodError`/segfault, and never a silently-wrong zero
     # derivative) and name the actual composition rather than surfacing an unrelated internal error
     # several frames removed from the real cause. Caught at the point reverse mode resolves a callee's
     # primal function or argument types (`_composition_bail_message`, `src/reverse_interp.jl`).
     rof(x) = frule!!(Dual(sin, NoTangent()), Dual(x, 1.0)).x
     e1 = try
-        gradient(rof, 1.0)
+        rev_gradient(rof, 1.0)
         nothing
     catch err
         err
@@ -208,11 +208,11 @@ end
     # rejection first (real and located, but naming `Tuple{CoDual,Tape}`, not the composition). Only
     # testing one shape is what let the composite one regress silently before.
     for (label, ror) in (
-        ("hand-ruled inner function", x -> gradient(sin, x)[2]),
-        ("composite inner function", x -> gradient(y -> y * y, x)[2]),
+        ("hand-ruled inner function", x -> rev_gradient(sin, x)[2]),
+        ("composite inner function", x -> rev_gradient(y -> y * y, x)[2]),
     )
         e2 = try
-            gradient(ror, 1.0)
+            rev_gradient(ror, 1.0)
             nothing
         catch err
             err

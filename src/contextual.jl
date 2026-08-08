@@ -86,7 +86,7 @@ struct ADInterpreter{M<:ADMode} <: AbstractInterpreter
     # `src_inlining_policy` (`reverse_interp.jl`) consults it to also protect calls with a hand
     # `frule!!` from inlining, so forward mode still gets to see them as calls rather than finding them
     # already inlined away by the reverse-mode optimizer. Always `false` for `Forward` and for an
-    # ordinary `Reverse` interpreter, so plain `gradient` is unaffected.
+    # ordinary `Reverse` interpreter, so plain `rev_gradient` is unaffected.
     nested_forward::Bool
     function ADInterpreter{M}(world::UInt,
                               ip::InferenceParams,

@@ -35,7 +35,7 @@ tr_fn(A) = tr(A)
         end
 
         # Reverse mode.
-        _, dx_dot, dy_dot = Differ.gradient(dot_fn, x, y)
+        _, dx_dot, dy_dot = Differ.rev_gradient(dot_fn, x, y)
         @test dx_dot ≈ y
         @test dy_dot ≈ x
         for k in eachindex(x)
@@ -68,7 +68,7 @@ tr_fn(A) = tr(A)
         end
 
         # Reverse mode.
-        _, dx_norm = Differ.gradient(norm_fn, x)
+        _, dx_norm = Differ.rev_gradient(norm_fn, x)
         @test dx_norm ≈ x ./ norm(x)
         for k in eachindex(x)
             xp = copy(x); xp[k] += 1e-6
@@ -95,7 +95,7 @@ tr_fn(A) = tr(A)
         end
 
         # Reverse mode.
-        _, dA_tr = Differ.gradient(tr_fn, A)
+        _, dA_tr = Differ.rev_gradient(tr_fn, A)
         @test dA_tr == Matrix(1.0I, 3, 3)
         for i in 1:3, j in 1:3
             Ap = copy(A); Ap[i, j] += 1e-6
@@ -138,7 +138,7 @@ tr_fn(A) = tr(A)
         # `_static_recursible_call`'s guard #3 in `reverse_interp.jl` — a pre-existing scope limit
         # of the composite recursion machinery, unrelated to this rule's correctness and not
         # fixable from this file). So `A*x`'s reverse rule is exercised by calling `rrule!!` directly
-        # — the same shape `Differ.gradient`/`value_and_gradient!` use under the hood — rather than
+        # — the same shape `Differ.rev_gradient`/`value_and_gradient!` use under the hood — rather than
         # through a wrapping scalar composite function.
         dA = zeros(size(A)); dx = zeros(size(x))
         Acd, xcd = Differ.CoDual(A, dA), Differ.CoDual(x, dx)
@@ -371,7 +371,7 @@ tr_fn(A) = tr(A)
 
         for n in (2, 40)   # 40x40 is the size that used to reach the illegal statement
             M = rand(n, n)
-            _, dM = Differ.gradient(g_t, M)
+            _, dM = Differ.rev_gradient(g_t, M)
             @test dM == ones(n, n)
 
             k = (1, min(2, n))   # a single perturbed entry, central-differenced against g_t

@@ -1,7 +1,7 @@
 using Test
 using Differ
 using Differ: Dual, CoDual, NoTangent, NoFData, NoRData, frule!!, rrule!!
-using Differ: AbstractCtx, Ctx, build_ctx, gradient, zero_fcodual, tangent_type, increment!!
+using Differ: AbstractCtx, Ctx, build_ctx, rev_gradient, zero_fcodual, tangent_type, increment!!
 using Differ: primal, tangent, extract
 
 include(joinpath(@__DIR__, "testutils.jl"))
@@ -28,7 +28,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
     @test rw.x === A2 && rw.dx === dA2
     checkverify(write2d!, (Matrix{Float64}, Int, Int, Float64))
 
-    _, dx_read = gradient(read2d, A, 2, 3)
+    _, dx_read = rev_gradient(read2d, A, 2, 3)
     @test dx_read == [0.0 0.0 0.0; 0.0 0.0 1.0]
     checkverify_rev(read2d, (Matrix{Float64}, Int, Int))
     check_stack_balance(read2d, A, 2, 3)
@@ -38,7 +38,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
         A[1, 1] = 2.0 * A[1, 1]
         return A[1, 1]
     end
-    _, dx_mut = gradient(mutate2d!, Am)
+    _, dx_mut = rev_gradient(mutate2d!, Am)
     @test dx_mut == [2.0 0.0; 0.0 0.0]
     checkverify_rev(mutate2d!, (Matrix{Float64},))
     check_stack_balance(mutate2d!, Am)
@@ -134,7 +134,7 @@ end
 end
 
 @testset "reverse mode: logical (mask) / index-vector getindex (direct rrule!! calls)" begin
-    # `Differ.gradient` assumes a *scalar*-output primal (it seeds the pullback with `one(y)`), so
+    # `Differ.rev_gradient` assumes a *scalar*-output primal (it seeds the pullback with `one(y)`), so
     # it can't be used directly on `getindex`, whose result is itself an array. Tested here by
     # calling `rrule!!` directly with an explicit seed, the same style `check_stack_balance` uses
     # elsewhere for array-argument rules.

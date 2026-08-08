@@ -153,6 +153,6 @@ end
 
 # `gradient`/`value_and_gradient` need no code — DI's generic `PullbackGradientPrep`
 # (src/first_order/gradient.jl) calls pullback with seed `oneunit(typeof(y))`, exactly what
-# `Differ.gradient`'s own `pb(one(y))` does internally.
+# `Differ.rev_gradient`'s own `pb(one(y))` does internally.
 
 end # module DifferDifferentiationInterfaceExt

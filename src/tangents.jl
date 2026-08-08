@@ -503,7 +503,7 @@ function zero_tangent(x::P) where {P}
     # circular references and aliasing, and `require_tangent_cache` is this system's authority on
     # when a tangent can contain either (`set_to_zero!!` consults the same thing). `isbitstype`
     # is cruder: it allocates an `IdDict` for every `Array`, including `Array{<:IEEEFloat}`, whose
-    # tangent is provably tree-like. That allocation was showing up on every `gradient` call, just
+    # tangent is provably tree-like. That allocation was showing up on every `rev_gradient` call, just
     # to build an argument's zero shadow.
     return zero_tangent_internal(x, _tangent_cache(require_tangent_cache(P)))
 end

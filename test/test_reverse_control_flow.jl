@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: Dual, NoTangent, frule!!, gradient
+using Differ: Dual, NoTangent, frule!!, rev_gradient
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
@@ -23,7 +23,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
     end
 
     for (f, x) in ((relu, 2.0), (relu, -2.0), (branch3, 3.0), (branch3, 1.0), (branch3, -1.0))
-        _, dx = gradient(f, x)
+        _, dx = rev_gradient(f, x)
         h = 1e-6
         @test dx ≈ (f(x + h) - f(x - h)) / 2h rtol = 1e-5
         @test dx ≈ frule!!(Dual(f, NoTangent()), Dual(x, 1.0)).dx
@@ -36,7 +36,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
         return a > b ? v.a * v.b : v.a + v.b
     end
     for (a, b) in ((5.0, 2.0), (1.0, 4.0))
-        _, da, db = gradient(branch_struct, a, b)
+        _, da, db = rev_gradient(branch_struct, a, b)
         h = 1e-6
         @test da ≈ (branch_struct(a + h, b) - branch_struct(a - h, b)) / 2h rtol = 1e-5
         @test db ≈ (branch_struct(a, b + h) - branch_struct(a, b - h)) / 2h rtol = 1e-5
@@ -62,8 +62,8 @@ end
     unionphi_ternary(x)  = (x > 0 ? x : 1) * x          # d/dx = 2x for x>0
     unionphi_ternary2(x) = (x > 0 ? x*x : 1) * 1.0      # d/dx = 2x for x>0
 
-    @test Differ.gradient(unionphi_ternary, 1.5) == (NoTangent(), 3.0)
-    @test Differ.gradient(unionphi_ternary2, 1.5) == (NoTangent(), 3.0)
+    @test Differ.rev_gradient(unionphi_ternary, 1.5) == (NoTangent(), 3.0)
+    @test Differ.rev_gradient(unionphi_ternary2, 1.5) == (NoTangent(), 3.0)
 
     # `Union`-typed rdata across a loop *back-edge* (Phase 2): `unionphi_loop`'s loop-carried `s`
     # is `Union{Int,Float64}` (starts as the `Int` literal `0`, becomes `Float64` after the first
@@ -76,7 +76,7 @@ end
         end
         return s
     end
-    @test Differ.gradient(unionphi_loop, 1.5) == (NoTangent(), 3.0)
+    @test Differ.rev_gradient(unionphi_loop, 1.5) == (NoTangent(), 3.0)
 
     checkverify_rev(unionphi_ternary, (Float64,))
     checkverify_rev(unionphi_ternary2, (Float64,))
@@ -125,15 +125,15 @@ end
         s + t
     end
 
-    _, dx_sumk = gradient(sumk, 3.0, 4)
+    _, dx_sumk = rev_gradient(sumk, 3.0, 4)
     @test dx_sumk ≈ frule!!(Dual(sumk, NoTangent()), Dual(3.0, 1.0), Dual(4, 0)).dx
-    _, dx_sumk2 = gradient(sumk2, 2.0, 3, 5)
+    _, dx_sumk2 = rev_gradient(sumk2, 2.0, 3, 5)
     @test dx_sumk2 ≈ frule!!(Dual(sumk2, NoTangent()), Dual(2.0, 1.0), Dual(3, 0), Dual(5, 0)).dx
-    _, dx_multi, dy_multi = gradient(sumk_multi, 2.0, 3.0, 4)
+    _, dx_multi, dy_multi = rev_gradient(sumk_multi, 2.0, 3.0, 4)
     @test dx_multi ≈ frule!!(Dual(sumk_multi, NoTangent()), Dual(2.0, 1.0), Dual(3.0, 0.0), Dual(4, 0)).dx
     @test dy_multi ≈ frule!!(Dual(sumk_multi, NoTangent()), Dual(2.0, 0.0), Dual(3.0, 1.0), Dual(4, 0)).dx
     # A zero-iteration loop (the loop-carried accumulator never updates) is a good edge case.
-    _, dx_zero = gradient(sumk, 3.0, 0)
+    _, dx_zero = rev_gradient(sumk, 3.0, 0)
     @test dx_zero == 0.0
 
     checkverify_rev(sumk, (Float64, Int))
@@ -156,7 +156,7 @@ end
         end
         s
     end
-    _, dx_ld, dv_ld = gradient(loopdot, 2.0, [1.0, 2.0, 3.0])
+    _, dx_ld, dv_ld = rev_gradient(loopdot, 2.0, [1.0, 2.0, 3.0])
     @test dx_ld ≈ 6.0
     @test dv_ld ≈ [2.0, 2.0, 2.0]
     checkverify_rev(loopdot, (Float64, Vector{Float64}))
@@ -177,7 +177,7 @@ end
         end
         s
     end
-    _, dx_pl = gradient(polyloop, 2.0, 4)
+    _, dx_pl = rev_gradient(polyloop, 2.0, 4)
     @test dx_pl ≈ central_diff(x -> polyloop(x, 4), 2.0) rtol = 1e-5
     checkverify_rev(polyloop, (Float64, Int))
     check_stack_balance(polyloop, 2.0, 4)
@@ -198,7 +198,7 @@ end
         end
         s
     end
-    _, dx_li, dv_li = gradient(loopinv, 2.0, [1.0, 2.0, 3.0])
+    _, dx_li, dv_li = rev_gradient(loopinv, 2.0, [1.0, 2.0, 3.0])
     @test dx_li ≈ central_diff(x -> loopinv(x, [1.0, 2.0, 3.0]), 2.0) rtol = 1e-5
     @test dv_li ≈ [4.0, 4.0, 4.0]
     checkverify_rev(loopinv, (Float64, Vector{Float64}))

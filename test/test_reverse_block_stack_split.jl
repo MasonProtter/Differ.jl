@@ -11,7 +11,7 @@
 # `reverse_fwds_to_ircode` (the one-line call before `CC.verify_ir(ir)`), paired with the per-edge
 # `pred_is_unique_pred` formula (`length(preds[b]) <= 1`) in `_unique_predecessor_info` that stops the
 # pullback's single-predecessor balance-pop. The two changes are coupled; neither is correct alone
-# (see ISSUES.md #52). The direct unit tests below cover the surgery itself; the `gradient`-level
+# (see ISSUES.md #52). The direct unit tests below cover the surgery itself; the `rev_gradient`-level
 # testsets exercise the live fix across the disambiguation boundary (N=0,1,2,3,5,50), and the
 # `memloop!` traffic test asserts the 3N+2 → 2N+3 reduction (the remaining 2/iter are irreducible).
 #
@@ -27,7 +27,7 @@
 
 using Test
 using Differ
-using Differ: gradient
+using Differ: rev_gradient
 using Differ: ID, CFGBlock, IDGotoIfNot, IDGotoNode, IDPhiNode, new_inst,
               _ircode_to_cfg_blocks, lower_cfg_blocks_to_ir, phi_nodes, terminator,
               _split_ambiguous_block_pushes, _is_expected_block_push, Stack
@@ -79,7 +79,7 @@ end
 @testset "loopsum: gradient correctness across the disambiguation boundary (N=0,1,2,3,5,50)" begin
     x = 3.0
     for N in (0, 1, 2, 3, 5, 50)
-        _, dx = gradient(loopsum, x, N)
+        _, dx = rev_gradient(loopsum, x, N)
         @test dx ≈ N atol = 1e-9
         h = 1e-6
         @test dx ≈ central_diff(z -> loopsum(z, N), x) rtol = 1e-5

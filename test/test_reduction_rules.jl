@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: gradient, rrule!!, Ctx, CoDual, NoFData, primal, tangent, zero_fcodual
+using Differ: rev_gradient, rrule!!, Ctx, CoDual, NoFData, primal, tangent, zero_fcodual
 using Differ: fdata_type, tangent_type, zero_tangent, fdata
 
 include(joinpath(@__DIR__, "testutils.jl"))
@@ -34,7 +34,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         @test d.dx == sum(ones(length(x)))
 
         # reverse mode
-        _, dx = gradient(f, x)
+        _, dx = rev_gradient(f, x)
         @test dx == ones(length(x))
         for k in eachindex(x)
             xp = copy(x); xp[k] += 1e-6
@@ -50,7 +50,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         # above `Base.pairwise_blocksize` elements (1024 for `+`); confirm the hand rule still
         # works well past that.
         xbig = rand(2000) .+ 0.5
-        _, dxbig = gradient(f, xbig)
+        _, dxbig = rev_gradient(f, xbig)
         @test dxbig == ones(length(xbig))
     end
 
@@ -63,7 +63,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         wrap_view_sum(v) = sum(view(v, 2:4))
         v = [1.0, 2.0, 3.0, 4.0, 5.0]
 
-        _, dv = gradient(wrap_view_sum, v)
+        _, dv = rev_gradient(wrap_view_sum, v)
         @test dv == [0.0, 1.0, 1.0, 1.0, 0.0]
         d = Differ.frule!!(Differ.zero_dual(wrap_view_sum), Differ.Dual(v, ones(length(v))))
         @test d.x == sum(view(v, 2:4))
@@ -86,11 +86,11 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         sumabs2(v) = sum(abs2, v)
         sumsq(v)  = sum(y -> y * y, v)   # a local closure operand, this shape always worked
 
-        _, dsin = gradient(sumsin, v)
+        _, dsin = rev_gradient(sumsin, v)
         @test dsin ≈ cos.(v)
-        _, dabs2 = gradient(sumabs2, v)
+        _, dabs2 = rev_gradient(sumabs2, v)
         @test dabs2 ≈ 2 .* v
-        _, dsq = gradient(sumsq, v)
+        _, dsq = rev_gradient(sumsq, v)
         @test dsq ≈ 2 .* v
 
         for k in eachindex(v)
@@ -120,7 +120,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         v = [0.3, -1.2, 2.0, 0.75]
         sumaddn(v) = sum(y -> y + n, v)
 
-        _, dv = gradient(sumaddn, v)
+        _, dv = rev_gradient(sumaddn, v)
         @test dv == ones(length(v))
         for k in eachindex(v)
             vp = copy(v); vp[k] += 1e-6
@@ -148,7 +148,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         end
         n = 2000   # past `Base.pairwise_blocksize`, matching forward mode's own regression size
         x = rand(n)
-        _, dx = gradient(simdsum, x)
+        _, dx = rev_gradient(simdsum, x)
         @test dx == ones(n)
 
         checkverify_rev(simdsum, (Vector{Float64},))
@@ -165,7 +165,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
             end
             return s
         end
-        _, dx_ivdep = gradient(simdsum_ivdep, x)
+        _, dx_ivdep = rev_gradient(simdsum_ivdep, x)
         @test dx_ivdep == ones(n)
         checkverify_rev(simdsum_ivdep, (Vector{Float64},))
     end
@@ -180,7 +180,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         p = prod(x)
         @test d.dx ≈ sum(p / xi for xi in x)
 
-        _, dx = gradient(f, x)
+        _, dx = rev_gradient(f, x)
         for k in eachindex(x)
             xp = copy(x); xp[k] += 1e-6
             xm = copy(x); xm[k] -= 1e-6
@@ -192,13 +192,13 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         check_stack_balance(wrap_prod, x)
 
         xbig = rand(2000) .+ 0.5   # avoid zeros: prod's pullback divides by each element
-        _, dxbig = gradient(f, xbig)
+        _, dxbig = rev_gradient(f, xbig)
         pbig = prod(xbig)
         for k in (1, 500, 2000)
             @test dxbig[k] ≈ pbig / xbig[k] rtol = 1e-8
         end
 
-        @test_throws ErrorException gradient(prod, Float64[])
+        @test_throws ErrorException rev_gradient(prod, Float64[])
     end
 
     @testset "maximum / minimum" begin
@@ -217,7 +217,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
             @test d.x == f(x)
             @test d.dx == Float64(expected_idx)
 
-            _, dx = gradient(f, x)
+            _, dx = rev_gradient(f, x)
             expected = zeros(length(x))
             expected[expected_idx] = 1.0
             @test dx == expected
@@ -232,24 +232,24 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
             check_stack_balance(wrap, x)
 
             xbig = rand(2000)
-            _, dxbig = gradient(f, xbig)
+            _, dxbig = rev_gradient(f, xbig)
             expected_idx_big = cmp === (>) ? argmax(xbig) : argmin(xbig)
             expected_big = zeros(length(xbig))
             expected_big[expected_idx_big] = 1.0
             @test dxbig == expected_big
 
-            @test_throws ErrorException gradient(f, Float64[])
+            @test_throws ErrorException rev_gradient(f, Float64[])
         end
 
         # Tie-breaking: the *first* occurrence of the extremal value gets the gradient. A central
         # difference cross-check would be ill-defined here (perturbing the non-first tied element
         # also changes the max/min by the same amount), so this is checked exactly instead.
         xtie_max = [3.0, 5.0, 5.0, -1.0]
-        _, dx_tie_max = gradient(maximum, xtie_max)
+        _, dx_tie_max = rev_gradient(maximum, xtie_max)
         @test dx_tie_max == [0.0, 1.0, 0.0, 0.0]
 
         xtie_min = [-1.0, -1.0, 5.0, 2.0]
-        _, dx_tie_min = gradient(minimum, xtie_min)
+        _, dx_tie_min = rev_gradient(minimum, xtie_min)
         @test dx_tie_min == [1.0, 0.0, 0.0, 0.0]
     end
 
@@ -260,7 +260,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         # a GlobalRef, whose real types _static_recursible_call reads from the IR. It used to read
         # the GlobalRef as type GlobalRef and never match the rule's concrete-op constraint, which is
         # why this case was once documented as an engine limitation and exercised only through a
-        # direct rrule!! call. It now composes through gradient (see the composite checks below).
+        # direct rrule!! call. It now composes through rev_gradient (see the composite checks below).
         g(y) = y^2 + 3y   # g'(y) = 2y + 3
         x = [1.0, 2.0, -1.5, 0.5]
         mr(x) = mapreduce(g, +, x)
@@ -284,7 +284,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
 
         # reverse mode through the composite call (the case the note above used to say was
         # impossible), and then the same rule driven directly.
-        _, dx_mr = gradient(mr, x)
+        _, dx_mr = rev_gradient(mr, x)
         @test dx_mr ≈ 2 .* x .+ 3
         checkverify_rev(mr, (Vector{Float64},))
         check_stack_balance(mr, x)
@@ -385,7 +385,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
             return 2mn + 3mx
         end
 
-        _, dx = gradient(extrema_wrap, x)
+        _, dx = rev_gradient(extrema_wrap, x)
         for k in eachindex(x)
             xp = copy(x); xp[k] += 1e-6
             xm = copy(x); xm[k] -= 1e-6
@@ -400,7 +400,7 @@ Core.eval(Differ, :(include(joinpath($(@__DIR__), "..", "src", "rules_perf_backs
         checkverify_rev(extrema_wrap, (Vector{Float64},))
         check_stack_balance(extrema_wrap, x)
 
-        @test_throws ErrorException gradient(extrema, Float64[])
+        @test_throws ErrorException rev_gradient(extrema, Float64[])
     end
 
 end

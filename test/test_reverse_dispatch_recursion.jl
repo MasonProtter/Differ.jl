@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: Dual, NoTangent, frule!!, gradient, get_tangent_field, MutableTangent
+using Differ: Dual, NoTangent, frule!!, rev_gradient, get_tangent_field, MutableTangent
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
@@ -15,7 +15,7 @@ dyncallee(x) = dyn_g(x)
 # stack-overflow. Must be a true top-level function, not testset-local: a self-recursive function
 # defined in local scope closes over its own boxed binding to call itself, which gives it a real
 # (non-NoTangent) tangent type instead of the plain singleton a top-level function has, defeating
-# gradient's zero-tangent seeding for f.
+# rev_gradient's zero-tangent seeding for f.
 @noinline function rec_self(x::Float64, n::Int)
     n <= 0 && return x
     return rec_self(x, n - 1)
@@ -66,7 +66,7 @@ usencg(v) = sum(nonconst_g, v)
     plus1(x) = sin(x) + 1
     nest(x)  = sin(cos(x))
 
-    _, dx_plus1 = gradient(plus1, 1.3)
+    _, dx_plus1 = rev_gradient(plus1, 1.3)
     @test dx_plus1 ≈ cos(1.3)
 
     checkverify_rev(plus1, (Float64,))
@@ -91,16 +91,16 @@ end
         return s
     end
 
-    _, dx_rec = gradient(rec_call, 3.0)
+    _, dx_rec = rev_gradient(rec_call, 3.0)
     @test dx_rec ≈ 2*3.0 + 1
     @test dx_rec ≈ frule!!(Dual(rec_call, NoTangent()), Dual(3.0, 1.0)).dx
 
     for x in (2.0, -2.0)
-        _, dx_rb = gradient(rec_branch, x)
+        _, dx_rb = rev_gradient(rec_branch, x)
         @test dx_rb ≈ 2x
     end
 
-    _, dx_rl = gradient(rec_loop, 2.0, 3)
+    _, dx_rl = rev_gradient(rec_loop, 2.0, 3)
     @test dx_rl ≈ 3 * 2 * 2.0
     check_stack_balance(rec_loop, 2.0, 5)
 
@@ -113,11 +113,11 @@ end
     # rec_self is genuinely self-recursive: no hand rrule!!, and the recursive call resolves to the
     # exact primal currently being differentiated. This is the case the in_progress cycle guard used
     # to bail on unconditionally. d(rec_self(x,n))/dx = 1 for every n >= 0.
-    _, dx_self, dn_self = gradient(rec_self, 1.0, 3)
+    _, dx_self, dn_self = rev_gradient(rec_self, 1.0, 3)
     @test dx_self == 1.0
     @test dn_self isa NoTangent
     for n in 0:4
-        _, dx_n, _ = gradient(rec_self, 2.7, n)
+        _, dx_n, _ = rev_gradient(rec_self, 2.7, n)
         @test dx_n == 1.0
     end
     checkverify_rev(rec_self, (Float64, Int))
@@ -132,7 +132,7 @@ end
     # Accumulating self-recursion: each level contributes a distinct addend, so a wrong tape layout
     # or a stale/misrouted comms value would show up as a wrong (not just uniformly-1) gradient.
     v = [1.0, 2.0, 3.0, 4.0]
-    _, dv, _ = gradient(rec_sum, v, 1)
+    _, dv, _ = rev_gradient(rec_sum, v, 1)
     @test dv == ones(4)
     h = 1e-6
     for k in 1:4
@@ -147,9 +147,9 @@ end
     function rec_sum_branch(v::Vector{Float64}, flag::Bool)
         return flag ? rec_sum(v, 1) : 0.0
     end
-    _, dvb, _ = gradient(rec_sum_branch, v, true)
+    _, dvb, _ = rev_gradient(rec_sum_branch, v, true)
     @test dvb == ones(4)
-    _, dvb0, _ = gradient(rec_sum_branch, v, false)
+    _, dvb0, _ = rev_gradient(rec_sum_branch, v, false)
     @test dvb0 == zeros(4)
     checkverify_rev(rec_sum_branch, (Vector{Float64}, Bool))
     check_stack_balance(rec_sum_branch, v, true)
@@ -162,7 +162,7 @@ end
         end
         return s
     end
-    _, dvl, _ = gradient(rec_sum_loop, v, 3)
+    _, dvl, _ = rev_gradient(rec_sum_loop, v, 3)
     @test dvl == fill(3.0, 4)
     checkverify_rev(rec_sum_loop, (Vector{Float64}, Int))
     check_stack_balance(rec_sum_loop, v, 3)
@@ -170,7 +170,7 @@ end
     # Mutual recursion (A -> B -> A) is explicitly out of scope (needs a tape-type pre-pass across
     # the whole SCC) and must still bail cleanly: never hang, never crash on verify_ir.
     err_mut = try
-        gradient(mutA, 1.0, 4)
+        rev_gradient(mutA, 1.0, 4)
         nothing
     catch e
         e
@@ -194,7 +194,7 @@ end
 
     # End to end: a `const` global function operand differentiates.
     v = [0.4, -1.1, 2.5]
-    _, dv = gradient(usecg, v)
+    _, dv = rev_gradient(usecg, v)
     @test dv ≈ cos.(v)
     checkverify_rev(usecg, (Vector{Float64},))
     check_stack_balance(usecg, v)
@@ -207,7 +207,7 @@ end
     v = [0.4, -1.1, 2.5]
 
     err = try
-        gradient(usencg, v)
+        rev_gradient(usencg, v)
         nothing
     catch e
         e
@@ -223,7 +223,7 @@ end
 end
 
 @testset "reverse mode: dynamic (non-statically-resolvable) callee bails" begin
-    @test_throws ErrorException gradient(dyncallee, 1.0)
+    @test_throws ErrorException rev_gradient(dyncallee, 1.0)
     # Asserting the exception is a located ErrorException naming the construct, not just any
     # ErrorException, and specifically not a MethodError or other crash, which a bare
     # @test_throws ErrorException wouldn't distinguish.
@@ -235,7 +235,7 @@ end
     # has no static type either), so the call still bails, just on the next guard down: "not a
     # concrete DataType" rather than "dynamic callee" directly.
     err_dyncall = try
-        gradient(dyncallee, 1.0)
+        rev_gradient(dyncallee, 1.0)
         nothing
     catch e
         e
@@ -285,7 +285,7 @@ end
     mutable struct MHet2; a::Float64; b::Int; end
     mhetdyn(m::MHet2, i::Int) = Core.getfield(m, i)
 
-    _, dt_dyn = gradient(tupsum_dyn, (3.0, 4.0))
+    _, dt_dyn = rev_gradient(tupsum_dyn, (3.0, 4.0))
     @test dt_dyn == (1.0, 1.0)
     @test dt_dyn[1] == frule!!(Dual(tupsum_dyn, NoTangent()), Dual((3.0, 4.0), (1.0, 0.0))).dx
     @test dt_dyn[2] == frule!!(Dual(tupsum_dyn, NoTangent()), Dual((3.0, 4.0), (0.0, 1.0))).dx
@@ -295,7 +295,7 @@ end
     checkverify_rev(tupsum_dyn, (Tuple{Float64,Float64},))
 
     # same, over a homogeneous NamedTuple.
-    _, dnt_dyn = gradient(ntupsum_dyn, (a=3.0, b=4.0))
+    _, dnt_dyn = rev_gradient(ntupsum_dyn, (a=3.0, b=4.0))
     @test dnt_dyn == (a=1.0, b=1.0)
     checkverify_rev(ntupsum_dyn, (@NamedTuple{a::Float64,b::Float64},))
 
@@ -304,20 +304,20 @@ end
     # `increment_field_rdata!` (not an object-level `RData`, as a mutable struct has none). The
     # gradient w.r.t. the struct is a one-hot `MutableTangent` for a single selected field, and
     # all-ones when summed over both. Index is a genuine `Argument`/`SSAValue`, not const-folded.
-    _, dmp2_r, _ = gradient(mp2get, MP2(3.0, 4.0), 2)
+    _, dmp2_r, _ = rev_gradient(mp2get, MP2(3.0, 4.0), 2)
     @test get_tangent_field(dmp2_r, :x) == 0.0 && get_tangent_field(dmp2_r, :y) == 1.0
-    _, dmp1_r, _ = gradient(mp2get, MP2(3.0, 4.0), 1)
+    _, dmp1_r, _ = rev_gradient(mp2get, MP2(3.0, 4.0), 1)
     @test get_tangent_field(dmp1_r, :x) == 1.0 && get_tangent_field(dmp1_r, :y) == 0.0
-    _, dms_r = gradient(mp2sum_dyn, MP2(3.0, 4.0))
+    _, dms_r = rev_gradient(mp2sum_dyn, MP2(3.0, 4.0))
     @test get_tangent_field(dms_r, :x) == 1.0 && get_tangent_field(dms_r, :y) == 1.0
     checkverify_rev(mp2get, (MP2, Int))
     checkverify_rev(mp2sum_dyn, (MP2,))
 
     # regression: a dynamic getfield index into a HETEROGENEOUS struct is the genuinely hard case.
     # Must bail with a located error, never crash or silently return a wrong/zero gradient.
-    @test_throws "dynamic (non-literal) field index" gradient(hetdyn, Het2(1.0, 2), 1)
+    @test_throws "dynamic (non-literal) field index" rev_gradient(hetdyn, Het2(1.0, 2), 1)
     err_het = try
-        gradient(hetdyn, Het2(1.0, 2), 1)
+        rev_gradient(hetdyn, Het2(1.0, 2), 1)
         nothing
     catch e
         e
@@ -330,7 +330,7 @@ end
     # rule (builtin_rrule_comms(::Val{Core.getfield},...), src/builtins_reverse.jl). A separate code
     # path from the immutable case above, must bail identically.
     err_mhet = try
-        gradient(mhetdyn, MHet2(1.0, 2), 1)
+        rev_gradient(mhetdyn, MHet2(1.0, 2), 1)
         nothing
     catch e
         e
@@ -340,7 +340,7 @@ end
     @test occursin("dynamic (non-literal) field index", err_mhet.msg)
 
     # regression: a dynamic setfield! index, Phase A only, always bails.
-    @test_throws "dynamic (non-literal) field index" gradient(setdyn!, MP2(1.0, 2.0), 1, 5.0)
+    @test_throws "dynamic (non-literal) field index" rev_gradient(setdyn!, MP2(1.0, 2.0), 1, 5.0)
 end
 
 # ===========================================================================
@@ -365,9 +365,9 @@ end
         ctx = build_ctx(f, map(Differ._typeof, args))
         fcd = zero_fcodual(f)
         argcds = map(zero_fcodual, args)
-        gradient!(ctx, fcd, argcds...)   # warm the slots
-        gradient!(ctx, fcd, argcds...)
-        @test (@allocated gradient!(ctx, fcd, argcds...)) == 0
+        rev_gradient!(ctx, fcd, argcds...)   # warm the slots
+        rev_gradient!(ctx, fcd, argcds...)
+        @test (@allocated rev_gradient!(ctx, fcd, argcds...)) == 0
     end
 end
 
@@ -387,8 +387,8 @@ end
     N = 6
     v = collect(1.0:N)
     pctx = build_ctx(loopcall_dtc, (Vector{Float64},))
-    gradient!(pctx, zero_fcodual(loopcall_dtc), zero_fcodual(v))
-    gradient!(pctx, zero_fcodual(loopcall_dtc), zero_fcodual(v))   # second call: slots now recycled
+    rev_gradient!(pctx, zero_fcodual(loopcall_dtc), zero_fcodual(v))
+    rev_gradient!(pctx, zero_fcodual(loopcall_dtc), zero_fcodual(v))   # second call: slots now recycled
 
     # Locate the block's comms Stack (its element type is a 1-tuple of addone_dtc's own tape type)
     # and pull out the N tapes the last forward pass used. A Stack never shrinks, so they're still
@@ -419,12 +419,12 @@ end
     v_long = collect(1.0:10.0)
     ctx = build_ctx(loopcall_sg, (Vector{Float64},))
 
-    g_short = gradient!(ctx, zero_fcodual(loopcall_sg), zero_fcodual(v_short))
-    @test g_short[2] == gradient(loopcall_sg, v_short)[2]
-    g_long = gradient!(ctx, zero_fcodual(loopcall_sg), zero_fcodual(v_long))
-    @test g_long[2] == gradient(loopcall_sg, v_long)[2]
-    g_short2 = gradient!(ctx, zero_fcodual(loopcall_sg), zero_fcodual(v_short))
-    @test g_short2[2] == gradient(loopcall_sg, v_short)[2]
+    g_short = rev_gradient!(ctx, zero_fcodual(loopcall_sg), zero_fcodual(v_short))
+    @test g_short[2] == rev_gradient(loopcall_sg, v_short)[2]
+    g_long = rev_gradient!(ctx, zero_fcodual(loopcall_sg), zero_fcodual(v_long))
+    @test g_long[2] == rev_gradient(loopcall_sg, v_long)[2]
+    g_short2 = rev_gradient!(ctx, zero_fcodual(loopcall_sg), zero_fcodual(v_short))
+    @test g_short2[2] == rev_gradient(loopcall_sg, v_short)[2]
 end
 
 @testset "reverse mode: nested-tape recycling — self-recursion (Stage 2)" begin
@@ -442,14 +442,14 @@ end
     @assert n > Base.pairwise_blocksize(abs2, Base.add_sum)
     x = rand(n)
 
-    _, dx = gradient(f_self, x)
+    _, dx = rev_gradient(f_self, x)
     @test dx ≈ 2 .* x
 
     ctx = build_ctx(f_self, (Vector{Float64},))
     fcd, xcd = zero_fcodual(f_self), zero_fcodual(x)
-    gradient!(ctx, fcd, xcd)   # warm
-    gradient!(ctx, fcd, xcd)
-    bytes = @allocated gradient!(ctx, fcd, xcd)
+    rev_gradient!(ctx, fcd, xcd)   # warm
+    rev_gradient!(ctx, fcd, xcd)
+    bytes = @allocated rev_gradient!(ctx, fcd, xcd)
     @test bytes == 0
 
     # Not vacuous: confirm the mechanism was genuinely exercised, not zero because nothing pushed to
@@ -486,10 +486,10 @@ end
     check_stack_balance(evenodd, 9, 1.0)
 
     ctx = build_ctx(evenodd, (Int, Float64))
-    g1 = gradient!(ctx, zero_fcodual(evenodd), zero_fcodual(9), zero_fcodual(1.0))
-    g2 = gradient!(ctx, zero_fcodual(evenodd), zero_fcodual(9), zero_fcodual(1.0))
+    g1 = rev_gradient!(ctx, zero_fcodual(evenodd), zero_fcodual(9), zero_fcodual(1.0))
+    g2 = rev_gradient!(ctx, zero_fcodual(evenodd), zero_fcodual(9), zero_fcodual(1.0))
     @test g1 == g2
-    @test g1 == gradient(evenodd, 9, 1.0)
+    @test g1 == rev_gradient(evenodd, 9, 1.0)
 end
 
 @testset "reverse mode: nested-tape recycling — hand rule callee still gets a fresh Ctx()" begin

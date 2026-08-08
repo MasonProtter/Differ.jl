@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: Dual, NoTangent, frule!!, gradient
+using Differ: Dual, NoTangent, frule!!, rev_gradient
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
@@ -13,7 +13,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
 
     for f in (rprod, rquot)
         x, y = 2.0, 3.0
-        _, dx, dy = gradient(f, x, y)
+        _, dx, dy = rev_gradient(f, x, y)
         @test dx ≈ central_diff(f, x, y, 1) rtol = 1e-5
         @test dy ≈ central_diff(f, x, y, 2) rtol = 1e-5
         @test dx ≈ frule!!(Dual(f, NoTangent()), Dual(x, 1.0), Dual(y, 0.0)).dx
@@ -34,7 +34,7 @@ end
         v.a*v.b + v.a
     end
 
-    _, da, db = gradient(rstruct, 2.0, 3.0)
+    _, da, db = rev_gradient(rstruct, 2.0, 3.0)
     @test da ≈ 3.0 + 1.0
     @test db ≈ 2.0
 
@@ -51,10 +51,10 @@ end
     sitofp_ctl(x::Float64) = (s = 0.0; for i in 1:3; s += x*i; end; s)
     mix32_ctl(x::Float64) = Float64(Float32(x) * Float32(2.0)) + x
 
-    _, dx_si = gradient(sitofp_ctl, 2.0)
+    _, dx_si = rev_gradient(sitofp_ctl, 2.0)
     @test dx_si == 6.0
     @test dx_si == frule!!(Dual(sitofp_ctl, NoTangent()), Dual(2.0, 1.0)).dx
-    _, dx_mx = gradient(mix32_ctl, 1.0)
+    _, dx_mx = rev_gradient(mix32_ctl, 1.0)
     @test dx_mx == 3.0
     @test dx_mx == frule!!(Dual(mix32_ctl, NoTangent()), Dual(1.0, 1.0)).dx
     @test dx_si ≈ central_diff(sitofp_ctl, 2.0; h=1e-5) rtol = 1e-5

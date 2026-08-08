@@ -1,6 +1,6 @@
 using Test
 using Differ
-using Differ: gradient, frule!!, Dual, NoTangent
+using Differ: rev_gradient, frule!!, Dual, NoTangent
 import DifferentiationInterface as DI
 
 include(joinpath(@__DIR__, "testutils.jl"))
@@ -39,15 +39,15 @@ end
     @test ty2 ≈ 2 .* [1.0, 2.0, 3.0]
 end
 
-@testset "DI reverse: gradient matches Differ.gradient" begin
+@testset "DI reverse: gradient matches Differ.rev_gradient" begin
     fscalar(x) = sin(x) * x * x
     x = 1.3
-    @test DI.gradient(fscalar, AutoDifferReverse(), x) ≈ gradient(fscalar, x)[2]
+    @test DI.gradient(fscalar, AutoDifferReverse(), x) ≈ rev_gradient(fscalar, x)[2]
     @test DI.gradient(fscalar, AutoDifferReverse(), x) ≈ central_diff(fscalar, x) rtol = 1e-5
 
     fvec(v) = sum(sin, v)   # vector -> scalar, known-supported reduction
     v = [0.3, -1.1, 2.4]
-    @test DI.gradient(fvec, AutoDifferReverse(), v) ≈ gradient(fvec, v)[2]
+    @test DI.gradient(fvec, AutoDifferReverse(), v) ≈ rev_gradient(fvec, v)[2]
 end
 
 @testset "DI reverse: prepared pullback! accumulates in place" begin
@@ -60,11 +60,11 @@ end
     y1, (result1,) = DI.value_and_pullback!(fvec, (dx,), prep, AutoDifferReverse(), v1, (1.0,))
     @test y1 ≈ fvec(v1)
     @test result1 === dx           # true in-place accumulation for fdata-carried (array) x
-    @test dx ≈ gradient(fvec, v1)[2]
+    @test dx ≈ rev_gradient(fvec, v1)[2]
 
     # reuse the same prep (and its preallocated tape) at a different point
     y2, (result2,) = DI.value_and_pullback!(fvec, (dx,), prep, AutoDifferReverse(), v2, (1.0,))
     @test y2 ≈ fvec(v2)
     @test result2 === dx
-    @test dx ≈ gradient(fvec, v2)[2]
+    @test dx ≈ rev_gradient(fvec, v2)[2]
 end

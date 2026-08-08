@@ -47,10 +47,14 @@ export code_dual_ircode, @code_dual_ircode
 
 # Reverse-mode entry points (branches supported; loops are Phase C — see reverse_interp.jl header).
 export rrule!!, AbstractCtx, Ctx, build_ctx
-export gradient, gradient!, value_and_gradient!, zero_fcodual
+export value_and_gradient!, zero_fcodual
 export code_reverse_fwds_ircode, @code_reverse_fwds_ircode
 export code_reverse_pullback_ircode, @code_reverse_pullback_ircode
 export tape_type, comms_element_types
+
+# `public`, not exported: DifferentiationInterface.jl (below) is the primary user-facing entry
+# point now; these remain available for direct use without polluting `using Differ`'s namespace.
+public rev_gradient, rev_gradient!
 
 # Tangent / fdata / rdata type system.
 export tangent_type, fdata_type, rdata_type
