@@ -51,7 +51,19 @@ function ContextualInterpreter(owner::T, custom_state::S;
                                 world::UInt=Base.get_world_counter(),
                                 inf_params::InferenceParams=InferenceParams(),
                                 opt_params::OptimizationParams=OptimizationParams()) where {T,S}
-    @assert world <= Base.get_world_counter()
+    # `jl_get_world_counter` returns the `typemax` sentinel while `in_pure_callback` is set — i.e.
+    # inside any `@generated` generator (`julia/src/gf.c`). So the obvious
+    # `@assert world <= Base.get_world_counter()` is *vacuously true* in exactly the context this
+    # interpreter is normally built from, and would never catch the real mistake: defaulting `world`
+    # from `Base.get_world_counter()` at generator time and silently getting `typemax`. Reject that
+    # sentinel outright, and only compare against the counter when we're not in a pure callback.
+    @assert world != typemax(UInt) """
+        ContextualInterpreter needs a concrete inference world, got the `typemax` sentinel that \
+        `Base.get_world_counter()` returns inside a `@generated` generator. Pass the generator's own \
+        `world` argument explicitly."""
+    let current = Base.get_world_counter()
+        @assert current == typemax(UInt) || world <= current
+    end
     return ContextualInterpreter{T,S}(
         owner, custom_state,
         InferenceResult[],
@@ -68,6 +80,65 @@ Core.Compiler.get_inference_world(interp::ContextualInterpreter) = interp.world
 Core.Compiler.get_inference_cache(interp::ContextualInterpreter) = interp.inf_cache
 Core.Compiler.cache_owner(interp::ContextualInterpreter) = interp.owner
 Core.Compiler.codegen_cache(interp::ContextualInterpreter) = interp.codegen_cache
+
+# ---------------------------------------------------------------------------
+# World-age hygiene for pass code that runs at generator time.
+#
+# A plugin's entry point is a `@generated` function, and `jl_call_staged` pins the generator body's
+# task world age to the *generated method's* `Method.primary_world` — fixed when that method was
+# defined, and unmovable afterwards (regenerating the body does not move it; neither does
+# invalidation). Every ordinary function the transform calls therefore dispatches at that pin, so
+# methods added by any *later-loaded* package — a sibling package, and always a package extension —
+# are invisible to it. That is what broke forward-over-reverse across the package split: DifferReverse's
+# `tangent_type` overrides and every one of the extension's coupling hooks silently resolved to
+# DifferCore's generic fallback / to their own inert defaults.
+#
+# THE CONTRACT for any pass built on this framework:
+#
+#   Pass code running at generator time may reach another package only through `at_world`, or
+#   through a call emitted into the IR (which is compiled later, at the real world). Never by
+#   direct dispatch, and never through mutable global state — a generator reading a registry
+#   populated in `__init__` is impure: nothing invalidates its cached result when that registry
+#   changes, and a result baked into a precompile image while the registry was empty is simply
+#   wrong. Every such lookup must record an `mt_edge!` so a later method definition invalidates
+#   the carrier.
+#
+# `Core._call_in_world_total` is the primitive that works here. Unlike `Base.invoke_in_world` — which
+# is a no-op while `in_pure_callback` is set, so it silently leaves the pin in place — it is not
+# guarded, and the world it switches to covers *nested* dispatch inside the callee too. That nesting
+# is load-bearing: `tangent_type(Stack{T})` recurses into `tangent_type(T)`, and a switch that only
+# covered the outermost frame would fix nothing. It is the same primitive inference itself uses for
+# concrete evaluation, which is why it is legitimate from a pure context; its one restriction is that
+# the callee must not `eval`/`include`.
+# ---------------------------------------------------------------------------
+
+# Call `f(args...)` with dispatch resolved at the interpreter's inference world instead of at the
+# generator's pin. Use for every call from transform code into a generic function another package can
+# extend.
+at_world(world::UInt, @nospecialize(f), @nospecialize(args...)) =
+    Core._call_in_world_total(world, f, args...)
+# Convenience for the common case; transform code that already carries a bare `iworld`
+# (`CC.get_inference_world(interp)`) rather than the interpreter itself uses the method above.
+at_world(interp::ContextualInterpreter, @nospecialize(f), @nospecialize(args...)) =
+    at_world(interp.world, f, args...)
+
+# Record a method-table backedge on `sig`, so that a method *appearing later* for that signature
+# invalidates the carrier being built. This is the encoding the ordinary
+# `compute_edges!`/`store_backedges` path expects (a `sig`/`Core.methodtable` pair inline in the edge
+# vector) and is what `finishinfer!` folds into `me.src.edges` below.
+#
+# A resolved-`MethodInstance` edge is NOT a substitute: it covers "this method changed", whereas the
+# case that matters for `at_world` is "a more specific method now exists". Deduplicated because the
+# transform queries the same handful of signatures once per statement, and an edge vector with a
+# thousand copies of `Tuple{typeof(tangent_type), Type{Float64}}` would bloat the invalidation graph
+# for no benefit.
+function mt_edge!(edges::Vector{Any}, @nospecialize(sig))
+    for i in 1:(length(edges) - 1)
+        edges[i] === sig && edges[i + 1] === Core.methodtable && return edges
+    end
+    push!(edges, sig, Core.methodtable)
+    return edges
+end
 
 # Build a lowered `CodeInfo` from an expression. Used by a plugin's `@generated` fallback to
 # produce the trivial generated body that `invoke`s the compiled transformed `CodeInstance`.
@@ -186,5 +257,6 @@ function run_ipo_passes!(ir::IRCode, opt::CC.OptimizationState)
 end
 
 export ContextualInterpreter, build_contextual_ir, expr_to_codeinfo, run_ipo_passes!
+export at_world, mt_edge!
 
 end # module Contextual

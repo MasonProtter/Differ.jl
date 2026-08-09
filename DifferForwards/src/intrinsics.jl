@@ -210,7 +210,7 @@ function _ptr_deref_ok(@nospecialize(Pptr), @nospecialize(align), ctx, what::Str
                        "(`tangent_type` of an abstract `Ptr` is `NoTangent`)"
         return false
     end
-    T = tangent_type(P)
+    T = ctx.tt(P)
     if align !== 1 && !(isbitstype(P) && isbitstype(T) &&
                         Base.datatype_alignment(P) == Base.datatype_alignment(T))
         ctx.reason[] = "`$what` on `$Pptr` with alignment `$align` — the tangent element type `$T` " *
@@ -297,7 +297,7 @@ function apply_intrinsic_frule!(::Val{Core.Intrinsics.pointerset}, actual, Ti, c
     # gate on the stored element's tangent type instead. With nothing to store, the shadow "result" is
     # just the shadow pointer (already typed `Ptr{NoTangent} === ctx.tt(Ti)`, and the null sentinel
     # when the buffer has no tangent storage), and the shadow store is skipped entirely.
-    nostore = tangent_type(_ptr_eltype(Pptr)) === NoTangent
+    nostore = ctx.tt(_ptr_eltype(Pptr)) === NoTangent
     # Defensive, as in `pointerref`: a genuine tangent store through the null sentinel would be a null
     # dereference. The `bitcast` rule should have declined before this is reachable.
     if !nostore && ctx.tresolve(ptr) === NULL_SHADOW_PTR
@@ -324,7 +324,7 @@ for op in (:add_ptr, :sub_ptr)
     @eval function apply_intrinsic_frule!(::Val{Core.Intrinsics.$op}, actual, Ti, ctx)
         ptr, off = actual[1], actual[2]
         P = _ptr_eltype(Ti)
-        T = P === nothing ? nothing : tangent_type(P)
+        T = P === nothing ? nothing : ctx.tt(P)
         # No tangent storage behind this address: there's no shadow buffer to offset into, so carry the
         # null sentinel through unchanged rather than computing an offset from it. Must be tested
         # before the stride gate below, which would otherwise reject this case outright (`NoTangent`'s

@@ -141,7 +141,7 @@ end
 # Returns `nothing` for anything the shape doesn't apply to (`Type`-valued parameters, a parameter
 # with no `tangent_type`, …) rather than throwing: `callee_mi` may be an arbitrary callee Julia's
 # compiler discovered, not something Differ validated.
-function implicit_frule_tt(callee_mi::MethodInstance)
+function implicit_frule_tt(interp::ContextualInterpreter, callee_mi::MethodInstance)
     isa(callee_mi.def, Method) || return nothing
     isa(callee_mi.specTypes, DataType) || return nothing   # `UnionAll` sig — see `is_dualized_impl`
     params = callee_mi.specTypes.parameters
@@ -159,9 +159,9 @@ function implicit_frule_tt(callee_mi::MethodInstance)
         # `register_implicit_frule_backedge!` over-invalidates. Both are sound.
         rest = Any[params[2:end]...]     # `params[2:end]` is a SimpleVector; need a Vector to `pop!`
         va = !isempty(rest) && isa(last(rest), Core.TypeofVararg) ? pop!(rest) : nothing
-        dualargs = Any[Dual{P,tangent_type(P)} for P in rest]
+        dualargs = Any[Dual{P,at_world(interp, tangent_type, P)} for P in rest]
         if va !== nothing
-            D = Dual{va.T,tangent_type(va.T)}
+            D = Dual{va.T,at_world(interp, tangent_type, va.T)}
             push!(dualargs, isdefined(va, :N) ? Vararg{D,va.N} : Vararg{D})
         end
         return Tuple{typeof(frule!!), Dual{ftype,NoTangent}, dualargs...}
@@ -178,9 +178,10 @@ end
 # `frule_codeinstance`. Best-effort, same caveats as `implicit_frule_tt`: a nice-to-have extra
 # invalidation trigger, not core, so a `frule_tt` that can't be built is silently skipped rather than
 # aborting the whole dualization.
-function register_implicit_frule_backedge!(edges::Vector{Any}, callee_mi::MethodInstance)
-    frule_tt = implicit_frule_tt(callee_mi)
-    frule_tt === nothing || push!(edges, frule_tt, Core.methodtable)
+function register_implicit_frule_backedge!(interp::ContextualInterpreter, edges::Vector{Any},
+                                           callee_mi::MethodInstance)
+    frule_tt = implicit_frule_tt(interp, callee_mi)
+    frule_tt === nothing || mt_edge!(edges, frule_tt)
     return nothing
 end
 
@@ -196,7 +197,7 @@ is_generated_frule_fallback(m::Method) = m.sig === Tuple{typeof(frule!!), Vararg
 # it through that rule (defends against "inlined `foo`, hand rule added, still gives the wrong
 # derivative").
 function has_hand_frule(interp::ContextualInterpreter, callee_mi::MethodInstance)
-    frule_tt = implicit_frule_tt(callee_mi)
+    frule_tt = implicit_frule_tt(interp, callee_mi)
     frule_tt === nothing && return false
     m, _ = CC.findsup(frule_tt, CC.method_table(interp))
     m === nothing && return false
@@ -408,7 +409,11 @@ function _build_dual_ir(interp::ContextualInterpreter, impl_mi::MethodInstance, 
     # fetches the real optimized IR instead, sharing this build's world age. Default-inert here
     # (DifferForwards has no dependency on any other AD-mode package); overridden in
     # `DifferForwardsOverReverseExt` once `DifferReverse` is also loaded.
-    if _is_foreign_mode_carrier(primal_mi)
+    # `at_world` + `mt_edge!`: both hooks are overridden in a package extension, whose methods are
+    # defined at a strictly later world than this generator's pin, so a direct call would silently
+    # take the inert default (see Contextual's world-age contract).
+    mt_edge!(edges, Tuple{typeof(_is_foreign_mode_carrier),MethodInstance})
+    if at_world(interp, _is_foreign_mode_carrier, primal_mi)
         # The forwards and pullback passes share the tape, so their shadow tapes must be `===` too.
         # This holds for both context shapes `reverse_fwds_impl` can be called with:
         #   - `Ctx{Nothing}` (fresh tape) — the prologue allocates the tape inline via `%new`, so the
@@ -440,7 +445,9 @@ function _build_dual_ir(interp::ContextualInterpreter, impl_mi::MethodInstance, 
         # against the bare in-progress `MethodInstance` rather than recursing into `build_dual_ir`
         # again, exactly mirroring the argument reverse mode's own comment above makes for its
         # `Ctx{Nothing}`/`Ctx{<:Tape}` sibling pair. One bounded nested compile total.
-        pir = _foreign_mode_primal_ir(interp, primal_mi, reason, edges)
+        mt_edge!(edges, Tuple{typeof(_foreign_mode_primal_ir),typeof(interp),MethodInstance,
+                              Ref{String},Vector{Any}})
+        pir = at_world(interp, _foreign_mode_primal_ir, interp, primal_mi, reason, edges)
         pir === nothing && return nothing
     else
         # Optimized primal IR, computed by hand (mirroring `Core.Compiler.typeinf_ircode`'s own body)
@@ -476,7 +483,7 @@ function _build_dual_ir(interp::ContextualInterpreter, impl_mi::MethodInstance, 
         # correctly regardless of which entry shape (plain MI/CI, invoke pair, mt-backedge pair,
         # multi-match record) each dependency took.
         for (_, item) in CC.ForwardToBackedgeIterator(Core.svec(frame.edges...))
-            isa(item, MethodInstance) && register_implicit_frule_backedge!(edges, item)
+            isa(item, MethodInstance) && register_implicit_frule_backedge!(interp, edges, item)
         end
     end
     return dualize_to_ircode(interp, impl_mi, pir, n; pir_is_vararg=false, primal_nfixed, reason, edges)
@@ -667,7 +674,50 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # `Core.PartialStruct`/`Const` lattice element instead — widen it first, since `tangent_type` is
     # only defined on `Type`s and only the backing type, not the narrowed const value, matters for
     # the tangent's own type.
-    tt(@nospecialize T) = tangent_type(_widen(T))
+    #
+    # `at_world`, not a direct call: `tangent_type` is extended by other packages (DifferReverse's
+    # `Stack`/`SingletonStack`/`CommsCell`/`Tape` methods), whose definitions are at a strictly later
+    # world than this generator's pin. A direct call silently takes DifferCore's generic per-field
+    # fallback, which for a self-referential type like `Tape` never terminates. `mt_edge!` on the
+    # signature so a `tangent_type` method appearing later invalidates this carrier. This closure is
+    # the single funnel for `builtins.jl`/`intrinsics.jl`/`foreigncalls.jl` too — it's handed to them
+    # via `builtin_ctx`/`intrinsic_ctx` below — so converting it covers those files wholesale.
+    function tt(@nospecialize T)
+        W = _widen(T)
+        mt_edge!(edges, Tuple{typeof(tangent_type),Type{W}})
+        return at_world(interp, tangent_type, W)
+    end
+
+    # The other two DifferCore/DifferForwards entry points this transform calls on primal types, for
+    # the same reason and with the same treatment. `dual_type` is DifferForwards' own, but it calls
+    # `tangent_type` internally, and `zero_tangent` dispatches to `zero_tangent_internal`, which
+    # DifferReverse extends — in both cases it is the *nested* dispatch that has to land at
+    # `interp.world`, which is exactly what `at_world` gives us (the switch covers the whole call).
+    function dualt(@nospecialize T)
+        mt_edge!(edges, Tuple{typeof(tangent_type),Type{T}})
+        return at_world(interp, dual_type, T)
+    end
+    function zt(@nospecialize v)
+        mt_edge!(edges, Tuple{typeof(zero_tangent),Core.Typeof(v)})
+        return at_world(interp, zero_tangent, v)
+    end
+
+    # The forward-over-reverse coupling hooks. Every one of these is overridden in a package
+    # extension, so a direct call from here resolves to the inert default — the same failure that
+    # made `_is_foreign_mode_carrier` silently report `false` post-split. Funnelled here so the
+    # `%new` arm below and the `builtin_ctx`/`intrinsic_ctx` rules share one treatment.
+    function fsel_shadow_type(@nospecialize T)
+        mt_edge!(edges, Tuple{typeof(_foreign_selfsim_shadow_type),Type{T}})
+        return at_world(interp, _foreign_selfsim_shadow_type, T)
+    end
+    function fsel_shadow_field(@nospecialize(T), fi::Int)
+        mt_edge!(edges, Tuple{typeof(_foreign_selfsim_shadow_field),Type{T},Int})
+        return at_world(interp, _foreign_selfsim_shadow_field, T, fi)
+    end
+    function fsel_mirror_field(@nospecialize(T), fi::Int)
+        mt_edge!(edges, Tuple{typeof(_foreign_selfsim_mirror_field),Type{T},Int})
+        return at_world(interp, _foreign_selfsim_mirror_field, T, fi)
+    end
 
     code = Any[]; types = Any[]; flags = UInt32[]
     # `flag` defaults to `CC.IR_FLAG_NULL` (ordinary statement, no special inlining/optimization
@@ -717,7 +767,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # the `%new` fast path (kept for concrete `R`, asserted allocation-free by the test suite) is
     # unaffected.
     dyn_dual!(@nospecialize(R), @nospecialize(p), @nospecialize(t)) =
-        emit!(Expr(:call, Dualg, p, t), dual_type(R))
+        emit!(Expr(:call, Dualg, p, t), dualt(R))
     # `(true, value)` when `gr` names a defined constant binding at the inference world — the test
     # that licenses both embedding its value in the IR and using that value's exact type. Returns a
     # separate flag rather than a `nothing` sentinel (a binding whose value is `nothing` must still
@@ -771,7 +821,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # `MutableTangent`) would then be one frozen object shared/aliased across every invocation of this
     # compiled carrier, corrupted by the first call that mutates it.
     function const_tangent(@nospecialize x)
-        isa(x, QuoteNode) && return zero_tangent(x.value)
+        isa(x, QuoteNode) && return zt(x.value)
         # The null shadow-pointer sentinel (`src/intrinsics.jl`): a `Ptr` operand with no tangent
         # storage behind it. `zero_tangent(::Ptr)` throws by design, but this one does have a
         # well-defined tangent — a null shadow's own shadow is again null
@@ -784,14 +834,14 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             # `zero_tangent(gr)` (the tangent of the GlobalRef *struct*, not the bound value).
             ok, gv = _globalref_val(x, iworld)
             if ok
-                T = tangent_type(Core.Typeof(gv))
+                T = tt(Core.Typeof(gv))
                 # The `zero_tangent` argument goes through `gref_operand!`, never the raw node: an
                 # `:invoke` operand is a value position too.
                 return T === NoTangent ? NoTangent() :
                        emit_invoke!(zerotang_g, T, (Core.Typeof(gv),), gref_operand!(x))
             end
         end
-        return zero_tangent(x)
+        return zt(x)
     end
     # Zero tangent for a computed primal value of type `Ti` (the tangent of a non-differentiable
     # operation's result). `NoTangent()` when the tangent type is trivial (`Int`, `Bool`, …), a
@@ -833,7 +883,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         vptys = Any[_dual_primal_type(dualparams[i]) for i in (nfixed + 1):n]
         vttys = Any[_dual_tangent_type(dualparams[i]) for i in (nfixed + 1):n]
         Pva = Tuple{vptys...}
-        Tva = tangent_type(Pva)
+        Tva = tt(Pva)
         if primal_nfixed !== nothing
             # `pir`'s own vararg slot type is a lattice element, not necessarily a bare `Type`
             # (`Core.Const(())` when the vararg is empty, `Core.Const((Float64,))` for a `Type`-valued
@@ -972,7 +1022,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # The callee's own tangent: a statically-known function is a code constant (zero tangent —
         # `NoTangent()` for a plain function); a genuinely dynamic callee (read out of a container)
         # carries whatever tangent the shadow pass computed for it.
-        ftang   = fval === nothing ? tresolve(fpos) : zero_tangent(fval)
+        ftang   = fval === nothing ? tresolve(fpos) : zt(fval)
         # A call is a genuine dynamic dispatch (`apply_generic`) when its callee or any argument has a
         # non-concrete declared type — the method that runs depends on runtime types unknowable here
         # (e.g. a value read out of an `Any`-typed global/field/container). We can't wrap such a call
@@ -1004,7 +1054,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 else                                   # statically-known: embed the value + its zero
                     P = _typeof(v)
                     push!(pvals, v); push!(ptys, P)
-                    push!(tvals, zero_tangent(v)); push!(ttys, tt(P))
+                    push!(tvals, zt(v)); push!(ttys, tt(P))
                 end
             end
             ptup = emit!(Expr(:call, ctuple, pvals...), Tuple{ptys...})
@@ -1040,7 +1090,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             else                                        # statically-known: embed value + its zero tangent
                 P = _typeof(v)
                 push!(dualtys, Dual{P,tt(P)})
-                push!(duals, dual!(P, tt(P), v, zero_tangent(v)))
+                push!(duals, dual!(P, tt(P), v, zt(v)))
             end
         end
         # Emit the surviving high-level rule as a static `:invoke` to a compiled `CodeInstance` when
@@ -1049,7 +1099,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # and the abstract `Dual` when `R` is non-concrete — the concrete `Dual` the rule actually
         # returns is a subtype of the latter (whereas the invariant `Dual{Any,Any}` would be unsound
         # and miscompile).
-        DR = dual_type(R)
+        DR = dualt(R)
         # Recursion: does this call's *derived* (non-hand-ruled) carrier resolve to `impl_mi` itself
         # (direct self-recursion) or to some other carrier that's currently mid-compile on this task
         # (mutual recursion, A→B→A)? Checked before ever calling `frule_codeinstance` — that call
@@ -1124,8 +1174,13 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # (`getfield`, `setfield!`, `Core.tuple`, `Core.ifelse`, the array-allocation builtins, `===`).
     # `optype`/`tt` give those rules the primal-type introspection they need for same-shape-vs-general
     # struct branching that a plain intrinsic never has to do.
+    # `fsel_*` are the forward-over-reverse coupling hooks, funnelled through `at_world` (see their
+    # definitions above): `getfield`/`setfield!` on a foreign self-similar-shadow type need the same
+    # answers the `%new` arm gets, and a direct call from `builtins.jl` would take the inert default.
     builtin_ctx = (emit! =emit!, presolve=presolve, tresolve=tresolve, zero_shadow=zero_shadow,
-                   optype=optype, tt=tt, emit_invoke! =emit_invoke!, opf=opf, reason=reason)
+                   optype=optype, tt=tt, emit_invoke! =emit_invoke!, opf=opf, reason=reason,
+                   fsel_shadow_type=fsel_shadow_type, fsel_shadow_field=fsel_shadow_field,
+                   fsel_mirror_field=fsel_mirror_field)
     # And for `apply_foreigncall_frule!` (`src/foreigncalls.jl`). Two extra members beyond the builtin
     # bundle, both for the pointer-provenance walk: `pstmt` reads a primal statement node back out of
     # `pir` (old numbering, unaffected by the shadow statements already interleaved into `code`), and
@@ -1351,10 +1406,10 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # (whose tangent is `NoTangent` and can't fill e.g. a `typeof(sin)` or `Int` slot),
                 # which carries the primal value through unchanged. This is what lets a
                 # `Dual{typeof(sin),NoTangent}` be re-dualized at higher order.
-                tf = Any[_nondiff_field(fieldtype(T, j)) ? vpresolve(args[j]) : tresolve(args[j])
+                tf = Any[_nondiff_field(interp, edges, fieldtype(T, j)) ? vpresolve(args[j]) : tresolve(args[j])
                          for j in eachindex(args)]
                 shadow[i] = emit!(Expr(:new, T, tf...), Ti)
-            elseif _foreign_selfsim_shadow_type(T)
+            elseif fsel_shadow_type(T)
                 # Self-similar-shadow bookkeeping types owned by a different AD-mode package (e.g.
                 # DifferReverse's `Stack`/`SingletonStack`/`CommsCell`/`Tape`) — reached under
                 # forward-over-reverse: that package's own carrier constructor calls for these get
@@ -1364,7 +1419,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # `%new`'s shadow and a later `getfield`'s shadow never disagree on which fields
                 # mirror. A field it declines carries the primal value through instead, like a
                 # non-differentiable `Dual` field above.
-                tf = Any[_foreign_selfsim_shadow_field(T, j) === nothing ? vpresolve(args[j]) : tresolve(args[j])
+                tf = Any[fsel_shadow_field(T, j) === nothing ? vpresolve(args[j]) : tresolve(args[j])
                          for j in eachindex(args)]
                 shadow[i] = emit!(Expr(:new, TT, tf...), TT)
             elseif TT === NoTangent
@@ -1663,8 +1718,16 @@ end
 #    clause misses them; every `T <: Type` has `NoTangent` tangent, so carrying the primal is always
 #    right there.
 # Differentiable structs/scalars have a non-`NoTangent` tangent, so they still take their tangent.
-_nondiff_field(@nospecialize T) = T isa DataType && T !== NoTangent &&
-    (T <: Type || (isconcretetype(T) && tangent_type(T) === NoTangent))
+#
+# Takes `interp`/`edges` so its `tangent_type` query lands at the interpreter's inference world
+# rather than the generator's pin — see Contextual's world-age contract.
+function _nondiff_field(interp::ContextualInterpreter, edges::Vector{Any}, @nospecialize(T))
+    (T isa DataType && T !== NoTangent) || return false
+    T <: Type && return true
+    isconcretetype(T) || return false
+    mt_edge!(edges, Tuple{typeof(tangent_type),Type{T}})
+    return at_world(interp, tangent_type, T) === NoTangent
+end
 
 
 function frule_body(world::UInt, source, self, dual_argtypes)

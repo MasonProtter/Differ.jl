@@ -4,7 +4,8 @@ import ADTypes
 using LinearAlgebra
 using Random: AbstractRNG
 
-using Contextual: Contextual, ContextualInterpreter, expr_to_codeinfo, run_ipo_passes!
+using Contextual: Contextual, ContextualInterpreter, expr_to_codeinfo, run_ipo_passes!,
+    at_world, mt_edge!
 import Contextual: build_contextual_ir
 
 import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangent, MutableTangent,

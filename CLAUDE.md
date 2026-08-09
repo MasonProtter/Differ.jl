@@ -39,17 +39,25 @@ IR.
 
 ## Differ skills
 
-`Differ/.claude/skills/` has three skills describing the structure and meaning of Differ's code in
-detail. They should trigger automatically when relevant, but can also be invoked directly (e.g.
+`Differ/.claude/skills/` has six skills describing the structure and meaning of Differ's code in
+detail, matching the package split (`Contextual`/`DifferCore`/`DifferForwards`/`DifferReverse`).
+They should trigger automatically when relevant, but can also be invoked directly (e.g.
 `/differ-architecture`):
 
-- **`differ-architecture`** — orientation: the custom `AbstractInterpreter` compiler-plugin design,
-  the `Dual`/`frule` calling convention, the file map, how to run tests and inspect dualized IR.
-  Start here.
-- **`differ-ircode-dualization`** — deep-dive internals of the split-shadow dualization engine
-  (`dualize_to_ircode` in `src/forward_interp.jl`): how control flow is handled, the `PhiNode`
-  forward-reference mechanism, and known `Core.Compiler.verify_ir` gotchas.
-- **`differ-extending-ir-support`** — playbook for adding support for a new Julia IR construct
-  (e.g. the next milestone, exception handling for `try`/`catch`), including what's already known
-  about that specific follow-up. 
+- **`differ-architecture`** — orientation: the package map, the `Contextual` compiler-plugin hooks,
+  the `Dual`/`frule!!` and `CoDual`/`rrule!!` calling conventions, how to run tests and inspect
+  dualized/reverse IR. Start here.
+- **`differ-tangent-system`** — deep-dive on `DifferCore`, the tangent/fdata/rdata type system
+  shared by both AD modes.
+- **`differ-forward-dualization`** — deep-dive internals of `DifferForwards`' split-shadow
+  dualization engine (`dualize_to_ircode` in `DifferForwards/src/forward_interp.jl`): how control
+  flow is handled, the `PhiNode` forward-reference mechanism, and known `Core.Compiler.verify_ir`
+  gotchas.
+- **`differ-reverse-engine`** — deep-dive internals of `DifferReverse`'s two-carrier `Tape`/
+  pullback engine (`DifferReverse/src/reverse_interp.jl`): the block-stack control-flow-replay
+  scheme, the mutation comms scheme, recursion, and reverse-specific `verify_ir` gotchas.
+- **`differ-extending-ir-support`** — playbook for adding support for a new Julia IR construct in
+  `DifferForwards`, including what's already known about outstanding forward-mode gaps.
+- **`differ-extending-reverse-support`** — the same playbook applied to `DifferReverse`, including
+  what's already known about outstanding reverse-mode gaps. 
 

@@ -8,7 +8,8 @@ using Core: MethodInstance, CodeInstance, CodeInfo, Compiler
 const CC = Core.Compiler
 using Base: specialize_method
 
-using Contextual: Contextual, ContextualInterpreter, expr_to_codeinfo, run_ipo_passes!
+using Contextual: Contextual, ContextualInterpreter, expr_to_codeinfo, run_ipo_passes!,
+    at_world, mt_edge!
 import Contextual: build_contextual_ir
 
 # Every name DifferReverse adds new methods to (as opposed to merely calling) must come in via

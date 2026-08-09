@@ -1,30 +1,9 @@
-# ============================================================================================
-# NOT wired into runtests.jl — see ISSUES.md #85 (in the repo root) before touching this file.
+# Forward-over-reverse composition: `D(x -> rev_gradient(f, x), v)`.
 #
-# Forward-over-reverse composition (`D(x -> rev_gradient(f, x), v)`, i.e. differentiating a
-# function that itself calls `rev_gradient`/`value_and_gradient!`/a `Tape` pullback, *under
-# forward mode*) currently hangs or crashes post-split — a `tangent_type` dispatch/compilation
-# issue specific to the self-referential `Tape` struct under the custom `ContextualInterpreter`
-# compiler plugin, not a simple hook-wiring bug (the coupling-point hooks in
-# `DifferForwards/ext/DifferForwardsOverReverseExt.jl` are individually verified correct). This
-# file — the original monolith's test coverage for exactly this feature, all 37 assertions of
-# which passed before the package split — is kept here for whoever picks up #85, with imports
-# updated to the post-split package names, but is **not** included in `runtests.jl`: most of its
-# testsets would hang, not just fail, and a hang can't be caught by `@test_broken`/`@test_skip`,
-# only killed by an external timeout. Do not add this file to `runtests.jl` until #85 is fixed.
-#
-# The last testset ("reverse-over-forward and reverse-over-reverse bail, not crash or silently
-# zero") is the one exception worth knowing about: it does *not* hang (it doesn't exercise
-# forward-over-reverse at all — both cases are *reverse* mode differentiating something that
-# calls forward/reverse machinery, the opposite composition). It was spot-checked directly against
-# the current split and behaves close to, but not exactly like, this original: reverse-over-
-# reverse gives the correct, specific, located bail message; reverse-over-forward now gives a
-# generic "Unhandled type Dual{...}" instead of the original's specific "reverse-over-forward is
-# not supported..." message (still a clean bail, not a hang or crash — just a less helpful
-# message; see ISSUES #85's "secondary, related finding"). That one testset's assertions on the
-# reverse-over-forward message text would need loosening before it could be safely re-enabled.
-# ============================================================================================
-
+# Previously disabled by ISSUES #85 — the whole file hung, because the forward pass's transform runs
+# inside `frule!!`'s generator, where dispatch is pinned to that method's `primary_world` and so
+# could not see DifferReverse's `tangent_type` overrides or the extension's coupling hooks. Fixed by
+# routing every such query through `Contextual.at_world`.
 using Test
 using DifferForwards
 using DifferForwards: Dual, NoTangent, frule!!, zero_tangent, code_dual_ircode
@@ -358,13 +337,6 @@ end
     # derivative) and name the actual composition rather than surfacing an unrelated internal error
     # several frames removed from the real cause. Caught at the point reverse mode resolves a callee's
     # primal function or argument types (`_composition_bail_message`, `src/reverse_interp.jl`).
-    #
-    # NOTE (post-split): as of this migration, reverse-over-forward's bail message regressed from
-    # the specific "reverse-over-forward is not supported..." to a generic "Unhandled type
-    # Dual{...}" — still a clean, located `ErrorException`, just less specific. See ISSUES #85's
-    # "secondary, related finding". The assertion on that specific message text is loosened below
-    # accordingly; everything else (no hang, no crash, no silent wrong answer, reverse-over-reverse
-    # unaffected) still holds and is still checked.
     rof(x) = frule!!(Dual(sin, NoTangent()), Dual(x, 1.0)).x
     e1 = try
         rev_gradient(rof, 1.0)
@@ -374,6 +346,8 @@ end
     end
     @test e1 isa ErrorException
     @test !(e1 isa MethodError)
+    @test occursin("reverse-over-forward", e1.msg)
+    @test occursin("not supported", e1.msg)
 
     # Reverse-over-reverse: two genuinely different shapes for the *inner* differentiated function,
     # each reaching the composition check from a different chokepoint. `sin` (a hand-ruled primitive)

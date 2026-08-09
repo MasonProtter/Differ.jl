@@ -125,14 +125,14 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
         # types); bail rather than guess.
         if !(Pobj <: Dual || Pobj <: Tuple || Pobj <: NamedTuple || Pobj <: Array ||
              (Pobj isa DataType && ismutabletype(Pobj))) ||
-           _bi_homog_tangent_type(Pobj) !== TT
+           _bi_homog_tangent_type(ctx.tt, Pobj) !== TT
             return nothing
         end
     end
     # Foreign self-similar shadows owned by a different AD-mode package (forward-over-reverse:
     # DifferReverse's `Stack`/`CommsCell`/`Tape`) — needs its own per-field check via the
     # `_foreign_selfsim_shadow_field` hook, independent of `Ti`/`TT`.
-    if Pobj isa DataType && _foreign_selfsim_shadow_type(Pobj)
+    if Pobj isa DataType && ctx.fsel_shadow_type(Pobj)
         fi = _bi_field_index(Pobj, actual[2])
         if fi === nothing
             ctx.reason[] = "dynamic field index into `$Pobj` — its fields do not share one tangent type"
@@ -140,7 +140,7 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
         end
         p = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(actual[1]), idx,
                            (ctx.presolve(a) for a in actual[3:end])...), Ti)
-        Fsh = _foreign_selfsim_shadow_field(Pobj, fi)
+        Fsh = ctx.fsel_shadow_field(Pobj, fi)
         Fsh === nothing && return p, NoTangent()
         t = ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), idx,
                            (ctx.presolve(a) for a in actual[3:end])...), Fsh)
@@ -219,7 +219,7 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
         # dynamic-dispatch, and SROA removes the intermediate. Otherwise (a dynamic homogeneous-mutable
         # index, or a `PossiblyUninitTangent` slot needing a `val`-unwrap) fall back to the generic
         # helper, type-stable over both cases exactly when the gate above allowed us here.
-        slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(Pobj, actual[2]) : nothing
+        slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(ctx.tt, Pobj, actual[2]) : nothing
         if slot === nothing
             # Fallback (dynamic homogeneous-mutable index, or a PossiblyUninitTangent slot): emit the
             # generic helper as a static `:invoke` so it runs compiled rather than dynamic-dispatched.
@@ -252,7 +252,7 @@ function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
     # it's the same pattern — widen at the source rather than rely on every future edit preserving
     # the guard ordering.
     Pobj = _widen(ctx.optype(actual[1]))
-    if !_bi_literal_index(actual[2]) && !(Pobj isa DataType && _bi_homog_tangent_type(Pobj) === NoTangent)
+    if !_bi_literal_index(actual[2]) && !(Pobj isa DataType && _bi_homog_tangent_type(ctx.tt, Pobj) === NoTangent)
         return nothing
     end
     p = ctx.emit!(Expr(:call, _setfieldg, ctx.presolve(actual[1]), idx, ctx.presolve(actual[3]),
@@ -262,13 +262,13 @@ function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
     # above). `Ti` is useless here too: DifferReverse's carrier's own `setfield!`s on these
     # declare statement type `Any` regardless of field (hand-built IR, not inferred), so decide
     # purely from `Pobj`'s own field type.
-    if Pobj isa DataType && _foreign_selfsim_shadow_type(Pobj)
+    if Pobj isa DataType && ctx.fsel_shadow_type(Pobj)
         fi = _bi_field_index(Pobj, actual[2])
         if fi === nothing
             ctx.reason[] = "dynamic field index into `$Pobj` — its fields do not share one tangent type"
             return nothing
         end
-        Fsh = _foreign_selfsim_shadow_field(Pobj, fi)
+        Fsh = ctx.fsel_shadow_field(Pobj, fi)
         if Fsh === nothing
             # A field with no tangent (e.g. `Stack.position`, an `Int`) can still be lockstep
             # bookkeeping that must stay identical between primal and shadow tape — not
@@ -276,7 +276,7 @@ function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
             # field; when it does, mirror the write with the **primal** value so a recycled
             # shadow (forward-over-reverse's `Ctx{<:Tape}` case) doesn't retain a stale value from
             # a previous call.
-            if _foreign_selfsim_mirror_field(Pobj, fi)
+            if ctx.fsel_mirror_field(Pobj, fi)
                 ctx.emit!(Expr(:call, _setfieldg, ctx.tresolve(actual[1]), idx, ctx.presolve(actual[3])),
                           fieldtype(Pobj, fi))
             end
@@ -290,7 +290,7 @@ function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
     TT = ctx.tt(Ti)
     TT === NoTangent && return p, NoTangent()
     newtan = ctx.tresolve(actual[3])
-    slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(Pobj, actual[2]) : nothing
+    slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(ctx.tt, Pobj, actual[2]) : nothing
     if slot === nothing
         # Fallback (a PossiblyUninitTangent target slot): emit the generic helper as a static
         # `:invoke` so it runs compiled rather than dynamic-dispatched.

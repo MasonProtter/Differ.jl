@@ -105,3 +105,79 @@ end
         @test CC.cache_owner(interp_a) !== CC.cache_owner(interp_c)
     end
 end
+
+# --- The world-age pin `at_world` exists to work around. ---
+#
+# `jl_call_staged` pins a generator body's task world age to the generated method's
+# `Method.primary_world`, so a method defined *after* that entry point is invisible to plain
+# dispatch from inside it — which is what silently broke cross-package pass composition
+# (`tangent_type` overrides and coupling hooks owned by a later-loaded package resolving to their
+# generic/inert fallbacks; ISSUES #85). Two escape hatches look like they should work and do not:
+# `Base.invoke_in_world` is a no-op while `in_pure_callback` is set, and `invoke` with a
+# `CodeInstance` inferred at a newer world throws. `Core._call_in_world_total` — what `at_world`
+# wraps — is the one that works, and the world it switches to covers nested dispatch inside the
+# callee too (load-bearing: `tangent_type(Stack{T})` recurses into `tangent_type(T)`).
+#
+# This whole design rests on that asymmetry, so assert it directly rather than only observing its
+# downstream effects. If a future Julia changes any of it, this fails here instead of surfacing as
+# a hang somewhere in an AD transform.
+
+pinned_probe(::Int) = :before
+nested_probe() = pinned_probe(1)
+
+function pin_body(world::UInt, source, self, x)
+    results = (plain          = pinned_probe(1),
+               invoke_in_world = try Base.invoke_in_world(world, pinned_probe, 1) catch; :threw end,
+               at_world        = at_world(world, pinned_probe, 1),
+               at_world_nested = at_world(world, nested_probe),
+               pinned_age      = Base.tls_world_age(),
+               world_arg       = world)
+    return expr_to_codeinfo(@__MODULE__, Any[Symbol("#self#"), :x], [], (),
+                            :(return $results), false)
+end
+
+@eval function pin_entry(x)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, pin_body))
+end
+
+const PIN_ENTRY_WORLD = which(pin_entry, Tuple{Int}).primary_world
+
+# Redefined strictly after `pin_entry`, so it is invisible to that generator's pinned world.
+pinned_probe(::Int) = :after
+
+@testset "generator world-age pin / at_world" begin
+    r = pin_entry(1)
+
+    # The pin itself: the generator ran long after the redefinition, and was still handed the
+    # current world as its `world` argument, yet its task world age is the entry's primary_world.
+    @test r.pinned_age == PIN_ENTRY_WORLD
+    @test r.world_arg > PIN_ENTRY_WORLD
+
+    # Plain dispatch and `invoke_in_world` both see the stale method...
+    @test r.plain === :before
+    @test r.invoke_in_world === :before
+
+    # ...while `at_world` sees the current one, including through a nested dispatch inside the
+    # callee (`nested_probe` calls `pinned_probe` dynamically).
+    @test r.at_world === :after
+    @test r.at_world_nested === :after
+end
+
+@testset "mt_edge! dedupes" begin
+    edges = Any[]
+    mt_edge!(edges, Tuple{typeof(pinned_probe),Int})
+    mt_edge!(edges, Tuple{typeof(pinned_probe),Int})
+    mt_edge!(edges, Tuple{typeof(nested_probe)})
+    @test length(edges) == 4      # two (sig, methodtable) pairs, the duplicate dropped
+    @test edges[2] === Core.methodtable
+    @test edges[4] === Core.methodtable
+end
+
+@testset "ContextualInterpreter rejects the pure-callback world sentinel" begin
+    # `Base.get_world_counter()` returns `typemax(UInt)` inside a generator, so defaulting `world`
+    # from it there would silently build an interpreter at that sentinel — and the obvious
+    # `world <= get_world_counter()` assert cannot catch it, being vacuously true in exactly that
+    # context. Rejected explicitly instead.
+    @test_throws AssertionError ContextualInterpreter(Double(), nothing; world=typemax(UInt))
+end

@@ -75,13 +75,19 @@ _bi_literal_index(@nospecialize(x)) = isa(x, QuoteNode) || isa(x, Symbol) || isa
 # concrete or its fields don't all share one tangent type. Used to allow a dynamic (runtime-
 # computed) field index into a homogeneous same-shape aggregate, and to recognize an object that's
 # entirely non-differentiable regardless of which field a dynamic index happens to hit.
-function _bi_homog_tangent_type(P)
+#
+# Takes the caller's `tangent_type` funnel rather than calling `tangent_type` directly: both callers
+# are IR transforms running inside a `@generated` generator, where plain dispatch is pinned to the
+# generator's world and would miss a `tangent_type` method owned by a later-loaded package. See
+# Contextual's world-age contract (`at_world`). DifferCore stays independent of Contextual by taking
+# the funnel as an argument instead of an interpreter.
+function _bi_homog_tangent_type(tt, P)
     (P isa DataType && isconcretetype(P)) || return nothing
     nf = fieldcount(P)
     nf == 0 && return nothing
-    tt1 = tangent_type(fieldtype(P, 1))
+    tt1 = tt(fieldtype(P, 1))
     for j in 2:nf
-        tangent_type(fieldtype(P, j)) === tt1 || return nothing
+        tt(fieldtype(P, j)) === tt1 || return nothing
     end
     return tt1
 end
@@ -91,9 +97,10 @@ end
 # type and the 1-based field index into it — or `nothing` when the direct-emission preconditions
 # don't hold (non-concrete primal, non-`Tangent`/`MutableTangent` tangent, unknown/out-of-range
 # field, or a `PossiblyUninitTangent` slot needing the generic unwrap/wrap helper instead).
-function _tangent_field_slot(@nospecialize(Pobj), @nospecialize(name))
+# Takes the caller's `tangent_type` funnel, for the reason on `_bi_homog_tangent_type` above.
+function _tangent_field_slot(tt, @nospecialize(Pobj), @nospecialize(name))
     (Pobj isa DataType && isconcretetype(Pobj)) || return nothing
-    Tobj = tangent_type(Pobj)
+    Tobj = tt(Pobj)
     (Tobj isa DataType && Tobj <: Union{Tangent,MutableTangent}) || return nothing
     NT = fields_type(Tobj)
     (NT isa DataType && isconcretetype(NT)) || return nothing

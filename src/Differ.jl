@@ -9,21 +9,8 @@ lives in one of the four sub-packages, each independently installable and usable
 adding the `Dual` method and `DifferReverse` adding the `CoDual` one, so they're already unified
 without `Differ` needing to do anything.
 
-# Known limitation: forward-over-reverse is currently unsupported
-
-Differentiating a function that itself calls `rev_gradient`/`value_and_gradient!`/a `Tape`
-pullback, *under forward mode* (`frule!!`/`D` applied to such a function) — hangs or crashes. This
-composition worked in the pre-split single-module version of this package; it broke as a result of
-splitting the tangent/fdata/rdata system (`DifferCore`) and the two AD engines
-(`DifferForwards`/`DifferReverse`) into separate packages connected only through
-`DifferForwards/ext/DifferForwardsOverReverseExt.jl`'s coupling-point hooks. The hooks themselves
-are implemented correctly (verified individually); the failure is a deeper `tangent_type`
-dispatch/compilation issue specific to a self-referential struct type (`Tape`) under the custom
-`AbstractInterpreter`-based compiler plugin this package is built on. See ISSUES.md #85 for the
-full investigation, root-cause findings so far, and suggested next steps — it is a known,
-documented, **currently-accepted** limitation, not an actively-worked bug. Every other use of
-`DifferForwards`/`DifferReverse`, together or separately (including loading both in one session
-without composing them), is unaffected.
+Forward-over-reverse (`D(x -> rev_gradient(f, x), v)` and friends) works: load `DifferForwards` and
+`DifferReverse` in either order, and `DifferForwardsOverReverseExt` wires the two engines together.
 """
 module Differ
 

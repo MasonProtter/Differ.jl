@@ -123,8 +123,8 @@ end
 # otherwise cost a real call per reverse iteration just to compute `t -> t`. Falls back to the call
 # for a real `Tangent` fdata/rdata split.
 function _emit_rdata!(ctx, @nospecialize(TT), @nospecialize(RT), cur_tangent)
-    rdtype(TT) === NoRData && return ctx.emit!(QuoteNode(NoRData()), RT)
-    (RT === TT && rdtype(TT) === TT) && return cur_tangent
+    ctx.rdtype(TT) === NoRData && return ctx.emit!(QuoteNode(NoRData()), RT)
+    (RT === TT && ctx.rdtype(TT) === TT) && return cur_tangent
     return ctx.emit!(ctx.icall(_rr_rdata, (TT,), cur_tangent), RT)
 end
 
@@ -142,7 +142,7 @@ function builtin_rrule_comms(::Val{Core.getfield}, actual, Ti, ctx)
     obj = actual[1]
     P = ctx.optype(obj)
     dyn = !_bi_literal_index(actual[2])
-    if dyn && tangent_type(_widen(Ti)) !== NoTangent
+    if dyn && ctx.tt(_widen(Ti)) !== NoTangent
         # Dynamic (non-literal) field index into a differentiable field: only supported when every
         # field of the object shares one pure-rdata tangent type (`_bi_homog_tangent_type`) — a
         # homogeneous immutable Tuple/NamedTuple (the `for i in eachindex(t); s += t[i]; end` pattern;
@@ -157,7 +157,7 @@ function builtin_rrule_comms(::Val{Core.getfield}, actual, Ti, ctx)
         # Mooncake.jl/src/rules/builtins.jl:1069) — a generated-unrolling path for the heterogeneous,
         # per-field-typed case would be fragile and type-unstable, and is out of scope even there.
         ok = P isa DataType && isconcretetype(P) && (P <: Tuple || P <: NamedTuple || ismutabletype(P)) &&
-             fdtype(Ti) === NoFData && _bi_homog_tangent_type(P) === tangent_type(Ti)
+             ctx.fdtype(Ti) === NoFData && _bi_homog_tangent_type(ctx.tt, P) === ctx.tt(Ti)
         if !ok
             ctx.reason[] = "reverse mode `getfield` with a dynamic (non-literal) field index is only " *
                            "supported for a homogeneous Tuple/NamedTuple/mutable struct whose fields " *
@@ -168,7 +168,7 @@ function builtin_rrule_comms(::Val{Core.getfield}, actual, Ti, ctx)
             return false
         end
     end
-    if rdtype(Ti) !== NoRData
+    if ctx.rdtype(Ti) !== NoRData
         if P isa DataType && ismutabletype(P)
             if !_bi_tracked(obj, ctx)
                 ctx.reason[] = "mutable-struct `getfield` has no differentiable provenance traceable " *
@@ -180,7 +180,7 @@ function builtin_rrule_comms(::Val{Core.getfield}, actual, Ti, ctx)
             # `apply_builtin_rrule!` passes it to `increment_field_rdata!`'s runtime-`Int` method as a
             # plain `Int`, since `Val{fieldidx}` can't be built from a value not known until the
             # pullback runs.
-            items = Tuple{Any,Any}[((:fshadow, obj), fdtype(P))]
+            items = Tuple{Any,Any}[((:fshadow, obj), ctx.fdtype(P))]
             dyn && push!(items, ((:primal, actual[2]), ctx.optype(actual[2])))
             return items
         elseif !(P isa DataType)
@@ -217,7 +217,7 @@ function apply_builtin_rrule_fwds!(::Val{Core.getfield}, actual, Ti, ctx)
             # whenever `fdtype(Ti) !== NoFData` (i.e. whenever this branch would run), so a tracked
             # fdata-carrying result never reaches this point with a runtime-computed index.
             fname = _bi_fieldname(actual[2])
-            shadow = ctx.icall!(_rr_get_fdata_field, fdtype(Ti), (fdtype(P), typeof(fname)),
+            shadow = ctx.icall!(_rr_get_fdata_field, ctx.fdtype(Ti), (ctx.fdtype(P), typeof(fname)),
                                 ctx.sresolve(obj), actual[2])
         end
     end
@@ -226,7 +226,7 @@ end
 
 function apply_builtin_rrule!(::Val{Core.getfield}, actual, Ti, ctx)
     nores = ntuple(_ -> nothing, length(actual))
-    rdtype(Ti) === NoRData && return nores
+    ctx.rdtype(Ti) === NoRData && return nores
     acc = ctx.deref_and_zero!(Ti)
     obj = actual[1]
     P = ctx.optype(obj)
@@ -254,7 +254,7 @@ function apply_builtin_rrule!(::Val{Core.getfield}, actual, Ti, ctx)
     # is `zero_like_rdata_type(P)`, not `rdtype(P)`, whenever `obj`'s own primal type isn't concrete.
     if ismutabletype(P)
         mt = ctx.fetch_shadow(obj)
-        slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(P, actual[2]) : nothing
+        slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(ctx.tt, P, actual[2]) : nothing
         if slot !== nothing
             # `increment_field_rdata!` is `set_tangent_field!(dx, f, increment_rdata!!(get_tangent_field(dx, f), acc))`;
             # emit the read/write directly. `increment_rdata!!` inlines safely for a scalar field — it
@@ -266,8 +266,8 @@ function apply_builtin_rrule!(::Val{Core.getfield}, actual, Ti, ctx)
             new = ctx.emit!(ctx.icall(increment_rdata!!, (TFslot, RTcur), cur_rdata, acc), TFslot)
             _emit_stf!(ctx, mt, slot, new)
         else
-            ctx.emit!(ctx.icall(_rr_increment_field_rdata!, (fdtype(P), zero_like_rdata_type(_widen(Ti)), idxty),
-                                mt, acc, idxval), fdtype(P))
+            ctx.emit!(ctx.icall(_rr_increment_field_rdata!, (ctx.fdtype(P), zero_like_rdata_type(_widen(Ti)), idxty),
+                                mt, acc, idxval), ctx.fdtype(P))
         end
     else
         target = ctx.ref_for(obj)
@@ -296,7 +296,7 @@ end
 # ---------------------------------------------------------------------------
 
 function builtin_rrule_comms(::Val{Core.tuple}, actual, Ti, ctx)
-    tangent_type(_widen(Ti)) === NoTangent && return nothing
+    ctx.tt(_widen(Ti)) === NoTangent && return nothing
     T = _widen(Ti)
     ok = T isa DataType && T <: Tuple && isconcretetype(T) &&
          !(!isempty(T.parameters) && isa(last(T.parameters), Core.TypeofVararg)) &&
@@ -307,7 +307,7 @@ function builtin_rrule_comms(::Val{Core.tuple}, actual, Ti, ctx)
                        "%$(ctx.ssa.id)"
         return false
     end
-    FT = fdtype(T)
+    FT = ctx.fdtype(T)
     if FT !== NoFData
         if !(FT isa DataType && FT <: Tuple)
             ctx.reason[] = "reverse mode `tuple` requires a concrete fdata type, got $(FT) at " *
@@ -315,7 +315,7 @@ function builtin_rrule_comms(::Val{Core.tuple}, actual, Ti, ctx)
             return false
         end
         for j in eachindex(actual)
-            fdtype(fieldtype(T, j)) === NoFData && continue
+            ctx.fdtype(fieldtype(T, j)) === NoFData && continue
             _bi_tracked(actual[j], ctx) && continue
             ctx.reason[] = "reverse mode `tuple` operand $(j) (type $(fieldtype(T, j))) carries " *
                            "fdata but has no provenance traceable to a function argument at " *
@@ -327,32 +327,32 @@ function builtin_rrule_comms(::Val{Core.tuple}, actual, Ti, ctx)
 end
 
 function apply_builtin_rrule_fwds!(::Val{Core.tuple}, actual, Ti, ctx)
-    tangent_type(_widen(Ti)) === NoTangent && return nothing
+    ctx.tt(_widen(Ti)) === NoTangent && return nothing
     p = ctx.emit!(Expr(:call, _ctupleg, (ctx.presolve(a) for a in actual)...), Ti)
     shadow = nothing
     if _bi_tracked(ctx.ssa, ctx)
         T = _widen(Ti)
-        FT = fdtype(T)
+        FT = ctx.fdtype(T)
         shadow = ctx.emit!(Expr(:call, _ctupleg,
-                     (fdtype(fieldtype(T, j)) === NoFData ? NoFData() : ctx.sresolve(actual[j])
+                     (ctx.fdtype(fieldtype(T, j)) === NoFData ? NoFData() : ctx.sresolve(actual[j])
                       for j in eachindex(actual))...), FT)
     end
     return p, shadow, Dict{Any,Any}()
 end
 
 function apply_builtin_rrule!(::Val{Core.tuple}, actual, Ti, ctx)
-    tangent_type(_widen(Ti)) === NoTangent && return nothing
+    ctx.tt(_widen(Ti)) === NoTangent && return nothing
     nores = ntuple(_ -> nothing, length(actual))
-    rdtype(Ti) === NoRData && return nores
+    ctx.rdtype(Ti) === NoRData && return nores
     T = _widen(Ti)
     acc = ctx.deref_and_zero!(Ti)
-    RDataT = rdtype(T)
+    RDataT = ctx.rdtype(T)
     real_acc = ctx.emit!(
         ctx.icall(_rr_realize_rdata, (zero_like_rdata_type(_widen(Ti)), Type{RDataT}), acc, RDataT),
         RDataT)
     contribs = Vector{Any}(undef, length(actual))
     for j in eachindex(actual)
-        Fty = rdtype(fieldtype(T, j))
+        Fty = ctx.rdtype(fieldtype(T, j))
         contribs[j] = Fty === NoRData ? nothing : ctx.emit!(Expr(:call, _getfieldg, real_acc, j), Fty)
     end
     return Tuple(contribs)
@@ -373,7 +373,7 @@ function apply_builtin_rrule_fwds!(::Val{Core.memorynew}, actual, Ti, ctx)
                        (ctx.presolve(a) for a in actual[2:end])...), Ti)
     shadow = nothing
     if _bi_tracked(ctx.ssa, ctx)
-        TT = tangent_type(_widen(Ti))
+        TT = ctx.tt(_widen(Ti))
         shadow = ctx.emit!(Expr(:call, Core.memorynew, TT,
                            (ctx.presolve(a) for a in actual[2:end])...), TT)
     end
@@ -428,7 +428,7 @@ apply_builtin_rrule!(::Val{Base.memoryrefnew}, actual, Ti, ctx) = ntuple(_ -> no
 #     itself is the backward flow, nothing to route through the tape.
 # ---------------------------------------------------------------------------
 function builtin_rrule_comms(::Val{Base.memoryrefget}, actual, Ti, ctx)
-    rdtype(Ti) === NoRData && return Tuple{Any,Any}[]
+    ctx.rdtype(Ti) === NoRData && return Tuple{Any,Any}[]
     ref_node = actual[1]
     if !(isa(ref_node, Core.SSAValue) && ref_node.id <= length(ctx.tracked) && ctx.tracked[ref_node.id])
         ctx.reason[] = "array read has no differentiable provenance traceable to a function " *
@@ -462,7 +462,7 @@ end
 
 function apply_builtin_rrule!(::Val{Base.memoryrefget}, actual, Ti, ctx)
     nores = ntuple(_ -> nothing, length(actual))
-    rdtype(Ti) === NoRData && return nores
+    ctx.rdtype(Ti) === NoRData && return nores
     acc = ctx.deref_and_zero!(Ti)
     shadow_ref = ctx.fetch_shadow(actual[1])
     # This rule only ever reaches a "bits" (rdata-carrying-directly) element, so ordinarily
@@ -517,7 +517,7 @@ function builtin_rrule_comms(::Val{Core.setfield!}, actual, Ti, ctx)
         return false
     end
     fname = _bi_fieldname(actual[2])
-    if fdtype(tangent_type(fieldtype(P, fname))) !== NoFData
+    if ctx.fdtype(ctx.tt(fieldtype(P, fname))) !== NoFData
         val_node = actual[3]
         if !_bi_tracked(val_node, ctx)
             ctx.reason[] = "reverse mode `setfield!` of a field whose tangent carries fdata " *
@@ -531,20 +531,20 @@ function builtin_rrule_comms(::Val{Core.setfield!}, actual, Ti, ctx)
                        "function argument at %$(ctx.ssa.id) (object type $(P))"
         return false
     end
-    return Tuple{Any,Any}[((:fshadow, obj), fdtype(P)), ((:primal, obj), P),
-                          ((:old_primal, ctx.ssa), Ti), ((:old_tangent, ctx.ssa), tangent_type(_widen(Ti)))]
+    return Tuple{Any,Any}[((:fshadow, obj), ctx.fdtype(P)), ((:primal, obj), P),
+                          ((:old_primal, ctx.ssa), Ti), ((:old_tangent, ctx.ssa), ctx.tt(_widen(Ti)))]
 end
 
 function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
     obj, name_node, val_node = actual[1], actual[2], actual[3]
     P = ctx.optype(obj)
     mt = ctx.sresolve(obj)
-    TF = tangent_type(_widen(Ti))
+    TF = ctx.tt(_widen(Ti))
     old_primal = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(obj), name_node), Ti)
     fname = _bi_fieldname(name_node)
     fieldidx = fname isa Symbol ? findfirst(==(fname), fieldnames(P)) : fname
-    FTi = fdtype(Ti)
-    slot = _tangent_field_slot(P, name_node)
+    FTi = ctx.fdtype(Ti)
+    slot = _tangent_field_slot(ctx.tt, P, name_node)
     if slot !== nothing
         # Emit the field read/write directly instead of the `_rr_*` `:invoke` barriers.
         # New field tangent is `zero_tangent(p, f)`; for a pure-rdata IEEEFloat field this is `zero(TF)`.
@@ -557,7 +557,7 @@ function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
         end
         _emit_stf!(ctx, mt, slot, zt)
     else
-        old_tangent = ctx.icall!(_rr_get_tangent_field, TF, (fdtype(P), Int), mt, fieldidx)
+        old_tangent = ctx.icall!(_rr_get_tangent_field, TF, (ctx.fdtype(P), Int), mt, fieldidx)
         # The field's new tangent: `zero_tangent(p, f)` embeds `f` (the assigned value's own fdata)
         # directly rather than fabricating a fresh zero when the field carries fdata — that embedding
         # is the alias that makes later in-place accumulation into this field flow straight into the
@@ -565,7 +565,7 @@ function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
         # the original fresh-zero behavior (`zero_tangent(p, ::NoFData) = zero_tangent(p)`).
         fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
         zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTi), ctx.presolve(val_node), fdata_val)
-        ctx.icall!(_rr_set_tangent_field!, TF, (fdtype(P), Int, TF), mt, fieldidx, zt)
+        ctx.icall!(_rr_set_tangent_field!, TF, (ctx.fdtype(P), Int, TF), mt, fieldidx, zt)
     end
     p = ctx.emit!(Expr(:call, _setfieldg, ctx.presolve(obj), name_node, ctx.presolve(val_node)), Ti)
     saved = Dict{Any,Any}((:old_primal, ctx.ssa) => old_primal, (:old_tangent, ctx.ssa) => old_tangent)
@@ -585,19 +585,19 @@ function apply_builtin_rrule!(::Val{Core.setfield!}, actual, Ti, ctx)
     old_tangent = ctx.fetch_saved((:old_tangent, ctx.ssa))
     fname = _bi_fieldname(name_node)
     fieldidx = fname isa Symbol ? findfirst(==(fname), fieldnames(P)) : fname
-    TF = tangent_type(_widen(Ti))
+    TF = ctx.tt(_widen(Ti))
     # `zero_like_rdata_type`, not `rdtype`: `acc` (below) may be `ZeroRData` when `Ti` (the field's own
     # type) isn't concrete enough (e.g. an abstractly-typed field). `cur_rdata` is always a real value
     # regardless (`_rr_rdata` on a genuine tangent), so declaring it at the same (possibly wider) `RT`
     # is harmless.
     RT = zero_like_rdata_type(_widen(Ti))
     acc = ctx.deref_and_zero!(Ti)
-    slot = _tangent_field_slot(P, name_node)
+    slot = _tangent_field_slot(ctx.tt, P, name_node)
     if slot !== nothing
         # Emit the read, rdata extract, increment, and restore directly, avoiding the `_rr_*` barriers.
         cur_tangent = _emit_gtf!(ctx, mt, slot)
     else
-        cur_tangent = ctx.emit!(ctx.icall(_rr_get_tangent_field, (fdtype(P), Int), mt, fieldidx), TF)
+        cur_tangent = ctx.emit!(ctx.icall(_rr_get_tangent_field, (ctx.fdtype(P), Int), mt, fieldidx), TF)
     end
     cur_rdata = _emit_rdata!(ctx, TF, RT, cur_tangent)
     new_dx = ctx.emit!(ctx.icall(increment!!, (RT, RT), acc, cur_rdata), RT)
@@ -605,7 +605,7 @@ function apply_builtin_rrule!(::Val{Core.setfield!}, actual, Ti, ctx)
     if slot !== nothing
         _emit_stf!(ctx, mt, slot, old_tangent)
     else
-        ctx.emit!(ctx.icall(_rr_set_tangent_field!, (fdtype(P), Int, TF), mt, fieldidx, old_tangent), TF)
+        ctx.emit!(ctx.icall(_rr_set_tangent_field!, (ctx.fdtype(P), Int, TF), mt, fieldidx, old_tangent), TF)
     end
     return ntuple(j -> j == 3 ? new_dx : nothing, length(actual))
 end
@@ -626,14 +626,14 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     length(actual) < 2 && return false
     elt = Ti
     ref_node, val_node = actual[1], actual[2]
-    if fdtype(elt) !== NoFData
+    if ctx.fdtype(elt) !== NoFData
         if !_bi_tracked(val_node, ctx)
             ctx.reason[] = "reverse mode `memoryrefset!` of a non-bits element ($(elt)) requires the " *
                            "assigned value's own fdata to be traceable to a function argument at " *
                            "%$(ctx.ssa.id)"
             return false
         end
-    elseif rdtype(elt) !== tangent_type(_widen(elt))
+    elseif ctx.rdtype(elt) !== ctx.tt(_widen(elt))
         ctx.reason[] = "reverse mode does not support array mutation of element type ($(elt)) at " *
                        "%$(ctx.ssa.id)"
         return false
@@ -668,7 +668,7 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
         end
         push!(items, ((:old_primal, ctx.ssa), elt))
     end
-    push!(items, ((:old_tangent, ctx.ssa), tangent_type(_widen(elt))))
+    push!(items, ((:old_tangent, ctx.ssa), ctx.tt(_widen(elt))))
     return items
 end
 
@@ -676,7 +676,7 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     ref_node, val_node = actual[1], actual[2]
     rest = @view actual[3:end]
     pref, sref = ctx.presolve(ref_node), ctx.sresolve(ref_node)
-    TT = tangent_type(_widen(Ti))
+    TT = ctx.tt(_widen(Ti))
     bulk = ctx.bulk_saved(ref_node)
     # The old primal is read only to put it back one element at a time; a bulk-saved array already has
     # its pre-call contents copied aside in the prologue, so this load is pure waste there.
@@ -688,7 +688,7 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     # later in-place accumulation into this element flow straight into the assigned value's own
     # shadow. `f = NoFData()` for a pure-rdata element collapses this back to the original fresh-zero
     # behavior (`zero_tangent(p, ::NoFData) = zero_tangent(p)`).
-    FTi = fdtype(Ti)
+    FTi = ctx.fdtype(Ti)
     fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
     zt = ctx.icall!(_rr_zero_tangent2, TT, (Ti, FTi), ctx.presolve(val_node), fdata_val)
     ctx.emit!(Expr(:call, Base.memoryrefset!, sref, zt, (ctx.presolve(a) for a in rest)...), TT)
@@ -707,7 +707,7 @@ function apply_builtin_rrule!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     sref = ctx.fetch_shadow(ref_node)
     bulk = ctx.bulk_saved(ref_node)
     old_tangent = ctx.fetch_saved((:old_tangent, ctx.ssa))
-    TT = tangent_type(_widen(Ti))
+    TT = ctx.tt(_widen(Ti))
     # `zero_like_rdata_type`, not `rdtype`: `acc` (below) may be `ZeroRData` when `Ti` (the element's
     # own type) isn't concrete enough (e.g. an array with an abstract eltype). `cur_rdata` is always a
     # real value regardless, so declaring it at the same (possibly wider) `RT` is harmless.

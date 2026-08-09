@@ -112,8 +112,10 @@ end
 # `Ptr{…}` parameter — deliberately the opposite of `add_ptr`'s gate (`src/intrinsics.jl`), and what
 # makes order ≥2 work: there the shadow pointer is a `Ptr{NoTangent}` (stride 0) reached by `bitcast`
 # from a `MemoryRef{Float64}`, and the `Float64` is what governs. Don't unify the two gates.
-function _fc_same_stride(@nospecialize(P))
-    T = tangent_type(P)
+# Takes the caller's `tangent_type` funnel (`ctx.tt`) rather than calling `tangent_type` directly —
+# transform-time dispatch is pinned to the generator's world. See Contextual's world-age contract.
+function _fc_same_stride(tt, @nospecialize(P))
+    T = tt(P)
     return isbitstype(P) && isbitstype(T) && Base.aligned_sizeof(P) == Base.aligned_sizeof(T) > 0
 end
 
@@ -196,7 +198,7 @@ for op in (:memmove, :memcpy)
         walked = Any[_fc_ptr_origin(x, ctx) for (x, _) in sides]
         nulls = Bool[]
         for ((x, side), o) in zip(sides, walked)
-            nt = o !== nothing && tangent_type(o[1]) === NoTangent
+            nt = o !== nothing && ctx.tt(o[1]) === NoTangent
             # The walk's verdict and the shadow operand must agree, or something other than this
             # rule's assumptions produced that operand — decline rather than guess which one is right.
             if nt != (ctx.tresolve(x) === NULL_SHADOW_PTR)
@@ -234,8 +236,8 @@ for op in (:memmove, :memcpy)
                 return nothing
             end
             P = o[1]
-            if !_fc_same_stride(P)
-                T = tangent_type(P)
+            if !_fc_same_stride(ctx.tt, P)
+                T = ctx.tt(P)
                 ctx.reason[] = "`$what` over `$P` elements: a byte count only carries over to the " *
                                "shadow buffer when the tangent element type has the same stride, " *
                                "and `$P` (stride $(isbitstype(P) ? Base.aligned_sizeof(P) : "?")) " *

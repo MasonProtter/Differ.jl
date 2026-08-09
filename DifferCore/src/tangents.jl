@@ -465,6 +465,18 @@ end
     # The same goes for if the type has any undetermined type parameters.
     (isabstracttype(P) || !isconcretetype(P)) && return Any
 
+    # No self-reference guard here, deliberately. A structurally self-referential `P` (one whose
+    # transitive field/element types reach `P` again) does NOT imply non-termination: `GlobalRef`
+    # cycles through `binding::Core.Binding`'s own `globalref::GlobalRef`, and derives fine —
+    # inference resolves the mutually-recursive `@foldable` calls to a fixpoint, which converges
+    # because every other field is `NoTangent`. `Tape`'s cycle does not converge, because it runs
+    # through `Stack`/`Vector` overrides that map the element type back through `tangent_type` and so
+    # keep producing new types. Telling the two apart at generation time means computing that
+    # fixpoint, which is exactly what inference already does — a static reachability walk rejects
+    # both, and was measured breaking working `GlobalRef` derivation. A self-referential type whose
+    # cycle does not converge must therefore still be given its own `tangent_type` method (see
+    # `DifferReverse`'s `Stack`/`Tape`), and gets a hang rather than a diagnostic if it isn't.
+
     tangent_fields_types_expr = Expr(:curly, Tuple, tangent_field_types_exprs(P)...)
     T_all_notangent = Tuple{Vararg{NoTangent,fieldcount(P)}}
     return quote
