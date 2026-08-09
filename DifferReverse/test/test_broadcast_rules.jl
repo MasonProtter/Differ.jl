@@ -4,33 +4,26 @@ using DifferReverse: CoDual, primal, tangent, NoFData, NoRData, Ctx, zero_fcodua
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
-# ===========================================================================
-# `map`/`map!` hand rules (`src/rules_broadcast.jl`, ISSUES.md #31), reverse-mode half.
-# Forward-mode tests for the same rules live in DifferForwards/test/test_broadcast_rules.jl.
+# `map`/`map!` hand rules (`rules_broadcast.jl`), reverse-mode half. Forward-mode tests for the
+# same rules live in DifferForwards/test/test_broadcast_rules.jl.
 #
 # A note on test shape, since it differs from most other rule test files: `map(f, x)` returns an
 # array, and Differ's reverse-mode engine has two pre-existing, general (not `map`-specific)
 # limitations that this uncovers:
 #
-#   1. `rev_gradient`/`value_and_gradient!` seed the top-level return with `one(y)` (ISSUES.md #51),
-#      which doesn't exist for a `Vector`, so `rev_gradient(map, f, x)` can't be called at all,
-#      regardless of `map`'s own rule.
-#   2. The general recursive-call dispatcher (`_static_recursible_call` in `reverse_interp.jl`)
-#      unconditionally bails on any call whose result carries fdata (an array): "the fwds pass
-#      has nowhere to route a result shadow today". This means a composite function that calls
-#      `map`/`map!` internally (e.g. `f(x) = sum(map(sin, x))`) cannot be differentiated in reverse
-#      mode via `rev_gradient(f, x)` today: the `map(sin, x)` call site bails before the engine ever
-#      gets to consult `map`'s hand rule. Confirmed empirically below (last testset): a clean,
-#      located `ErrorException`, not a crash. Fixing this is out of scope here; it's a general
-#      engine limitation in `reverse_interp.jl`, not specific to `map`/`map!`.
+#   1. `rev_gradient`/`value_and_gradient!` seed the top-level return with `one(y)`, which doesn't
+#      exist for a `Vector`, so `rev_gradient(map, f, x)` can't be called at all.
+#   2. The general recursive-call dispatcher unconditionally bails on any call whose result carries
+#      fdata (an array). So a composite function that calls `map`/`map!` internally (e.g.
+#      `f(x) = sum(map(sin, x))`) cannot be differentiated in reverse mode via `rev_gradient(f, x)`
+#      today: the `map(sin, x)` call site bails before the engine ever consults `map`'s hand rule.
+#      Confirmed empirically below (last testset): a clean, located `ErrorException`, not a crash.
+#      A general engine limitation, not specific to `map`/`map!`.
 #
-# So reverse-mode `map`/`map!` correctness below is tested by calling `rrule!!` directly (exactly
-# the pattern `check_stack_balance`/`SumMapPullback`'s own direct-construction test already use),
-# following the same fdata convention every array-returning value uses throughout Differ: an
-# array's cotangent is supplied by writing into its own fdata array directly (`tangent(ycd) .= ...`),
-# not by passing a "seed" to the pullback (whose seed argument is the array's rdata, always
-# `NoRData()`).
-# ===========================================================================
+# So reverse-mode `map`/`map!` correctness below is tested by calling `rrule!!` directly, following
+# the same fdata convention every array-returning value uses: an array's cotangent is supplied by
+# writing into its own fdata array directly (`tangent(ycd) .= ...`), not by passing a seed to the
+# pullback (whose seed argument is the array's rdata, always `NoRData()`).
 
 @testset "reverse mode: map(f, x) unary" begin
     x = [0.3, 1.2, -0.7]
@@ -123,12 +116,12 @@ end
     @test tangent(ycd) ≈ ones(3)
 end
 
-@testset "reverse mode: map/map! #43 guard (Union-typed function argument)" begin
-    # `f`'s static type must be concrete: reverse mode has no dynamic dispatch (ISSUES.md #43), so
-    # the per-element `rrule!!(gcd, Ctx(), ...)` call inside `map`/`map!`'s own rule can't resolve a
-    # rule for a non-concrete callee type. `make_map_closures` returns two closures over distinct
-    # captured `Float64`s whose common supertype is a genuine `Union`, exactly the shape the
-    # derived recursion glue can bind `G` to when `f` is reached through an abstractly-typed
+@testset "reverse mode: map/map! guard (Union-typed function argument)" begin
+    # `f`'s static type must be concrete: reverse mode has no dynamic dispatch, so the per-element
+    # `rrule!!(gcd, Ctx(), ...)` call inside `map`/`map!`'s own rule can't resolve a rule for a
+    # non-concrete callee type. `make_map_closures` returns two closures over distinct captured
+    # `Float64`s whose common supertype is a genuine `Union`, exactly the shape the derived
+    # recursion glue can bind `G` to when `f` is reached through an abstractly-typed
     # field/container (mirrors the identical `SumMapPullback` test in `test_reverse_arrays.jl`).
     function make_map_closures()
         a = 1.0

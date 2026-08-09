@@ -12,16 +12,9 @@ using Contextual: Contextual, ContextualInterpreter, expr_to_codeinfo, run_ipo_p
     at_world, mt_edge!
 import Contextual: build_contextual_ir
 
-# Every name DifferReverse adds new methods to (as opposed to merely calling) must come in via
-# `import`, not a bare `using DifferCore`/`using DifferCore: name` — see the stage-3/4
-# "module-boundary extension gotcha" note in the migration progress notes: a name brought in any
-# other way either errors loudly ("must be explicitly imported to be extended") if it's also
-# reachable some other way, or — worse — silently creates a brand-new, disconnected same-named
-# local function with no error at all. `tangent`, `_copy`, `zero_tangent_internal`,
-# `set_to_zero_internal!!`, `tangent_type` are all extended (with new methods for `Stack`/
-# `SingletonStack`/`CommsCell`/`Tape`/`CoDual`/`NoPullback`) — found by cross-referencing every
-# top-level function definition in this package's source against DifferCore's own, not by
-# inspection alone.
+# Any name DifferReverse adds new methods to (not just calls) must come in via `import`, not bare
+# `using DifferCore`/`using DifferCore: name` — otherwise it either errors ("must be explicitly
+# imported to be extended") or silently creates a disconnected same-named local function.
 import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangent, MutableTangent,
     PossiblyUninitTangent, tangent_type, fdata_type, rdata_type,
     zero_tangent, zero_rdata, randn_tangent, increment!!, set_to_zero!!,
@@ -38,23 +31,18 @@ import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangen
     _bi_literal_index, _bi_homog_tangent_type, _tangent_field_slot, _widen,
     _getfieldg, _setfieldg, _ctupleg
 
-# `Reverse` is the plugin owner type identifying DifferReverse to `Contextual.jl`'s
-# `ContextualInterpreter{T,S}`. Unlike `Forward`, it carries one bit of immutable config
-# (`nested_forward`) — see the `Contextual.jl` API design: `owner` IS the `cache_owner`
-# partition key directly, so a build compiling on behalf of an outer forward-mode dualization
-# (forward-over-reverse) must get a genuinely distinct partition from an ordinary build, which a
-# plain fieldless `Reverse()` singleton could not provide.
+# `Reverse` is the plugin owner type identifying DifferReverse to `Contextual`'s
+# `ContextualInterpreter{T,S}`. `owner` doubles as the `cache_owner` partition key, so
+# `nested_forward` must be a real field (not a fieldless singleton) — a build compiling on behalf
+# of an outer forward-over-reverse dualization needs a distinct partition from an ordinary build.
 struct Reverse
     nested_forward::Bool
 end
 Reverse(; nested_forward::Bool=false) = Reverse(nested_forward)
 
-# Mutable, per-session bookkeeping the framework doesn't manage itself — deliberately kept out of
-# `owner`/`cache_owner`'s reach (see `Contextual.jl`'s `custom_state` field). Shared across every
-# ordinary (non-nested) `Reverse` build so a later interpreter can hit an already-cached bailed
-# carrier's reason without re-running the transform (see `custom_state.bail_reasons`'s docstring
-# at its use site in `reverse_interp.jl`, ported from `contextual.jl`'s old `bail_reasons` field
-# comment).
+# Per-session bookkeeping kept out of `owner`/`cache_owner`'s reach (`Contextual`'s `custom_state`
+# field). Shared across every ordinary (non-nested) `Reverse` build so a later interpreter can look
+# up why a cached carrier bailed without re-running the transform.
 const REVERSE_BAIL_REASONS = IdDict{MethodInstance,String}()
 
 function build_reverse_interp(; world::UInt=Base.get_world_counter(),

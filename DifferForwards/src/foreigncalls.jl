@@ -8,11 +8,9 @@
 # shadow_ssa)`; the fallback returns `nothing`, so an unregistered target bails with a located reason
 # instead of silently miscompiling.
 #
-# Bailing is the only safe default here, more so than for intrinsics. Native code can write through
-# any pointer it's handed, so "compute the primal, hand back a zero tangent" — the treatment a
-# non-differentiable intrinsic gets — isn't sound: a `memmove` given that treatment would leave the
-# destination's tangent stale rather than zero. Each target has to be understood individually before
-# it can be registered.
+# Bailing is the only safe default here, more so than for intrinsics: native code can write through
+# any pointer it's handed, so "compute the primal, hand back a zero tangent" isn't sound — a
+# `memmove` given that treatment would leave the destination's tangent stale rather than zero.
 #
 # Statement layout (Julia 1.13, `Compiler/src/tfuncs.jl`'s `FOREIGNCALL_ARG_START`):
 #

@@ -1,7 +1,6 @@
 # Hand-written rrule!! for scalar math functions: Base.Math transcendentals, plus reverse-only
-# rules for functions that inline to LLVM intrinsics before rrule!! dispatch can fire. See
-# ISSUES.md #20. Forward-mode frule!!s for the same functions live in
-# DifferForwards/src/rules_math.jl — split by AD mode from the original combined rules_math.jl.
+# rules for functions that inline to LLVM intrinsics before rrule!! dispatch can fire.
+# Forward-mode frule!!s for the same functions live in DifferForwards/src/rules_math.jl.
 #
 # Every rule uses the closed-form derivative directly, never by differentiating through Base's
 # actual implementation.

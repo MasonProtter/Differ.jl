@@ -1,21 +1,16 @@
-# Hand-written rrule!! for fancy/logical indexing (getindex only). See ISSUES.md #30.
+# Hand-written rrule!! for fancy/logical indexing (getindex only).
 # Forward-mode frule!!s (including setindex!) live in DifferForwards/src/rules_indexing.jl.
 #
-# Both getindex rules allocate the result's own fdata array (`dy`) as a fresh zero and hand it back
-# as part of `ycd`, exactly like the derived array-allocation path does for a freshly `%new`'d
-# array. Later code that reads the gathered array `y` accumulates into `dy` through the ordinary
-# tracked-array machinery; the pullback (run during the backward sweep, after the whole forward
-# sweep is done) reads `dy`'s populated contents and scatters them back into the source array's
-# fdata (`dA`) via `increment!!`. That's required for the index-vector case, where the same source
-# index can repeat (e.g. `A[[1,1,2]]`) — a later occurrence must accumulate into `dA[i]`, not
-# overwrite an earlier one's contribution.
+# Both getindex rules allocate the result's own fdata array (`dy`) as a fresh zero, handed back as
+# part of `ycd`. Later reads of `y` accumulate into `dy` through the ordinary tracked-array
+# machinery; the pullback then scatters `dy`'s contents back into the source array's fdata (`dA`)
+# via `increment!!` — needed for the index-vector case, where a repeated source index (e.g.
+# `A[[1,1,2]]`) must accumulate rather than overwrite.
 #
-# NOTE: reachable only via a direct top-level `rev_gradient(Base.getindex, A, mask_or_idxvec)` call, not
-# through a user-defined wrapper (`f(A, m) = A[m]`) — `_static_recursible_call`'s static eligibility
-# gate (reverse_interp.jl) rejects any surviving high-level call whose result carries non-trivial
-# fdata ("array-valued results from a recursive call are a separate, not-yet-supported feature")
-# before hand-rule resolution is even attempted. That gate lives outside this file's scope, so a
-# wrapped call bails with that message regardless of the rule below. Tested here by calling
+# Reachable only via a direct top-level `rev_gradient(Base.getindex, A, mask_or_idxvec)` call, not
+# through a user-defined wrapper (`f(A, m) = A[m]`): `_static_recursible_call`'s static eligibility
+# gate (`reverse_interp.jl`) rejects any high-level call whose result carries non-trivial fdata
+# before hand-rule resolution is attempted, regardless of the rule below. Tested here by calling
 # `rev_gradient`/`rrule!!` on `Base.getindex` directly.
 
 struct MaskGetindexPullback{DA<:Array,M<:AbstractArray{Bool},DY<:Array}

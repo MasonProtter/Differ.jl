@@ -1,8 +1,6 @@
 # Small, mode-agnostic IR-inspection helpers used by both AD engines (`DifferForwards`/
-# `DifferReverse`). Lived in DifferForwards.jl's `forward_interp.jl`/`builtins.jl` in the
-# pre-split monolith, reached by reverse-mode code only because everything shared one module
-# namespace. Homed here rather than in either AD package: self-contained, no-state utilities with
-# no AD-mode opinion of their own, needed by both sides.
+# `DifferReverse`). Homed here rather than in either package since they carry no AD-mode opinion
+# of their own.
 
 # Resolve a `GlobalRef` to its bound value, distinguishing "resolved" from "undefined/unresolvable".
 # `world` is mandatory, never the ambient task world — this runs inside code compiled at a
@@ -72,15 +70,13 @@ end
 _bi_literal_index(@nospecialize(x)) = isa(x, QuoteNode) || isa(x, Symbol) || isa(x, Int)
 
 # The common tangent type shared by every field of concrete type `P`, or `nothing` if `P` isn't
-# concrete or its fields don't all share one tangent type. Used to allow a dynamic (runtime-
-# computed) field index into a homogeneous same-shape aggregate, and to recognize an object that's
-# entirely non-differentiable regardless of which field a dynamic index happens to hit.
+# concrete or its fields don't all share one tangent type. Lets a dynamic (runtime-computed)
+# field index be handled uniformly for a homogeneous aggregate.
 #
-# Takes the caller's `tangent_type` funnel rather than calling `tangent_type` directly: both callers
-# are IR transforms running inside a `@generated` generator, where plain dispatch is pinned to the
-# generator's world and would miss a `tangent_type` method owned by a later-loaded package. See
-# Contextual's world-age contract (`at_world`). DifferCore stays independent of Contextual by taking
-# the funnel as an argument instead of an interpreter.
+# Takes the caller's `tangent_type` funnel rather than calling `tangent_type` directly: both
+# callers run inside a `@generated` generator, where plain dispatch is pinned to the generator's
+# world and would miss a method owned by a later-loaded package (Contextual's `at_world`
+# contract). DifferCore stays independent of Contextual by taking the funnel as an argument.
 function _bi_homog_tangent_type(tt, P)
     (P isa DataType && isconcretetype(P)) || return nothing
     nf = fieldcount(P)

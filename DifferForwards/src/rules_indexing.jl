@@ -1,5 +1,5 @@
-# Hand-written frule!! for fancy/logical indexing. See ISSUES.md #30. Reverse-mode rrule!!s for
-# the same functions live in DifferReverse/src/rules_indexing.jl.
+# Hand-written frule!! for fancy/logical indexing. Reverse-mode rrule!!s for the same functions
+# live in DifferReverse/src/rules_indexing.jl.
 #
 # Scalar/multi-dimensional Int-indexed getindex/setindex! on a concrete `Array` already works
 # without any rule here: it lowers to `memoryrefnew`/`memoryrefget`/`memoryrefset!`, which the

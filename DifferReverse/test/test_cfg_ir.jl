@@ -1,14 +1,13 @@
-# Phase A checkpoint (see the "reverse-mode control flow, Mooncake style" plan): round-trip a
-# handful of real multi-block `IRCode`s through the `ID`/`CFGBlock` working-IR layer (`src/cfg_ir.jl`)
-# with no AD involved. This isolates "did the IR-plumbing port correctly" from any reverse-mode AD
-# concern before that layer gets its first real user (the pullback-pass builder).
+# Round-trip a handful of real multi-block `IRCode`s through the `ID`/`CFGBlock` working-IR layer
+# (`cfg_ir.jl`) with no AD involved, isolating "did the IR-plumbing port correctly" from any
+# reverse-mode AD concern.
 #
 # `lower_cfg_blocks_to_ir(_ircode_to_cfg_blocks(ir), ir)` should be the identity (mod object
 # identity), verified two ways per statement kind exercised (branches, loops, nested branches):
 # `Core.Compiler.verify_ir` doesn't throw, and the round-tripped IR computes the same result as the
-# original when run (via `Core.OpaqueClosure`, a convenient way to execute a bare `IRCode` directly —
-# used here purely as test-harness plumbing, unrelated to the "no OpaqueClosure in the AD engine
-# itself" design constraint the plan follows for reverse mode).
+# original when run (via `Core.OpaqueClosure`, used here purely as test-harness plumbing to execute
+# a bare `IRCode` directly — unrelated to the "no OpaqueClosure in the AD engine itself" design
+# constraint the reverse-mode engine follows).
 
 using Test
 using DifferReverse: _ircode_to_cfg_blocks, lower_cfg_blocks_to_ir

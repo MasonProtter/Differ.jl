@@ -10,9 +10,8 @@
 # the generic struct-tangent machinery, so a rule would be redundant and risk dispatch ambiguity
 # with the generic fallback. See `test/test_linalg_rules.jl` for the regression test.
 #
-# Bare `Base`/`LinearAlgebra` names are qualified throughout (`Base.:*`, `LinearAlgebra.dot`, ...),
-# matching `rrules.jl`'s qualification style — see that file's header for why an unqualified name
-# is unsafe once a rule body gets embedded elsewhere.
+# `Base`/`LinearAlgebra` names are qualified throughout (`Base.:*`, `LinearAlgebra.dot`, ...) for
+# the same GlobalRef-inlining reason as `rrules.jl`.
 
 # ---------------------------------------------------------------------------
 # dot(x, y)
@@ -184,11 +183,9 @@ end
 
 # ---------------------------------------------------------------------------
 # mul!(C, A, B) — in-place `C = A*B`, `Matrix{Float64}`/`Vector{Float64}` only (3-arg form; the
-# α/β-scaled 5-arg form isn't covered). `C` is mutated, so reverse zeroes `C`'s fdata after
-# reading its old contents as the backward seed (C's previous value is overwritten, not
-# accumulated, so cotangent built up on it before this call belongs to that overwritten value,
-# not to A/B), then restores the old fdata so an earlier write to the same array still sees its
-# own seed correctly.
+# α/β-scaled 5-arg form isn't covered). `C` is overwritten, not accumulated, so the pullback reads
+# `C`'s old fdata as the backward seed, zeroes it, and restores the old fdata afterward — same
+# old-tangent-restore pattern as the `memoryrefset!` builtin rule.
 # ---------------------------------------------------------------------------
 
 # --- mul!(y, A, x) — matrix * vector ---

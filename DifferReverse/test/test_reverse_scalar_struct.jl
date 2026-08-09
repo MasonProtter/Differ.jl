@@ -2,8 +2,7 @@ using Test
 using DifferReverse
 using DifferReverse: NoTangent, rev_gradient
 # `Dual`/`frule!!` here are DifferForwards' forward-mode carrier, used purely as an independent
-# numerical oracle — DifferForwards is a test-only dependency of DifferReverse for exactly this
-# (see test/Project.toml).
+# numerical oracle.
 using DifferForwards: Dual, frule!!
 
 include(joinpath(@__DIR__, "testutils.jl"))
@@ -46,12 +45,11 @@ end
 end
 
 @testset "reverse mode: conversion intrinsics (sitofp/fpext/fptrunc)" begin
-    # `sitofp` (Int->Float promotion) is the INACTIVE bucket: its result carries a real tangent but
-    # its operands don't, so its pullback consumes the seed and contributes `NoRData`, d/dx
-    # (x·(1+2+3)) = 6. `fpext`/`fptrunc` (Float32<->Float64) is the LINEAR bucket: genuinely
-    # differentiable, d/dx (Float64(Float32(x)·2) + x) = 3. Before these rules existed, either
-    # bailed with "no reverse rule for intrinsic `sitofp`/`fptrunc`". Cross-checked against forward
-    # mode and finite differences.
+    # `sitofp` (Int->Float promotion) is the inactive bucket: its result carries a real tangent
+    # but its operands don't, so its pullback consumes the seed and contributes `NoRData`, d/dx
+    # (x·(1+2+3)) = 6. `fpext`/`fptrunc` (Float32<->Float64) is the linear bucket: genuinely
+    # differentiable, d/dx (Float64(Float32(x)·2) + x) = 3. Cross-checked against forward mode and
+    # finite differences.
     sitofp_ctl(x::Float64) = (s = 0.0; for i in 1:3; s += x*i; end; s)
     mix32_ctl(x::Float64) = Float64(Float32(x) * Float32(2.0)) + x
 

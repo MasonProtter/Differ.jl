@@ -38,20 +38,14 @@ function _bi_field_index(@nospecialize(Pobj), @nospecialize(name))
     return (i isa Int && 1 <= i <= fieldcount(Pobj)) ? i : nothing
 end
 
-# `_foreign_selfsim_shadow_field` (defined in `forward_interp.jl`, the coupling-point-2/3 hook)
-# is the general form of this: for a `Stack`/`CommsCell`/`Tape` field index `fi` (already
-# validated by `_bi_field_index`), the shadow's own field type there when it's sound to mirror
-# `getfield`/`setfield!` directly, or `nothing` when the field carries no tangent. These types
-# are self-similar shadows (own `tangent_type` maps the type parameter directly).
-# `Tape.block_stack` *does* mirror despite looking like it shouldn't: it's always declared
-# `Stack{Int32}` regardless of `Tape`'s type parameters, and `tangent_type(Stack{Int32}) ===
-# Stack{Int32}` by the self-typed collapse (`stack.jl`), so a shadow `Tape`'s `block_stack` is
-# also `Stack{Int32}` — same object shape on both sides, nothing to differentiate but still
-# mirrored. The real non-mirroring cases are `Stack.position` (an `Int`, handled as a special
-# case in `setfield!`'s branch below via `_foreign_selfsim_mirror_field`), `CommsCell.val` when
-# its element has no tangent, and a degenerate all-`NoTangent` `comms`/`args` tuple. Independent
-# of `Ti`: re-deriving from `Pobj` alone keeps `getfield` and `setfield!` agreeing on the same
-# field.
+# `_foreign_selfsim_shadow_field` (defined in `forward_interp.jl`) is the general form of this: for
+# a `Stack`/`CommsCell`/`Tape` field index `fi`, the shadow's own field type there when it's sound to
+# mirror `getfield`/`setfield!` directly, or `nothing` when the field carries no tangent.
+# `Tape.block_stack` mirrors despite looking like it shouldn't: it's always `Stack{Int32}`
+# regardless of `Tape`'s type parameters, so shadow and primal have the same shape. The real
+# non-mirroring cases are `Stack.position` (handled via `_foreign_selfsim_mirror_field`),
+# `CommsCell.val` with no tangent, and a degenerate all-`NoTangent` tuple. Independent of `Ti`: this
+# keeps `getfield` and `setfield!` agreeing on the same field.
 
 # `MemoryRef.ptr_or_offset` / `Memory.ptr` hold a real address only when the buffer's element layout
 # is inline and non-empty. Otherwise the field is an offset — for a bits-union element (`arrayelem == 2`)
@@ -106,13 +100,10 @@ const _ifelseg    = GlobalRef(Core, :ifelse)
 # operand, not embedded as a dangling reference into the primal's numbering (embedding it raw crashed
 # with a `TypeError`, since the two numberings diverge once shadow instructions are interleaved).
 function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
-    # `_widen`: `ctx.optype` can return a `Core.PartialStruct`/`Core.Const` lattice element (const
-    # propagation narrowing an object's inferred type), not a bare `Type` — e.g. a 3-element array
-    # literal's dynamic-index loop-copy shape (`getfield(tuple, i, false)` with `i` a loop variable)
-    # infers the tuple operand as `Core.PartialStruct(Tuple{Float64,Float64,Float64}, ...)`. Every
-    # `<:`/`isa DataType` check below needs a real `Type`; skipping this widening `TypeError`s at the
-    # first `<:` (same bug class as `apply_builtin_frule!(::Val{Core.tuple})`'s `fieldtype` call —
-    # gotcha #9 in the `differ-ircode-dualization` skill, ISSUES #83).
+    # `_widen`: `ctx.optype` can return a `PartialStruct`/`Const` lattice element (const-prop
+    # narrowing), not a bare `Type`. Every `<:`/`isa DataType` check below needs a real `Type`;
+    # skipping this widening `TypeError`s at the first `<:` (gotcha #9 in the
+    # `differ-forward-dualization` skill).
     Pobj = _widen(ctx.optype(actual[1]))
     idx = ctx.presolve(actual[2])
     TT = ctx.tt(Ti)
@@ -246,11 +237,9 @@ end
 # dynamic index could hit carries a tangent anyway.
 function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
     idx = ctx.presolve(actual[2])
-    # `_widen` — same reason as `getfield`'s arm above (ISSUES #83): `ctx.optype` can return a
-    # lattice element, not a bare `Type`. Every direct use of `Pobj` below happens to already sit
-    # behind an `isa DataType` guard (so this doesn't fix a live crash the way `getfield`'s did), but
-    # it's the same pattern — widen at the source rather than rely on every future edit preserving
-    # the guard ordering.
+    # `_widen` — same reason as `getfield`'s arm above. Every direct use of `Pobj` below already sits
+    # behind an `isa DataType` guard, but widen at the source rather than rely on future edits
+    # preserving the guard ordering.
     Pobj = _widen(ctx.optype(actual[1]))
     if !_bi_literal_index(actual[2]) && !(Pobj isa DataType && _bi_homog_tangent_type(ctx.tt, Pobj) === NoTangent)
         return nothing

@@ -7,22 +7,19 @@ include(joinpath(@__DIR__, "testutils.jl"))
 # Forward mode over `Expr(:foreigncall)` (`src/foreigncalls.jl` and the `:foreigncall` arms of
 # `dualize_to_ircode`), plus the `Expr(:loopinfo)` marker that arrives with it.
 #
-# Only bulk memory copies (`memmove`/`memcpy`) have a rule. That is not a placeholder: a copy is
-# linear and structure-preserving, so performing the identical copy between the two *shadow* buffers
-# is exactly the tangent of performing it between the primals. Native code in general can write
-# through any pointer it is handed, so an unregistered target has no safe default: "primal plus a
-# zero tangent", the treatment a non-differentiable intrinsic gets, would leave a destination's
-# tangent stale rather than zero. Unregistered targets bail, and the last testset pins one located
-# reason per gate.
+# Only bulk memory copies (`memmove`/`memcpy`) have a rule: a copy is linear and structure-preserving,
+# so performing the identical copy between the two shadow buffers is exactly the tangent of copying
+# the primals. Native code can write through any pointer it's handed, so an unregistered target has
+# no safe default and bails; the last testset pins one located reason per gate.
 #
 # The single most important property here is the *length* check. `Dual`'s constructor only checks
 # `tangent_type(P) == T`, never that a caller's tangent array is as long as its primal, and a raw
 # `memmove` has no bounds check of its own: an unguarded mirror segfaults on a short destination
 # tangent and silently reads uninitialised heap on a short source. Julia's own `@boundscheck` guards
-# in `unsafe_copyto!` do not cover this: they sit inside an `@inbounds` block and are elided under
-# the default `--check-bounds=auto`. So the "short shadow" testset must be run under the default,
-# which is why the suite is invoked as `julia --project=test test/runtests.jl` rather than through
-# `Pkg.test()` (which passes `--check-bounds=yes` and would mask exactly this).
+# in `unsafe_copyto!` don't cover this — elided under the default `--check-bounds=auto` — so the
+# "short shadow" testset must be run under the default, which is why the suite is invoked as
+# `julia --project=test test/runtests.jl` rather than through `Pkg.test()` (which passes
+# `--check-bounds=yes` and would mask exactly this).
 
 D(f, x, dx) = frule!!(Dual(f, zero_tangent(f)), Dual(x, dx)).dx
 D2(f, a, da, b, db) = frule!!(Dual(f, zero_tangent(f)), Dual(a, da), Dual(b, db)).dx
@@ -120,11 +117,9 @@ end
     checkverify(f, (Vector{Float64},))
 
     g(x) = exp.(x)
-    # Was `@test_broken` (ISSUES.md #84, a reentrant-typeinf/PhiNode-ordering bug hit while
-    # dualizing `exp`'s own composite-fallback body) until `rules_math.jl` was split into this
-    # package (stage 5): `exp` now has a hand-written `frule!!`, so this call never dualizes
-    # `exp`'s body at all and the bug isn't reached. Left as a plain `@test` — see ISSUES.md #84
-    # for why the underlying engine issue may still be latent for some other composite function.
+    # `exp` has a hand-written `frule!!`, so this call never dualizes `exp`'s composite-fallback body
+    # at all — relevant because doing so can hit a reentrant-typeinf/PhiNode-ordering bug for some
+    # other composite function without a hand rule (see the `differ-forward-dualization` skill).
     @test D(g, x, dx) ≈ exp.(x) .* dx
 
     # Array-with-scalar forms. These need the `Core.tuple` rule to widen a `Core.PartialStruct`
@@ -134,9 +129,8 @@ end
     @test D(x -> x .* 2.0, x, dx) ≈ 2 .* dx
     @test D(x -> 2.0 .* x, x, dx) ≈ 2 .* dx
 
-    # Two-array broadcast, which needed the ISSUES #60 fix on top of this file's memmove support:
-    # `Base.broadcasted` builds `%new(Broadcasted{…}, …, Base.Broadcast.nothing)`, whose raw
-    # `GlobalRef` operand `verify_ir` rejected until the `:new` arm learned to resolve it.
+    # Two-array broadcast: `Base.broadcasted` builds `%new(Broadcasted{…}, …, Base.Broadcast.nothing)`,
+    # whose raw `GlobalRef` operand needs the `:new` arm's `GlobalRef` resolution.
     y, dy = [2.0, 3.0, 5.0, 7.0], [0.0, 1.0, 0.0, 0.0]
     @test D2((a, b) -> a .* b, x, dx, y, dy) ≈ dx .* y .+ x .* dy
     @test D2((a, b) -> a .+ b, x, dx, y, dy) ≈ dx .+ dy

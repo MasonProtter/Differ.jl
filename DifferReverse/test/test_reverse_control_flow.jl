@@ -2,19 +2,17 @@ using Test
 using DifferReverse
 using DifferReverse: NoTangent, rev_gradient
 # `Dual`/`frule!!` here are DifferForwards' forward-mode carrier, used purely as an independent
-# numerical oracle — DifferForwards is a test-only dependency of DifferReverse for exactly this
-# (see test/Project.toml).
+# numerical oracle.
 using DifferForwards: Dual, frule!!
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
 @testset "reverse mode: branches" begin
     # `relu` is the multiple-reachable-`return`s shape (the common shape Julia's optimizer
-    # produces for an `if/else` with a value in each arm — see `_exit_blocks`'s docstring);
-    # `branch3` merges all three arms into a single `return` via one `PhiNode` with three
-    # predecessors (exercises the `Switch`-with-more-than-two-targets path). Both are checked
-    # against finite differences and the trusted forward-mode `frule!!` (already supports control
-    # flow) as an independent cross-check of the tape/block-stack machinery.
+    # produces for an `if/else` with a value in each arm); `branch3` merges all three arms into a
+    # single `return` via one `PhiNode` with three predecessors (exercises the
+    # `Switch`-with-more-than-two-targets path). Both cross-checked against finite differences and
+    # the trusted forward-mode `frule!!`.
     relu(x) = x > 0.0 ? x : -x
     function branch3(x)
         if x > 2.0
@@ -58,21 +56,20 @@ include(joinpath(@__DIR__, "testutils.jl"))
 end
 
 @testset "reverse mode: Union-typed phis" begin
-    # `Union`-typed rdata (Phase 2): a phi merging two branches of different concrete type
-    # (`Float64` vs. an `Int` literal) makes reverse mode's rdata accumulator for that SSA value
-    # non-concrete. Before the `ZeroRData`-aware `Ref`/`deref_and_zero!`/`route!` machinery, this
-    # crashed with `TypeError: in new, expected Union{NoRData, Float64}, got a value of type
-    # DifferCore.CannotProduceZeroRDataFromType`.
+    # A phi merging two branches of different concrete type (`Float64` vs. an `Int` literal) makes
+    # reverse mode's rdata accumulator for that SSA value non-concrete. Before the `ZeroRData`-aware
+    # `Ref`/`deref_and_zero!`/`route!` machinery, this crashed with `TypeError: in new, expected
+    # Union{NoRData, Float64}, got a value of type DifferCore.CannotProduceZeroRDataFromType`.
     unionphi_ternary(x)  = (x > 0 ? x : 1) * x          # d/dx = 2x for x>0
     unionphi_ternary2(x) = (x > 0 ? x*x : 1) * 1.0      # d/dx = 2x for x>0
 
     @test DifferReverse.rev_gradient(unionphi_ternary, 1.5) == (NoTangent(), 3.0)
     @test DifferReverse.rev_gradient(unionphi_ternary2, 1.5) == (NoTangent(), 3.0)
 
-    # `Union`-typed rdata across a loop *back-edge* (Phase 2): `unionphi_loop`'s loop-carried `s`
-    # is `Union{Int,Float64}` (starts as the `Int` literal `0`, becomes `Float64` after the first
+    # `Union`-typed rdata across a loop back-edge: `unionphi_loop`'s loop-carried `s` is
+    # `Union{Int,Float64}` (starts as the `Int` literal `0`, becomes `Float64` after the first
     # iteration), so its accumulator `Ref`'s `deref_and_zero!`/`route!` treatment is exercised
-    # repeatedly (once per iteration), not just once.
+    # repeatedly, not just once.
     function unionphi_loop(x)
         s = 0
         for i in 1:3
@@ -91,10 +88,9 @@ end
     # A loop body may execute an unknown number of times, so this is the first place the block
     # stack and per-block comms `Stack`s are actually needed (not just degenerate 0-or-1-entry
     # stacks, as in the branch-only cases), and the first place rdata `Ref`s must correctly
-    # reset/accumulate across repeated visits in exact LIFO order. `sumk`/`sumk2`/`sumk_multi` are
-    # the existing forward-mode loop fixtures (a single while-loop, nested while-loops, and two
-    # live loop-carried accumulators in one block, respectively), reused here and cross-checked
-    # against the already-trusted `frule!!`.
+    # reset/accumulate across repeated visits in exact LIFO order. `sumk`/`sumk2`/`sumk_multi`
+    # exercise a single while-loop, nested while-loops, and two live loop-carried accumulators in
+    # one block, respectively, cross-checked against the already-trusted `frule!!`.
     function sumk(x, k)
         s = x - x
         i = 0
@@ -190,10 +186,10 @@ end
     check_tape_size(polyloop, (Float64, Int); bytes=8, isbits=true, stacks=1)
 
     # `loopinv`'s `y = x*x` is loop-invariant (defined once, outside the loop, from an argument) but
-    # consumed by the loop body every iteration. Stage 2 hoists `y`'s comms item to its own defining
-    # (non-loop) block, once, instead of re-pushing it per iteration — the loop-body comms tuple
-    # drops from `Tuple{Float64,Float64}` (`y`, `v[i]`) to `Tuple{Float64}` (`v[i]` alone), same as
-    # `loopdot` above.
+    # consumed by the loop body every iteration. The comms-hoisting optimization moves `y`'s comms
+    # item to its own defining (non-loop) block, once, instead of re-pushing it per iteration — the
+    # loop-body comms tuple drops from `Tuple{Float64,Float64}` (`y`, `v[i]`) to `Tuple{Float64}`
+    # (`v[i]` alone), same as `loopdot` above.
     function loopinv(x::Float64, v::Vector{Float64})
         y = x * x
         s = 0.0

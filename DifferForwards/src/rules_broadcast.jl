@@ -1,15 +1,15 @@
-# Hand-written frule!! for map/map!. See ISSUES.md #31. Reverse-mode rrule!!s for the same
-# functions live in DifferReverse/src/rules_broadcast.jl.
+# Hand-written frule!! for map/map!. Reverse-mode rrule!!s for the same functions live in
+# DifferReverse/src/rules_broadcast.jl.
 #
-# Same motivation as `sum`/`sum(f, ·)`: Base's real `map`/`map!` implementations use IR constructs
-# the dualization engine doesn't support (chiefly self-recursive pairwise reduction). Every rule
-# here is an explicit per-element loop calling `frule!!` on the user's function `f`, never
-# touching Base's actual `map`/`broadcast` internals.
+# Base's real `map`/`map!` implementations use IR constructs the dualization engine doesn't support
+# (chiefly self-recursive pairwise reduction). Every rule here is an explicit per-element loop
+# calling `frule!!` on the user's function `f`, never touching Base's actual `map`/`broadcast`
+# internals.
 #
 # Unmodified `.`-syntax dualizes for a single array argument (`sin.(x)`) and array-with-scalar
-# forms (`x .* 2.0`) via the `memmove`/`copyto!` path (`foreigncalls.jl`); two-array broadcast
-# (`x .* y`) is the remaining gap, blocked by ISSUES #60 rather than anything here. These rules
-# still matter for `map`/`map!` proper and the two-array case.
+# forms (`x .* 2.0`) via the `memmove`/`copyto!` path; two-array broadcast (`x .* y`) is a
+# separate, currently-unsupported gap. These rules still matter for `map`/`map!` proper and the
+# two-array case.
 #
 # Scope: unary and binary `map`/`map!` over same-shape `Array`s.
 

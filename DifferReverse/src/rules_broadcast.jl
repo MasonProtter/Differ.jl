@@ -1,23 +1,19 @@
-# Hand-written rrule!! for map/map!. See ISSUES.md #31. Forward-mode frule!!s for the same
-# functions live in DifferForwards/src/rules_broadcast.jl.
+# Hand-written rrule!! for map/map!. Forward-mode frule!!s for the same functions live in
+# DifferForwards/src/rules_broadcast.jl.
 #
-# Reverse-mode rules follow `SumMapPullback`'s structure exactly (`rrules.jl`): call `rrule!!` on
-# each element, collect the per-element pullbacks in a `Vector`, and replay them in reverse,
-# accumulating both the array argument(s)' tangent(s) and `f`'s own gradient contribution via
-# `zero_like_rdata_from_type` (not `zero_rdata_from_type` — see the comment on `SumMapPullback`: `G`
-# is usually concrete, but the derived recursion glue can resolve this hand rule via a non-concrete
-# static call-site type for `f`).
+# Follows `SumMapPullback`'s structure (`rrules.jl`): call `rrule!!` on each element, collect the
+# per-element pullbacks in a `Vector`, replay them in reverse, accumulating both the array
+# argument(s)' tangent(s) and `f`'s own gradient contribution via `zero_like_rdata_from_type` (not
+# `zero_rdata_from_type` — the derived recursion glue can resolve this hand rule via a non-concrete
+# static call-site type for `f`, even though `G` is usually concrete).
 #
-# Every reverse-mode rule carries the ISSUES.md #43 guard: reverse mode has no dynamic dispatch, so
-# a `map`/`map!` call whose function argument's static type isn't concrete (e.g. a `Union` of
-# closures reached through an abstractly-typed field) can't be differentiated — the per-element
-# `rrule!!(gcd, Ctx(), ...)` call would need to resolve a rule for a non-concrete callee type, which
-# is exactly what #43 rules out.
+# Every rule requires `G` concrete: reverse mode has no dynamic dispatch, so a `map`/`map!` call
+# whose function argument's static type isn't concrete can't resolve a per-element `rrule!!` call.
 #
 # Scope: unary and binary `map`/`map!` over same-shape `Array`s, restricted to `Array{<:IEEEFloat}`
-# element types (matching `SumMapPullback`): the "read the array's own accumulated fdata back out
-# as the per-element seed" trick below requires `rdata_type(tangent_type(Y)) == tangent_type(Y)`
-# (a "pure rdata" type) for the per-element result, and every `IEEEFloat` satisfies this.
+# element types — the "read the array's accumulated fdata back as the per-element seed" trick below
+# needs `rdata_type(tangent_type(Y)) == tangent_type(Y)` (a pure-rdata type), which every
+# `IEEEFloat` satisfies.
 
 # ===========================================================================
 # map(f, x) — unary
@@ -30,9 +26,8 @@ struct MapPullback{G,PB,Dx<:Array,Dy<:Array}
 end
 function (pb::MapPullback{G})(seed) where {G}
     pbs, dx, dy = pb.pbs, pb.dx, pb.dy
-    # `dy` is `y`'s own fdata array (fresh, zero-initialised below). By the time this pullback runs,
-    # every downstream use of `y` has accumulated its cotangent into `dy` in place (fdata semantics
-    # — see the header comment on `SumMapPullback`), so `dy[i]` is the full backward-accumulated
+    # `dy` is `y`'s own fdata array; by the time this pullback runs, every downstream use of `y`
+    # has accumulated its cotangent into `dy` in place, so `dy[i]` is the full backward-accumulated
     # seed for element `i`.
     grdata = zero_like_rdata_from_type(G)
     for i in length(pbs):-1:1
@@ -134,10 +129,9 @@ function (pb::MapBangPullback{G})(seed) where {G}
         gi_r, xi_r = pbs[i](ddest[i])
         grdata = increment!!(grdata, gi_r)
         dx[i] = increment!!(dx[i], xi_r)
-        # Restore what was in `ddest[i]` before this call, mirroring the `memoryrefset!` builtin
-        # rule's old-tangent restore (`builtins_reverse.jl`): `map!` overwrites `dest[i]` rather
-        # than accumulating into it, so whatever was there before is gone from the primal's
-        # perspective and must not receive gradient contributions from after this call.
+        # Restore what was in `ddest[i]` before this call (same old-tangent restore as the
+        # `memoryrefset!` builtin rule): `map!` overwrites rather than accumulates, so gradient
+        # contributions from after this call must not reach what was overwritten.
         ddest[i] = old[i]
     end
     return (NoRData(), grdata, NoRData(), NoRData())

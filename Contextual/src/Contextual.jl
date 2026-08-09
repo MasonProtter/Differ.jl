@@ -7,25 +7,16 @@ using Base: specialize_method
 
 const CC = Core.Compiler
 
-# ---------------------------------------------------------------------------
-# ContextualInterpreter: a generic AbstractInterpreter that compiles a *contextually
-# transformed* version of a primal method. The transform is a single source-to-source pass on
-# the primal's post-optimization `IRCode`, installed into the normal typeinf pipeline so it
-# produces an ordinary `invoke`-able `CodeInstance`. The concrete transform is supplied by
-# a plugin (e.g. Differ's forward/reverse-mode AD engines) via the `build_contextual_ir` hook.
-# Modeled on the plugin shape in `julia/Compiler/extras/CompilerDevTools`.
-# ---------------------------------------------------------------------------
+# A generic AbstractInterpreter that compiles a *contextually transformed* version of a
+# primal method: a source-to-source pass on the primal's post-optimization `IRCode`, installed
+# into the normal typeinf pipeline so it produces an ordinary `invoke`-able `CodeInstance`. The
+# concrete transform is supplied by a plugin (Differ's forward/reverse-mode engines) via the
+# `build_contextual_ir` hook. Modeled on `julia/Compiler/extras/CompilerDevTools`.
 
-# `owner::T` is immutable, portable plugin identity only (e.g. "which mode", plus small
-# config). It IS the `cache_owner` partition key directly, with no indirection — that's
-# exactly why it must stay immutable/portable: two `owner` values that are `===`/egal-equal
-# must always be safe to share a CodeInstance cache partition, which only holds if `owner`
-# never carries per-session mutable scratch.
-#
-# `custom_state::S` is whatever additional bookkeeping the owner needs beyond what this
-# framework itself manages, in whatever shape the owner chooses (`NamedTuple`, a dedicated
-# struct, or `nothing`). Mutable, per-session scratch (in-progress sets, bail-reason logs, …)
-# goes here — deliberately kept out of `owner` and out of `cache_owner`'s reach.
+# `owner::T` must be immutable/portable: it's used directly as the `cache_owner` partition key,
+# so two egal-equal `owner`s must always be safe to share a CodeInstance cache partition.
+# `custom_state::S` is whatever mutable per-session bookkeeping the owner needs beyond that
+# (in-progress sets, bail-reason logs, …) — kept separate so it never leaks into `cache_owner`.
 struct ContextualInterpreter{T,S} <: AbstractInterpreter
     owner::T
     custom_state::S
@@ -34,16 +25,11 @@ struct ContextualInterpreter{T,S} <: AbstractInterpreter
     inf_params::InferenceParams
     opt_params::OptimizationParams
     codegen_cache::IdDict{CodeInstance, CodeInfo}
-    # Per-compile scratch: the transformed IRCode built in `finishinfer!` (which also supplies
-    # the return type) and installed as the optimization result in `optimize`. Keyed by the
-    # carrier MethodInstance being compiled. Safe because one interpreter instance serves both
-    # hooks of a given frame. Framework-owned, not the owner's concern: `finishinfer!` writes
-    # `interp.transformed_ir[me.linfo] = ir` and `optimize` reads it back for the same
-    # MethodInstance, passing the built IR between the two pipeline hooks.
+    # Transformed IRCode built in `finishinfer!`, installed as the optimization result in
+    # `optimize`; keyed by the carrier MethodInstance being compiled.
     transformed_ir::IdDict{MethodInstance, IRCode}
     # Backedges discovered while building `transformed_ir[mi]`, folded into `me.src.edges` in
-    # `finishinfer!` so the ordinary `compute_edges!`/`store_backedges` path registers real
-    # Julia backedges, without a plugin calling any invalidation ccall itself.
+    # `finishinfer!` so the ordinary `compute_edges!`/`store_backedges` path registers them.
     transformed_edges::IdDict{MethodInstance, Vector{Any}}
 end
 
@@ -51,12 +37,10 @@ function ContextualInterpreter(owner::T, custom_state::S;
                                 world::UInt=Base.get_world_counter(),
                                 inf_params::InferenceParams=InferenceParams(),
                                 opt_params::OptimizationParams=OptimizationParams()) where {T,S}
-    # `jl_get_world_counter` returns the `typemax` sentinel while `in_pure_callback` is set — i.e.
-    # inside any `@generated` generator (`julia/src/gf.c`). So the obvious
-    # `@assert world <= Base.get_world_counter()` is *vacuously true* in exactly the context this
-    # interpreter is normally built from, and would never catch the real mistake: defaulting `world`
-    # from `Base.get_world_counter()` at generator time and silently getting `typemax`. Reject that
-    # sentinel outright, and only compare against the counter when we're not in a pure callback.
+    # `Base.get_world_counter()` returns the `typemax` sentinel inside any `@generated` generator
+    # (`in_pure_callback`), so the obvious `world <= get_world_counter()` assert would be
+    # vacuously true right where the real mistake — defaulting `world` from the counter at
+    # generator time — happens. Reject the sentinel outright instead.
     @assert world != typemax(UInt) """
         ContextualInterpreter needs a concrete inference world, got the `typemax` sentinel that \
         `Base.get_world_counter()` returns inside a `@generated` generator. Pass the generator's own \
@@ -81,57 +65,39 @@ Core.Compiler.get_inference_cache(interp::ContextualInterpreter) = interp.inf_ca
 Core.Compiler.cache_owner(interp::ContextualInterpreter) = interp.owner
 Core.Compiler.codegen_cache(interp::ContextualInterpreter) = interp.codegen_cache
 
-# ---------------------------------------------------------------------------
 # World-age hygiene for pass code that runs at generator time.
 #
-# A plugin's entry point is a `@generated` function, and `jl_call_staged` pins the generator body's
-# task world age to the *generated method's* `Method.primary_world` — fixed when that method was
-# defined, and unmovable afterwards (regenerating the body does not move it; neither does
-# invalidation). Every ordinary function the transform calls therefore dispatches at that pin, so
-# methods added by any *later-loaded* package — a sibling package, and always a package extension —
-# are invisible to it. That is what broke forward-over-reverse across the package split: DifferReverse's
-# `tangent_type` overrides and every one of the extension's coupling hooks silently resolved to
-# DifferCore's generic fallback / to their own inert defaults.
+# `jl_call_staged` pins a generator body's task world age to the generated method's
+# `Method.primary_world`, fixed at definition and never moved afterwards. Ordinary dispatch from
+# inside the generator therefore can't see methods added by any later-loaded package (a sibling
+# package, or any package extension) — the cause of the forward-over-reverse regression across the
+# package split, where DifferReverse's `tangent_type` overrides were invisible to it.
 #
-# THE CONTRACT for any pass built on this framework:
+# Contract: pass code running at generator time may reach another package only through
+# `at_world`, or through a call emitted into the IR (compiled later, at the real world) — never by
+# direct dispatch, and never through mutable global state (a generator reading a registry mutated
+# in `__init__` bakes in whatever the registry held at that world, with nothing to invalidate it
+# later). Every `at_world` lookup must record an `mt_edge!` so a later method definition
+# invalidates the carrier.
 #
-#   Pass code running at generator time may reach another package only through `at_world`, or
-#   through a call emitted into the IR (which is compiled later, at the real world). Never by
-#   direct dispatch, and never through mutable global state — a generator reading a registry
-#   populated in `__init__` is impure: nothing invalidates its cached result when that registry
-#   changes, and a result baked into a precompile image while the registry was empty is simply
-#   wrong. Every such lookup must record an `mt_edge!` so a later method definition invalidates
-#   the carrier.
-#
-# `Core._call_in_world_total` is the primitive that works here. Unlike `Base.invoke_in_world` — which
-# is a no-op while `in_pure_callback` is set, so it silently leaves the pin in place — it is not
-# guarded, and the world it switches to covers *nested* dispatch inside the callee too. That nesting
-# is load-bearing: `tangent_type(Stack{T})` recurses into `tangent_type(T)`, and a switch that only
-# covered the outermost frame would fix nothing. It is the same primitive inference itself uses for
-# concrete evaluation, which is why it is legitimate from a pure context; its one restriction is that
-# the callee must not `eval`/`include`.
-# ---------------------------------------------------------------------------
+# `Core._call_in_world_total` is what `at_world` wraps. Unlike `Base.invoke_in_world` (a no-op
+# while `in_pure_callback` is set), it actually switches worlds, and covers nested dispatch inside
+# the callee too — load-bearing, since e.g. `tangent_type(Stack{T})` recurses into
+# `tangent_type(T)`. Its one restriction is that the callee must not `eval`/`include`.
 
 # Call `f(args...)` with dispatch resolved at the interpreter's inference world instead of at the
-# generator's pin. Use for every call from transform code into a generic function another package can
-# extend.
+# generator's pin. Use for every call from transform code into a generic function another package
+# can extend.
 at_world(world::UInt, @nospecialize(f), @nospecialize(args...)) =
     Core._call_in_world_total(world, f, args...)
-# Convenience for the common case; transform code that already carries a bare `iworld`
-# (`CC.get_inference_world(interp)`) rather than the interpreter itself uses the method above.
 at_world(interp::ContextualInterpreter, @nospecialize(f), @nospecialize(args...)) =
     at_world(interp.world, f, args...)
 
-# Record a method-table backedge on `sig`, so that a method *appearing later* for that signature
-# invalidates the carrier being built. This is the encoding the ordinary
-# `compute_edges!`/`store_backedges` path expects (a `sig`/`Core.methodtable` pair inline in the edge
-# vector) and is what `finishinfer!` folds into `me.src.edges` below.
-#
-# A resolved-`MethodInstance` edge is NOT a substitute: it covers "this method changed", whereas the
-# case that matters for `at_world` is "a more specific method now exists". Deduplicated because the
-# transform queries the same handful of signatures once per statement, and an edge vector with a
-# thousand copies of `Tuple{typeof(tangent_type), Type{Float64}}` would bloat the invalidation graph
-# for no benefit.
+# Record a method-table backedge on `sig` so a method appearing later for that signature
+# invalidates the carrier being built — the `sig`/`Core.methodtable` pair inline in the edge
+# vector that `compute_edges!`/`store_backedges` expects. A resolved-`MethodInstance` edge is not
+# a substitute: it covers "this method changed", not "a more specific method now exists".
+# Deduplicated since the same signature gets queried repeatedly per statement.
 function mt_edge!(edges::Vector{Any}, @nospecialize(sig))
     for i in 1:(length(edges) - 1)
         edges[i] === sig && edges[i + 1] === Core.methodtable && return edges
@@ -160,30 +126,15 @@ function expr_to_codeinfo(m::Module, argnames, spnames, sp, e::Expr, isva::Bool=
     ci
 end
 
-# ---------------------------------------------------------------------------
-# Installing the transformed IR via `finishinfer!` and `optimize`.
-#
-# A plugin's entry point (e.g. a `@generated` fallback) asks this interpreter to compile a
-# *carrier* MethodInstance whose `specTypes` encodes the transformed signature. We compile it
-# by transforming the corresponding primal method's post-optimization `IRCode` into a new
-# `IRCode` and splicing that transform into the pipeline at two points:
-#
-#   * `finishinfer!` — the pipeline function that *supplies* the `CodeInstance` return type. We
-#     build the transformed IR here and set `me.bestguess` to its return type, so the ordinary
-#     `jl_fill_codeinst` writes the correct type once (no post-hoc patching).
-#   * `optimize` — installs the already-built IR as the optimization result via the ordinary
-#     `ipo_dataflow_analysis!` + `finishopt!`.
-#
-# Plugins hook in by overriding `build_contextual_ir`; the default builds nothing, so any MI a
-# plugin doesn't handle flows through the ordinary pipeline unchanged. When a plugin's
-# transform hits a construct it can't handle, it returns `nothing`: we leave `me.bestguess`/the
-# cache untouched, the carrier stub's throwing body flows through the pipeline normally, and
-# the compiled CI raises when invoked — a graceful bail.
-# ---------------------------------------------------------------------------
+# Installing the transformed IR happens at two pipeline hooks: `finishinfer!` builds it and sets
+# `me.bestguess` to its return type (so `jl_fill_codeinst` writes the correct type once), and
+# `optimize` installs it as the optimization result via the ordinary `ipo_dataflow_analysis!` +
+# `finishopt!`. When a plugin's transform can't handle a construct, `build_contextual_ir` returns
+# `nothing`: the carrier stub's throwing body flows through the pipeline unchanged, and the
+# compiled CodeInstance raises when invoked instead of hard-erroring at compile time.
 
-# Plugin hook: build the transformed `IRCode` for a carrier MethodInstance, or `nothing` to
-# leave `mi` to the ordinary pipeline. Overridden per plugin (e.g. Differ's forward/reverse
-# engines).
+# Plugin hook: build the transformed `IRCode` for a carrier MethodInstance, or `nothing` to leave
+# `mi` to the ordinary pipeline. Overridden per plugin.
 build_contextual_ir(::ContextualInterpreter, ::MethodInstance) = nothing
 
 # Builds the transformed IR and sets `me.bestguess` to its return type so the generic
@@ -192,31 +143,20 @@ function CC.finishinfer!(me::CC.InferenceState, interp::ContextualInterpreter, c
                          opt_cache::IdDict{MethodInstance, CodeInstance})
     ir = build_contextual_ir(interp, me.linfo)
     if ir !== nothing
-        # `build_contextual_ir` builds `ir` via the 6-arg `CC.IRCode(...)` constructor, which
-        # defaults `valid_worlds` to the unbounded sentinel `WorldRange(0, typemax(UInt))`. That
-        # sentinel fails `abstract_eval_globalref_type`'s partition-coverage check
-        # (`Compiler/src/abstractinterpretation.jl`) for any `GlobalRef` whose binding partition
-        # doesn't itself span the full sentinel range — e.g. `Base.add_float` (an *imported*
-        # binding, pulled in when inlining primal library code), whose partition starts at a
-        # finite world — so `argextype`/the IR pretty-printer mislabels those calls "dynamic"
-        # even though they're ordinary builtin/intrinsic calls. Fix by giving `ir` a real world
-        # range: `interp.world` onward, since every binding this IR references already resolved
-        # successfully at that world.
+        # `build_contextual_ir`'s 6-arg `CC.IRCode(...)` constructor defaults `valid_worlds` to
+        # the unbounded sentinel `WorldRange(0, typemax(UInt))`, which fails
+        # `abstract_eval_globalref_type`'s partition-coverage check for any `GlobalRef` whose
+        # binding partition starts at a finite world (e.g. `Base.add_float`, pulled in via
+        # inlining) — such calls get mislabeled "dynamic" instead of ordinary builtin/intrinsic
+        # calls. Fix by giving `ir` a real world range from `interp.world` onward.
         ir = CC.IRCode(ir.stmts, ir.cfg, ir.debuginfo, ir.argtypes, ir.meta, ir.sptypes,
                        CC.WorldRange(interp.world, typemax(UInt)))
         interp.transformed_ir[me.linfo] = ir
         me.bestguess = CC.compute_ir_rettype(ir)
-        # Fold in whatever backedges the plugin's transform discovered. These must land on
-        # *this* CodeInstance (`me.linfo`'s own compile), not merely on some caller of it:
-        # `finish!` on THIS `InferenceState` is what calls `store_backedges` against
-        # `me.linfo`'s CodeInstance below, and a `@generated` caller's own cached CodeInstance
-        # for a call to `me.linfo` is only re-examined for staleness by looking `me.linfo`'s
-        # cache up again — so if `me.linfo`'s CodeInstance were never itself invalidated, a
-        # caller regenerating around it would just keep reusing the same stale result. Setting
-        # `me.src.edges` here, before delegating to the generic `finishinfer!` (which internally
-        # calls `compute_edges!(me)`, reading this field), is the standard, documented way a
-        # generator-produced `CodeInfo` declares extra edges (`compute_edges!` in
-        # `typeinfer.jl`).
+        # Fold in backedges the plugin's transform discovered, before delegating to the generic
+        # `finishinfer!` (which calls `compute_edges!(me)`, reading `me.src.edges`) — the
+        # documented way a generator-produced `CodeInfo` declares extra edges. Must land on this
+        # CodeInstance itself so a later method definition invalidates it, not just its callers.
         edges = get(interp.transformed_edges, me.linfo, nothing)
         if edges !== nothing && !isempty(edges)
             existing = me.src.edges

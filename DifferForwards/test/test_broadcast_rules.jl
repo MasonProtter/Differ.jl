@@ -4,15 +4,13 @@ using DifferForwards: Dual, primal, tangent, NoTangent, frule!!
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
-# ===========================================================================
-# `map`/`map!` hand rules (`src/rules_broadcast.jl`, ISSUES.md #31), forward-mode half.
-# Reverse-mode tests for the same rules live in DifferReverse/test/test_broadcast_rules.jl.
+# `map`/`map!` hand rules (`src/rules_broadcast.jl`), forward-mode half. Reverse-mode tests for
+# the same rules live in DifferReverse/test/test_broadcast_rules.jl.
 #
 # Forward mode has no restriction composing `map`/`map!` inside a larger function (see the
 # "composed inside a larger function" testset below) since `frule!!` dispatches on a genuine
 # `Dual` value regardless of what it returns — unlike reverse mode, which has two pre-existing,
 # general (not `map`-specific) engine limitations documented in DifferReverse's half of this file.
-# ===========================================================================
 
 @testset "forward mode: map(f, x) unary" begin
     x = [0.3, 1.2, -0.7]

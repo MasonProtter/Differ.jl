@@ -3,16 +3,14 @@ using DifferReverse
 using DifferReverse: NoTangent, NoRData, NoFData, rev_gradient
 using DifferReverse: zero_fcodual, rrule!!, Ctx, primal, tangent, code_reverse_fwds_ircode
 # `Dual`/`frule!!` here are DifferForwards' forward-mode carrier, used purely as an independent
-# numerical oracle — DifferForwards is a test-only dependency of DifferReverse for exactly this
-# (see test/Project.toml).
+# numerical oracle.
 using DifferForwards: Dual, frule!!
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
-# `Core.tuple` reverse rule (`src/builtins_reverse.jl`, `_fdata_tracked`'s tuple arm in
-# `src/reverse_interp.jl`). Before this, any tuple whose result carried a tangent (a multi-value
-# return, `[a, b]` array literals via `Base.vect`'s `X::Tuple` capture, ...) bailed with "reverse
-# mode does not support builtin `tuple` with a differentiable result".
+# `Core.tuple` reverse rule (`builtins_reverse.jl`, `_fdata_tracked`'s tuple arm). Before this, any
+# tuple whose result carried a tangent (a multi-value return, `[a, b]` array literals, ...) bailed
+# with "reverse mode does not support builtin `tuple` with a differentiable result".
 
 # Module-level (not testset-local): a locally-defined function/global picks up a boxed/closure
 # tangent type instead of the plain singleton these tests want (same requirement documented in
@@ -124,10 +122,9 @@ end
 
 @testset "reverse mode: Core.tuple — [a, b] array literal (Base.vect)" begin
     # `[a, b]` lowers through `Base.vect`'s `X = Core.tuple(a, b)` capture, filled into the result
-    # array by a dynamic-index loop (`test_reverse_mutation_aliasing.jl`'s former "out-of-scope gap"
-    # note). Scalar elements only: `Base.vect`'s fill loop reads `X[i]` at a *dynamic* index, and a
-    # dynamic `getfield` into an fdata-carrying (array-valued) tuple field is a separate, still-open
-    # limitation (`getfield`'s own homogeneous-pure-rdata restriction) — unrelated to this rule.
+    # array by a dynamic-index loop. Scalar elements only: `Base.vect`'s fill loop reads `X[i]` at
+    # a dynamic index, and a dynamic `getfield` into an fdata-carrying (array-valued) tuple field is
+    # a separate, still-open limitation (`getfield`'s own homogeneous-pure-rdata restriction).
     g_vect(a, b) = sum(x -> x^2, [a, b])
     a0, b0 = 2.0, 3.0
 

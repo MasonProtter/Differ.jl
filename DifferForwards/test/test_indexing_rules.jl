@@ -5,11 +5,10 @@ using DifferForwards: Dual, NoTangent, frule!!, zero_tangent
 include(joinpath(@__DIR__, "testutils.jl"))
 
 @testset "regression: multi-dim Int indexing already works (native memoryref path)" begin
-    # Locks in the pre-existing, engine-native behavior (see `differ-architecture`): scalar/multi-dim
-    # Int indexing on a plain `Array` lowers to `memoryrefnew`/`memoryrefget`/`memoryrefset!` and is
-    # already fully supported without any rule in this file. This file's own rules (mask/index-vector
-    # indexing) never dispatch on this shape, so it's a pure regression lock, not something this
-    # file's changes could plausibly affect — kept here anyway per the task's ask.
+    # Locks in the pre-existing, engine-native behavior: scalar/multi-dim Int indexing on a plain
+    # `Array` lowers to `memoryrefnew`/`memoryrefget`/`memoryrefset!` and is already fully supported
+    # without any rule in this file. This file's own rules (mask/index-vector indexing) never
+    # dispatch on this shape.
     read2d(A, i, j) = A[i, j]
     write2d!(A, i, j, x) = (A[i, j] = x; A)
 

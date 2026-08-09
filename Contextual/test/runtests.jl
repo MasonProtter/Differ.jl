@@ -1,6 +1,5 @@
 # Exercises ContextualInterpreter end-to-end with a trivial toy plugin (no AD machinery
-# involved) to prove the generic finishinfer!/optimize wiring works, and that the owner/
-# custom_state split gives the cache_owner correctness the design is for.
+# involved), and checks the owner/custom_state cache_owner split.
 
 using Test
 using Contextual
@@ -106,21 +105,9 @@ end
     end
 end
 
-# --- The world-age pin `at_world` exists to work around. ---
-#
-# `jl_call_staged` pins a generator body's task world age to the generated method's
-# `Method.primary_world`, so a method defined *after* that entry point is invisible to plain
-# dispatch from inside it — which is what silently broke cross-package pass composition
-# (`tangent_type` overrides and coupling hooks owned by a later-loaded package resolving to their
-# generic/inert fallbacks; ISSUES #85). Two escape hatches look like they should work and do not:
-# `Base.invoke_in_world` is a no-op while `in_pure_callback` is set, and `invoke` with a
-# `CodeInstance` inferred at a newer world throws. `Core._call_in_world_total` — what `at_world`
-# wraps — is the one that works, and the world it switches to covers nested dispatch inside the
-# callee too (load-bearing: `tangent_type(Stack{T})` recurses into `tangent_type(T)`).
-#
-# This whole design rests on that asymmetry, so assert it directly rather than only observing its
-# downstream effects. If a future Julia changes any of it, this fails here instead of surfacing as
-# a hang somewhere in an AD transform.
+# Directly asserts the world-age pin `at_world` works around (see Contextual.jl), rather than
+# only observing its downstream effects, so a future Julia change to this behavior fails here
+# instead of surfacing as a hang somewhere in an AD transform.
 
 pinned_probe(::Int) = :before
 nested_probe() = pinned_probe(1)
@@ -175,9 +162,5 @@ end
 end
 
 @testset "ContextualInterpreter rejects the pure-callback world sentinel" begin
-    # `Base.get_world_counter()` returns `typemax(UInt)` inside a generator, so defaulting `world`
-    # from it there would silently build an interpreter at that sentinel — and the obvious
-    # `world <= get_world_counter()` assert cannot catch it, being vacuously true in exactly that
-    # context. Rejected explicitly instead.
     @test_throws AssertionError ContextualInterpreter(Double(), nothing; world=typemax(UInt))
 end

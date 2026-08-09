@@ -181,31 +181,22 @@ function fdata_type(::Type{PossiblyUninitTangent{T}}) where {T}
 end
 
 @generated function fdata_type(::Type{T}) where {T}
-
-    # If the tangent type is NoTangent, then the forwards-component must be `NoFData`.
     T == NoTangent && return NoFData
 
-    # This method can only handle struct types. Tell user to implement their own method.
     if isprimitivetype(T)
         msg = "$T is a primitive type. Implement a method of `fdata_type` for it."
         return :(error($msg))
     end
 
-    # If the type is a Union, then take the union type of its arguments.
     T isa Union && return :(Union{fdata_type($(T.a)),fdata_type($(T.b))})
 
-    # If `P` is a mutable type, then its forwards data is its tangent.
     ismutabletype(T) && return T
 
-    # If the type is itself abstract, its forward data could be anything.
-    # The same goes for if the type has any undetermined type parameters.
     (isabstracttype(T) || !isconcretetype(T)) && return Any
 
-    # We should now have a `Tangent`. If not, we do not know what to do, so error.
     T <: Tangent || return :(error("Unhandled type $T"))
 
-    # If `P` is an immutable type, then some of its fields may not need to be propagated
-    # on the forwards-pass.
+    # Some fields of an immutable type may not need to be propagated on the forwards-pass.
     field_names = fieldnames(fields_type(T))
     Tfields = fieldtypes(fields_type(T))
     fdata_type_exprs = map(n -> :(fdata_type($(Tfields[n]))), 1:length(Tfields))
@@ -218,13 +209,9 @@ end
 
 fdata_type(::Type{T}) where {T<:Ptr} = T
 
-# MemoryRef/Memory are reference/address-identified like Ptr: their tangent_type is self-typed
-# (tangents.jl), since a shadow MemoryRef/Memory is a distinct object holding tangent data, not a
-# value embedded in a larger structure. So like Ptr, their fdata is themselves with no rdata.
-# Without these methods, fdata_type's generic struct-derivation fails on MemoryRef/Memory (they're
-# primitive-ish compiler types, not derivable from fields) — a pre-existing gap exposed once
-# tangent_type(MemoryRef)/tangent_type(Memory) started returning themselves instead of a bogus
-# generic-derivation type (see tangents.jl).
+# MemoryRef/Memory are reference/address-identified like Ptr (tangent_type is self-typed, see
+# tangents.jl): fdata is themselves with no rdata. Needed explicitly since the generic
+# struct-derivation below can't handle these primitive-ish compiler types.
 fdata_type(::Type{T}) where {T<:MemoryRef} = T
 fdata_type(::Type{T}) where {T<:Memory} = T
 
@@ -269,17 +256,9 @@ end
 Extract the forwards data from tangent `t`.
 """
 function fdata(t::T) where {T}
-
-    # Ask for the forwards-data type. Useful catch-all error checking for unexpected types.
     F = fdata_type(T)
-
-    # Catch-all for anything with no forwards-data.
     F == NoFData && return NoFData()
-
-    # Catch-all for anything where we return the whole object (mutable structs, arrays...).
-    F == T && return t
-
-    # T must be a `Tangent` by now. If it's not, something has gone wrong.
+    F == T && return t   # mutable structs, arrays, ... : fdata is the whole object
     T <: Tangent || error("Unhandled type $T")
     return F(fdata(t.fields))
 end
@@ -360,7 +339,6 @@ function __verify_fdata_value(c::IdDict{Any,Nothing}, p::Array, f::Array)
         throw(InvalidFDataException("p has size $(size(p)) but f has size $(size(f))"))
     end
 
-    # If the element type is `NoFData` then stop here.
     eltype(f) == NoFData && return nothing
 
     @static if VERSION > v"1.11-" && VERSION < v"1.12-"
@@ -396,17 +374,13 @@ end
 )
 
 function __verify_fdata_value(c::IdDict{Any,Nothing}, p, f)
-
-    # NoFData is a singleton, and its type was already verified correct for p, so nothing more
-    # to check.
     f isa NoFData && return nothing
 
-    # A primitive reaching here means no specific _verify_fdata_value method exists for it, and
-    # its fdata type isn't NoFData. The rest of this method assumes p is a struct, so error.
+    # A primitive reaching here has no specific _verify_fdata_value method and a non-NoFData
+    # fdata type — an error, since everything else here assumes p is a struct.
     P = _typeof(p)
     isprimitivetype(P) && error("Encountered primitive $p with fdata $f")
 
-    # Must be a (mutable) struct now. Recurse into its fields and verify each of them.
     for name in fieldnames(P)
         if isdefined(p, name)
             _p = getfield(p, name)
@@ -480,28 +454,21 @@ function rdata_type(::Type{PossiblyUninitTangent{T}}) where {T}
 end
 
 @generated function rdata_type(::Type{T}) where {T}
-
-    # If the tangent type is NoTangent, then the reverse-component must be `NoRData`.
     T == NoTangent && return NoRData
 
-    # This method can only handle struct types. Tell user to implement their own method.
     if isprimitivetype(T)
         msg = "$T is a primitive type. Implement a method of `rdata_type` for it."
         return :(error($msg))
     end
 
-    # If the type is a Union, then take the union type of its arguments.
     T isa Union && return :(Union{rdata_type($(T.a)),rdata_type($(T.b))})
 
-    # If `P` is a mutable type, then all tangent info is propagated on the forwards-pass.
+    # Mutable type: all tangent info is propagated on the forwards-pass, so no rdata.
     ismutabletype(T) && return NoRData
 
-    # If the type is itself abstract, its reverse data could be anything.
-    # The same goes for if the type has any undetermined type parameters.
     (isabstracttype(T) || !isconcretetype(T)) && return Any
 
-    # If `T` is an immutable type, then some of its fields may not need to be propagated
-    # on the forwards-pass.
+    # Some fields of an immutable type may not need to be propagated on the forwards-pass.
     field_names = fieldnames(fields_type(T))
     Tfields = fieldtypes(fields_type(T))
     rdata_type_exprs = map(n -> :(rdata_type($(Tfields[n]))), 1:length(Tfields))
@@ -561,17 +528,9 @@ Extract the reverse data from tangent `t`.
 See extended help section of [fdata_type](@ref).
 """
 function rdata(t::T) where {T}
-
-    # Ask for the reverse-data type. Useful catch-all error checking for unexpected types.
     R = rdata_type(T)
-
-    # Catch-all for anything with no reverse-data.
     R == NoRData && return NoRData()
-
-    # Catch-all for anything where we return the whole object (Float64, isbits structs, ...)
-    R == T && return t
-
-    # T must be a `Tangent` by now. If it's not, something has gone wrong.
+    R == T && return t   # Float64, isbits structs, ... : rdata is the whole object
     T <: Tangent || error("Unhandled type $T")
     return R(rdata(t.fields))
 end
@@ -644,16 +603,10 @@ zero_rdata(p::IEEEFloat) = zero(p)
     backing_expr = :(rdata_backing_type($P)($backing_data_expr))
 
     return quote
-        # Get types associated to primal.
         T = tangent_type($P)
         R = rdata_type(T)
-
-        # If there's no reverse data, return no reverse data, e.g. for mutable types.
         R == NoRData && return NoRData()
-
-        # T ought to be a `Tangent`. If it's not, something has gone wrong.
         T <: Tangent || error("Unhandled type $T")
-
         return R($backing_expr)
     end
 end
@@ -728,8 +681,6 @@ constitute a correctness problem, but can be detrimental to performance, so shou
 with.
 """
 @generated function zero_rdata_from_type(::Type{P}) where {P}
-
-    # Prepare expressions for manually-unrolled loop to construct zero rdata elements.
     if P isa DataType && isconcretetype(P)
         names = fieldnames(P)
         types = fieldtypes(P)
@@ -746,14 +697,9 @@ with.
     end
 
     return quote
-
-        # If we know we can't produce a tangent, say so.
         can_produce_zero_rdata_from_type($P) || return CannotProduceZeroRDataFromType()
-
-        # Simple case.
         R = rdata_type(tangent_type($P))
         R == NoRData && return NoRData()
-
         $(isstructtype(P)) || error("Unhandled type $P")
         return $wrapped_expr
     end
@@ -832,13 +778,10 @@ _verify_rdata_value(::P, ::P) where {P<:IEEEFloat} = nothing
 _verify_rdata_value(::Array, ::NoRData) = nothing
 
 function _verify_rdata_value(p, r)
-
-    # NoRData is a singleton, and its type was already verified correct for p, so nothing more
-    # to check.
     r isa NoRData && return nothing
 
-    # A primitive reaching here means no specific _verify_rdata_value method exists for it, and
-    # its rdata type isn't NoRData. The rest of this method assumes p is a struct, so error.
+    # A primitive reaching here has no specific _verify_rdata_value method and a non-NoRData
+    # rdata type — an error, since everything else here assumes p is a struct.
     P = _typeof(p)
     isprimitivetype(P) && error("Encountered primitive $p with rdata $r")
 
@@ -847,7 +790,6 @@ function _verify_rdata_value(p, r)
     _get_rdata_field(r::Tuple, name) = getfield(r, name)
     _get_rdata_field(r::RData, name) = val(getfield(r.data, name))
 
-    # Must be a (mutable) struct now. Recurse into its fields and verify each of them.
     for name in fieldnames(P)
         if isdefined(p, name)
             verify_rdata_value(getfield(p, name), _get_rdata_field(r, name))
@@ -914,7 +856,7 @@ tangent type. This method must be equivalent to `tangent_type(_typeof(primal))`.
 @foldable tangent_type(::Type{F}, ::Type{NoRData}) where {F<:Array} = F
 
 # Union types. Supported shapes:
-# - F=NoFData, R<:Union{NoRData, IEEEFloat or RData{...}}        (issue #1130)
+# - F=NoFData, R<:Union{NoRData, IEEEFloat or RData{...}}
 # - F<:Union{NoFData, FData}, R<:Union{NoRData, RData}            (both unions)
 # - F<:Union{NoFData, T} for fdata-only T (e.g. Array), R=NoRData
 # Each branch recurses by binary splitting on R.a/R.b or F.a/F.b, which handles
@@ -925,8 +867,8 @@ tangent type. This method must be equivalent to `tangent_type(_typeof(primal))`.
     @assert R isa Union  # R==NoRData hits a more specific method above; Any is excluded.
     Union{tangent_type(NoFData, R.a),tangent_type(NoFData, R.b)}
 end
-# Covers Union{NoRData, RData{...}} (issue #1130). More specific than the F-union method
-# below on R, so dispatch lands here when F=NoFData and R<:Union{NoRData, RData}.
+# Covers Union{NoRData, RData{...}}. More specific than the F-union method below on R, so
+# dispatch lands here when F=NoFData and R<:Union{NoRData, RData}.
 @foldable function tangent_type(::Type{NoFData}, ::Type{R}) where {R<:Union{NoRData,RData}}
     @assert R isa Union
     Union{tangent_type(NoFData, R.a),tangent_type(NoFData, R.b)}
@@ -1099,10 +1041,9 @@ end
     increment_field_rdata!(dx::MutableTangent, dy_rdata, f) -> dx
 
 Increment field `f` of a mutable struct's tangent by an rdata contribution `dy_rdata`, in place.
-Ported from Mooncake's `increment_field_rdata!` (`src/rules/misc.jl`), the mutable-struct analogue
-of `increment_field!!` (`tangents.jl`): a mutable struct has no rdata of its own (its whole tangent
-lives in fdata), so a field access routes its contribution here instead of into an object-level
-`RData` accumulator.
+Mutable-struct analogue of `increment_field!!` (`tangents.jl`): a mutable struct has no rdata of
+its own (its whole tangent lives in fdata), so a field access routes its contribution here
+instead of into an object-level `RData` accumulator.
 """
 increment_field_rdata!(dx::MutableTangent, ::NoRData, ::Val) = dx
 increment_field_rdata!(dx::NoFData, ::NoRData, ::Val) = dx

@@ -11,10 +11,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
 # cycle. Neither shape needs a fixed point solved for the `Dual` type the way reverse mode's `Tape`
 # type does: `Dual{P,tangent_type(P)}` doesn't grow with recursion depth, and a call site's result
 # type is read straight off `pir` — already fixed-point-solved by Julia's own inference. See
-# `src/forward_interp.jl`'s `dual_recursive_impl_mi`/`frule_split!` for the resolver, and ISSUES.md
-# for the full writeup (closes #80: forward-over-reverse of a self-recursive primal, which is a
-# special case of this — the reverse carrier's own self-`:invoke` reaches `frule_split!` like any
-# other call).
+# `src/forward_interp.jl`'s `dual_recursive_impl_mi`/`frule_split!` for the resolver.
 
 # Top-level, not testset-local: a self-recursive function defined in local scope closes over its own
 # boxed binding, which gives it a real (non-`NoTangent`) tangent type instead of the plain singleton a
@@ -54,8 +51,7 @@ dfdx(f, x, others...) =
 # The dual IR for a self-recursive primal contains a static self-`:invoke` — its target is a bare
 # `MethodInstance`, unlike every other `:invoke` this engine emits (always a compiled `CodeInstance`).
 # Guards against a silent regression to the dynamic `:call` form, or worse, to a boxed `jl_invoke`
-# against the wrong (native) method cache — see the recursion plan's Design section for why the
-# latter would be a silently wrong answer, not an error.
+# against the wrong (native) method cache, which would be a silently wrong answer, not an error.
 function has_self_invoke(ir)
     for i in 1:length(ir.stmts)
         s = ir.stmts[i][:stmt]
@@ -78,8 +74,7 @@ end
 
 @testset "self-recursion: accumulating over an array" begin
     # rec_arrsum(v,1) = Σv — linear, so d/dv₁ = 1 regardless of the other entries or array length.
-    # A plain `[x, 2.0, 3.0]` literal — the shape a user would actually write (ISSUES #83 fixed this;
-    # see the dedicated regression test in `test_forward_arrays.jl`'s "array allocation" testset).
+    # A plain `[x, 2.0, 3.0]` literal — the shape a user would actually write.
     arrsum_at(x) = rec_arrsum([x, 2.0, 3.0], 1)
     d = dfdx(arrsum_at, 0.0)
     @test d ≈ central_diff(arrsum_at, 0.0)

@@ -42,22 +42,18 @@ end
 end
 
 @testset "dynamically-selected closure callee, non-inlined" begin
-    # Regression pin for two bugs in shared forward-mode code (`frule_split!` and
-    # `frule_codeinstance`, `src/forward_interp.jl`), both only ever exercised before this test via
-    # forward-over-reverse (a callee's own tangent flowing through `frule_split!` when the callee is a
-    # pullback closure popped off a `Tape`). Reproduced here with no reverse-mode machinery involved: a
-    # concretely-typed callee whose value is chosen at run time (by a branch) and carries a real
-    # differentiable capture, called as a surviving (non-inlined) call — `frule_split!`'s static path
-    # (as opposed to the `dynamic_frule` trampoline, which only fires for a non-concrete
+    # A concretely-typed callee whose value is chosen at run time (by a branch) and carries a real
+    # differentiable capture, called as a surviving (non-inlined) call — exercises `frule_split!`'s
+    # static path (as opposed to the `dynamic_frule` trampoline, which only fires for a non-concrete
     # callee/argument type).
     #
     # `mkscale` makes a closure over a captured `Float64`; its type is fixed by the method, so both
     # branches below produce the *same* concrete closure type with *different* captured values —
-    # `ftype` is concrete (`_conc(ftype)` true), but the callee is a genuine `SSAValue`/`PhiNode`
-    # result, not something `_calleeval` can resolve to a compile-time constant. `@noinline` is on
-    # `scale`, not `pick_scale`: `pick_scale` is cheap and inlines away, leaving `f` as a two-way
-    # phi merging `%new(closureT, a)`/`%new(closureT, b)`; the closure *call* `f(x)` is what must
-    # survive as a static `:invoke`.
+    # `ftype` is concrete, but the callee is a genuine `SSAValue`/`PhiNode` result, not something
+    # `_calleeval` can resolve to a compile-time constant. `@noinline` is on `scale`, not
+    # `pick_scale`: `pick_scale` is cheap and inlines away, leaving `f` as a two-way phi merging
+    # `%new(closureT, a)`/`%new(closureT, b)`; the closure *call* `f(x)` is what must survive as a
+    # static `:invoke`.
     function mkscale(a::Float64)
         @noinline scale(x::Float64) = a * x
         return scale
@@ -68,8 +64,7 @@ end
 
     # Evidence this hits the intended path rather than some other one: the dualized IR still
     # contains exactly one `:invoke` of `frule!!`, and its callee operand's declared type is
-    # `Dual{closureT, Tangent{...}}` — a real capture tangent, not the `NoTangent` bug 1 hardcoded
-    # (which would also mismatch the `CodeInstance` bug 2 resolves, crashing at codegen — see below).
+    # `Dual{closureT, Tangent{...}}` — a real capture tangent, not a hardcoded `NoTangent`.
     ir, _ = code_dual_ircode(call_dynamic_scale, (Bool, Float64, Float64, Float64))
     Core.Compiler.verify_ir(ir)
     invokes = [stmt for stmt in ir.stmts.stmt
@@ -83,8 +78,8 @@ end
     @test DifferForwards._dual_tangent_type(callee_dualty) != NoTangent
 
     # Numerical correctness: f(x) = a·x if branch, b·x otherwise; only the selected capture's
-    # derivative should be nonzero. Actually *running* the call matters for bug 2: it fails at
-    # codegen ("Unreachable reached"), which `verify_ir` above does not catch.
+    # derivative should be nonzero. Actually *running* the call matters: a mismatched resolution
+    # fails at codegen ("Unreachable reached"), which `verify_ir` above does not catch.
     seed(v, dv) = Dual(v, dv)
     r_da = frule!!(Dual(call_dynamic_scale, NoTangent()), seed(true, NoTangent()),
                    seed(2.0, 1.0), seed(3.0, 0.0), seed(5.0, 0.0))
@@ -248,22 +243,15 @@ end
     Core.Compiler.verify_ir(code_dual_ircode(d1_scpx, (Float64,))[1])
     @test true
 
-    # Self-recursion, direct correctness check (used to be a `@test_throws` regression — forward mode
-    # had no recursion support at all and bailed cleanly via the `dualized_impl_in_progress` cycle
-    # guard; ISSUES #82 gave `frule_split!` a resolver that emits a static self-`:invoke` for exactly
-    # this shape instead, so this now runs and must give the right answer, not just avoid crashing).
-    # `rec_self(x,n) = n<=0 ? x : rec_self(x,n-1)` is the identity in `x` for any `n`, so `d/dx == 1`
-    # regardless of recursion depth. `rec_self` must be top-level, not testset-local, for the same
-    # reason as the top of this file: a testset-local self-recursive function boxes its own binding,
-    # giving it a real (non-`NoTangent`) tangent type that would defeat the `Dual(rec_self,
-    # NoTangent())` call below.
+    # Self-recursion, direct correctness check. `rec_self(x,n) = n<=0 ? x : rec_self(x,n-1)` is the
+    # identity in `x` for any `n`, so `d/dx == 1` regardless of recursion depth. `rec_self` must be
+    # top-level, not testset-local, for the same reason as the top of this file: a testset-local
+    # self-recursive function boxes its own binding, giving it a real (non-`NoTangent`) tangent type
+    # that would defeat the `Dual(rec_self, NoTangent())` call below.
     @test frule!!(Dual(rec_self, NoTangent()), Dual(1.0, 1.0), Dual(3, NoTangent())).dx == 1.0
 
-    # Previously a limitation: a closure/struct with differentiable fields could not be
-    # differentiated at order ≥2. The blocker was its shadow being built by a `build_tangent` call,
-    # an opaque `@generated` function the outer dualization pass couldn't re-dualize, so it bailed.
-    # Now that a `Tangent`/`MutableTangent` shadow is emitted as plain `%new`s (which re-dualize like
-    # any other struct construction), this composes cleanly. `mkquad(3.0)` is a closure with a
+    # A closure/struct with differentiable fields, differentiated at order ≥2: its shadow is a plain
+    # `%new`, which re-dualizes like any other struct construction. `mkquad(3.0)` is a closure with a
     # `Float64` capture, so nesting D over it exercises exactly this path: d²/dx²[3x²] = 6.
     mkquad(a) = x -> a*(x*x)
     @test Dop(z -> Dop(mkquad(3.0), z), 1.7) ≈ 6.0
@@ -273,8 +261,8 @@ end
 @testset "user function with a hand-written frule!! (world-age callee resolution)" begin
     # Differentiating a caller of a *user* function with a hand rule: the callee must be resolved
     # at the interpreter's inference world, not the stale generation world. First order works even
-    # on a clean tree; the crash was at order ≥2 (a `Dual{GlobalRef,…}`). `@noinline` keeps the
-    # callee a surviving `:invoke`. This is the exact shape of the original bug report.
+    # on a clean tree; a stale-world resolution crashes at order ≥2 (a `Dual{GlobalRef,…}`).
+    # `@noinline` keeps the callee a surviving `:invoke`.
     Dop(f, x)  = frule!!(Dual(f, zero_tangent(f)), Dual(x, unit_tangent(x))).dx
     @noinline hr_lin(x) = x + 1     # hand rule below; d/dx = 1,  higher derivatives = 0
     @noinline hr_sqr(x) = x*x       # hand rule below; d/dx = 2x, d²/dx² = 2, d³/dx³ = 0
@@ -285,7 +273,7 @@ end
 
     @test Dop(call_lin, 1.0) == 1.0                          # d/dx (x+1) = 1
 
-    # The exact original bug report: D-of-D over the wrapper. Second/third derivatives of x+1 = 0.
+    # D-of-D over the wrapper. Second/third derivatives of x+1 = 0.
     @test (Dop(1.0) do x; Dop(call_lin, x) end) == 0.0
     @test (Dop(1.0) do x; Dop(y -> Dop(call_lin, y), x) end) == 0.0
 

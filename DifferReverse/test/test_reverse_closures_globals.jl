@@ -2,17 +2,16 @@ using Test
 using DifferReverse
 using DifferReverse: NoTangent, rev_gradient, zero_tangent
 # `Dual`/`frule!!`/`primal`/`tangent` here are DifferForwards' forward-mode carrier, used purely
-# as an independent numerical oracle (not testing forward/reverse composition) — DifferForwards
-# is a test-only dependency of DifferReverse for exactly this (see test/Project.toml).
+# as an independent numerical oracle (not testing forward/reverse composition).
 using DifferForwards: Dual, frule!!, primal, tangent
 
 @testset "boxed captured variable (reassigned closure variable)" begin
     # Reassigning a captured variable inside a closure forces Julia to box it (`Core.Box`, with
     # an `Any`-typed `.contents` field), which lowers each read behind a `Core.isdefined` guard
-    # and a `throw_undef_if_not` marker. This used to crash reverse mode with a `MethodError`
-    # from deep inside `set_to_zero_internal!!` (no method for `FData`/`RData`); it now bails
-    # cleanly with a located `ErrorException` instead (reverse mode's own, separate limitation on
-    # `setfield!` of a field whose tangent carries fdata — Phase 2 territory, out of scope here).
+    # and a `throw_undef_if_not` marker. This used to crash reverse mode with a `MethodError` from
+    # deep inside `set_to_zero_internal!!` (no method for `FData`/`RData`); it now bails cleanly
+    # with a located `ErrorException` instead (reverse mode's own, separate limitation on
+    # `setfield!` of a field whose tangent carries fdata).
     err = try
         let y = 1.0
             rev_gradient(1.0) do x

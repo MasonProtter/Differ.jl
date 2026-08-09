@@ -333,11 +333,9 @@ tangent_type(::Type{String}) = NoTangent
 tangent_type(::Type{<:Array{P,N} where {P}}) where {N} = Array
 
 # A `MemoryRef`'s (and bare `Memory`'s) tangent is the same wrapper over the shadow `Memory`.
-# The array-indexing dualization in `forward_interp.jl` never builds these by hand; it mirrors
-# the primal's `memoryrefnew`/`getfield(:ref)` onto a genuine `Array{tangent_type(P),N}` shadow
-# array. Only matches the default `MemoryRef{P}`/`Memory{P}` (`:not_atomic`, CPU) aliases. A
+# Only matches the default `MemoryRef{P}`/`Memory{P}` (`:not_atomic`, CPU) aliases; a
 # `GenericMemoryRef` with a different `Kind`/`AddrSpace` (e.g. atomic memory) falls through to
-# the generic struct derivation below instead. This is a known sharp edge, undocumented elsewhere.
+# the generic struct derivation below instead.
 @foldable tangent_type(::Type{<:MemoryRef{P}}) where {P} = MemoryRef{tangent_type(P)}
 @foldable tangent_type(::Type{<:Memory{P}}) where {P} = Memory{tangent_type(P)}
 
@@ -378,14 +376,11 @@ tangent_type(::Type{Core.Compiler.InferenceResult}) = NoTangent
 end
 
 function split_union_tuple_type(tangent_types)
-
-    # Create first split.
     ta_types = map(tangent_types) do T
         return T isa Union ? T.a : T
     end
     ta = Tuple{ta_types...}
 
-    # Create second split.
     tb_types = map(tangent_types) do T
         return T isa Union ? T.b : T
     end
@@ -398,47 +393,31 @@ end
 isconcrete_or_union(p) = p isa Union || isconcretetype(p)
 
 @foldable @generated function tangent_type(::Type{P}) where {N,P<:Tuple{Vararg{Any,N}}}
-
-    # As with other types, tangent type of Union is Union of tangent types.
     P isa Union && return :(Union{tangent_type($(P.a)),tangent_type($(P.b))})
 
-    # Determine whether P isa a Tuple with a Vararg, e.g, Tuple, or Tuple{Float64, Vararg}.
-    # Exclude `UnionAll`s by checking `isa(P, DataType)` first, so `Base.datatype_fieldcount(P)`
-    # doesn't fail below.
+    # `isa(P, DataType)` excludes UnionAll first so `Base.datatype_fieldcount`/`N` below don't
+    # fail on a bare `Tuple` or `Tuple{Float64, Vararg}`.
     isa(P, DataType) && !(@isdefined(N)) && return Any
-
-    # Tuple{} can only have `NoTangent` as its tangent type. Again check for `UnionAll` first
-    # so datatype_fieldcount doesn't fail.
     isa(P, DataType) && N == 0 && return NoTangent
 
-    # Expression to construct `Tuple` type containing tangent type for all fields.
     tangent_type_exprs = map(n -> :(tangent_type(fieldtype(P, $n))), 1:N)
     tangent_types = Expr(:call, tuple, tangent_type_exprs...)
-
-    # Construct a Tuple type of the same length as `P`, containing all `NoTangent`s.
     T_all_notangent = Tuple{Vararg{NoTangent,N}}
 
     return quote
-
-        # Get tangent types for all fields. If they're all `NoTangent`, return `NoTangent`.
-        # i.e. if `P = Tuple{Int, Int}`, do not return `Tuple{NoTangent, NoTangent}`.
-        # Simplify and return `NoTangent`.
+        # If every field's tangent type is `NoTangent` (e.g. `Tuple{Int,Int}`), collapse to
+        # `NoTangent` rather than `Tuple{NoTangent,NoTangent}`.
         tangent_types = $tangent_types
         T = Tuple{tangent_types...}
         T <: $T_all_notangent && return NoTangent
 
-        # If exactly one of the field types is a Union, then split.
         union_fields = _findall(Base.Fix2(isa, Union), tangent_types)
         if length(union_fields) == 1 && all(tuple_map(isconcrete_or_union, tangent_types))
             return split_union_tuple_type(tangent_types)
         end
 
-        # If it's _possible_ for a subtype of `P` to have tangent type `NoTangent`, then we
-        # must account for that by returning the union of `NoTangent` and `T`. For example,
-        # if `P = Tuple{Any, Int}`, then `P2 = Tuple{Int, Int}` is a subtype. Since `P2` has
-        # tangent type `NoTangent`, it must be true that `NoTangent <: tangent_type(P)`. If,
-        # on the other hand, it's not possible for `NoTangent` to be the tangent type, e.g.
-        # for `Tuple{Float64, Any}`, then there's no need to take the union.
+        # If some subtype of `P` could have tangent type `NoTangent` (e.g. `Tuple{Any,Int}`
+        # via `Tuple{Int,Int}`), account for it with `Union{T,NoTangent}`.
         return $T_all_notangent <: T ? Union{T,NoTangent} : T
     end
 end
@@ -452,42 +431,28 @@ end
 end
 
 @foldable @generated function tangent_type(::Type{P}) where {P}
-
-    # This method can only handle struct types. Something has gone wrong if P is primitive.
     if isprimitivetype(P)
         return error("$P is a primitive type. Implement a method of `tangent_type` for it.")
     end
 
-    # If the type is a Union, then take the union type of its arguments.
     P isa Union && return :(Union{tangent_type($(P.a)),tangent_type($(P.b))})
 
-    # If the type is itself abstract, its tangent could be anything.
-    # The same goes for if the type has any undetermined type parameters.
     (isabstracttype(P) || !isconcretetype(P)) && return Any
 
-    # No self-reference guard here, deliberately. A structurally self-referential `P` (one whose
-    # transitive field/element types reach `P` again) does NOT imply non-termination: `GlobalRef`
-    # cycles through `binding::Core.Binding`'s own `globalref::GlobalRef`, and derives fine —
-    # inference resolves the mutually-recursive `@foldable` calls to a fixpoint, which converges
-    # because every other field is `NoTangent`. `Tape`'s cycle does not converge, because it runs
-    # through `Stack`/`Vector` overrides that map the element type back through `tangent_type` and so
-    # keep producing new types. Telling the two apart at generation time means computing that
-    # fixpoint, which is exactly what inference already does — a static reachability walk rejects
-    # both, and was measured breaking working `GlobalRef` derivation. A self-referential type whose
-    # cycle does not converge must therefore still be given its own `tangent_type` method (see
-    # `DifferReverse`'s `Stack`/`Tape`), and gets a hang rather than a diagnostic if it isn't.
+    # No self-reference guard here, deliberately: a structurally self-referential `P` doesn't
+    # imply non-termination on its own. `GlobalRef`'s cycle (through `Core.Binding`) converges
+    # because every other field is `NoTangent`; `Tape`'s cycle does not, because `Stack`/`Vector`
+    # overrides keep mapping the element type back through `tangent_type`. A static reachability
+    # check can't distinguish the two without computing the fixpoint inference already computes,
+    # and was measured breaking working `GlobalRef` derivation. A self-referential type whose
+    # cycle doesn't converge must get its own `tangent_type` method (see `DifferReverse`'s
+    # `Stack`/`Tape`) or this hangs instead of erroring.
 
     tangent_fields_types_expr = Expr(:curly, Tuple, tangent_field_types_exprs(P)...)
     T_all_notangent = Tuple{Vararg{NoTangent,fieldcount(P)}}
     return quote
-
-        # Construct a `Tuple{...}` whose fields are the tangent types of the fields of `P`.
         tangent_field_types_tuple = $tangent_fields_types_expr
-
-        # If all fields are definitely `NoTangent`s, then return `NoTangent`.
         tangent_field_types_tuple <: $T_all_notangent && return NoTangent
-
-        # Derive tangent type.
         bt = NamedTuple{$(fieldnames(P)),tangent_field_types_tuple}
         return $(ismutabletype(P) ? MutableTangent : Tangent){bt}
     end
@@ -511,12 +476,10 @@ anything other than that which this function returns.
 """
 zero_tangent(x)
 function zero_tangent(x::P) where {P}
-    # Use `require_tangent_cache`, not a bare `isbitstype(P)`. The cache exists only to handle
-    # circular references and aliasing, and `require_tangent_cache` is this system's authority on
-    # when a tangent can contain either (`set_to_zero!!` consults the same thing). `isbitstype`
-    # is cruder: it allocates an `IdDict` for every `Array`, including `Array{<:IEEEFloat}`, whose
-    # tangent is provably tree-like. That allocation was showing up on every `rev_gradient` call, just
-    # to build an argument's zero shadow.
+    # Use `require_tangent_cache`, not a bare `isbitstype(P)`: it's this system's authority on
+    # when a tangent can contain circular references/aliasing (`set_to_zero!!` consults the same
+    # thing). `isbitstype` is cruder and would allocate an `IdDict` for every `Array`, including
+    # provably tree-like ones like `Array{<:IEEEFloat}`.
     return zero_tangent_internal(x, _tangent_cache(require_tangent_cache(P)))
 end
 @inline _tangent_cache(::Val{true}) = IdDict()
@@ -572,30 +535,11 @@ julia> unit_tangent(1)
 NoTangent()
 ```
 
-Not every object (e.g. vectors) has a canonical `oneunit`, so these will error.
+Not every object (e.g. vectors) has a canonical `oneunit`, so these will error:
 ```
 julia> unit_tangent([1.0])
 ERROR: MethodError: no method matching one(::Vector{Float64})
-The function `one` exists, but no method is defined for this combination of argument types.
-
-Closest candidates are:
-  one(::Type{Union{}}, Any...)
-   @ Base number.jl:401
-  one(::Type{Missing})
-   @ Base missing.jl:107
-  one(::BitMatrix)
-   @ Base bitarray.jl:418
-  ...
-
-Stacktrace:
- [1] oneunit(x::Vector{Float64})
-   @ Base ./number.jl:424
- [2] unit_tangent(x::Vector{Float64})
-   @ Differ ~/Nextcloud/Julia/DifferPlayground/Differ/src/tangents.jl:555
- [3] top-level scope
-   @ REPL[114]:1
 ```
- 
 """
 unit_tangent(x) = primal_to_tangent!!(zero_tangent(x), oneunit(x))::tangent_type(typeof(x))
 
@@ -664,20 +608,16 @@ end
     return quote
         tangent_type(P) == NoTangent && return NoTangent()
 
-        # If dealing with a mutable type, ensure that we have an entry in `d`.
         if tangent_type(P) <: MutableTangent
             haskey(d, x) && return d[x]::tangent_type(P)
-            d[x] = tangent_type(P)() # create an uninitialised MutableTangent
+            d[x] = tangent_type(P)() # uninitialised placeholder, filled in below
         end
 
-        # For each field in `x`, construct its zero tangent. This is where the generated
-        # expression above is used. Everything else is regular code.
         fields = backing_type(P)($tangent_fields_tuple_expr)
 
         if tangent_type(P) <: MutableTangent
-            # if circular reference exists, then the recursive call will first look up d
-            # and return the uninitialised MutableTangent
-            # after the recursive call returns, d will be initialised
+            # A circular reference recurses back into this branch and returns the placeholder
+            # from `d` above before it's filled in here.
             d[x].fields = fields
             return d[x]::tangent_type(P)
         else
@@ -777,20 +717,16 @@ end
     return quote
         tangent_type(P) == NoTangent && return NoTangent()
 
-        # If dealing with a mutable type, ensure that we have an entry in `d`.
         if tangent_type(P) <: MutableTangent
             haskey(d, x) && return d[x]::tangent_type(P)
-            d[x] = tangent_type(P)() # create an uninitialised MutableTangent
+            d[x] = tangent_type(P)() # uninitialised placeholder, filled in below
         end
 
-        # For each field in `x`, construct its randn tangent. This is where the generated
-        # expression above is used. Everything else is regular code.
         fields = backing_type(P)($tangent_fields_tuple_expr)
 
         if tangent_type(P) <: MutableTangent
-            # if circular reference exists, then the recursive call will first look up d
-            # and return the uninitialised MutableTangent
-            # after the recursive call returns, d will be initialised
+            # A circular reference recurses back into this branch and returns the placeholder
+            # from `d` above before it's filled in here.
             d[x].fields = fields
             return d[x]::tangent_type(P)
         else
@@ -825,68 +761,11 @@ references or aliasing:
 - **Unsafe**: any `Any`/abstract-typed field; a type that could reference its own container;
   multiple fields that could alias the same mutable object.
 
-#### Example 1: Circular References with Abstract-Typed Fields
-
-`Ref` with abstract types can lead to circular references:
-
-```jldoctest; setup = :(using Mooncake: tangent_type, zero_tangent)
-julia> # Ref{Any} is dangerous because Any can hold circular references
-       struct Evil
-           r::Ref{Any}
-           data::Float64
-       end
-
-julia> e = Evil(Ref{Any}(nothing), 1.0);
-
-julia> e.r[] = e;  # Store the struct in its own field!
-
-julia> # The tangent type has PossiblyUninitTangent{Any}
-       tangent_type(Evil)
-Tangent{@NamedTuple{r, data::Float64}}
-
-julia> # Let's trace what happens with zero_tangent
-       zt = zero_tangent(e);
-
-julia> # The Ref field's tangent is a MutableTangent
-       typeof(zt.fields.r)
-MutableTangent{@NamedTuple{x::Mooncake.PossiblyUninitTangent{Any}}}
-
-julia> # And it contains a circular reference to zt itself!
-       zt.fields.r.fields.x.tangent === zt
-true
-```
-
-#### Example 2: Aliasing in Tangent Structures
-
-When a primal contains aliased references, the tangent must preserve that aliasing. Without
-caching, operations would process the aliased tangents twice:
-
-```jldoctest; setup = :(using Mooncake: zero_tangent)
-julia> # Create a mutable primal with aliased references
-       mutable struct Container
-           data::Vector{Float64}
-       end
-
-julia> x = Container([1.0, 2.0, 3.0]);
-
-julia> # Create aliasing: both fields reference the same Container
-       primal_object = (x, x);
-
-julia> # The tangent preserves the aliasing structure
-       zt = zero_tangent(primal_object);
-
-julia> # Verify the tangent type: tuple of two MutableTangents
-       typeof(zt)
-Tuple{MutableTangent{@NamedTuple{data::Vector{Float64}}}, MutableTangent{@NamedTuple{data::Vector{Float64}}}}
-
-julia> # Both elements are the SAME tangent object (aliased)
-       zt[1] === zt[2]
-true
-```
-
-This aliasing mirrors the primal's: without caching, [`increment!!`](@ref) would visit `zt[1]`
-and `zt[2]` separately and double-count the shared tangent.
-
+For example, `struct Evil; r::Ref{Any}; data::Float64; end` with `e.r[] = e` (a struct storing
+itself in its own field via an `Any`-typed `Ref`) makes `zero_tangent(e)` produce a tangent that
+circularly references itself. Similarly, `primal_object = (x, x)` for a mutable `x` produces a
+tangent tuple whose two elements are the same object (`===`); without caching, `increment!!`
+would visit that shared tangent twice and double-count it.
 """
 require_tangent_cache(::Type{P}) where {P} = Val{!isbitstype(P)}()
 require_tangent_cache(::Type{<:Array{P}}) where {P} = Val{!isbitstype(P) && tangent_type(P) !== NoTangent}()

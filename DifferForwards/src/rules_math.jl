@@ -1,6 +1,5 @@
-# Hand-written frule!! for scalar math functions (Base.Math transcendentals). See ISSUES.md #20.
-# Reverse-mode rrule!!s for the same functions live in DifferReverse/src/rules_math.jl — split by
-# AD mode from the original combined rules_math.jl.
+# Hand-written frule!! for scalar math functions (Base.Math transcendentals).
+# Reverse-mode rrule!!s for the same functions live in DifferReverse/src/rules_math.jl.
 #
 # Every rule uses the closed-form derivative directly, never by differentiating through Base's
 # actual implementation. Some of those internals (e.g. asin's bitcast/and_int precision trick) use

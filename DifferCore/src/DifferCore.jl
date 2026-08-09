@@ -1,26 +1,22 @@
 module DifferCore
 
-# Tangent / fdata / rdata type system, ported from Mooncake.jl (`tangent_type`/`fdata_type`/
-# `rdata_type` keyed on the *primal* type, `Tangent`/`MutableTangent`/`PossiblyUninitTangent`,
-# `FData`/`RData`, `zero_tangent`/`increment!!`). Shared by Differ's forward-mode `Dual` and
-# reverse-mode `CoDual` carriers, which live in DifferForwards.jl/DifferReverse.jl respectively —
-# nothing in this package is forward- or reverse-mode-specific.
+# Tangent / fdata / rdata type system, ported from Mooncake.jl. Shared by Differ's forward-mode
+# `Dual` and reverse-mode `CoDual` carriers (DifferForwards.jl/DifferReverse.jl) — nothing here
+# is forward- or reverse-mode-specific.
 include("tangent_utils.jl")
 include("tangents.jl")
 include("fwds_rvs_data.jl")
 include("array_tangents.jl")
 
-# Small, mode-agnostic IR-inspection helpers shared by DifferForwards' and DifferReverse's own
-# dualization/pullback engines (both `include` neither owns exclusively) — see the file header.
+# Mode-agnostic IR-inspection helpers shared by DifferForwards' and DifferReverse's own
+# dualization/pullback engines.
 include("shared_ir_helpers.jl")
 
 """
     primal(x)
 
-The primal value carried by `x` — a `Dual` (forward mode, `DifferForwards.jl`) or a `CoDual`
-(reverse mode, `DifferReverse.jl`). A bare stub here: `DifferForwards`/`DifferReverse` each add
-their own method, so `primal` is one shared generic function across both, the same way `tangent`
-already is (`tangent(f, r)` above).
+The primal value carried by `x` — a `Dual` (forward mode) or a `CoDual` (reverse mode). A bare
+stub here; `DifferForwards`/`DifferReverse` each add their own method.
 """
 function primal end
 

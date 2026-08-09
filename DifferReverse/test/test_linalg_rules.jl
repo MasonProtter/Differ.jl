@@ -69,12 +69,9 @@ tr_fn(A) = tr(A)
 
     @testset "* (matrix-vector)" begin
         # Composite-recursion into a hand rule whose *result* is array-shaped (fdata-carried, not
-        # rdata) isn't supported by the general derived-call engine yet (see
-        # `_static_recursible_call`'s guard #3 in `reverse_interp.jl` — a pre-existing scope limit
-        # of the composite recursion machinery, unrelated to this rule's correctness and not
-        # fixable from this file). So `A*x`'s reverse rule is exercised by calling `rrule!!`
-        # directly — the same shape `rev_gradient`/`value_and_gradient!` use under the hood —
-        # rather than through a wrapping scalar composite function.
+        # rdata) isn't supported by the general derived-call engine yet (`_static_recursible_call`'s
+        # result-fdata guard). So `A*x`'s reverse rule is exercised by calling `rrule!!` directly —
+        # the same shape `rev_gradient`/`value_and_gradient!` use under the hood.
         A = [1.0 2.0; 3.0 4.0; 5.0 6.0]   # 3x2
         x = [1.5, -0.5]
 
@@ -213,14 +210,11 @@ tr_fn(A) = tr(A)
         @test dC2 == [10.0 20.0; 30.0 40.0]
     end
 
-    @testset "reverse mode over a Transpose/Adjoint (ISSUES #65)" begin
+    @testset "reverse mode over a Transpose/Adjoint" begin
         # `sum(::Transpose)` misses the `sum` hand rules (they require `X<:Array{<:IEEEFloat}`) and
-        # falls through to Base's *pairwise* `mapreduce_impl`, which is self-recursive. Direct
-        # self-recursion is supported (`reverse_fwds_recursive_ci`, `src/reverse_interp.jl`, ISSUES
-        # #65), so this no longer bails on the `in_progress` cycle guard. It used to still bail past
-        # that, on `mapreduce_impl`'s non-recursive base case: an `@simd for` loop, which reverse
-        # mode had no `Expr(:loopinfo)` support for. Reverse mode now carries `:loopinfo` through,
-        # so this composes correctly end to end.
+        # falls through to Base's pairwise `mapreduce_impl`, which is self-recursive and bottoms
+        # out in an `@simd for` loop. Direct self-recursion plus `:loopinfo` carry-through make
+        # this compose correctly end to end.
         g_t(M) = sum(transpose(M))
 
         for n in (2, 40)   # 40x40 is the size that used to reach the illegal statement

@@ -6,11 +6,9 @@ using DifferReverse: zero_fcodual, primal, tangent
 include(joinpath(@__DIR__, "testutils.jl"))
 
 @testset "regression: multi-dim Int indexing already works (native memoryref path)" begin
-    # Locks in the pre-existing, engine-native behavior (see `differ-architecture`): scalar/multi-dim
-    # Int indexing on a plain `Array` lowers to `memoryrefnew`/`memoryrefget`/`memoryrefset!` and is
-    # already fully supported without any rule in this file. This file's own rules (mask/index-vector
-    # indexing) never dispatch on this shape, so it's a pure regression lock, not something this
-    # file's changes could plausibly affect — kept here anyway per the task's ask.
+    # Locks in the pre-existing, engine-native behavior: scalar/multi-dim Int indexing on a plain
+    # `Array` lowers to `memoryrefnew`/`memoryrefget`/`memoryrefset!` and is already fully
+    # supported without any rule in this file.
     read2d(A, i, j) = A[i, j]
 
     A = [1.0 2.0 3.0; 4.0 5.0 6.0]
@@ -31,16 +29,15 @@ include(joinpath(@__DIR__, "testutils.jl"))
 end
 
 @testset "reverse mode: logical (mask) / index-vector getindex (direct rrule!! calls)" begin
-    # `rev_gradient` assumes a *scalar*-output primal (it seeds the pullback with `one(y)`), so
-    # it can't be used directly on `getindex`, whose result is itself an array. Tested here by
-    # calling `rrule!!` directly with an explicit seed, the same style `check_stack_balance` uses
-    # elsewhere for array-argument rules.
+    # `rev_gradient` assumes a scalar-output primal (it seeds the pullback with `one(y)`), so it
+    # can't be used directly on `getindex`, whose result is itself an array. Tested here by calling
+    # `rrule!!` directly with an explicit seed.
     #
-    # Also only reachable this way (a direct call to `Base.getindex`'s own `rrule!!`), not through a
-    # user-defined wrapper (`f(A, m) = A[m]`): see the NOTE above the rules in
-    # `src/rules_indexing.jl`. The array-valued getindex result trips the reverse engine's own
-    # (unrelated, out-of-scope-for-this-file) "recursive call with a non-trivial-fdata result" bail
-    # before a hand rule is even considered.
+    # Also only reachable this way (a direct call to `Base.getindex`'s own `rrule!!`), not through
+    # a user-defined wrapper (`f(A, m) = A[m]`): see the note above the rules in
+    # `rules_indexing.jl`. The array-valued getindex result trips the reverse engine's own
+    # unrelated "recursive call with a non-trivial-fdata result" bail before a hand rule is even
+    # considered.
     v = [1.0, 2.0, 3.0, 4.0]
     mask = [true, false, true, true]
 

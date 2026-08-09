@@ -74,10 +74,10 @@ include(joinpath(@__DIR__, "testutils.jl"))
     @test rt.x == 1.0 && rt.dx == 5.0
     checkverify(tupfirst, (Tuple{Float64,Float64},))
 
-    # dynamic (non-literal) getfield index (Phase B, forward): `for i in 1:2` does not unroll,
-    # so `t[i]` reaches `dualize_to_ircode` as a genuine dynamic index. Raw (unresolved) before
-    # the fix, this crashed with a TypeError: the primal index referenced the primal IR's own
-    # (stale) SSA numbering once shadow instructions were interleaved.
+    # dynamic (non-literal) getfield index: `for i in 1:2` does not unroll, so `t[i]` reaches
+    # `dualize_to_ircode` as a genuine dynamic index. An unresolved index would crash with a
+    # TypeError, referencing the primal IR's own (stale) SSA numbering once shadow instructions are
+    # interleaved.
     for seed in ((1.0, 0.0), (0.0, 1.0))
         d = frule!!(Dual(tupsum_dyn, NoTangent()), Dual((3.0, 4.0), seed))
         @test d.x == 7.0 && d.dx == 1.0   # d(t1+t2)/dt_i = 1 for either seed direction
@@ -139,12 +139,12 @@ include(joinpath(@__DIR__, "testutils.jl"))
                                       Dual(2, NoTangent()))
 end
 
-@testset "nothing-returning primal (forward mode, ISSUES #53)" begin
+@testset "nothing-returning primal (forward mode)" begin
     # A mutator that ends in `return nothing`, the ordinary way to write an in-place function.
-    # `return nothing` survives optimization as a bare `GlobalRef` (`Main.nothing`), which used to
-    # (1) leak into value position (verify_ir rejects a non-Core/Base GlobalRef there) and (2) get
-    # typed `GlobalRef` instead of `Nothing`. Fixed: the result is a `Dual{Nothing,NoTangent}` and
-    # the shadow array still receives the tangent write.
+    # `return nothing` survives optimization as a bare `GlobalRef` (`Main.nothing`), which needs
+    # resolving rather than leaking into value position or being typed `GlobalRef` instead of
+    # `Nothing`. The result is a `Dual{Nothing,NoTangent}` and the shadow array still receives the
+    # tangent write.
     noret!(v, x) = (v[1] = x; nothing)
     v, dv = [1.0, 2.0], [0.0, 0.0]
     r = frule!!(Dual(noret!, NoTangent()), Dual(v, dv), Dual(5.0, 7.0))
@@ -174,12 +174,11 @@ newpair(x)    = [NewPair(x, 1)][1].a
 newconst(x)   = NewHolder(x*x, NEWCONST)
 newconstuse(x) = NEWCONST[1] * x
 
-@testset "`%new` with GlobalRef operands (forward mode, ISSUES #60)" begin
-    # `%new`'s type argument and its field operands are both value positions `verify_ir` checks, and
-    # the arm used to test `T <: Dual` on the raw node. A struct defined at module level lowers to
-    # `%new(<Module>.NewHolder, %1, <Module>.nothing)`, so both defects fired at once: a `TypeError`
-    # from `<:` on a `GlobalRef`, and (once past that) "Unbound or partitioned GlobalRef not allowed
-    # in value position". Both operands are now resolved through the binding.
+@testset "`%new` with GlobalRef operands (forward mode)" begin
+    # `%new`'s type argument and its field operands are both value positions `verify_ir` checks. A
+    # struct defined at module level lowers to `%new(<Module>.NewHolder, %1, <Module>.nothing)`, so
+    # both must be resolved through the binding before use: a raw `GlobalRef` fails `<:`/`fieldtype`
+    # with a `TypeError`, and in value position trips "Unbound or partitioned GlobalRef not allowed".
     r = frule!!(Dual(newnothing, NoTangent()), Dual(3.0, 1.0))
     @test r.x == NewHolder(9.0, nothing)
     @test get_tangent_field(r.dx, :a) ≈ 6.0            # d(x²)/dx
@@ -257,13 +256,12 @@ end
     @test r.x ≈ 9.0 && r.dx ≈ 3.0
     checkverify(alloccomp, (Float64, Int))
 
-    # `[x, 2.0, 3.0]` array-literal allocation (ISSUES #83). For this element count, `Base.vect`
-    # lowers to a *dynamic*-index loop copy — build the elements into a tuple via `Core.tuple`, then
+    # `[x, 2.0, 3.0]` array-literal allocation. For this element count, `Base.vect` lowers to a
+    # *dynamic*-index loop copy — build the elements into a tuple via `Core.tuple`, then
     # `getfield(tuple, i, false)` with `i` a loop induction variable — rather than fully-unrolled
     # static-index copies. The tuple statement's inferred type is a `Core.PartialStruct`, not a bare
-    # `Type` (const-propagation having pinned the two literal elements), which used to `TypeError` in
-    # `apply_builtin_frule!(::Val{Core.getfield})`'s dynamic-index branch (`Pobj <: Dual || ...`
-    # tested directly against the un-widened lattice element).
+    # `Type` (const-propagation pinned the two literal elements), which needs widening before use in
+    # `apply_builtin_frule!(::Val{Core.getfield})`'s dynamic-index branch.
     alloclit(x) = sum([x, 2.0, 3.0])
     r = frule!!(Dual(alloclit, NoTangent()), Dual(3.0, 1.0))
     @test r.x ≈ 8.0 && r.dx ≈ 1.0

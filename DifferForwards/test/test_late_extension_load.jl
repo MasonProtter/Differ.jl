@@ -2,8 +2,8 @@
 #
 # `DifferForwardsOverReverseExt`'s methods — and `DifferReverse`'s own `tangent_type` overrides —
 # are always defined at a strictly later world than `DifferForwards`' `frule!!`. A generator body
-# dispatches at its method's `primary_world`, so before the `at_world` treatment those methods were
-# invisible to the forward transform and forward-over-reverse hung (ISSUES #85).
+# dispatches at its method's `primary_world`, so without the `at_world` treatment those methods
+# would be invisible to the forward transform.
 #
 # The ordinary suite loads everything up front, which is the *easy* order. What actually has to work
 # is: compile and cache a derived forward carrier while only `DifferForwards` exists, then load
@@ -55,8 +55,8 @@ end
 
 @testset "forward-over-reverse after a late extension load" begin
     # The regression order: `frule!!` carriers already compiled and cached before the extension's
-    # methods exist. Before the fix this hung rather than failing, so it could not be caught by a
-    # plain `@test` in-process — hence the subprocess.
+    # methods exist. A world-age bug here would hang rather than throw, so it couldn't be caught by
+    # a plain `@test` in-process — hence the subprocess.
     ok, out, err = run_in_fresh_session(_FORWARDS_FIRST)
     @test ok
     @test occursin("OK", out)

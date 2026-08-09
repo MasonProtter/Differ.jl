@@ -1,26 +1,19 @@
-# Hand-written rrule!! for reductions (cumsum/extrema). See ISSUES.md #32. Forward-mode frule!!s
-# for the same functions live in DifferForwards/src/rules_reductions.jl.
+# Hand-written rrule!! for reductions (cumsum/extrema). Forward-mode frule!!s for the same
+# functions live in DifferForwards/src/rules_reductions.jl.
 #
 # `sum`/`prod`/`maximum`/`minimum`/`mapreduce(f,+,x)` moved to `rules_perf_backstop.jl` (not
-# included by default) — they were pure performance backstops. `cumsum`/`extrema` stay here: see
-# DifferForwards/src/rules_reductions.jl's header for why.
+# included by default) — pure performance backstops. `cumsum`/`extrema` stay here.
 
 # ---- cumsum ----
-# `y = cumsum(x)` is itself array-valued, so like every array-valued primal here its rdata is
-# `NoRData` — gradient information flows through its *fdata* instead, a fresh zero array `dy`
-# allocated here and returned as `y`'s shadow. Downstream code that reads/writes `y` accumulates
-# into `dy` in place (same mechanism as array element mutation generally); by the time this
-# pullback runs (after all of that, since pullback order reverses forward execution order), `dy`
-# holds the total seed vector, and `dx[i] += sum(dy[i:end])` is exactly the reverse cumulative
-# sum — computed here as a running suffix sum in a plain loop (ordinary code, not re-dualized, so
-# `cumsum`/`reverse` would work just as well).
+# `y = cumsum(x)` is array-valued, so its rdata is `NoRData`; gradient flows through its fdata
+# instead — a fresh zero array `dy` returned as `y`'s shadow, accumulated into in place by
+# downstream reads/writes. By the time this pullback runs, `dy` holds the total seed vector, and
+# `dx[i] += sum(dy[i:end])` is the reverse cumulative sum, computed here as a running suffix sum.
 #
 # Known limitation: using `cumsum(x)`'s result (e.g. indexing into it) inside another
-# differentiated function fails in reverse mode. The static provenance scan (`_fdata_tracked`,
-# `reverse_interp.jl`) only recognizes specific operations (`%new`,
-# `memorynew`/`memoryrefnew`/`memoryrefget`) as differentiable-array provenance roots, not an
-# arbitrary hand-ruled call's result, so downstream reads off `y` are rejected as untracked. Not
-# fixable from here; see `test_reduction_rules.jl` for the direct `rrule!!`-level regression test.
+# differentiated function fails in reverse mode — the static provenance scan (`_fdata_tracked`)
+# doesn't recognize a hand-ruled call's result as a differentiable-array provenance root, so
+# downstream reads off `y` are rejected as untracked. Not fixable from here.
 
 struct CumsumPullback{X<:Array}
     dx::X
@@ -47,9 +40,8 @@ function rrule!!(
 end
 
 # ---- extrema ----
-# Unlike arrays, a `Tuple`'s rdata is a plain tuple of its fields' rdata (see `fwds_rvs_data.jl`),
-# so the pullback receives a real `(seed_min, seed_max)` seed directly — no fdata-aliasing trick
-# needed, unlike `cumsum` above.
+# Unlike arrays, a `Tuple`'s rdata is a plain tuple of its fields' rdata, so the pullback receives
+# a real `(seed_min, seed_max)` seed directly — no fdata-aliasing trick needed, unlike `cumsum`.
 
 struct ExtremaPullback{X<:Array}
     dx::X

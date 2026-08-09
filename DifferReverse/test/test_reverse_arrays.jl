@@ -49,9 +49,8 @@ include(joinpath(@__DIR__, "testutils.jl"))
 
     # `_collapsible_regions`: a single fixed-index read is nothing but a `@boundscheck` diamond, so
     # it collapses to zero block-stack traffic. `arr_idx_branch`'s merge point has a real `PhiNode`
-    # (it selects between two *different* values, `x[1]` vs `x[2]`) and `arr_sum`'s loop has a real
-    # back-edge — both must keep paying block-stack traffic, and this locks that in as a regression
-    # guard against the optimization over-firing.
+    # and `arr_sum`'s loop has a real back-edge — both must keep paying traffic, a regression guard
+    # against the optimization over-firing.
     check_block_stack_traffic(arr_idx3, x4; expect_zero=true)
     check_block_stack_traffic(arr_idx_branch, x2, true; expect_zero=false)
     check_block_stack_traffic(arr_sum, x3; expect_zero=false)
@@ -77,10 +76,9 @@ end
 end
 
 @testset "reverse mode: collapsible @boundscheck regions" begin
-    # The motivating case: a genuinely straight-line primal (no real branch or loop, just plain
-    # array reads/writes) whose `@boundscheck` diamonds — normally CFG-ambiguous, since `merge` has
-    # two real static predecessors, the direct "skip the check" edge and the checked "pass" edge —
-    # should all collapse away, per `_collapsible_regions` (`src/reverse_interp.jl`).
+    # A genuinely straight-line primal (no real branch or loop) whose `@boundscheck` diamonds —
+    # normally CFG-ambiguous, since `merge` has two real static predecessors — should all collapse
+    # away, per `_collapsible_regions`.
     function straightline!(v::Vector{Float64}, a::Float64)
         v[1] = a
         v[2] = 2a
@@ -96,13 +94,11 @@ end
     check_stack_balance(straightline!, [1.0, 2.0], 4.0)
     check_block_stack_traffic(straightline!, [1.0, 2.0], 4.0; expect_zero=true)
 
-    # A loop over indices is a different source of ambiguity (a genuine back-edge, Phase B/D) and
-    # must keep paying block-stack traffic even though every individual access is still a collapsed
+    # A loop over indices is a different source of ambiguity (a genuine back-edge) and must keep
+    # paying block-stack traffic even though every individual access is still a collapsed
     # `@boundscheck` diamond underneath — collapsing the diamonds must not be mistaken for
-    # collapsing the loop itself.
-    # `check_stack_balance`/`check_block_stack_traffic` seed the pullback with `one(primal(ycd))`,
-    # so unlike `bench/workloads.jl`'s `nothing`-returning version, this one returns a value
-    # (ISSUES #51: a `Nothing`-returning primal isn't drivable through those helpers at all).
+    # collapsing the loop itself. Returns a value (not `nothing`): `check_stack_balance`/
+    # `check_block_stack_traffic` seed the pullback with `one(primal(ycd))`, which needs one.
     function vecloop!(v::Vector{Float64}, x::Float64)
         for i in 1:length(v)
             v[i] = x
@@ -113,8 +109,7 @@ end
     check_stack_balance(vecloop!, [1.0, 2.0, 3.0], 5.0)
     check_block_stack_traffic(vecloop!, [1.0, 2.0, 3.0], 5.0; expect_zero=false)
 
-    # 2-D indexing: not required to collapse (out of scope for v1 — see `_collapsible_regions`'s
-    # docstring), but must still be correct either way.
+    # 2-D indexing: not required to collapse, but must still be correct either way.
     function mat_mutate!(A::Matrix{Float64}, a::Float64)
         A[1, 1] = a
         return A[1, 1]
@@ -127,9 +122,9 @@ end
 end
 
 @testset "reverse mode: dynamic array index re-derivation (no MemoryRef push)" begin
-    # `comms-dynamic-index-instead-of-memoryref.md`: a loop-indexed read/write over an
-    # argument-rooted array re-derives its `MemoryRef` handle in the pullback from a pushed `Int`
-    # index instead of pushing the (16-byte, GC-scanned) handle itself.
+    # A loop-indexed read/write over an argument-rooted array re-derives its `MemoryRef` handle in
+    # the pullback from a pushed `Int` index instead of pushing the (16-byte, GC-scanned) handle
+    # itself.
     has_memoryref(T) = T <: Tuple && any(F -> F <: MemoryRef, fieldtypes(T))
 
     # 1. The conversion happened: no argument-rooted access leaves a `MemoryRef` on the tape.
@@ -139,8 +134,8 @@ end
 
     # 2. Bounds: `@inbounds` and checked reads both round-trip. The re-derived shadow ref forces
     # `boundscheck=true` regardless, so an out-of-bounds `@inbounds` primal access still throws on
-    # the shadow instead of corrupting it (pinned directly for the literal-index case in
-    # `test_reverse_mutation_aliasing.jl`; this is the loop-index analogue).
+    # the shadow instead of corrupting it — the loop-index analogue of the literal-index case
+    # pinned in `test_reverse_mutation_aliasing.jl`.
     dynread_inbounds(x) = (s = 0.0; for i in eachindex(x); s += (@inbounds x[i]); end; s)
     x7 = [2.0, 3.0, 5.0, 7.0]
     checkverify_rev(dynread, (Vector{Float64},))
@@ -178,8 +173,7 @@ end
     # 5. Writes: a bulk-saved loop (isbits eltype — the primal is restored via one whole-array
     # copy-back, not per element) and a non-bulk-saved one (non-isbits eltype, so every element's
     # old primal/tangent is still saved individually). The index item is declared outside the
-    # `bulk_saved` branch in `builtin_rrule_comms(::Val{Base.memoryrefset!}, ...)`, so both
-    # configurations must still push it and still balance.
+    # `bulk_saved` branch, so both configurations must still push it and still balance.
     bulkwrite!(x) = (for i in eachindex(x); x[i] = 2 * x[i]; end; sum(x))
     xb = [1.0, 2.0, 3.0]
     checkverify_rev(bulkwrite!, (Vector{Float64},))
@@ -202,13 +196,11 @@ end
     @test dxn == [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]   # every element overwritten before any read
     @test dwn == [1.0, 1.0]                             # only x[end] (== w, aliased) is read
     # The write loop itself still converts (matching `bulkwrite!` above): `check_tape_size` on a
-    # write-only variant of this same primal is MemoryRef-free. `sum(x[end])` legitimately keeps one,
-    # though: `sum`'s hand rule moved to `src/rules_perf_backstop.jl` (nested-tape-recycling plan,
-    # Stage 3) and is not in the default build, so this reduction now falls through to generic
-    # recursion — and `x[end]` is extracted via indexing from the *outer* argument `x`, not itself a
-    # direct function argument, so `_static_ref_derivation` has no `tape.args` entry to re-derive its
-    # ref from at pullback time. Same "untracked provenance keeps its handle" case `ts6` checks below
-    # for `f2`'s differently-sourced local array.
+    # write-only variant of this same primal is MemoryRef-free. `sum(x[end])` legitimately keeps
+    # one, though: `sum`'s hand rule is not in the default build, so this reduction falls through
+    # to generic recursion, and `x[end]` is extracted via indexing from the outer argument `x`, not
+    # itself a direct function argument, so `_static_ref_derivation` has no `tape.args` entry to
+    # re-derive its ref from. Same "untracked provenance keeps its handle" case `ts6` checks below.
     @test !any(has_memoryref, check_tape_size(write_only_nested!, (Vector{Vector{Float64}}, Vector{Float64})))
     @test any(has_memoryref, check_tape_size(nested_loop_write!, (Vector{Vector{Float64}}, Vector{Float64})))
 
@@ -228,10 +220,9 @@ end
 
 @testset "reverse mode: recursive calls with an array argument" begin
     # The recursive-call guard allows an array argument through when its identity is traceable
-    # back to a function argument, threading the real fdata array through the
-    # recursive `:invoke` instead of a detached `NoFData()`. `arr_inner` is a plain composite
-    # function (no hand-written rule) taking the array directly, so differentiating a caller of it
-    # exercises the *general* engine path, not `sum`'s own hand rule.
+    # back to a function argument, threading the real fdata array through the recursive `:invoke`
+    # instead of a detached `NoFData()`. `arr_inner` is a plain composite function (no hand-written
+    # rule) taking the array directly, exercising the general engine path, not `sum`'s hand rule.
     @noinline arr_inner(v::Vector{Float64}) = v[1]^2 + v[2]^2         # d/dv = [2v1, 2v2]
     arr_outer(v::Vector{Float64}) = arr_inner(v)                       # one level of pass-through recursion
     arr_nest_mid(v::Vector{Float64}) = arr_inner(v)
@@ -241,9 +232,8 @@ end
     # the same shared fdata array.
     arr_alias(v::Vector{Float64}) = arr_inner(v) + arr_inner(v)
 
-    # `sum(v) do vi ... end` desugars to `sum(f, v)`, which Julia's optimizer inlines down to
-    # `Base._mapreduce` — routed via the hand-written `sum`/`sum(f,·)` rules in `src/rrules.jl`
-    # (kept off Base's own internals, which are self-recursive above
+    # `sum(v) do vi ... end` desugars to `sum(f, v)`, routed via the hand-written `sum`/`sum(f,·)`
+    # rules (kept off Base's own internals, which are self-recursive above
     # `Base.pairwise_blocksize` elements and would hit the unrelated self-recursion cycle guard).
     f_sumdo(v::Vector{Float64}) = sum(v) do vi
         vi^2 + 2vi + 1
@@ -313,21 +303,14 @@ end
 end
 
 @testset "zero_like_rdata_from_type for a non-concrete (Union) closure type" begin
-    # A pullback that has to produce a zero rdata for a closure type `G` normally sees `G` bound to
-    # the closure's concrete runtime type, but the derived recursion glue can resolve a rule via a
+    # A pullback producing a zero rdata for a closure type `G` normally sees `G` bound to the
+    # closure's concrete runtime type, but the derived recursion glue can resolve a rule via a
     # static call-site type that isn't concrete (`g` reached through an abstractly-typed
-    # field/container), binding `G` to a non-concrete type. Calling `zero_rdata_from_type(G)` there
-    # returns the `CannotProduceZeroRDataFromType()` sentinel for a `G` with real (non-`NoRData`)
-    # rdata, and `increment!!` has no method for that, so the pullback crashed with a raw
-    # `MethodError`. The fix is `zero_like_rdata_from_type(G)`, which returns `ZeroRData()` instead,
-    # which `increment!!` handles.
-    #
-    # This was originally written against `sum(f, x)`'s hand rule (`SumMapPullback`), whose `G`
-    # parameter is exactly that shape. Those `sum` rules are currently commented out in
-    # `src/rrules.jl` (the generic `mapreduce` path covers `sum` now), so the part that constructed
-    # a `SumMapPullback` directly is gone; what's asserted below is the underlying tangent-system
-    # behaviour, which is what actually regressed and is rule-independent. Restore the
-    # `SumMapPullback` construction alongside those rules if they ever come back.
+    # field/container), binding `G` to a non-concrete type. `zero_rdata_from_type(G)` there returns
+    # the `CannotProduceZeroRDataFromType()` sentinel for a `G` with real (non-`NoRData`) rdata, and
+    # `increment!!` has no method for that, so the pullback crashed with a raw `MethodError`. The
+    # fix is `zero_like_rdata_from_type(G)`, which returns `ZeroRData()` instead, which
+    # `increment!!` handles.
     #
     # `make_sum_map_closures` returns two closures over distinct captured `Float64`s, each with
     # real (non-`NoRData`) rdata, whose common supertype is a non-concrete `Union`. Built inside a

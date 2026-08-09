@@ -1,29 +1,23 @@
-# ISSUES #52: the reverse-mode forwards carrier used to push a block's number onto the block stack
-# unconditionally whenever the block wasn't a unique predecessor of *all* its successors, even though
-# the push is only ever popped on the one successor edge that's genuinely ambiguous. `loopsum` below
-# is the validated fixture: a `for` loop whose per-iteration "continue vs. exit" check is a
-# `GotoIfNot` with one unambiguous arm (loop body, single predecessor) and one ambiguous arm (the
-# shared loop-exit merge, reached both from here and from the "zero-trip" skip check) — exactly the
-# loop-exit-diamond shape ISSUES #49 measured as the largest remaining per-iteration reverse-mode
-# cost.
+# The reverse-mode forwards carrier used to push a block's number onto the block stack
+# unconditionally whenever the block wasn't a unique predecessor of *all* its successors, even
+# though the push is only ever popped on the one successor edge that's genuinely ambiguous.
+# `loopsum` below is the validated fixture: a `for` loop whose per-iteration "continue vs. exit"
+# check is a `GotoIfNot` with one unambiguous arm (loop body, single predecessor) and one ambiguous
+# arm (the shared loop-exit merge, reached both from here and from the "zero-trip" skip check).
 #
-# STATUS: FIXED. `_split_ambiguous_block_pushes` (`src/reverse_interp.jl`) is wired into
-# `reverse_fwds_to_ircode` (the one-line call before `CC.verify_ir(ir)`), paired with the per-edge
-# `pred_is_unique_pred` formula (`length(preds[b]) <= 1`) in `_unique_predecessor_info` that stops the
-# pullback's single-predecessor balance-pop. The two changes are coupled; neither is correct alone
-# (see ISSUES.md #52). The direct unit tests below cover the surgery itself; the `rev_gradient`-level
-# testsets exercise the live fix across the disambiguation boundary (N=0,1,2,3,5,50), and the
-# `memloop!` traffic test asserts the 3N+2 → 2N+3 reduction (the remaining 2/iter are irreducible).
+# Fixed by `_split_ambiguous_block_pushes` (`reverse_interp.jl`), paired with the per-edge
+# `pred_is_unique_pred` formula (`length(preds[b]) <= 1`) that stops the pullback's
+# single-predecessor balance-pop — the two changes are coupled, neither is correct alone. The
+# direct unit tests below cover the surgery itself; the `rev_gradient`-level testsets exercise the
+# live fix across the disambiguation boundary (N=0,1,2,3,5,50), and the `memloop!` traffic test
+# asserts the 3N+2 -> 2N+3 reduction (the remaining 2/iter are irreducible).
 #
 # A second, *fallthrough*-ambiguous shape (the mirror insertion case: the ambiguous arm is the
 # implicit fallthrough rather than the explicit `dest`) is exercised too, but not via a real Julia
-# primal — see the comment above `_raw_mixed_candidates` for why. Every structured-control-flow
-# shape tried (if/else in every polarity, `||`/ternary, `for`/`while` in both directions, `break`/
-# `continue`, `try`/`catch`, if/elseif chains, multi-exit loops) reliably produces the "skip" arm as
-# `GotoIfNot`'s `dest`, never as the fallthrough — Julia's own `if`/`while`/`for` lowering always
-# encodes "skip past code" as the explicit jump. The fallthrough-ambiguous fixture here is therefore
-# a hand-built `IRCode`, in the same style `test_cfg_ir.jl` uses for its own round-trip tests, just
-# assembled from `CFGBlock`/`ID` primitives rather than compiled from source.
+# primal — every structured-control-flow shape tried reliably produces the "skip" arm as
+# `GotoIfNot`'s `dest`, never as the fallthrough (Julia's own lowering always encodes "skip past
+# code" as the explicit jump). The fallthrough-ambiguous fixture here is a hand-built `IRCode`
+# instead, assembled from `CFGBlock`/`ID` primitives (see `_raw_mixed_candidates`).
 
 using Test
 using DifferReverse
@@ -40,9 +34,9 @@ const CC = Core.Compiler
 loopsum(x, N) = (s = 0.0; for i in 1:N; s = s + x; end; s)
 
 # Every block `b` (not the last) whose terminator is a `GotoIfNot` with exactly one ambiguous
-# successor (>1 real predecessor) — i.e. exactly `_split_ambiguous_block_pushes`'s Stage 0
-# classification, reimplemented here (over a plain `IRCode`, not `pir`-specific) so this file can
-# assert on a fixture's *shape* without reaching into `DifferReverse`'s own classification helper.
+# successor (>1 real predecessor) — `_split_ambiguous_block_pushes`'s own classification,
+# reimplemented here (over a plain `IRCode`) so this file can assert on a fixture's shape without
+# reaching into `DifferReverse`'s own helper.
 function _raw_mixed_candidates(ir::CC.IRCode)
     nblocks = length(ir.cfg.blocks)
     out = Tuple{Int,Symbol,Int}[]
@@ -101,9 +95,8 @@ _has_push(b::CFGBlock) =
 _is_relay(b::CFGBlock) = length(b) == 2 && terminator(b) isa IDGotoNode && _has_push(b)
 
 @testset "_split_ambiguous_block_pushes: direct unit test, dest-ambiguous case (loopsum-shaped)" begin
-    # Hand-built mirror of loopsum's own block-13-style shape (see the file header): `pre` stands in
-    # for the "did we skip the whole loop" check (both its own arms are already ambiguous, exactly
-    # like loopsum's block 9, so it is *not* itself a candidate). `chk` mirrors block 13: it
+    # Hand-built mirror of loopsum's own shape: `pre` stands in for the "did we skip the whole loop"
+    # check (both its own arms are already ambiguous, so it is not itself a candidate). `chk`
     # branches to `exitb` (dest, ambiguous, also reached directly from `pre`) or `body`
     # (fallthrough, unambiguous), and `exitb` carries a `PhiNode`, the edge-fixup path.
     template_ir = first(only(Base.code_ircode(x -> x, (Bool,))))
@@ -166,9 +159,9 @@ end
 
 @testset "_split_ambiguous_block_pushes: direct unit test, fallthrough-ambiguous case" begin
     # The mirror shape: block `chk`'s *fallthrough* (not `dest`) is the ambiguous arm. `merge`
-    # carries a `PhiNode` and is reached both as `chk`'s fallthrough and via a back-edge from `body`.
-    # `chk`'s `dest` goes straight to a single-predecessor `ret` block. No source-level Julia function
-    # was found that produces this polarity (see the file header), so it's built directly via `cfg_ir.jl`.
+    # carries a `PhiNode` and is reached both as `chk`'s fallthrough and via a back-edge from
+    # `body`. `chk`'s `dest` goes straight to a single-predecessor `ret` block. No source-level
+    # Julia function produces this polarity (see the file header), so it's built directly.
     template_ir = first(only(Base.code_ircode(x -> x, (Bool,))))
 
     chk, merge, ret, body = ID(), ID(), ID(), ID()
@@ -225,11 +218,10 @@ end
     @test Set(phi.edges) == Set([relay.id, body_blk.id])   # `chk`'s edge renamed to the relay
 end
 
-@testset "memloop!: block-stack traffic scales 2N+3, not 3N+2 (ISSUES #52)" begin
+@testset "memloop!: block-stack traffic scales 2N+3, not 3N+2" begin
     # Same shape as `bench/workloads.jl`'s `memloop!` benchmark, redefined locally rather than
-    # `include`d (the bench project pulls in `BenchmarkTools`, not a `test/Project.toml` dependency).
-    # `Memory` has no `zero_tangent` method (ISSUES #50), so its `CoDual` is built by hand, as the
-    # benchmark does.
+    # `include`d (the bench project pulls in `BenchmarkTools`, not a `test/Project.toml`
+    # dependency). `Memory` has no `zero_tangent` method, so its `CoDual` is built by hand.
     memloop!(o::Memory{Float64}, x::Float64, N::Int) = (for i in 1:N; @inbounds o[i] = x; end; nothing)
 
     function run_memloop(N)
@@ -246,11 +238,10 @@ end
         return length(pb.block_stack.memory)
     end
 
-    # The fix removes the wasteful loop-exit-diamond per-block push (ISSUES #49): traffic drops from
-    # 3N+2 to 2N+3. The remaining 2/iteration are irreducible (the loop header's two real
-    # predecessors, and the loop-body→merge edge's two real predecessors, both need runtime
-    # disambiguation — see the ISSUES #52 writeup), so this asserts the *reduction*, not flatness.
-    # Measured: N=2→7, N=3→9, N=5→13, N=100→203, N=10_000→20_003.
+    # The fix removes the wasteful loop-exit-diamond per-block push: traffic drops from 3N+2 to
+    # 2N+3. The remaining 2/iteration are irreducible (the loop header's two real predecessors, and
+    # the loop-body->merge edge's two real predecessors, both need runtime disambiguation), so this
+    # asserts the reduction, not flatness. Measured: N=2->7, N=3->9, N=5->13, N=100->203, N=10_000->20_003.
     @test run_memloop(2)  == 7
     @test run_memloop(5)  == 13
     large = run_memloop(10_000)

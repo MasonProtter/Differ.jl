@@ -1,20 +1,12 @@
-# ===========================================================================
 # The reverse-mode working IR: an immutable, basic-block representation of `Core.Compiler.IRCode`
 # keyed by `ID` rather than by position, so blocks can be inserted/removed/reordered while building
-# the pullback pass (Mooncake's terminology and design — ported from
-# `/project/Mooncake.jl/src/interpreter/{ir_utils,reverse_mode}.jl`, the generic CFGBlock/ID layer
-# only, none of the AD-specific `rrule!!`/`CoDual` logic).
+# the pullback pass. Ported from Mooncake's `src/interpreter/{ir_utils,reverse_mode}.jl` generic
+# CFGBlock/ID layer only, none of its AD-specific `rrule!!`/`CoDual` logic.
 #
-# `dualize_to_ircode` (`forward_interp.jl`) never needed this: forward mode preserves the primal's
-# block topology 1:1 (only within-block instruction counts change), so plain block numbers suffice.
-# The reverse-mode pullback pass doesn't preserve topology — it inserts extra phi-routing blocks and
+# Forward mode's `dualize_to_ircode` never needed this: it preserves the primal's block topology
+# 1:1, so plain block numbers suffice. The pullback pass doesn't — it inserts phi-routing blocks and
 # lowers `Switch` dispatches into `GotoIfNot` chains — so block identity must survive
-# insertion/reordering, which position-based numbering can't do. Hence the `ID` indirection here.
-#
-# Adapted for Differ (Julia 1.13 only, no multi-version `@static if` branching) and for this
-# project's existing conventions (`Core.PhiNode`/`Core.GotoNode`/... qualified, `CC` alias for
-# `Core.Compiler` from `contextual.jl`, bare `copy` rather than `CC.copy`).
-# ===========================================================================
+# insertion/reordering, which position-based numbering can't do.
 
 # ---------------------------------------------------------------------------
 # ID: a unique name for a block or statement in the working IR, independent of position.

@@ -14,16 +14,13 @@ include(joinpath(@__DIR__, "testutils.jl"))
     @testset "cumsum" begin
         x = [1.0, 2.0, -3.0, 4.5, 0.5]
 
-        # y = cumsum(x) is array-valued, so (like every array-valued primal here) its rdata is
-        # NoRData; real gradient information flows through its fdata (see the comment on the rule
-        # in rules_reductions.jl). Reading y[i] back out of a hand-ruled call's result inside a
-        # larger differentiated function needs the surrounding call's result to be recognized as
-        # a differentiable-array provenance root, which the current static provenance scan
-        # (_fdata_tracked, reverse_interp.jl) does not do for arbitrary calls (only for specific
-        # known operations: %new, memorynew/memoryrefnew/memoryrefget). That's a separate,
-        # pre-existing engine limitation, not fixable from a rules file. So the rule is exercised
-        # directly: seed the output fdata dy and confirm the pullback computes the reverse
-        # cumulative sum into dx.
+        # y = cumsum(x) is array-valued, so its rdata is NoRData; gradient flows through its fdata
+        # (see the comment on the rule in rules_reductions.jl). Reading y[i] back out of a
+        # hand-ruled call's result inside a larger differentiated function needs the static
+        # provenance scan to recognize the call's result as a provenance root, which it doesn't for
+        # arbitrary calls — a separate, pre-existing engine limitation, not fixable from a rules
+        # file. So the rule is exercised directly: seed the output fdata dy and confirm the
+        # pullback computes the reverse cumulative sum into dx.
         dx = zeros(length(x))
         ycd, pb = rrule!!(zero_fcodual(cumsum), Ctx(), CoDual(x, dx))
         @test primal(ycd) == cumsum(x)
@@ -99,7 +96,7 @@ Core.eval(DifferReverse, :(include(joinpath(pkgdir(DifferReverse), "src", "rules
         @test dxbig == ones(length(xbig))
     end
 
-    @testset "sum over a SubArray (ISSUES #65, reverse mode)" begin
+    @testset "sum over a SubArray" begin
         # `sum`'s hand rule is constrained to `X<:Array{<:IEEEFloat}` (above), so `sum(view(v,…))`
         # misses it and falls through to Base's own self-recursive `_mapreduce`/`mapreduce_impl`
         # (`reverse_fwds_recursive_ci`), which now works end to end.
@@ -198,8 +195,7 @@ Core.eval(DifferReverse, :(include(joinpath(pkgdir(DifferReverse), "src", "rules
         @test dx ≈ 2 .* x .+ 3
 
         # Reverse-mode guard: a Union-typed function argument must fail with a clear, located
-        # error rather than crash deep inside (ISSUES.md #43: reverse mode has no dynamic
-        # dispatch).
+        # error rather than crash deep inside (reverse mode has no dynamic dispatch).
         h1 = y -> y^2
         h2 = y -> 2y
         G2 = Union{typeof(h1),typeof(h2)}

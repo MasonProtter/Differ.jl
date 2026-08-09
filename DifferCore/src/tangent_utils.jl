@@ -2,7 +2,7 @@
 # Copyright (c) 2024 Will Tebbutt and Hong Ge, licensed under the MIT License.
 
 # Utility helpers ported from Mooncake's `src/utils.jl`, trimmed to what the tangent /
-# fdata / rdata system needs. See `/project/Mooncake.jl/src/utils.jl` for the originals.
+# fdata / rdata system needs.
 
 const CC = Core.Compiler
 

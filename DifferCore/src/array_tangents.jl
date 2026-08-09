@@ -1,20 +1,10 @@
 # Array tangent *value* operations, ported from Mooncake's `src/rules/array_legacy.jl`
-# (lines 1-80: the element-wise, rule-system-free part). These build a plain
-# `Array{tangent_type(P),N}` tangent element-wise, aliasing/circular-reference aware via the
-# cache, matching the generic scalar/struct implementations in `tangents.jl`.
-#
-# NOTE (Differ port): Mooncake's Julia-1.13 array path (`src/rules/memory.jl`) instead recurses
-# through `Memory`/`MemoryRef` tangent internals and is fused with the reverse-mode rule system
-# (`frule!!`/`rrule!!`/`@is_primitive`), out of scope here. The element-wise version below is
-# semantically identical for the tangent/fdata/rdata system: an `Array{P,N}`'s tangent is
+# (the element-wise, rule-system-free part). Build a plain `Array{tangent_type(P),N}` tangent
+# element-wise, aliasing/circular-reference aware via the cache, matching the generic
+# scalar/struct implementations in `tangents.jl`. An `Array{P,N}`'s tangent is
 # `Array{tangent_type(P),N}`, its fdata is itself, and its rdata is `NoRData` (handled generically
-# in `fwds_rvs_data.jl`). Memory/MemoryRef primals themselves are not covered here.
-#
-# Exception: `tangents.jl` (next to its `Array`/`Ptr` methods, not here) defines the single
-# type-level `tangent_type(MemoryRef{P})`/`tangent_type(Memory{P})` rule that the forward-mode
-# array builtin arms (`forward_interp.jl`) need to type their shadow SSAs. That's type
-# bookkeeping, not a value-level operation, so it's outside this file's scope but doesn't
-# conflict with it.
+# in `fwds_rvs_data.jl`); Memory/MemoryRef primals themselves are not covered here — their
+# type-level `tangent_type` rules live in `tangents.jl`.
 
 @inline function zero_tangent_internal(x::Array{P,N}, dict::MaybeCache) where {P,N}
     haskey(dict, x) && return dict[x]::tangent_type(typeof(x))

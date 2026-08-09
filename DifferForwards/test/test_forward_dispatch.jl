@@ -47,12 +47,11 @@ end
 
 # A `const` global `Ref`, unlike `dyn_ref` above, resolves to a concrete type at compile time, so
 # reading it (`Core.getfield` on a bare `GlobalRef` in value position) stays on the static
-# per-statement dualization path instead of falling to `dynamic_frule`. This used to crash with
-# `MethodError: get_tangent_field(::NoTangent, ::Symbol)`, because the tangent of the value the
-# global names was computed as the tangent of the `GlobalRef` struct itself (always `NoTangent`)
-# rather than the tangent of the `Ref`. Exercised for both a concrete-eltype and an `Any`-eltype
-# `Ref`, since the bug isn't a type-instability issue: both go through the identical code path.
-# Must be real `const` module-level globals for the same reason as `dyn_ref` above.
+# per-statement dualization path instead of falling to `dynamic_frule`. The tangent of the value the
+# global names must be computed from the `Ref`, not from the `GlobalRef` struct itself (which is
+# always `NoTangent`). Exercised for both a concrete-eltype and an `Any`-eltype `Ref`, since both go
+# through the identical code path. Must be real `const` module-level globals for the same reason as
+# `dyn_ref` above.
 const constref_float = Ref(2.0)
 constref_float_use(x) = x * constref_float[]
 const constref_any = Ref{Any}(2.0)
@@ -81,8 +80,7 @@ end
 # annotated `Core.Const(v)` in `:type` rather than a plain `Type`. This shows up for an ordinary
 # `@noinline` helper that has a genuine side effect (so the call can't be folded away entirely) but
 # whose return value is nonetheless provably fixed for these arguments, e.g. a usage-counter/
-# telemetry call guarding a fixed config value, or a feature-flag check guarding a branch. This used
-# to crash with `MethodError: no method matching dual_type(::Core.Const)` inside `frule_split!`. A
+# telemetry call guarding a fixed config value, or a feature-flag check guarding a branch. A
 # provably-constant result's derivative is definitionally zero regardless of what the callee
 # computes, so the call is reconstructed faithfully (preserving its side effect) but its shadow is
 # the zero tangent directly, without going through `frule!!` dispatch at all.

@@ -2,13 +2,12 @@
 # the same functions live in DifferReverse/src/rules_linalg.jl.
 #
 # `dot`/`norm`/`*` (on `Matrix`/`Vector`) bottom out in BLAS `ccall`s once inlined, which the
-# dualization engine can't see through. Forward mode has a per-target `:foreigncall` rule layer
-# (`src/foreigncalls.jl`, ISSUES #62), but that doesn't help here: it registers bulk memory copies,
-# while a BLAS kernel like `:cblas_ddot64_` is opaque native code with no rule and no prospect of
-# one. A hand rule is the only way to differentiate these — there's no generic-recursion fallback
-# like an ordinary composite function gets. Each rule computes the primal via a plain untracked call
-# (or an explicit loop) and supplies the tangent via the closed-form identity, never by dualizing
-# the target's actual body.
+# dualization engine can't see through. Forward mode's `:foreigncall` rule layer
+# (`src/foreigncalls.jl`) doesn't help here either: it registers bulk memory copies, while a BLAS
+# kernel like `:cblas_ddot64_` is opaque native code with no rule and no prospect of one. A hand
+# rule is the only way to differentiate these. Each rule computes the primal via a plain untracked
+# call (or an explicit loop) and supplies the tangent via the closed-form identity, never by
+# dualizing the target's actual body.
 #
 # `transpose`/`adjoint` deliberately have no rule here: both already differentiate correctly via the
 # generic struct-tangent machinery (`tangent_type(Transpose{...})` resolves to a real `Tangent`), so

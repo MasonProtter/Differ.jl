@@ -10,14 +10,10 @@
 # `dualize_to_ircode` (`forward_interp.jl`) for every intrinsic call in the primal IR. It emits the
 # primal + shadow IR directly into the caller's instruction stream and returns
 # `(primal_ssa, shadow_ssa)` (or `nothing` if unregistered) — no `Dual` boxing, no `frule!!` dispatch,
-# no `CodeInstance` resolution/compile the way a surviving high-level call (`frule_split!`, e.g.
-# `sin`/`cos`) needs. That machinery is fine for the handful of calls that survive a function's body,
-# but every arithmetic op in a differentiated function is an intrinsic call — routing each one through
-# a full `frule!!`/`CodeInstance` round trip (as an earlier version of this file did: wrap each
-# intrinsic in a thin wrapper function with its own singleton type, rewrite the call to it, and
-# dispatch `frule!!` on that) bloated both compile time and the generated code. Direct emission keeps
-# intrinsics exactly as cheap as the primal computation itself, while still reaching each rule via
-# ordinary dispatch instead of a hand-rolled if-else chain.
+# no `CodeInstance` resolution the way a surviving high-level call (`frule_split!`, e.g. `sin`/`cos`)
+# needs. Every arithmetic op in a differentiated function is an intrinsic call, so routing each
+# through a full `frule!!`/`CodeInstance` round trip would bloat both compile time and generated
+# code; direct emission keeps intrinsics as cheap as the primal computation itself.
 #
 # `ctx` is a `NamedTuple` of the closures `dualize_to_ircode` builds once per call:
 #   * `ctx.opf(name, ty, args...)` — emit `Expr(:call, GlobalRef(Core.Intrinsics, name), args...)`
@@ -167,11 +163,10 @@ end
 #    all: `Ptr` has no zero tangent (`zero_tangent(::Ptr)` throws by design), so there's nothing to
 #    fall back on and the rule declines via `ctx.reason` rather than inventing one.
 #
-# NOTE (limitation, see ISSUES): a `Ptr` field of a struct gets the primal's own address as its
-# tangent (`zero_tangent_internal(x::Ptr)`/`uninit_tangent(x::Ptr)` — a type-correct placeholder that
-# must not be dereferenced). `pointerset` cannot tell that apart from a genuine shadow pointer, so
-# storing through such a field writes tangent values over primal data. Pointer provenance isn't
-# tracked; nothing here can catch it.
+# Known limitation: a `Ptr` field of a struct gets the primal's own address as its tangent
+# (a type-correct placeholder that must not be dereferenced). `pointerset` cannot tell that apart
+# from a genuine shadow pointer, so storing through such a field writes tangent values over primal
+# data. Pointer provenance isn't tracked; nothing here can catch it.
 # ---------------------------------------------------------------------------
 
 # The null shadow pointer: what a rule hands back when the primal pointer addresses a buffer whose
