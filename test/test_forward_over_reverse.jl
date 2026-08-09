@@ -20,13 +20,35 @@ include(joinpath(@__DIR__, "testutils.jl"))
 #   3. `Vector{Float64}`, hand-written loop — array indexing, `MemoryRef` comms items, real
 #      block-stack traffic.
 #
-# `sum(abs2, v)` is explicitly not supported (see the "not `sum`" testset below): it routes through
-# `Base._mapreduce`/`mapreduce_impl`, which survive as non-inlined nested calls, each getting a
-# recycled inner tape via `_inner_ctx` — a `Ctx{<:Tape}`, which the hook above bails on cleanly (only
-# the fresh-tape `Ctx{Nothing}` context is supported). Reaching the `sum` spelling needs recycled-tape
-# support, a substantially larger job than array support — deferred.
+# Also covered below: `sum`/`mapreduce`-family primals (which route through non-inlined nested calls
+# to `Base._mapreduce`/`mapreduce_impl`, each getting a recycled inner tape via `_inner_ctx` — a
+# `Ctx{<:Tape}` context handed to a `reverse_fwds_impl` carrier), a pre-allocated top-level context
+# (`build_ctx(...; prealloc=true)`), and a bulk-saved argument mutation. All three were previously
+# blocked by one aliasing gate in `src/forward_interp.jl` that assumed a `Ctx{<:Tape}`'s tape had no
+# shadow to alias to — wrong, since `Ctx{P}`'s ordinary struct-derived tangent
+# (`Tangent{@NamedTuple{tape::tangent_type(P)}}`) gives it one (ISSUES #79). A directly self-recursive
+# primal (`reverse_fwds_recursive_ci`'s `Ctx{own_TapeT}` self-edge) now also works, as a consequence
+# of forward mode gaining its own general recursion support (ISSUES #82, `test_forward_recursion.jl`)
+# rather than anything specific to forward-over-reverse — see the "self-recursion" testset below.
+# *Mutual* recursion (A→B→A) is a different, still-open reverse-mode gap (its tape types would need a
+# fixed point solved across the whole SCC) — unaffected by either fix, and bails the same way with or
+# without FoR; see its own pinning testset below. Reverse-over-forward and reverse-over-reverse remain
+# non-goals — see the bail testset at the bottom of this file.
 
 D(f, x) = frule!!(Dual(f, zero_tangent(f)), Dual(x, one(x))).dx
+
+# Module-level (not testset-local) for the same reason `test_reverse_dispatch_recursion.jl`'s
+# recursive test fixtures are: a self-recursive function defined in local scope closes over its own
+# boxed binding, which gives it a real (non-`NoTangent`) function tangent instead of the plain
+# singleton a top-level function has, defeating `rev_gradient`'s zero-tangent seeding for `f`.
+@noinline function recsum(v::Vector{Float64}, i::Int)
+    i > length(v) && return 0.0
+    return v[i]^3 + recsum(v, i + 1)
+end
+
+# Mutually recursive (A→B→A), same module-level requirement as `recsum` above.
+@noinline mutA_fr(x::Float64, n::Int) = n <= 0 ? x : 2 * mutB_fr(x, n - 1)
+@noinline mutB_fr(x::Float64, n::Int) = n <= 0 ? x : 3 * mutA_fr(x, n - 1)
 
 @testset "staging 1: scalar straight-line" begin
     # g(x) = x² + sin(x), g'(x) = 2x + cos(x), g''(x) = 2 - sin(x).
@@ -140,42 +162,166 @@ end
     checkverify(x -> rev_gradient(nontrivial, [x, 2x, 3x])[2], (Float64,))
 end
 
-@testset "not `sum`: sum(abs2, v) bails on a recycled inner tape (Ctx{<:Tape})" begin
-    # `sum(abs2, v)` survives dualization as a non-inlined call into `Base._mapreduce`, whose own
-    # reverse-mode rule recycles an inner tape via `_inner_ctx` — i.e. a `Ctx{<:Tape}` context supplied
-    # to a `reverse_fwds_impl` carrier, which forward-over-reverse's aliasing restriction
-    # (`src/forward_interp.jl`) explicitly declines: with no shadow tape of its own threaded in from
-    # outside, there's nothing to alias the pullback's shadow tape to. Confirms this is a clean,
-    # located bail — not a silent zero and not a crash.
-    e = try
+@testset "sum-family correctness under forward-over-reverse (recycled inner tape, Ctx{<:Tape})" begin
+    # `sum(abs2, v)`/`sum(f, v)` survive dualization as a non-inlined call into `Base._mapreduce`,
+    # whose own reverse-mode rule recycles an inner tape via `_inner_ctx` — i.e. a `Ctx{<:Tape}`
+    # context supplied to a `reverse_fwds_impl` carrier. Each case is checked three ways: against a
+    # closed-form/independently-derived value, against the central-difference oracle, and for IR
+    # legality.
+
+    # f(v) = Σ vᵢ² — same closed form as `sumsq` above, reached through `sum(abs2, v)` instead of a
+    # hand-written loop.
+    val1 = D(1.0) do x
+        rev_gradient(v -> sum(abs2, v), [x, 2x, 3x])[2]
+    end
+    @test val1 ≈ [2.0, 4.0, 6.0]
+    fd1(x) = rev_gradient(v -> sum(abs2, v), [x, 2x, 3x])[2]
+    @test val1 ≈ (fd1(1.0 + 1e-6) .- fd1(1.0 - 1e-6)) ./ 2e-6 atol = 1e-6
+    checkverify(x -> rev_gradient(v -> sum(abs2, v), [x, 2x, 3x])[2], (Float64,))
+
+    # nt(v) = (Σvᵢ²)(Σvᵢ) — the cross term between the two sums gives a genuinely non-diagonal,
+    # non-constant Hessian (unlike `sumsq`'s constant 2I), so a dropped cross term can't pass.
+    nt(v) = sum(abs2, v) * sum(v)
+    val2 = D(1.0) do x
+        rev_gradient(nt, [x, 2x, 3x])[2]
+    end
+    @test val2 ≈ [52.0, 76.0, 100.0]
+    fd2(x) = rev_gradient(nt, [x, 2x, 3x])[2]
+    @test val2 ≈ (fd2(1.0 + 1e-6) .- fd2(1.0 - 1e-6)) ./ 2e-6 atol = 1e-6
+    checkverify(x -> rev_gradient(nt, [x, 2x, 3x])[2], (Float64,))
+
+    # sum(sin, v) — a reduction with a function (ISSUES #63b), over a plain array.
+    val3 = D(1.0) do x
+        rev_gradient(v -> sum(sin, v), [x, 2x, 3x])[2]
+    end
+    @test val3 ≈ [-0.8414709848078965, -1.8185948536513634, -0.4233600241796016]
+    fd3(x) = rev_gradient(v -> sum(sin, v), [x, 2x, 3x])[2]
+    @test val3 ≈ (fd3(1.0 + 1e-6) .- fd3(1.0 - 1e-6)) ./ 2e-6 atol = 1e-6
+    checkverify(x -> rev_gradient(v -> sum(sin, v), [x, 2x, 3x])[2], (Float64,))
+end
+
+@testset "pre-allocated context (Ctx{<:Tape}) correctness under forward-over-reverse" begin
+    # IR level, mirroring the `Ctx{Nothing}` check in staging 3 above: the reverse-mode carrier's own
+    # dualized IR must verify on its own, given a pre-allocated context type instead of a fresh one.
+    pctx = build_ctx(sumsq, (Vector{Float64},); prealloc=true)
+    argtypes = (fcodual_type(typeof(sumsq)), typeof(pctx), fcodual_type(Vector{Float64}))
+    ir, _ = code_dual_ircode(Differ.reverse_fwds_impl, argtypes)
+    Core.Compiler.verify_ir(ir)
+
+    # Runtime, exercising reuse: hold both the ctx *and* the outer `Dual` seed across two calls, so
+    # the primal tape *and* the shadow tape are recycled. (Plain `D(inner, 1.0)` called twice would
+    # only reuse the primal tape — `zero_tangent(f)` builds a fresh shadow closure every call.) This
+    # is the case the `Stack.position` shadow mirroring (`src/builtins.jl`) matters for: without it, a
+    # reused shadow tape's stack positions would drift out of step with the primal's.
+    ctx = build_ctx(sumsq, (Vector{Float64},); prealloc=true)
+    inner = let c = ctx
+        x -> value_and_gradient!(c, zero_fcodual(sumsq), zero_fcodual([x, 2x, 3x]))[2]
+    end
+    t = zero_tangent(inner)
+    r1 = frule!!(Dual(inner, t), Dual(1.0, 1.0)).dx
+    r2 = frule!!(Dual(inner, t), Dual(1.0, 1.0)).dx
+    @test r1 == r2 == (NoTangent(), [2.0, 4.0, 6.0])
+end
+
+@testset "self-recursion under forward-over-reverse" begin
+    # `recsum(v) = Σ vᵢ³`, gradient `3vᵢ²` — reverse mode alone handles this fine, through
+    # `reverse_fwds_recursive_ci`'s closed-form self-edge (`Ctx{own_TapeT}`, the same concrete Tape
+    # type at every recursion depth, so no fixed point to solve).
+    @test rev_gradient(recsum, [1.0, 2.0, 3.0], 1) == (NoTangent(), [3.0, 12.0, 27.0], NoTangent())
+
+    # Forward-over-reverse of it now works too (closes ISSUES #80), as a special case of the general
+    # forward-mode recursion fix (ISSUES #82): dualizing `reverse_fwds_impl`'s IR for this primal
+    # walks into the self-edge's `:invoke` back into `reverse_fwds_impl` itself — the *same*
+    # `reverse_fwds_impl` specialization currently being dualized one level up — and `frule_split!`'s
+    # recursion resolver now recognizes that and emits a static self-`:invoke` against the bare
+    # in-progress `MethodInstance` instead of recursing into `build_dual_ir` again (which is what used
+    # to trip `dualized_impl_in_progress`'s cycle guard at depth 2). This is also the first test to
+    # exercise `_inner_self_ctx`'s hand `frule!!` (`src/rules_ad_runtime.jl`) — previously written but
+    # never actually reached by anything, since dualization always bailed before the recursive call
+    # was ever emitted.
+    #
+    # IR level, mirroring the `Ctx{Nothing}` check in staging 3: the reverse-mode carrier's own
+    # dualized IR must verify on its own for a self-recursive primal too.
+    argtypes = (fcodual_type(typeof(recsum)), Ctx{Nothing}, fcodual_type(Vector{Float64}), fcodual_type(Int))
+    ir, _ = code_dual_ircode(Differ.reverse_fwds_impl, argtypes)
+    Core.Compiler.verify_ir(ir)
+
+    # Runtime, FD-matched.
+    val = D(1.0) do x
+        rev_gradient(recsum, [x, 2x, 3x], 1)[2]
+    end
+    @test val ≈ [6.0, 24.0, 54.0]
+    fd(x) = rev_gradient(recsum, [x, 2x, 3x], 1)[2]
+    @test val ≈ (fd(1.0 + 1e-6) .- fd(1.0 - 1e-6)) ./ 2e-6 atol = 1e-6
+end
+
+@testset "mutual recursion under forward-over-reverse still bails (reverse mode's own SCC gap, not forward mode's)" begin
+    # Unlike direct self-recursion, mutual recursion (A→B→A) is a genuine reverse-mode gap: its tape
+    # types would need a fixed-point solved across the whole SCC (`reverse_fwds_recursive_ci`'s
+    # docstring), which isn't implemented — plain, non-FoR `rev_gradient` on a mutually recursive
+    # primal already bails on its own, via `interp.in_progress` (`reverse_interp.jl`'s
+    # `build_reverse_fwds_ir`/`build_reverse_pullback_ir`). Forward-mode recursion support (ISSUES
+    # #82) doesn't touch this: it fixes forward mode's *own* dualizer, not reverse mode's tape-type
+    # machinery. Pin that the bail under FoR still carries reverse mode's message
+    # ("recursive reverse-mode forwards-pass build for ...") and not forward mode's ("recursive
+    # dualization of ...") — i.e. forward mode gets past its own layer fine and the failure is
+    # reverse mode's, propagated through unchanged.
+    e_plain = try
+        rev_gradient(mutA_fr, 1.0, 3)
+        nothing
+    catch err
+        err
+    end
+    @test e_plain isa ErrorException
+    @test occursin("reverse-mode forwards-pass build", e_plain.msg)
+
+    e_for = try
         D(1.0) do x
-            rev_gradient(v -> sum(abs2, v), [x, 2x, 3x])[2]
+            rev_gradient(mutA_fr, x, 3)[1]
         end
         nothing
     catch err
         err
     end
-    @test e isa ErrorException
-    @test occursin("Ctx", e.msg)
-    @test occursin("not yet supported", e.msg)
+    @test e_for isa ErrorException
+    @test occursin("reverse-mode forwards-pass build", e_for.msg)
+    @test !occursin("recursive dualization of", e_for.msg)   # forward mode's own (fixed) message
 end
 
-@testset "Ctx{<:Tape} (pre-allocated context) bails cleanly" begin
-    # Same underlying restriction as the `sum` case above, triggered directly: a pre-allocated
-    # (`build_ctx(...; prealloc=true)`) context's tape is supplied from outside `reverse_fwds_impl`,
-    # so forward-over-reverse has no shadow tape to alias it to. `rev_gradient`/`build_ctx(...;
-    # prealloc=false)` (what plain `rev_gradient` and the staging tests above use) are unaffected — this
-    # is specifically about the pre-allocated path.
-    ctx = build_ctx(sumsq, (Vector{Float64},); prealloc=true)
-    inner(x) = value_and_gradient!(ctx, zero_fcodual(sumsq), zero_fcodual([x, 2x, 3x]))[2]
-    e = try
-        D(inner, 1.0)
-        nothing
-    catch err
-        err
+@testset "bulk-save under forward-over-reverse (fresh and pre-allocated)" begin
+    # A primal that mutates its argument array in a loop routes the write through the bulk
+    # save/restore path (`_bulk_save!`/`_bulk_restore!`, `src/rules_ad_runtime.jl`), which reads and
+    # writes the tape's own `Vector{Any}` buffer field (`getfield(tape, 3)`) rather than the per-block
+    # comms stacks the staging tests above exercise. `bulk_sq!(v) = Σ vᵢ²` in place, then sums —
+    # same closed-form gradient as `sumsq`, reached through the bulk-save path instead.
+    function bulk_sq!(v::Vector{Float64})
+        for i in 1:length(v)
+            @inbounds v[i] = v[i] * v[i]
+        end
+        s = 0.0
+        for i in 1:length(v)
+            @inbounds s += v[i]
+        end
+        return s
     end
-    @test e isa ErrorException
-    @test occursin("pre-allocated context", e.msg)
+
+    # Fresh tape (Ctx{Nothing}).
+    val = D(1.0) do x
+        rev_gradient(bulk_sq!, [x, 2x, 3x])[2]
+    end
+    @test val ≈ [2.0, 4.0, 6.0]
+    checkverify(x -> rev_gradient(bulk_sq!, [x, 2x, 3x])[2], (Float64,))
+
+    # Pre-allocated (recycled) tape — ctx and outer Dual seed both held across two calls, so the
+    # bulk-save buffer is reused, not freshly allocated each time.
+    ctx = build_ctx(bulk_sq!, (Vector{Float64},); prealloc=true)
+    inner = let c = ctx
+        x -> value_and_gradient!(c, zero_fcodual(bulk_sq!), zero_fcodual([x, 2x, 3x]))[2]
+    end
+    t = zero_tangent(inner)
+    r1 = frule!!(Dual(inner, t), Dual(1.0, 1.0)).dx
+    r2 = frule!!(Dual(inner, t), Dual(1.0, 1.0)).dx
+    @test r1 == r2 == (NoTangent(), [2.0, 4.0, 6.0])
 end
 
 @testset "reverse-over-forward and reverse-over-reverse bail, not crash or silently zero" begin

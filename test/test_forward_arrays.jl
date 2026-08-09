@@ -257,6 +257,18 @@ end
     @test r.x ≈ 9.0 && r.dx ≈ 3.0
     checkverify(alloccomp, (Float64, Int))
 
+    # `[x, 2.0, 3.0]` array-literal allocation (ISSUES #83). For this element count, `Base.vect`
+    # lowers to a *dynamic*-index loop copy — build the elements into a tuple via `Core.tuple`, then
+    # `getfield(tuple, i, false)` with `i` a loop induction variable — rather than fully-unrolled
+    # static-index copies. The tuple statement's inferred type is a `Core.PartialStruct`, not a bare
+    # `Type` (const-propagation having pinned the two literal elements), which used to `TypeError` in
+    # `apply_builtin_frule!(::Val{Core.getfield})`'s dynamic-index branch (`Pobj <: Dual || ...`
+    # tested directly against the un-widened lattice element).
+    alloclit(x) = sum([x, 2.0, 3.0])
+    r = frule!!(Dual(alloclit, NoTangent()), Dual(3.0, 1.0))
+    @test r.x ≈ 8.0 && r.dx ≈ 1.0
+    checkverify(alloclit, (Float64,))
+
     # Still out of scope: growing an existing array (`push!`/`resize!`), which calls
     # `Core.memoryrefoffset` directly, a distinct, still-unhandled builtin (unrelated to
     # allocation). Should bail gracefully with an `ErrorException`.

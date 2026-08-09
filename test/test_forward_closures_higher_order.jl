@@ -248,15 +248,16 @@ end
     Core.Compiler.verify_ir(code_dual_ircode(d1_scpx, (Float64,))[1])
     @test true
 
-    # Regression: forward-mode dualization of a self-recursive `@noinline` primal must bail
-    # cleanly rather than stack-overflow. This exercises the `dualized_impl_in_progress` cycle
-    # guard, whose forward-mode twist is that the recursion crosses fresh `ADInterpreter`
-    # instances via the `frule!!` `@generated` boundary, so the guard is task-local (shared across
-    # those instances) rather than a per-`interp` field like reverse mode's `in_progress`.
-    # `rec_self` must be top-level, not testset-local, for the same reason as the top of this file:
-    # a testset-local self-recursive function boxes its own binding, giving it a real
-    # (non-`NoTangent`) tangent type that would defeat the `Dual(rec_self, NoTangent())` call below.
-    @test_throws ErrorException frule!!(Dual(rec_self, NoTangent()), Dual(1.0, 1.0), Dual(3, NoTangent()))
+    # Self-recursion, direct correctness check (used to be a `@test_throws` regression — forward mode
+    # had no recursion support at all and bailed cleanly via the `dualized_impl_in_progress` cycle
+    # guard; ISSUES #82 gave `frule_split!` a resolver that emits a static self-`:invoke` for exactly
+    # this shape instead, so this now runs and must give the right answer, not just avoid crashing).
+    # `rec_self(x,n) = n<=0 ? x : rec_self(x,n-1)` is the identity in `x` for any `n`, so `d/dx == 1`
+    # regardless of recursion depth. `rec_self` must be top-level, not testset-local, for the same
+    # reason as the top of this file: a testset-local self-recursive function boxes its own binding,
+    # giving it a real (non-`NoTangent`) tangent type that would defeat the `Dual(rec_self,
+    # NoTangent())` call below.
+    @test frule!!(Dual(rec_self, NoTangent()), Dual(1.0, 1.0), Dual(3, NoTangent())).dx == 1.0
 
     # Previously a limitation: a closure/struct with differentiable fields could not be
     # differentiated at order ≥2. The blocker was its shadow being built by a `build_tangent` call,

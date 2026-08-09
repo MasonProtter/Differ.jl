@@ -111,9 +111,12 @@ end
 # already generic over the tape type they recycle, so the shadow call is literally the *same*
 # function called again: `_inner_ctx`/`_inner_self_ctx` on the shadow stack, with the shadow tape
 # type (`tangent_type(TapeT)`) in place of the primal one. Correct because primal and shadow stacks
-# are always pushed in lockstep (the `Stack` rule above), so they agree on position/occupancy at
-# every call — the recycle-vs-allocate-fresh decision the primal makes is exactly the one the shadow
-# makes too.
+# agree on *position* at every call (the `Stack` rule above keeps pushes/pops in lockstep) — not on
+# *occupancy*: a pre-allocated primal tape can recycle an already-populated slot while a per-call
+# `zero_tangent` shadow tape allocates fresh, so `_inner_ctx` routinely takes different
+# recycle-vs-allocate-fresh branches on the two sides. Sound anyway, because the pairing this rule
+# relies on is established freshly within the call, not carried over from occupancy agreeing across
+# calls.
 #
 # `Ctx{P}` gets its tangent from the ordinary generic struct derivation (a 1-field immutable wrapper,
 # not one of the self-typed shadows) — `Tangent{@NamedTuple{tape::tangent_type(P)}}` — so the result

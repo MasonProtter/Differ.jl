@@ -8,6 +8,7 @@ using SafeTestsets
 @safetestset "forward: foreigncall (ccall)" begin include("test_forward_foreigncall.jl") end
 @safetestset "forward: dispatch" begin include("test_forward_dispatch.jl") end
 @safetestset "forward: closures & higher-order" begin include("test_forward_closures_higher_order.jl") end
+@safetestset "forward: recursion" begin include("test_forward_recursion.jl") end
 @safetestset "forward-over-reverse" begin include("test_forward_over_reverse.jl") end
 @safetestset "reverse: scalar & struct" begin include("test_reverse_scalar_struct.jl") end
 @safetestset "reverse: control flow" begin include("test_reverse_control_flow.jl") end

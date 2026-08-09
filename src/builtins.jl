@@ -86,11 +86,15 @@ end
 # For a `Stack`/`CommsCell`/`Tape` field index `fi` (already validated by `_bi_field_index`): the
 # shadow's own field type there when it's sound to mirror `getfield`/`setfield!` directly, or
 # `nothing` when the field carries no tangent. These types are self-similar shadows (own `tangent_type`
-# maps the type parameter directly), but not every field matches: `Tape.block_stack` is always declared
-# `Stack{Int32}` regardless of `Tape`'s type parameters, so a shadow `Tape`'s `block_stack` is also
-# `Stack{Int32}`, not `Stack{NoTangent}` — bookkeeping with nothing to differentiate, same status as a
-# plain `Int` field. Independent of `Ti`: re-deriving from `Pobj` alone keeps `getfield` and
-# `setfield!` agreeing on the same field.
+# maps the type parameter directly). `Tape.block_stack` *does* mirror despite looking like it
+# shouldn't: it's always declared `Stack{Int32}` regardless of `Tape`'s type parameters, and
+# `tangent_type(Stack{Int32}) === Stack{Int32}` by the self-typed collapse (`stack.jl`), so a shadow
+# `Tape`'s `block_stack` is also `Stack{Int32}` — same object shape on both sides, nothing to
+# differentiate but still mirrored. The real non-mirroring cases are `Stack.position` (an `Int`,
+# handled as a special case in `setfield!`'s branch below rather than through this function),
+# `CommsCell.val` when its element has no tangent, and a degenerate all-`NoTangent` `comms`/`args`
+# tuple. Independent of `Ti`: re-deriving from `Pobj` alone keeps `getfield` and `setfield!` agreeing
+# on the same field.
 function _bi_selfsim_shadow_field(@nospecialize(Pobj), fi::Int)
     FT = tangent_type(fieldtype(Pobj, fi))
     Fsh = fieldtype(tangent_type(Pobj), fi)
@@ -151,7 +155,14 @@ const _ifelseg    = GlobalRef(Core, :ifelse)
 # operand, not embedded as a dangling reference into the primal's numbering (embedding it raw crashed
 # with a `TypeError`, since the two numberings diverge once shadow instructions are interleaved).
 function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
-    Pobj = ctx.optype(actual[1])
+    # `_widen`: `ctx.optype` can return a `Core.PartialStruct`/`Core.Const` lattice element (const
+    # propagation narrowing an object's inferred type), not a bare `Type` — e.g. a 3-element array
+    # literal's dynamic-index loop-copy shape (`getfield(tuple, i, false)` with `i` a loop variable)
+    # infers the tuple operand as `Core.PartialStruct(Tuple{Float64,Float64,Float64}, ...)`. Every
+    # `<:`/`isa DataType` check below needs a real `Type`; skipping this widening `TypeError`s at the
+    # first `<:` (same bug class as `apply_builtin_frule!(::Val{Core.tuple})`'s `fieldtype` call —
+    # gotcha #9 in the `differ-ircode-dualization` skill, ISSUES #83).
+    Pobj = _widen(ctx.optype(actual[1]))
     idx = ctx.presolve(actual[2])
     TT = ctx.tt(Ti)
     if !_bi_literal_index(actual[2]) && TT !== NoTangent
@@ -283,7 +294,12 @@ end
 # dynamic index could hit carries a tangent anyway.
 function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
     idx = ctx.presolve(actual[2])
-    Pobj = ctx.optype(actual[1])
+    # `_widen` — same reason as `getfield`'s arm above (ISSUES #83): `ctx.optype` can return a
+    # lattice element, not a bare `Type`. Every direct use of `Pobj` below happens to already sit
+    # behind an `isa DataType` guard (so this doesn't fix a live crash the way `getfield`'s did), but
+    # it's the same pattern — widen at the source rather than rely on every future edit preserving
+    # the guard ordering.
+    Pobj = _widen(ctx.optype(actual[1]))
     if !_bi_literal_index(actual[2]) && !(Pobj isa DataType && _bi_homog_tangent_type(Pobj) === NoTangent)
         return nothing
     end
@@ -300,7 +316,19 @@ function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
             return nothing
         end
         Fsh = _bi_selfsim_shadow_field(Pobj, fi)
-        Fsh === nothing && return p, NoTangent()
+        if Fsh === nothing
+            # `Stack.position` has no tangent (`Int`, tangent type `NoTangent`), but it's still
+            # lockstep bookkeeping that must stay identical between primal and shadow tape — not
+            # differentiable content, just an index. Mirror the write with the **primal** value so a
+            # recycled shadow tape (forward-over-reverse's `Ctx{<:Tape}` case) doesn't retain a stale
+            # position from a previous call. Its only other writers are `push!`/`pop!`, hand-frule'd
+            # in `rules_ad_runtime.jl` and never reaching the dualizer.
+            if Pobj <: Stack && fieldname(Pobj, fi) === :position
+                ctx.emit!(Expr(:call, _setfieldg, ctx.tresolve(actual[1]), idx, ctx.presolve(actual[3])),
+                          fieldtype(Pobj, fi))
+            end
+            return p, NoTangent()
+        end
         newtan = ctx.tresolve(actual[3])
         ctx.emit!(Expr(:call, _setfieldg, ctx.tresolve(actual[1]), idx, newtan), Fsh)
         return p, newtan

@@ -203,20 +203,31 @@ function primal_of_impl(interp::ADInterpreter, impl_mi::MethodInstance, reason::
 end
 
 # Recursion cycle guard for `build_dual_ir`, analogous to reverse mode's `interp.in_progress` field
-# (`contextual.jl`/`reverse_interp.jl`) but task-local rather than per-instance: a self- or
-# mutually-recursive primal's nested resolution crosses the `frule!!` `@generated`-function boundary
-# (`frule_codeinstance` below compiles the generic `frule!!` fallback under a fresh
+# (`contextual.jl`/`reverse_interp.jl`) but task-local rather than per-instance, for the same reason:
+# a self- or mutually-recursive primal's nested resolution crosses the `frule!!` `@generated`-function
+# boundary (`frule_codeinstance` compiles the generic `frule!!` fallback under a fresh
 # `CC.NativeInterpreter`, whose generator body `frule_body` then spins up a brand-new
 # `ADInterpreter{Forward}` to resolve the inner `dualized_impl`), so a guard scoped to one interpreter
 # instance can never observe the cycle — each recursive level uses a different `interp` object even
-# though it targets the same `impl_mi`. Confirmed empirically: a `@noinline` self-recursive function
-# run through `frule!!` stack-overflows without this (a hard crash, not a catchable error) — the same
-# failure mode reverse mode's `in_progress` field prevents, just reached by a different code path.
+# though it targets the same `impl_mi`.
 #
-# The recursion is synchronous and never leaves the compiling task, so task-local storage is exactly
-# the right scope: shared across the nested interpreter instances (so the cycle stays observable) but
-# isolated between concurrently-compiling tasks/threads. A plain `const` global `IdDict` would be a
-# shared bag concurrent compilation on another thread could corrupt; keying it to the task fixes that.
+# NOT the primary recursion mechanism — `frule_split!`'s `dual_recursive_impl_mi` resolves a
+# self-/mutually-recursive call *at the call site*, before ever reaching a `frule_codeinstance`/
+# `typeinf_ext_toplevel` call that would recurse back into `build_dual_ir` for the same `impl_mi`. A
+# self-edge takes a static bare-`MethodInstance` `:invoke`; a mutual back-edge takes the ordinary
+# dynamic `:call` form. Neither path re-enters `build_dual_ir`, so this guard is never armed for
+# either shape any more. It survives as a backstop for anything that reaches `build_dual_ir` some
+# other way — a genuine bug in the resolver above, or any future call path that doesn't route through
+# `frule_split!`. Confirmed empirically (before the resolver existed): a `@noinline` self-recursive
+# function run through `frule!!` stack-overflows without this (a hard crash, not a catchable error) —
+# the same failure mode reverse mode's `in_progress` field prevents, just reached by a different code
+# path.
+#
+# The recursion this backstops is synchronous and never leaves the compiling task, so task-local
+# storage is exactly the right scope: shared across the nested interpreter instances (so the cycle
+# stays observable) but isolated between concurrently-compiling tasks/threads. A plain `const` global
+# `IdDict` would be a shared bag concurrent compilation on another thread could corrupt; keying it to
+# the task fixes that.
 function dualized_impl_in_progress()
     return get!(() -> IdDict{MethodInstance,Nothing}(), task_local_storage(),
                 :differ_dualized_impl_in_progress)::IdDict{MethodInstance,Nothing}
@@ -356,23 +367,36 @@ function _build_dual_ir(interp::ADInterpreter, impl_mi::MethodInstance, reason::
     # guard, scoped to just this nested build.
     if is_reverse_fwds_impl(primal_mi)
         # The forwards and pullback passes share the tape, so their shadow tapes must be `===` too.
-        # With `Ctx{Nothing}` (fresh tape — `reverse_fwds_impl`'s own prologue allocates it) this is
-        # automatic: the tape is an explicit value `reverse_fwds_impl` returns and `(t::Tape)(seed)`
-        # receives, so the shadow tape rides along as that value's tangent through ordinary
-        # split-shadow SSA tracking, no extra plumbing needed (confirmed against the independent
-        # forward-over-forward oracle, `code_dual_ircode(...; order=2)`). `Ctx{<:Tape}` (pre-allocated)
-        # is different: `reverse_fwds_impl`'s prologue reads the tape out of `ctx`, supplied from
-        # outside by ordinary code, so there's no shadow tape to ride along with — not implemented.
-        # Bail cleanly here rather than an opaque internal `TypeError` deeper in the transform.
-        CtxT = primal_mi.specTypes.parameters[3]
-        if !(CtxT isa DataType && CtxT <: Ctx && CtxT.parameters[1] === Nothing)
-            reason[] = "forward-over-reverse only supports the fresh-tape context (`Ctx()`/" *
-                       "`Ctx{Nothing}`, what `rev_gradient` and `build_ctx(...; prealloc=false)` use) — " *
-                       "a pre-allocated context (`build_ctx(...; prealloc=true)`, ctx type `$(CtxT)`) " *
-                       "is not yet supported: its tape is supplied from outside this build, with no " *
-                       "shadow tape to alias it to"
-            return nothing
-        end
+        # This holds for both context shapes `reverse_fwds_impl` can be called with:
+        #   - `Ctx{Nothing}` (fresh tape) — the prologue allocates the tape inline via `%new`, so the
+        #     `%new` self-similar arm builds a parallel shadow tape; it rides out on the returned tape
+        #     value's tangent through ordinary split-shadow SSA tracking, no extra plumbing needed.
+        #   - `Ctx{<:Tape}` (pre-allocated, e.g. `build_ctx(...; prealloc=true)` or a recycled
+        #     `_inner_ctx`) — the prologue instead reads the tape out of `ctx` via `getfield`, and the
+        #     *shadow* tape comes out of `ctx`'s own tangent by the ordinary general-struct `getfield`
+        #     path (`tangent_type(Ctx{P}) === Tangent{@NamedTuple{tape::tangent_type(P)}}`, so
+        #     `getfield(ctx_dual.dx.fields, 1)` is the shadow tape, correctly typed). That's the same
+        #     object the prologue writes `args` into and the `ReturnNode` hands back to
+        #     `reverse_pullback_impl`, so the forwards and pullback passes still share one shadow tape.
+        # (Confirmed against the independent forward-over-forward oracle,
+        # `code_dual_ircode(...; order=2)`.) This is what makes forward-over-reverse work through
+        # `_inner_ctx`-recycled nested derived callees and a top-level `build_ctx(...; prealloc=true)`
+        # context. A genuinely mismatched pre-allocated tape is still caught, downstream, by
+        # `reverse_fwds_to_ircode`'s own `PreTapeT !== TapeT` bail (`reverse_interp.jl`), propagated
+        # through `reason[]`.
+        #
+        # A self-recursive primal also falls out, once `frule_split!` has its own recursion resolver
+        # (ISSUES #80/#82): `reverse_fwds_recursive_ci`'s self-edge targets `Ctx{own_TapeT}` — the same
+        # concrete type at every recursion depth, no fixed point to solve. Dualizing that self-edge
+        # still walks into this very branch for the exact same `reverse_fwds_impl` specialization one
+        # level down, but that's not a cycle at the *outer* level: the outer entry (from `rev_gradient`
+        # etc.) starts at `Ctx{Nothing}`, a genuinely different carrier from the self-edge's
+        # `Ctx{own_TapeT}`, so that first nested compile is real work, not a repeat. It's only the
+        # self-edge's *own* self-call, one level further in, that's type-identical to a build already
+        # in progress — and `frule_split!` now resolves that directly to a static self-`:invoke`
+        # against the bare in-progress `MethodInstance` rather than recursing into `build_dual_ir`
+        # again, exactly mirroring the argument reverse mode's own comment above makes for its
+        # `Ctx{Nothing}`/`Ctx{<:Tape}` sibling pair. One bounded nested compile total.
         rinterp = ADInterpreter{Reverse}(; world=interp.world, nested_forward=true)
         pir = optimized_reverse_fwds_ir(rinterp, primal_mi, reason, edges)
         pir === nothing && return nothing
@@ -467,6 +491,28 @@ function frule_codeinstance(interp::ADInterpreter, @nospecialize(ftype), @nospec
     ci = CC.typeinf_ext_toplevel(CC.NativeInterpreter(world), frule_mi, CC.SOURCE_MODE_ABI)::CodeInstance
     CC.add_invoke_edge!(edges, frule_tt, ci)
     return ci
+end
+
+# The `dualized_impl` carrier a *derived* (non-hand-ruled) call to `Dual{ftype,ftangty}(dual_argtypes...)`
+# would compile to, or `nothing` when a hand-written `frule!!` wins instead (no derived recursion is
+# possible through a hand rule — it's a leaf, resolved directly by `frule_codeinstance`) or nothing
+# resolves at all. Used by `frule_split!` to detect a recursive edge (self or mutual) *before*
+# resolving/compiling anything, so it can route around `frule_codeinstance`'s `typeinf_ext_toplevel`
+# call, which is exactly what would recurse forever on a self-/mutually-recursive primal.
+#
+# Object identity with the carrier `frule_body`'s generator would itself produce is the whole point
+# (`callee_impl_mi === impl_mi` in `frule_split!` below only means anything if this resolves the same
+# way `dualized_impl`'s own generator does) — so this mirrors `frule_body` exactly: `findsup` against
+# the interpreter's method table, then the 3-argument `specialize_method`, not `findall`.
+function dual_recursive_impl_mi(interp, @nospecialize(ftype), @nospecialize(ftangty), dual_argtypes)
+    frule_tt = Tuple{typeof(frule!!), Dual{ftype,ftangty}, dual_argtypes...}
+    fm, _ = CC.findsup(frule_tt, CC.method_table(interp))
+    (fm === nothing || !isa(fm.method, Method) || !is_generated_frule_fallback(fm.method)) && return nothing
+    impl_tt = Tuple{typeof(dualized_impl), Dual{ftype,ftangty}, dual_argtypes...}
+    match, _ = CC.findsup(impl_tt, CC.method_table(interp))
+    match === nothing && return nothing
+    isa(match.method, Method) || return nothing
+    return specialize_method(match.method, match.spec_types, match.sparams)::MethodInstance
 end
 
 # Resolve an arbitrary call whose dispatch tuple is `tt` to a `CodeInstance` for a static `:invoke`,
@@ -618,6 +664,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     fruleg = frule!!
     Dualg  = Dual                # the `Dual` constructor, for a runtime (dynamic) pack of a non-concrete result
     dynfrule_g = dynamic_frule   # runtime dispatcher for a surviving dynamic (`apply_generic`) call
+    dualimplg  = dualized_impl   # self-recursive edge target (`frule_split!`'s static self-`:invoke`)
     getf   = GlobalRef(Core, :getfield)
     ctuple = GlobalRef(Core, :tuple)
     intrg(name) = GlobalRef(Core.Intrinsics, name)
@@ -633,8 +680,13 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # the tangent's own type.
     tt(@nospecialize T) = tangent_type(_widen(T))
 
-    code = Any[]; types = Any[]
-    emit!(ex, @nospecialize(ty)) = (push!(code, ex); push!(types, ty); Core.SSAValue(length(code)))
+    code = Any[]; types = Any[]; flags = UInt32[]
+    # `flag` defaults to `CC.IR_FLAG_NULL` (ordinary statement, no special inlining/optimization
+    # treatment) — every existing call site is unaffected. The one caller that passes something else
+    # is the self-recursive `:invoke` in `frule_split!` (`IR_FLAG_NOINLINE`, so the inliner doesn't
+    # try to inline a self-call into itself).
+    emit!(ex, @nospecialize(ty), flag::UInt32=CC.IR_FLAG_NULL) =
+        (push!(code, ex); push!(types, ty); push!(flags, flag); Core.SSAValue(length(code)))
     opf(name, ty, args...) = emit!(Expr(:call, intrg(name), args...), ty)
     # Emit a call `f(args...)` (declared result type `R`) as a static `:invoke` to a resolved
     # `CodeInstance` when its signature resolves, falling back to a bare `:call` otherwise. The win:
@@ -1008,10 +1060,67 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # and the abstract `Dual` when `R` is non-concrete — the concrete `Dual` the rule actually
         # returns is a subtype of the latter (whereas the invariant `Dual{Any,Any}` would be unsound
         # and miscompile).
-        ci = frule_codeinstance(interp, ftype, tt(ftype), dualtys, edges)
         DR = dual_type(R)
-        dd = ci === nothing ? emit!(Expr(:call, fruleg, fd, duals...), DR) :
-                              emit!(Expr(:invoke, ci, fruleg, fd, duals...), DR)
+        # Recursion: does this call's *derived* (non-hand-ruled) carrier resolve to `impl_mi` itself
+        # (direct self-recursion) or to some other carrier that's currently mid-compile on this task
+        # (mutual recursion, A→B→A)? Checked before ever calling `frule_codeinstance` — that call
+        # would otherwise `typeinf_ext_toplevel` straight into the same cycle
+        # `dualized_impl_in_progress` exists to catch. Order matters: `impl_mi` is itself already a
+        # member of `dualized_impl_in_progress()` (inserted by `build_dual_ir` before this build
+        # started), so the self-edge test must run *first* — checking `haskey` before `===` would
+        # misroute every self-edge onto the slower mutual-recursion path below.
+        callee_impl_mi = dual_recursive_impl_mi(interp, ftype, tt(ftype), dualtys)
+        dd = if callee_impl_mi !== nothing && callee_impl_mi === impl_mi
+            # Self-recursion: `impl_mi` is the *bare, uncompiled* `MethodInstance` currently being
+            # dualized — exactly the target this build's own `finishinfer!`/`optimize` seam will
+            # install a `CodeInstance` for once this pass returns. `Expr(:invoke, mi, f, args...)`
+            # against a bare `MethodInstance` (not a `CodeInstance`) is legal and fast ONLY for this
+            # exact case: `codegen.cpp`'s `mi == ctx.linfo` self-recursion fast path emits a direct
+            # specsig self-call, no `CodeInstance` needed and nothing to JIT separately — the same
+            # trick reverse mode's `reverse_fwds_recursive_ci` already uses for its own self-edge.
+            # This must NEVER be used for a non-self target: codegen otherwise requires a
+            # `CodeInstance`, so a bare non-self MI degrades to a boxed `jl_invoke` that resolves
+            # against the *native* method cache — Differ's dual code is cached under
+            # `cache_owner(::ADInterpreter{Forward}) === Forward()`, so that would silently run
+            # `dualized_impl`'s throwing stub instead of the derivative (a wrong answer, not an
+            # error) — see the `haskey` branch below for the case that must NOT take this path.
+            # `dualized_impl(dualargs::Dual...)` takes the callee's own dual `fd` FIRST, then each
+            # value arg dual — the same convention `frule!!` itself uses (and what `frule_body`'s
+            # generated body forwards unchanged: `invoke(dualized_impl, $cinst, dualargs...)`, where
+            # `dualargs[1]` is the callee dual). Omitting `fd` here is an arity mismatch against
+            # `impl_mi`'s own `specTypes` — caught the hard way once already (a `verify_ir`-clean but
+            # run-time "Unreachable reached" codegen crash, since a bare-MI `:invoke`'s argument count
+            # isn't checked until codegen builds the direct specsig call).
+            frule_tt = Tuple{typeof(frule!!), Dual{ftype,tt(ftype)}, dualtys...}
+            push!(edges, frule_tt, Core.methodtable)   # a later hand frule!! must invalidate this derived choice
+            CC.add_inlining_edge!(edges, callee_impl_mi)
+            # `IR_FLAG_NOINLINE`: `handle_invoke_expr!` processes an `:invoke` regardless of
+            # `CallInfo`, extracting the MI from a bare `MethodInstance` and trying to inline it —
+            # this is the surgical way to stop it from inlining this self-call into itself. Widening
+            # `src_inlining_policy` instead would also block ordinary, wanted inlining of
+            # non-recursive dual carriers, and by the time `CC.optimize` runs the IPO passes,
+            # `impl_mi` has already been removed from `dualized_impl_in_progress()` anyway (the
+            # `haskey` test in `build_contextual_ir`'s caller no longer applies at that point).
+            emit!(Expr(:invoke, impl_mi, dualimplg, fd, duals...), DR, CC.IR_FLAG_NOINLINE)
+        elseif callee_impl_mi !== nothing && haskey(dualized_impl_in_progress(), callee_impl_mi)
+            # Mutual recursion: the callee's own carrier is genuinely mid-compile on this task (some
+            # other, currently-in-progress `impl_mi` up the call chain), so there is no
+            # `CodeInstance` for it yet and it isn't this build's own `impl_mi` either — the
+            # bare-MI self-invoke trick above doesn't apply. Fall back to the existing dynamic form:
+            # a plain (uninlined, since it carries no `CallInfo`) `:call` to `frule!!`, resolved at
+            # run time against whatever `CodeInstance` the in-progress build eventually installs
+            # under `Forward()`. No invoke edge is registered here — nothing was compiled. This is
+            # what breaks the compile-time cycle: any SCC, of any size, stops recursing at the first
+            # back-edge into an already-in-progress carrier, so `build_dual_ir` finishes in bounded
+            # work without ever re-entering `dualized_impl_in_progress`'s own guard.
+            frule_tt = Tuple{typeof(frule!!), Dual{ftype,tt(ftype)}, dualtys...}
+            push!(edges, frule_tt, Core.methodtable)
+            emit!(Expr(:call, fruleg, fd, duals...), DR)
+        else
+            ci = frule_codeinstance(interp, ftype, tt(ftype), dualtys, edges)
+            ci === nothing ? emit!(Expr(:call, fruleg, fd, duals...), DR) :
+                             emit!(Expr(:invoke, ci, fruleg, fd, duals...), DR)
+        end
         return emit!(Expr(:call, getf, dd, 1), R), emit!(Expr(:call, getf, dd, 2), tt(R))
     end
 
@@ -1518,7 +1627,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     for i in 1:len
         stream.stmt[i] = code[i]
         stream.type[i] = types[i]
-        stream.flag[i] = CC.IR_FLAG_NULL
+        stream.flag[i] = flags[i]
     end
     new_blocks = Vector{CC.BasicBlock}(undef, nblocks)
     for b in 1:nblocks
