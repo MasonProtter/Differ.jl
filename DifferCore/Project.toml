@@ -1,0 +1,13 @@
+name = "DifferCore"
+uuid = "b1e82f89-b04a-4ab9-a6bf-30478a31d0bf"
+version = "0.1.0"
+authors = ["Mason Protter <mason.protter@icloud.com>"]
+
+[deps]
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+
+[compat]
+julia = "1.13"
+
+[workspace]
+projects = ["test"]

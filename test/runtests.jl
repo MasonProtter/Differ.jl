@@ -1,30 +1,10 @@
 using SafeTestsets
 
-@safetestset "tangent system" begin include("test_tangent_system.jl") end
-@safetestset "forward: scalar" begin include("test_forward_scalar.jl") end
-@safetestset "forward: control flow" begin include("test_forward_control_flow.jl") end
-@safetestset "forward: arrays" begin include("test_forward_arrays.jl") end
-@safetestset "forward: pointers & GC.@preserve" begin include("test_forward_pointers.jl") end
-@safetestset "forward: foreigncall (ccall)" begin include("test_forward_foreigncall.jl") end
-@safetestset "forward: dispatch" begin include("test_forward_dispatch.jl") end
-@safetestset "forward: closures & higher-order" begin include("test_forward_closures_higher_order.jl") end
-@safetestset "forward: recursion" begin include("test_forward_recursion.jl") end
-@safetestset "forward-over-reverse" begin include("test_forward_over_reverse.jl") end
-@safetestset "reverse: scalar & struct" begin include("test_reverse_scalar_struct.jl") end
-@safetestset "reverse: control flow" begin include("test_reverse_control_flow.jl") end
-@safetestset "reverse: block-stack push/edge split (ISSUES #52)" begin include("test_reverse_block_stack_split.jl") end
-@safetestset "reverse: dispatch & recursion" begin include("test_reverse_dispatch_recursion.jl") end
-@safetestset "reverse: arrays" begin include("test_reverse_arrays.jl") end
-@safetestset "reverse: mutation & aliasing" begin include("test_reverse_mutation_aliasing.jl") end
-@safetestset "reverse: tuples" begin include("test_reverse_tuples.jl") end
-@safetestset "reverse: closures & globals" begin include("test_reverse_closures_globals.jl") end
+# `Differ` is now a thin re-export meta-package (see src/Differ.jl) — the real implementation and
+# most of the test suite live in the four sub-packages (Contextual/, DifferCore/, DifferForwards/,
+# DifferReverse/), each with its own full test suite. What remains here are genuine cross-package
+# integration tests that don't belong to any one sub-package: backedge/invalidation behavior
+# spanning both `frule!!` and `rrule!!`, and a combined no-method-ambiguities check across the
+# whole re-exported namespace.
 @safetestset "backedges: derivative invalidation" begin include("test_backedges.jl") end
-@safetestset "cfg / IR" begin include("test_cfg_ir.jl") end
-@safetestset "intrinsic dispatch" begin include("test_intrinsic_dispatch.jl") end
-@safetestset "rules: math" begin include("test_math_rules.jl") end
-@safetestset "rules: reductions" begin include("test_reduction_rules.jl") end
-@safetestset "rules: broadcast" begin include("test_broadcast_rules.jl") end
-@safetestset "rules: indexing" begin include("test_indexing_rules.jl") end
-@safetestset "rules: linalg" begin include("test_linalg_rules.jl") end
 @safetestset "rules: no ambiguities" begin include("test_rule_ambiguities.jl") end
-@safetestset "DifferentiationInterface.jl integration" begin include("test_differentiation_interface.jl") end

@@ -1,0 +1,6 @@
+[deps]
+DifferCore = "b1e82f89-b04a-4ab9-a6bf-30478a31d0bf"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+DifferCore = {path = ".."}

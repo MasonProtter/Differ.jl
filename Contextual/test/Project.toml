@@ -1,0 +1,6 @@
+[deps]
+Contextual = "229be6ac-9b2d-4fc6-978e-5be963aa322f"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+Contextual = {path = ".."}

@@ -4,22 +4,19 @@ version = "0.1.0"
 authors = ["Mason Protter <mason.protter@icloud.com>"]
 
 [deps]
-ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
-LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
-Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
-
-[weakdeps]
-DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
-
-[extensions]
-DifferDifferentiationInterfaceExt = "DifferentiationInterface"
+Contextual = "229be6ac-9b2d-4fc6-978e-5be963aa322f"
+DifferCore = "b1e82f89-b04a-4ab9-a6bf-30478a31d0bf"
+DifferForwards = "34f6438e-af45-4f3f-ad00-3f9fa4b9edc3"
+DifferReverse = "0c588a63-e2e3-4c17-88ed-37ea1a5468a1"
 
 [compat]
-ADTypes = "1"
-DifferentiationInterface = "0.7"
-PrecompileTools = "1.3.4"
 julia = "1.13"
 
 [workspace]
-projects = ["test", "bench"]
+projects = ["test", "bench", "Contextual", "DifferCore", "DifferForwards", "DifferReverse"]
+
+[sources]
+Contextual = {path = "Contextual"}
+DifferCore = {path = "DifferCore"}
+DifferForwards = {path = "DifferForwards"}
+DifferReverse = {path = "DifferReverse"}

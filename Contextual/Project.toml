@@ -1,0 +1,10 @@
+name = "Contextual"
+uuid = "229be6ac-9b2d-4fc6-978e-5be963aa322f"
+version = "0.1.0"
+authors = ["Mason Protter <mason.protter@icloud.com>"]
+
+[compat]
+julia = "1.13"
+
+[workspace]
+projects = ["test"]
