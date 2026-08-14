@@ -149,3 +149,34 @@ function print_vs_enzyme(differ_results::BenchmarkGroup, enzyme_results::Benchma
     println(io, "Minima compared. `Differ/Enzyme` > 1× means Differ is slower on that workload.")
     return nothing
 end
+
+# Differ vs Mooncake, on the core workload set (see mooncake_workloads.jl). Same shape as
+# `print_vs_enzyme` — a snapshot, not a regression check, so no noise tolerance. Mooncake is the
+# closest comparison of the three: Differ's tangent system is a direct port of Mooncake's, so the two
+# sides run at the same calling-convention level (`rrule!!`/`frule!!` + a once-built rule) rather than
+# through an activity-annotation translation layer like Enzyme.
+function print_vs_mooncake(differ_results::BenchmarkGroup, mooncake_results::BenchmarkGroup,
+                           meta::Dict{String,WorkloadMeta}; io::IO=stdout)
+    names = sort!(collect(keys(mooncake_results)))
+    data = Matrix{Any}(undef, length(names), 7)
+    for (i, k) in enumerate(names)
+        td, tm = minimum(differ_results[k]), minimum(mooncake_results[k])
+        m = get(meta, k, nothing)
+        data[i, :] = Any[k, m === nothing ? "" : (m.mode === :forward ? "fwd" : "rev"),
+                         BenchmarkTools.prettytime(time(td)), memory(td),
+                         BenchmarkTools.prettytime(time(tm)), memory(tm),
+                         _ratio(time(td), time(tm))]
+    end
+    hl_alloc_d = TextHighlighter((d, i, j) -> j == 4 && d[i, j] isa Integer && d[i, j] > 0,
+                                 crayon"yellow")
+    hl_alloc_m = TextHighlighter((d, i, j) -> j == 6 && d[i, j] isa Integer && d[i, j] > 0,
+                                 crayon"yellow")
+    pretty_table(io, data;
+                 column_labels=["workload", "mode", "Differ min", "Differ allocs",
+                               "Mooncake min", "Mooncake allocs", "Differ/Mooncake"],
+                 alignment=[:l, :l, :r, :r, :r, :r, :r],
+                 highlighters=[hl_alloc_d, hl_alloc_m],
+                 display_size=(-1, -1))
+    println(io, "Minima compared. `Differ/Mooncake` > 1× means Differ is slower on that workload.")
+    return nothing
+end

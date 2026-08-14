@@ -39,6 +39,8 @@ before believing any single number.
 | `harness.jl` | reporting: the table, and the before/after comparison |
 | `run.jl` | entry point for a single measurement |
 | `compare.jl` | entry point for an A/B against a git revision |
+| `enzyme_workloads.jl` | the core workload set, timed through Enzyme.jl (`--vs-enzyme`) |
+| `mooncake_workloads.jl` | the core workload set, timed through Mooncake.jl (`--vs-mooncake`) |
 | `results/` | recorded runs, with the change they measured |
 
 ## Reading the table
@@ -199,3 +201,40 @@ fair comparison against Differ's pre-allocated-context path.
 The `Differ/Enzyme` column is minimum-time ratio; above 1× means Differ is slower on that workload.
 Unlike `compare.jl` this isn't a regression check against history, so there's no noise tolerance —
 just the two numbers next to each other.
+
+## Comparing against Mooncake
+
+```bash
+julia +1.13 --project=bench bench/run.jl --vs-mooncake
+julia +1.13 --project=bench bench/run.jl --vs-mooncake --mode=forward --n=10000 --seconds=2
+julia +1.13 --project=bench bench/run.jl --vs-enzyme --vs-mooncake   # both, one run
+```
+
+Same shape as `--vs-enzyme`: a second table pairing each workload against the same primal run through
+[Mooncake.jl](https://github.com/chalk-lab/Mooncake.jl), only `using`d (from `mooncake_workloads.jl`)
+when the flag is passed, so a plain `run.jl` invocation never pays Mooncake's first-run precompile
+(~80s the first time its manifest entry is instantiated). Mooncake comes from the General registry —
+not a `path` source to `../Mooncake.jl` — so `compare.jl`'s baseline worktree (which lives outside
+this checkout) can still resolve it.
+
+Mooncake is the closest comparison of the three: Differ's tangent system (`Tangent`/`MutableTangent`,
+`FData`/`RData`, `CoDual`/`Dual`, `rrule!!`/`frule!!`) is a direct port of Mooncake's, so
+`mooncake_workloads.jl` calls Mooncake at the same level Differ's own workloads call Differ — build a
+rule once (`Mooncake.build_rrule`/`build_frule`, the `build_ctx` analogue) in `setup`, then in the
+timed body call the rule and, for reverse, its pullback — rather than through Mooncake's higher-level
+`prepare_gradient_cache`/`value_and_gradient!!` convenience API. Every Mooncake name is written
+`Mooncake.foo` rather than pulled in unqualified: workloads.jl already has Differ's `CoDual`, `Dual`,
+`NoRData`, `rrule!!`, `frule!!`, etc. in scope, and Mooncake uses the identical names for the identical
+concepts.
+
+The comparison covers the same **core workload set** as `--vs-enzyme` (`readonly`, `vecloop!`,
+`wrloop`, `straightline!`, `structloop`, `scalarcf`, `memloop!`, `loopdot`, plus `fwd polychain`).
+**Not covered**: `cpoly` — Mooncake's `build_tangent(ComplexF64, ...)` doesn't accept the
+`(re, im)` pair the way Differ's does on this Mooncake version, and `applyN`/`polychain order-2` for
+the same reasons `--vs-enzyme` excludes them (no direct equivalent to ask Mooncake for).
+
+`memloop!` pairs against Differ's `(prealloc)` key, matching `--vs-enzyme`'s convention: a rule built
+once and reused is Mooncake's natural steady-state call, the fair comparison against Differ's
+pre-allocated-context path.
+
+The `Differ/Mooncake` column is minimum-time ratio; above 1× means Differ is slower on that workload.
