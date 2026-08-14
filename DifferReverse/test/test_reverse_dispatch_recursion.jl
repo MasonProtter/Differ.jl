@@ -55,6 +55,8 @@ usecg(v) = sum(CONST_G, v)
 nonconst_g = sin
 usencg(v) = sum(nonconst_g, v)
 
+vasum(x...) = sum(x)
+
 @testset "reverse mode: recursion into a hand-written rule" begin
     # A surviving high-level call differentiates via the recursive rrule support below (sin
     # resolves to the hand-written rule in rrules.jl, not raw recursion into its internals).
@@ -232,6 +234,19 @@ end
     @test err_dyncall isa ErrorException
     @test !(err_dyncall isa MethodError)
     @test occursin("is not a concrete DataType", err_dyncall.msg)
+end
+
+@testset "reverse mode: build_ctx reports the recorded bail reason" begin
+    err = try
+        build_ctx(vasum, (Float64, Float64))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("vararg method", err.msg)
+    @test occursin("vasum", err.msg)
+    @test !occursin("prealloc=false", err.msg)
 end
 
 @testset "reverse mode: dynamic (non-literal) getfield index" begin

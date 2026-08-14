@@ -3238,16 +3238,22 @@ function _build_tape_body(world::UInt, source, self, ftype, argst)
     end
     # Carrier layout is `reverse_fwds_impl(fcd, ctx, argcds...)`: fcd first, then `Ctx{Nothing}`
     # (tape-allocating mode — this only reads its return type), then the argument coduals.
+    primal_tt = Tuple{ftype,ArgsT.parameters...}
     impl_tt = Tuple{typeof(reverse_fwds_impl),codualtys[1],Ctx{Nothing},codualtys[2:end]...}
     match, _ = CC.findsup(impl_tt, CC.method_table(interp))
-    match === nothing && return bail("Differ.build_ctx: no reverse_fwds_impl match")
+    match === nothing &&
+        return bail("Differ.build_ctx: no reverse_fwds_impl match for `$(primal_tt)`")
     impl_mi = specialize_method(match.method, match.spec_types, match.sparams)::MethodInstance
     cinst = CC.typeinf_ext_toplevel(interp, impl_mi, CC.SOURCE_MODE_ABI)
     RT = cinst.rettype
     if !(RT isa DataType && RT <: Tuple && length(RT.parameters) == 2 &&
          RT.parameters[2] isa DataType && RT.parameters[2] <: Tape)
-        return bail("Differ.build_ctx: could not derive a rule for this signature (it bailed; " *
-                    "call `build_ctx(f, argtypes; prealloc=false)` and then differentiate to see why)")
+        why = get(REVERSE_BAIL_REASONS, impl_mi, nothing)
+        return bail(why !== nothing ?
+                    "Differ.build_ctx: could not derive a reverse rule for `$(primal_tt)`: $(why)" :
+                    "Differ.build_ctx: could not derive a reverse rule for `$(primal_tt)`: the " *
+                    "reverse forwards pass returned `$(RT)` rather than a `(CoDual, Tape)` pair, " *
+                    "and no bail reason was recorded")
     end
     ci = expr_to_codeinfo(@__MODULE__(), argnames, [], (),
                           :(return $(_fresh_tape_expr(RT.parameters[2]))), false)
