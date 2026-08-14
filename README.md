@@ -17,6 +17,23 @@ This is a project mostly made for fun, and is not something serious to be relied
   - Reverse mode works on a lot of common programs, but is more liable to choke. It will try to tell you what part of your program it doesn't understand.
 - Nested forwards-mode differentiation usually works. Forwards-over-Reverse differentiation works in limited case. 
 
+## Installing Differ
+
+Differ currently has a bunch of sublibraries, none of which are registered. The easiest way to try it out is 
+
+``` julia
+using Pkg; Pkg.add([
+    PackageSpec(url="https://github.com/MasonProtter/Differ.jl", subdir="Contextual")
+    PackageSpec(url="https://github.com/MasonProtter/Differ.jl", subdir="DifferCore")
+    PackageSpec(url="https://github.com/MasonProtter/Differ.jl", subdir="DifferForwards")
+    PackageSpec(url="https://github.com/MasonProtter/Differ.jl", subdir="DifferReverse")
+    PackageSpec(url="https://github.com/MasonProtter/Differ.jl")
+])
+
+```
+
+Remember, Differ **only works on julia v1.13**
+
 ## Using via DifferentiationInterface.jl 
 
 The most ergonomic way to Differ is with DifferentiationInterface.jl, I have not yet upstreamed dispatch structs to ADTypes.jl, but Differ exports it's own structs `AutoDifferForwards()` and `AutoDifferReverse()`.
@@ -65,7 +82,7 @@ julia> @btime gradient(f, $prep, AutoDifferReverse(), $v);
 
 Differ.jl's internal entrypoints are invoked by calling `frule!!` with `Dual` arguments, or `rrule!!` with `CoDual` arguments.
 
-This program computes `1.0 * d/dx sin(x)` at `x=5.0` using forwards mode AD:
+This computes the derivative `1.0 * d/dx sin(x)` at `x=5.0` using forwards mode AD:
 
 ``` julia
 julia> f(x) = sin(x)^2 + 1;
@@ -80,7 +97,7 @@ julia> ydy = frule!!(fdf, xdx)
 Dual{Float64, Float64}(1.9195357645382263, -0.5440211108893698)
 ```
 
-This computes the `1.0 *  ∇g(v)` at `v = [1.0, 2.0, 3.0]`:
+This computes the gradient `1.0 *  ∇g(v)` at `v = [1.0, 2.0, 3.0]` using reverse mode AD:
 
 ``` julia
 julia> g(v) = sum(sin, v);
@@ -92,12 +109,14 @@ julia> v = [1.0, 2.0, 3.0] # where we differentiate
        vdv = CoDual(v, dv) # v together with gradient accumulator 
 CoDual{Vector{Float64}, Vector{Float64}}([1.0, 2.0, 3.0], [0.0, 0.0, 0.0])
 
+julia> ctx = build_ctx(g, (Vector{Float64},)); # this pre-allocates a tape. If you don't want to do that, just do `Ctx()` instead.
+
 julia> res, pullback = rrule!!(gdg, ctx, vdv);
 
 julia> res # this is just g(v)
 CoDual{Float64, NoFData}(1.8918884196934453, NoFData())
 
-julia> pb(1.0) # compute the pullback, modifying vdv
+julia> pullback(1.0) # compute the pullback, modifying vdv
 (NoRData(), NoRData())
 
 julia> dv # dv was mutated in place by `pullback`
