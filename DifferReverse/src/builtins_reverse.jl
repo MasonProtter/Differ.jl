@@ -66,6 +66,7 @@ _bi_tracked(@nospecialize(node), ctx) =
 @noinline _rr_get_fdata_field(f, name) = _get_fdata_field(f, name)
 @noinline _rr_increment_field_rdata!(dx, dy, v) = increment_field_rdata!(dx, dy, v)
 @noinline _rr_rdata(t) = rdata(t)
+@noinline _rr_fdata(t) = fdata(t)
 
 @noinline _rr_zero_tangent2(p, f) = zero_tangent(p, f)
 @noinline _rr_build_tangent(::Type{P}, fields...) where {P} = build_tangent(P, fields...)

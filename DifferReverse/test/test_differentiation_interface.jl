@@ -14,6 +14,9 @@ include(joinpath(@__DIR__, "testutils.jl"))
     fvec(v) = sum(sin, v)   # vector -> scalar, known-supported reduction
     v = [0.3, -1.1, 2.4]
     @test DI.gradient(fvec, AutoDifferReverse(), v) ≈ rev_gradient(fvec, v)[2]
+
+    # Regression test for `.`-broadcast through the derived path; d/dx sum(x .+ x) = 2 elementwise.
+    @test DI.gradient(x -> sum(x .+ x), AutoDifferReverse(), [1.0, 2.0]) ≈ [2.0, 2.0]
 end
 
 @testset "DI reverse: prepared pullback! accumulates in place" begin
