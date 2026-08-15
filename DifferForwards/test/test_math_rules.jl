@@ -99,8 +99,8 @@ end
 
 @testset "atan" begin
     check_unary(atan, (-2.0, 0.3, 3.0))
-    # atan(y, x), 2-arg
-    check_binary(atan, ((1.0, 2.0), (-3.0, 1.5), (2.0, -0.5)))
+    # atan(y, x), 2-arg, one point per quadrant of (y, x)
+    check_binary(atan, ((1.0, 2.0), (-3.0, 1.5), (2.0, -0.5), (-2.0, -1.5)))
 end
 
 @testset "cbrt" begin
@@ -111,8 +111,66 @@ end
     check_binary(^, ((0.5, 0.3), (1.5, 2.0), (2.0, -1.5)))
 end
 
+@testset "^ (non-literal Int exponent — regression)" begin
+    # The reported bug: `x^n` with `n::Int` gives the exponent's `Dual` a `NoTangent` tangent, and
+    # the old rule unconditionally computed `yp*log(x)*dyv`, which both errors on `Float64*NoTangent`
+    # and (independently) evaluates `log(x)` eagerly even when its term is structurally zero.
+    f4(x) = x^4
+    d = frule!!(Dual(f4, NoTangent()), Dual(2.0, 1.0))
+    @test d.x == 2.0^4
+    @test d.dx ≈ 4*2.0^3
+
+    # Negative base with an odd Int exponent: must not throw DomainError (old rule would evaluate
+    # log(negative) even though its coefficient is multiplied by a structural zero).
+    f3(x) = x^3
+    dneg = frule!!(Dual(f3, NoTangent()), Dual(-2.0, 1.0))
+    @test dneg.x == (-2.0)^3
+    @test dneg.dx ≈ 3*(-2.0)^2
+
+    # IR-legality for a wrapper with a genuine Int argument (x differentiable, exponent not).
+    wrapped(x, n) = x^n
+    checkverify(wrapped, (Float64, Int))
+
+    # Both base and exponent non-differentiable (Int^Int): tangent_type(Int) === NoTangent, so the
+    # result must be `Dual{Int,NoTangent}`, never a `Dual{Int,Int}` — see the reachability
+    # investigation in the PR description: the dualizer's `frule_split!` routes any surviving `^`
+    # call through `frule!!` regardless of whether its operands are differentiable, so this case is
+    # reachable (e.g. `f(x::Float64, n::Int, m::Int) = x + Float64(n^m)`), not merely speculative.
+    rboth = frule!!(Dual(^, NoTangent()), Dual(3, NoTangent()), Dual(4, NoTangent()))
+    @test rboth.x == 3^4
+    @test rboth.dx === NoTangent()
+    @test rboth isa Dual{Int,NoTangent}
+
+    # Differentiating w.r.t. the exponent alone (both Float64, base held fixed).
+    fexp(y) = 2.0^y
+    check_unary(fexp, (0.5, 2.0, -1.0))
+end
+
 @testset "hypot" begin
     check_binary(hypot, ((3.0, 4.0), (1.0, 2.0), (-3.0, 4.0)))
+end
+
+@testset "atan/hypot with a non-differentiable (Int) operand — regression" begin
+    # `atan(y, x)` and `hypot(x, y)` promote internally when called directly, but Differ's own
+    # `src_inlining_policy` blocks inlining of any call whose callee has a hand-written `frule!!` —
+    # so a composite caller like `f(n::Int, x::Float64) = atan(n, x)` reaches `frule!!` with the
+    # *unpromoted* `Dual{Int,NoTangent}`/`Dual{Float64,Float64}` pair, not two same-typed Duals.
+    # Confirmed via `code_dual_ircode` that this survives as a direct call, not something the
+    # ordinary optimizer would ever produce. The old unguarded rules threw `MethodError(*, ...)`
+    # on exactly this input.
+    fatan(n, x) = atan(n, x)
+    fhypot(n, x) = hypot(n, x)
+
+    datan = frule!!(Dual(fatan, NoTangent()), Dual(3, NoTangent()), Dual(2.0, 1.0))
+    @test datan.x == atan(3, 2.0)
+    @test datan.dx ≈ central_diff(x -> atan(3, x), 2.0)
+
+    dhypot = frule!!(Dual(fhypot, NoTangent()), Dual(3, NoTangent()), Dual(2.0, 1.0))
+    @test dhypot.x == hypot(3, 2.0)
+    @test dhypot.dx ≈ central_diff(x -> hypot(3, x), 2.0)
+
+    checkverify(fatan, (Int, Float64))
+    checkverify(fhypot, (Int, Float64))
 end
 
 @testset "sqrt(::Complex)" begin

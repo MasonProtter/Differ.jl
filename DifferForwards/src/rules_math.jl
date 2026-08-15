@@ -129,11 +129,12 @@ function frule!!(::Dual{typeof(atan)}, (; x, dx)::Dual)
     Dual(atan(x), dx/(1+x^2))
 end
 
-function frule!!(::Dual{typeof(atan)}, dy::Dual, dx::Dual)
-    y, dyv = primal(dy), tangent(dy)
-    x, dxv = primal(dx), tangent(dx)
+function frule!!(::Dual{typeof(atan)}, (; y, dy)::Dual, (; x, dx)::Dual)
     r2 = x^2+y^2
-    Dual(atan(y, x), (x*dyv-y*dxv)/r2)
+    z = atan(y, x)
+    dzy = dy isa NoTangent ? zero(z) : x*dy/r2
+    dzx = dx isa NoTangent ? zero(z) : -y*dx/r2
+    Dual(z, dzy + dzx)
 end
 
 # ===========================================================================
@@ -146,14 +147,14 @@ function frule!!(::Dual{typeof(cbrt)}, (; x, dx)::Dual)
 end
 
 # ===========================================================================
-# ^ (x::Float64, y::Float64) — non-literal real exponent
+# ^ (x::Float64, y::Float64 or y::Int) — non-literal exponent, possibly non-differentiable
 # ===========================================================================
 
-function frule!!(::Dual{typeof(^)}, dx::Dual, dy::Dual)
-    x, dxv = primal(dx), tangent(dx)
-    y, dyv = primal(dy), tangent(dy)
-    yp = x^y
-    Dual(yp, y*x^(y-1)*dxv + yp*log(x)*dyv)
+function frule!!(::Dual{typeof(^)}, (; x, dx)::Dual, (; y, dy)::Dual)
+    z = x^y
+    dzx = dx isa NoTangent ? zero(z) : y*x^(y-1)*dx
+    dzy = dy isa NoTangent ? zero(z) : z*log(x)*dy
+    Dual(z, dzx + dzy)
 end
 
 # ===========================================================================
@@ -162,7 +163,9 @@ end
 
 function frule!!(::Dual{typeof(hypot)}, (; x, dx)::Dual, (; y, dy)::Dual)
     r = hypot(x, y)
-    Dual(r, (x*dx+y*dy)/r)
+    drx = dx isa NoTangent ? zero(r) : x*dx/r
+    dry = dy isa NoTangent ? zero(r) : y*dy/r
+    Dual(r, drx + dry)
 end
 
 # ===========================================================================
