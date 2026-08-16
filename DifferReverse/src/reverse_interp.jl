@@ -1212,7 +1212,7 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
             if isa(s, Core.PiNode)
                 tracked[i] = provenance_tracked(s.val)
             elseif isa(s, Core.PhiNode)
-                Ti = pir.stmts[i][:type]
+                Ti = _stype(pir.stmts, i)
                 if fdtype(iworld, Ti) !== NoFData
                     ok = true
                     for j in 1:length(s.values)
@@ -1248,7 +1248,7 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
                 if f === Core.getfield && length(actual) >= 2 && provenance_tracked(actual[1])
                     fk = actual[2]
                     fname = isa(fk, QuoteNode) ? fk.value : fk
-                    Ti = pir.stmts[i][:type]
+                    Ti = _stype(pir.stmts, i)
                     Pobj = _optype(pir, actual[1])
                     if fname === :ref && _widen(Ti) <: MemoryRef
                         tracked[i] = true
@@ -1262,7 +1262,7 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
                 elseif f === Core.memorynew && !isempty(actual)
                     # Array allocation step 1: a fresh `Memory{P}` is itself a provenance root, exactly
                     # like a locally-`%new`'d mutable struct above.
-                    MT = _widen(pir.stmts[i][:type])
+                    MT = _stype(pir.stmts, i)
                     tracked[i] = MT isa DataType && MT <: Memory && fdtype(iworld, MT) !== NoFData
                 elseif f === Base.memoryrefnew && !isempty(actual) && provenance_tracked(actual[1])
                     tracked[i] = true
@@ -1272,12 +1272,12 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
                     # element of the shadow array. A scalar (bits) result carries no fdata of its own, so
                     # is deliberately left untracked — its gradient flows via rdata routing, not shadow
                     # aliasing.
-                    fdtype(iworld, pir.stmts[i][:type]) !== NoFData && (tracked[i] = true)
+                    fdtype(iworld, _stype(pir.stmts, i)) !== NoFData && (tracked[i] = true)
                 elseif f === Core.tuple && !isempty(actual)
                     # Mirrors `builtin_rrule_comms(::Val{Core.tuple}, ...)`'s scope gate: concrete
                     # non-vararg Tuple, one field per operand, tracked iff every fdata-carrying operand is.
-                    Ti = pir.stmts[i][:type]
-                    T = _widen(Ti)
+                    Ti = _stype(pir.stmts, i)
+                    T = Ti
                     if fdtype(iworld, Ti) !== NoFData && T isa DataType && T <: Tuple && isconcretetype(T) &&
                        !(!isempty(T.parameters) && isa(last(T.parameters), Core.TypeofVararg)) &&
                        fieldcount(T) == length(actual)
@@ -1285,7 +1285,7 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
                                          eachindex(actual))
                     end
                 elseif !(f isa Core.Builtin) && !(f isa Core.IntrinsicFunction) &&
-                       fdtype(iworld, pir.stmts[i][:type]) !== NoFData
+                       fdtype(iworld, _stype(pir.stmts, i)) !== NoFData
                     # A derived recursive call's array/mutable-struct result now gets a real shadow
                     # (`shadow_map`). Over-approximates (a callee that fails to resolve bails the
                     # whole build anyway), so can't produce a wrong gradient.
@@ -1724,6 +1724,8 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                            unreachable, codualparams::Vector{Any}, reason::Ref{String}, edges::Vector{Any})
     nblocks = length(pir.cfg.blocks)
     nodes = [Any[] for _ in 1:nblocks]
+    # Widened on the way in: these become `Tuple{types[b]...}`, and the hoisting/fusion decisions
+    # below ask them `isbitstype`.
     types = [Any[] for _ in 1:nblocks]
     # A direct self-recursive call's inner tape is routed through `Tape.subtapes` (a single,
     # global, `Tape`-wide stack), not a per-block comms item: every such call in this primal targets
@@ -1764,7 +1766,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             # mutable struct). Declaring one here would just be dead weight on every array allocation.
             if T isa DataType && !(T <: Array) && ismutabletype(T) && fdtype(iworld, T) !== NoFData
                 push!(nodes[b], (:fshadow, Core.SSAValue(i)))
-                push!(types[b], fdtype(iworld, T))
+                push!(types[b], _widen(fdtype(iworld, T)))
             end
             continue
         elseif isa(s, Expr) && s.head === :foreigncall
@@ -1772,9 +1774,11 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             # builtin, an unregistered target always bails (native code can write through any pointer,
             # so no primal-only replay fallback).
             fc = _fc_parse(s)
+            # `optype` widens here and in the five sibling closures below; they must move together,
+            # or the fwds and pullback builders disagree about what a block communicates.
             ctx = (pstmt=(x::Core.SSAValue) -> pir.stmts[x.id][:stmt],
                   calleeval=(@nospecialize x) -> _calleeval(x, iworld),
-                  optype=(@nospecialize x) -> _optype(pir, x), reason=reason,
+                  optype=(@nospecialize x) -> _widen(_optype(pir, x)), reason=reason,
                   tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                   tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i))
             if fc === nothing
@@ -1782,7 +1786,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                            "pointer target at %$i: `$(_stmt_str(s))`"
                 return nothing
             end
-            result = foreigncall_rrule_comms(Val(fc.name), fc, pir.stmts[i][:type], ctx)
+            result = foreigncall_rrule_comms(Val(fc.name), fc, _stype(pir.stmts, i), ctx)
             result === false && return nothing
             if result === nothing
                 reason[] = "reverse mode does not support foreigncall target `:$(fc.name)` at %$i: " *
@@ -1793,7 +1797,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                 any(nd -> nd == item, nodes[b]) && continue
                 elide_argument_primal(item, ty) && continue
                 push!(nodes[b], item)
-                push!(types[b], ty)
+                push!(types[b], _widen(ty))
             end
             continue
         end
@@ -1806,7 +1810,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             # carries no gradient at all (`NoRData` result), or the rule for this specific intrinsic
             # doesn't read that operand (see `intrinsic_rrule_operands` — a linear op like
             # `add_float` reads neither addend).
-            rdtype(iworld, pir.stmts[i][:type]) === NoRData && continue
+            rdtype(iworld, _stype(pir.stmts, i)) === NoRData && continue
             needed = intrinsic_rrule_operands(Val(f))
             for (k, a) in enumerate(actual)
                 (isa(a, Core.SSAValue) || isa(a, Core.Argument)) || continue
@@ -1816,14 +1820,14 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                 ty = _optype(pir, a)
                 elide_argument_primal(item, ty) && continue
                 push!(nodes[b], item)
-                push!(types[b], ty)
+                push!(types[b], _widen(ty))
             end
         elseif isa(f, Core.Builtin)
             # The dispatch layer (`builtins_reverse.jl`) decides everything: whether this call needs
             # comms items, and whether it's even in scope. `tt`/`rdtype`/`fdtype` are
             # world-parameterized funnels: the builtin rules must not call `tangent_type` directly,
             # or their dispatch is pinned to the generator's own world.
-            ctx = (optype=(@nospecialize x) -> _optype(pir, x), ssa=Core.SSAValue(i),
+            ctx = (optype=(@nospecialize x) -> _widen(_optype(pir, x)), ssa=Core.SSAValue(i),
                   tracked=fdata_tracked, arg_tracked=arg_tracked, reason=reason,
                   bulk_saved=bulk_saved,
                   tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
@@ -1832,14 +1836,14 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                   # A `MemoryRef` statically re-derivable from an argument + literal index need not
                   # be pushed (see `_static_ref_derivation`). Consulted by `builtins_reverse.jl`.
                   static_ref=(@nospecialize x) -> _static_ref_derivation(pir, iworld, x))
-            result = builtin_rrule_comms(Val(f), actual, pir.stmts[i][:type], ctx)
+            result = builtin_rrule_comms(Val(f), actual, _stype(pir.stmts, i), ctx)
             result === false && return nothing
             if result !== nothing
                 for (item, ty) in result
                     any(nd -> nd == item, nodes[b]) && continue
                     elide_argument_primal(item, ty) && continue
                     push!(nodes[b], item)
-                    push!(types[b], ty)
+                    push!(types[b], _widen(ty))
                 end
             end
         else
@@ -1849,7 +1853,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, fdata_tracked)
             info === nothing && continue
             _, ftype, argtypes = info
-            R = _widen(pir.stmts[i][:type])
+            R = _stype(pir.stmts, i)
             resolved = reverse_fwds_recursive_ci(interp, scan_impl_mi, primal_mi, ftype, argtypes, R,
                                                  edges, reason)
             if resolved === nothing
@@ -1865,7 +1869,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                 block_has_subtape[b] = true
             else
                 push!(nodes[b], (:subtape, Core.SSAValue(i)))
-                push!(types[b], InnerTapeT)
+                push!(types[b], _widen(InnerTapeT))
             end
         end
     end
@@ -2246,7 +2250,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             bidx += 1
             block_start_new[bidx] = length(code) + 1
         end
-        s = pstmts[i][:stmt]; Ti = pstmts[i][:type]
+        s = pstmts[i][:stmt]; Ti = _stype(pstmts, i)
         is_terminator = i == pir.cfg.blocks[bidx].stmts.stop
         # Every reachable, non-throw block pushes its own comms + block number before whatever comes
         # next — an ordinary successor block, or the pullback's own entry, which pops this same
@@ -2464,7 +2468,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             # rule applies here.
             fc = _fc_parse(s)
             fcctx = (; emit!, icall!, presolve, sresolve,
-                    optype=(@nospecialize x) -> _optype(pir, x),
+                    optype=(@nospecialize x) -> _widen(_optype(pir, x)),
                     pstmt=(x::Core.SSAValue) -> pir.stmts[x.id][:stmt],
                     calleeval=(@nospecialize x) -> _calleeval(x, iworld),
                     tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
@@ -2488,7 +2492,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                 primal_map[i] = emit!(Expr(:call, f, (presolve(a) for a in actual)...), Ti)
             elseif isa(f, Core.Builtin)
                 bctx = (; emit!, icall!, presolve, sresolve,
-                       optype=(@nospecialize x) -> _optype(pir, x), tracked=fdata_tracked,
+                       optype=(@nospecialize x) -> _widen(_optype(pir, x)), tracked=fdata_tracked,
                        ssa=Core.SSAValue(i), bulk_saved=pb_bulk_saved,
                        tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                        rdtype=(@nospecialize(T) -> rdtype(iworld, T)),
@@ -2860,7 +2864,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         # `_widen`: a statement's inferred type can be a lattice element (`Core.PartialStruct`), not a
         # bare `Type` — e.g. a `Core.memorynew` call with a literal length — and `zero_rdata_from_type`
         # (like `tangent_type`) is only ever defined on `Type`s.
-        Ti = _widen(pstmts[i][:type])
+        Ti = _stype(pstmts, i)
         # See the `arg_ref_id` prologue above for why `zero_like_rdata_type`/`zero_like_rdata_from_type`.
         RT = zero_like_rdata_type(Ti)
         ssa_ref_id[i] = eemit!(Expr(:new, Base.RefValue{RT}, zero_like_rdata_from_type(Ti)), Base.RefValue{RT})
@@ -2919,8 +2923,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         end
         # `Pi` is the *primal* type of the statement whose rdata `ref` accumulates — needed (not just
         # its rdata type) because the zero-reset literal is computed via `zero_rdata_from_type(Pi)`.
-        # `_widen` first: callers pass `pstmts[i][:type]` directly, which can be a lattice element
-        # (see the `ssa_ref_id` prologue above) — `zero_rdata_from_type` only accepts a bare `Type`.
+        # `_widen`: `Pi` also arrives from `_optype` operands, and `zero_rdata_from_type` only
+        # accepts a bare `Type`.
         deref_and_zero!(ref, @nospecialize(Pi)) = begin
             Pi = _widen(Pi)
             # `zero_like_rdata_type`/`zero_like_rdata_from_type` — see the `arg_ref_id`/`ssa_ref_id`
@@ -3058,7 +3062,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             phi_end = i
         end
         for i in reverse((phi_end + 1):hi)
-            s = pstmts[i][:stmt]; Ti = pstmts[i][:type]
+            s = pstmts[i][:stmt]; Ti = _stype(pstmts, i)
             if isa(s, Core.GotoNode) || isa(s, Core.GotoIfNot) || isa(s, Core.ReturnNode)
                 continue
             elseif isa(s, Expr) && s.head === :boundscheck
@@ -3080,7 +3084,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                         fetch_shadow=pb_fetch_shadow, fetch_primal=pb_presolve,
                         fetch_saved=pb_fetch_saved,
                         deref_and_zero! = (@nospecialize Pi) -> deref_and_zero!(ssa_ref_id[i], Pi),
-                        optype=(@nospecialize x) -> _optype(pir, x),
+                        optype=(@nospecialize x) -> _widen(_optype(pir, x)),
                         pstmt=(x::Core.SSAValue) -> pstmts[x.id][:stmt],
                         calleeval=(@nospecialize x) -> _calleeval(x, iworld),
                         ssa=Core.SSAValue(i), ref_for,
@@ -3212,7 +3216,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                            fetch_shadow=pb_fetch_shadow, fetch_primal=pb_presolve,
                            fetch_saved=pb_fetch_saved,
                            deref_and_zero! = (@nospecialize Pi) -> deref_and_zero!(ssa_ref_id[i], Pi),
-                           optype=(@nospecialize x) -> _optype(pir, x), ssa=Core.SSAValue(i), ref_for,
+                           optype=(@nospecialize x) -> _widen(_optype(pir, x)), ssa=Core.SSAValue(i), ref_for,
                            tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                            rdtype=(@nospecialize(T) -> rdtype(iworld, T)),
                            fdtype=(@nospecialize(T) -> fdtype(iworld, T)))
@@ -3292,7 +3296,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         haskey(regions, b) && (preds = [regions[b]])
         phi_acc = Any[]
         for i in lo:phi_end
-            Ti = pstmts[i][:type]
+            Ti = _stype(pstmts, i)
             push!(phi_acc, deref_and_zero!(ssa_ref_id[i], Ti))
         end
 
@@ -3356,7 +3360,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     v = phi.values[eidx]
                     tgt = ref_for(v)
                     tgt === nothing && continue
-                    Ti = pstmts[i][:type]
+                    Ti = _stype(pstmts, i)
                     # `tgt`'s actual declared element type is `zero_like_rdata_type` of `v`'s own primal
                     # type (the edge value) — generally not the same as the phi node's own (merged,
                     # typically wider) type `Ti`. `phi_acc[j]` is `zero_like_rdata_type` of `Ti` instead,

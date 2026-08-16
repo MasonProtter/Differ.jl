@@ -582,3 +582,30 @@ end
     checkverify_rev(g_vcat_abs2, (Vector{Float64},))
     check_stack_balance(g_vcat_abs2, v)
 end
+
+@testset "reverse mode: `PartialStruct`-typed statement" begin
+    # The `memoryrefset!` storing a not-yet-escaped `%new` is typed `Core.PartialStruct`, not a bare
+    # `Type`; that reached `Tuple{block_comms_types[b]...}` raw and threw.
+    function ps_ref_in_vec(x)
+        r = Ref(x)
+        v = Base.RefValue{Float64}[r]
+        return v[1][] * 2.0
+    end
+    _, dx_ps = rev_gradient(ps_ref_in_vec, 1.5)
+    @test dx_ps ≈ 2.0
+    @test dx_ps ≈ central_diff(ps_ref_in_vec, 1.5) rtol = 1e-5
+    checkverify_rev(ps_ref_in_vec, (Float64,))
+    check_stack_balance(ps_ref_in_vec, 1.5)
+
+    # Element read twice, so the pullback accumulates through the stored `Ref`.
+    function ps_ref_squared(x)
+        r = Ref(x)
+        v = Base.RefValue{Float64}[r]
+        return v[1][] * v[1][]
+    end
+    _, dx_sq = rev_gradient(ps_ref_squared, 1.5)
+    @test dx_sq ≈ 3.0
+    @test dx_sq ≈ central_diff(ps_ref_squared, 1.5) rtol = 1e-5
+    checkverify_rev(ps_ref_squared, (Float64,))
+    check_stack_balance(ps_ref_squared, 1.5)
+end

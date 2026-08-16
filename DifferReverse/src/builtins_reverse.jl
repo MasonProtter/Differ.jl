@@ -21,6 +21,8 @@
 #   (c) (emit!, icall, fetch_shadow, fetch_primal, fetch_saved, pb_presolve, deref_and_zero!,
 #        optype, ssa, ref_for)
 #
+# `Ti` and `ctx.optype(x)` are always bare `Type`s — all three passes widen before dispatching here.
+#
 # `ctx.tracked`/`ctx.arg_tracked` (`_fdata_tracked`/`_arg_fdata_tracked`) say which SSA values/
 # arguments have a statically-known fdata (shadow) value — needed by any rule whose pullback reaches
 # into an object's `MutableTangent`/shadow `MemoryRef`. `ctx.deref_and_zero!(Pi)` derefs-and-zeros
@@ -71,6 +73,20 @@ _bi_tracked(@nospecialize(node), ctx) =
 
 @noinline _rr_zero_tangent2(p, f) = zero_tangent(p, f)
 @noinline _rr_build_tangent(::Type{P}, fields...) where {P} = build_tangent(P, fields...)
+
+# Save/restore of a `Memory` slot that may not be assigned yet: a fresh array's `Core.memorynew`
+# leaves every slot undefined, so `memoryrefset!`'s read of the value it overwrites throws
+# `UndefRefError` for a non-`isbits` element. Restoring `nothing` leaves the slot undefined, which is
+# correct — in reverse order, anything reading it afterwards ran before the store in the primal.
+# `isbits` elements keep the plain path, so their comms tuple stays `isbits`.
+@noinline _rr_memref_get_or_nothing(ref) =
+    Base.memoryref_isassigned(ref, :not_atomic, false) ?
+        Base.memoryrefget(ref, :not_atomic, false) : nothing
+@noinline function _rr_memref_restore!(ref, v)
+    v === nothing || Base.memoryrefset!(ref, v, :not_atomic, false)
+    return nothing
+end
+_rr_saved_slot_type(@nospecialize T) = isbitstype(T) ? T : Union{Nothing,T}
 
 # Direct-emission fast paths for `get_tangent_field`/`set_tangent_field!` (reverse-mode analogue of
 # forward mode's `_tangent_field_slot`). For the common case — a concrete struct whose
@@ -347,7 +363,7 @@ end
 function builtin_rrule_comms(::Val{Core.ifelse}, actual, Ti, ctx)
     ctx.tt(_widen(Ti)) === NoTangent && return nothing
     P = _widen(Ti)
-    if !(isconcretetype(P) && _widen(ctx.optype(actual[2])) === P && _widen(ctx.optype(actual[3])) === P)
+    if !(isconcretetype(P) && ctx.optype(actual[2]) === P && ctx.optype(actual[3]) === P)
         ctx.reason[] = "reverse mode `ifelse` requires both branches to share the concrete result " *
                        "type $(P) at %$(ctx.ssa.id)"
         return false
@@ -365,7 +381,7 @@ function builtin_rrule_comms(::Val{Core.ifelse}, actual, Ti, ctx)
     ctx.rdtype(Ti) === NoRData && return Tuple{Any,Any}[]
     cond = actual[1]
     (isa(cond, Core.SSAValue) || isa(cond, Core.Argument)) || return Tuple{Any,Any}[]
-    return Tuple{Any,Any}[((:primal, cond), _widen(ctx.optype(cond)))]
+    return Tuple{Any,Any}[((:primal, cond), ctx.optype(cond))]
 end
 
 function apply_builtin_rrule_fwds!(::Val{Core.ifelse}, actual, Ti, ctx)
@@ -682,10 +698,10 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
         if !derivable
             push!(items, ((:primal, ref_node), ctx.optype(ref_node)))
         end
-        push!(items, ((:old_primal, ctx.ssa), elt))
+        push!(items, ((:old_primal, ctx.ssa), _rr_saved_slot_type(elt)))
     end
     if !notangent
-        push!(items, ((:old_tangent, ctx.ssa), ctx.tt(_widen(elt))))
+        push!(items, ((:old_tangent, ctx.ssa), _rr_saved_slot_type(ctx.tt(_widen(elt)))))
     end
     return items
 end
@@ -698,8 +714,11 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     bulk = ctx.bulk_saved(ref_node)
     # The old primal is read only to put it back one element at a time; a bulk-saved array already has
     # its pre-call contents copied aside in the prologue, so this load is pure waste there.
+    PRT = ctx.optype(ref_node)
     old_primal = bulk ? nothing :
-        ctx.emit!(Expr(:call, Base.memoryrefget, pref, (ctx.presolve(a) for a in rest)...), Ti)
+        (isbitstype(Ti) ?
+            ctx.emit!(Expr(:call, Base.memoryrefget, pref, (ctx.presolve(a) for a in rest)...), Ti) :
+            ctx.icall!(_rr_memref_get_or_nothing, Union{Nothing,Ti}, (PRT,), pref))
     if TT === NoTangent
         p = ctx.emit!(Expr(:call, Base.memoryrefset!, pref, ctx.presolve(val_node), (ctx.presolve(a) for a in rest)...), Ti)
         saved = Dict{Any,Any}()
@@ -707,7 +726,10 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
         return p, nothing, saved
     end
     sref = ctx.sresolve(ref_node)
-    old_tangent = ctx.emit!(Expr(:call, Base.memoryrefget, sref, (ctx.presolve(a) for a in rest)...), TT)
+    SRT = ctx.fdtype(PRT)
+    old_tangent = isbitstype(TT) ?
+        ctx.emit!(Expr(:call, Base.memoryrefget, sref, (ctx.presolve(a) for a in rest)...), TT) :
+        ctx.icall!(_rr_memref_get_or_nothing, Union{Nothing,TT}, (SRT,), sref)
     # `zero_tangent(p, f)` embeds `f` (the assigned value's own fdata) directly rather than
     # fabricating a fresh zero when the element carries fdata — the alias that makes later in-place
     # accumulation into this element flow into the assigned value's own shadow. `f = NoFData()` for
@@ -722,6 +744,17 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     return p, nothing, saved
 end
 
+# Restore a slot, matching whichever read shape `apply_builtin_rrule_fwds!` used. `RT` is `ref`'s
+# declared type, primal or shadow.
+function _rr_emit_slot_restore!(ctx, @nospecialize(RT), ref, val, @nospecialize(T))
+    if isbitstype(T)
+        ctx.emit!(Expr(:call, Base.memoryrefset!, ref, val, QuoteNode(:not_atomic), false), T)
+    else
+        ctx.emit!(ctx.icall(_rr_memref_restore!, (RT, Union{Nothing,T}), ref, val), Nothing)
+    end
+    return nothing
+end
+
 # Unaffected by the fdata-aliasing branch above: `rdata(cur_tangent)` already reads whatever rdata
 # the element separately accumulated (`NoRData` for a pure array element), and restoring the slot
 # to `old_primal`/`old_tangent` is the same operation either way.
@@ -730,11 +763,12 @@ function apply_builtin_rrule!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     bulk = ctx.bulk_saved(ref_node)
     nores = ntuple(_ -> nothing, length(actual))
     TT = ctx.tt(_widen(Ti))
+    PRT = ctx.optype(ref_node)
     if TT === NoTangent
         if !bulk
             pref = ctx.fetch_primal(ref_node)
             old_primal = ctx.fetch_saved((:old_primal, ctx.ssa))
-            ctx.emit!(Expr(:call, Base.memoryrefset!, pref, old_primal, QuoteNode(:not_atomic), false), Ti)
+            _rr_emit_slot_restore!(ctx, PRT, pref, old_primal, Ti)
         end
         return nores
     end
@@ -748,12 +782,12 @@ function apply_builtin_rrule!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     cur_tangent = ctx.emit!(Expr(:call, Base.memoryrefget, sref, QuoteNode(:not_atomic), false), TT)
     cur_rdata = _emit_rdata!(ctx, TT, RT, cur_tangent)
     new_dx = ctx.emit!(ctx.icall(increment!!, (RT, RT), acc, cur_rdata), RT)
-    ctx.emit!(Expr(:call, Base.memoryrefset!, sref, old_tangent, QuoteNode(:not_atomic), false), TT)
+    _rr_emit_slot_restore!(ctx, ctx.fdtype(PRT), sref, old_tangent, TT)
     # Primal restore, unless the whole array is copied back at the end of the pullback instead.
     if !bulk
         pref = ctx.fetch_primal(ref_node)
         old_primal = ctx.fetch_saved((:old_primal, ctx.ssa))
-        ctx.emit!(Expr(:call, Base.memoryrefset!, pref, old_primal, QuoteNode(:not_atomic), false), Ti)
+        _rr_emit_slot_restore!(ctx, PRT, pref, old_primal, Ti)
     end
     return ntuple(j -> j == 2 ? new_dx : nothing, length(actual))
 end

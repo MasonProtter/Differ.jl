@@ -607,6 +607,11 @@ recursion into `Base.mapreduce_impl`'s `@simd`-annotated pairwise base case (`su
   reachable once `Core.tuple` got a reverse rule (ISSUES #78): the `ReturnNode` handling in
   `reverse_fwds_to_ircode` (`fcodual_type(R)` on an unwidened `R`) and the pullback's exit-route seeding
   in `reverse_pullback_to_ircode` (`zero_like_rdata_type(_optype(...))`).
+  ISSUES #110 moved the widening to the boundary: statement-type reads go through `_stype(stmts, i)`
+  (`DifferCore`) and all six `ctx.optype` closures widen, so **a rule's `Ti` and `ctx.optype(x)` are
+  always bare `Type`s**. `_optype` itself still returns the IR's exact lattice element, deliberately.
+  The widening must stay consistent across `_scan_block_comms` and both builders, or they disagree
+  about the tape's type.
 
 ## Debugging entry points (`reflection.jl`)
 
@@ -645,11 +650,12 @@ index (block numbering shifts with unrelated optimizer changes).
   specific combination. The identical access *inside* a loop, or a *literal*-index access outside a
   loop, both work in either direction — it's "dynamic index" ∩ "non-loop" that crashes, for reads and
   writes alike. Neither case investigated further yet.
-- **`ctx.optype` types some operands by node shape, not resolved value** (ISSUES #64) — a `getfield` on
-  a `const` global with a dynamic index is typed as `GlobalRef` rather than its true (possibly mutable
-  struct) type; fixing it requires widening three `optype=` closures together (comms scan, both
-  builders must agree) plus teaching `builtins_reverse.jl`'s `getfield` rules that a non-`SSAValue`/
-  non-`Argument` object operand is a compile-time constant.
+- **`ctx.optype` types some operands by node shape, not resolved value** (ISSUES #64, partly fixed by
+  #110) — the lattice-element half is gone (the closures widen now), but a `getfield` on a `const`
+  global with a dynamic index is still typed as `GlobalRef` rather than its true (possibly mutable
+  struct) type; fixing that means switching all six `optype=` closures to `_optype_w` together (comms
+  scan and both builders must agree) plus teaching `builtins_reverse.jl`'s `getfield` rules that a
+  non-`SSAValue`/non-`Argument` object operand is a compile-time constant.
 - **ISSUES #85** (fixed) — forward-over-reverse `tangent_type` non-termination; see "`Tape{ArgsTT,CS}`" above.
   Accepted as a known limitation, not currently being chased.
 - **A self-referential loop phi can't go tracked** (ISSUES #91) — see the caveat in "`_fdata_tracked`:

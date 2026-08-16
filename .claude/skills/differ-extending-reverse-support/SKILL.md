@@ -83,6 +83,9 @@ The last two use a "shadow chain" comms scheme: three new comms-item kinds beyon
   statement overwrote, keyed by the mutating statement itself. Unlike every other comms kind these
   are computed by the fwds-emission function's own emitted statements rather than resolved from an
   existing node, so it must return them in a `saved` dict for `emit_epilogue!` to find.
+  For `memoryrefset!` these are declared at `_rr_saved_slot_type(T)`: `T` for an `isbits` element,
+  `Union{Nothing,T}` otherwise, since a fresh array's `Core.memorynew` leaves every slot undefined
+  and the first write has nothing to read back (ISSUES #111).
 
 Mechanically: the fwds pass zeroes the fdata slot and writes through; the pullback increments the
 rdata accumulator with the *old* tangent's rdata and restores both the old primal value and old

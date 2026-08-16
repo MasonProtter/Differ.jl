@@ -40,6 +40,10 @@ _calleeval(@nospecialize(x), world::UInt) =
 _optype(pir, @nospecialize x) = isa(x, Core.SSAValue) ? pir.stmts[x.id][:type] :
                                 isa(x, Core.Argument) ? pir.argtypes[x.n] : typeof(x)
 
+# Statement `i`'s type as a bare `Type`. `stmts[i][:type]` is a lattice element, illegal in
+# type-parameter position and a false fact once stamped on a shadow/tangent instruction.
+_stype(stmts, i::Int) = _widen(stmts[i][:type])
+
 # The type of the *value* an operand denotes, as a bare (widened) `Type`: `_optype` alone reports
 # `GlobalRef`/`QuoteNode` as the node's own type rather than the value it denotes, and can return a
 # lattice element (`Core.Const`/`PartialStruct`) for an `SSAValue`/`Argument` rather than a bare

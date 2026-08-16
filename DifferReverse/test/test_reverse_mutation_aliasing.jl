@@ -473,3 +473,49 @@ end
     checkverify_rev(bulk_outer, (Vector{Float64}, Float64))
     check_stack_balance(bulk_outer, vr, 2.0)
 end
+
+@testset "reverse mode: store into an undefined `Memory` slot" begin
+    # A fresh array's `Core.memorynew` leaves every slot undefined, so `memoryrefset!`'s read of the
+    # value it overwrites threw `UndefRefError` for a non-`isbits` element.
+    nested_lit(x) = (v = [[x]]; v[1][1] * 2.0)
+    _, dx_n = rev_gradient(nested_lit, 1.5)
+    @test dx_n ≈ 2.0
+    @test dx_n ≈ central_diff(nested_lit, 1.5) rtol = 1e-5
+    checkverify_rev(nested_lit, (Float64,))
+    check_stack_balance(nested_lit, 1.5)
+
+    # Inner array named first, so the stored value has its own tracked shadow.
+    nested_named(x) = (a = [x]; v = [a]; v[1][1] * 2.0)
+    _, dx_nn = rev_gradient(nested_named, 1.5)
+    @test dx_nn ≈ 2.0
+    checkverify_rev(nested_named, (Float64,))
+    check_stack_balance(nested_named, 1.5)
+
+    # The undefined-slot path must not disturb the other slot.
+    nested_two(x) = (v = Vector{Float64}[[x], [2x]]; v[2][1] * 2.0)
+    _, dx_n2 = rev_gradient(nested_two, 1.5)
+    @test dx_n2 ≈ 4.0
+    @test dx_n2 ≈ central_diff(nested_two, 1.5) rtol = 1e-5
+    checkverify_rev(nested_two, (Float64,))
+    check_stack_balance(nested_two, 1.5)
+
+    # Explicitly `undef`-allocated: both slots start undefined.
+    function undef_fill(x)
+        v = Vector{Vector{Float64}}(undef, 2)
+        v[1] = [x]
+        v[2] = [2x]
+        return v[1][1] * v[2][1]
+    end
+    _, dx_uf = rev_gradient(undef_fill, 1.5)
+    @test dx_uf ≈ 6.0
+    @test dx_uf ≈ central_diff(undef_fill, 1.5) rtol = 1e-5
+    checkverify_rev(undef_fill, (Float64,))
+    check_stack_balance(undef_fill, 1.5)
+
+    # `isbits` control: keeps the plain path.
+    bits_two(x) = (v = [x, 2x]; v[1] * v[2])
+    _, dx_b = rev_gradient(bits_two, 1.5)
+    @test dx_b ≈ 6.0
+    checkverify_rev(bits_two, (Float64,))
+    check_stack_balance(bits_two, 1.5)
+end
