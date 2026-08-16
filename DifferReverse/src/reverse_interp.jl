@@ -2152,7 +2152,10 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
         # matching `pop!` for this case.)
         if !isempty(nodes)
             vals = (nd[1] === :primal ? presolve(nd[2]) :
-                    nd[1] === :subtape ? inner_tape_map[nd[2].id] :
+                    nd[1] === :subtape ?
+                        get(() -> error("Differ internal error: comms item $(nd) was declared but " *
+                                        "its inner tape was never recorded"),
+                            inner_tape_map, nd[2].id) :
                     (nd[1] === :old_primal || nd[1] === :old_tangent) ?
                         get(() -> error("Differ internal error: comms item $(nd) was declared but " *
                                         "never saved by its rule's fwds emission (builtin_rrule_comms/" *
@@ -2194,11 +2197,12 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
         # terminator is an explicit GotoNode/GotoIfNot": some fallthrough blocks have no explicit
         # terminator, yet still have a real successor.
         #
-        # Defer the push when the terminator is a `PhiNode` (merge-only block with implicit
-        # fallthrough): a push before the phi violates `verify_ir`'s "phi leads its block" rule.
-        # Control-transfer terminators keep the pre-statement push; `_split_ambiguous_block_pushes`
-        # later relocates the `GotoIfNot` case per-edge.
-        defer_epilogue = is_terminator && !unreachable_block[bidx] && isa(s, Core.PhiNode)
+        # Defer past any non-control-transfer terminator: a `PhiNode` must lead its block
+        # (`verify_ir`), and a value-producing terminator can own this block's own comms item
+        # (`:subtape`/`:fshadow`/`:old_primal`/`:old_tangent`), unresolvable until it's emitted.
+        # `_split_ambiguous_block_pushes` later relocates the `GotoIfNot` case per-edge.
+        is_ctrl_transfer = isa(s, Core.GotoNode) || isa(s, Core.GotoIfNot) || isa(s, Core.ReturnNode)
+        defer_epilogue = is_terminator && !unreachable_block[bidx] && !is_ctrl_transfer
         if is_terminator && !unreachable_block[bidx] && !defer_epilogue
             emit_epilogue!(bidx)
         end
@@ -2545,8 +2549,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
             end
             delete!(pending, i)
         end
-        # Deferred for a phi-terminator block (see above): the push follows the phi so it leads
-        # its block, still within this block's range.
+        # Deferred (see above); still within this block's range.
         if defer_epilogue
             emit_epilogue!(bidx)
         end
