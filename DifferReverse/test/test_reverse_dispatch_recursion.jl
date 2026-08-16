@@ -57,6 +57,34 @@ usencg(v) = sum(nonconst_g, v)
 
 vasum(x...) = sum(x)
 
+# fdata-carrying immutable arguments to a recursive call (struct/tuple/NamedTuple wrapping a
+# tracked array) — module-level per the file's convention.
+struct RecW
+    v::Vector{Float64}
+end
+@noinline recw_inner(w::RecW) = sum(w.v)
+recw_outer(x) = recw_inner(RecW(x))
+
+# Mixed fdata (b) + rdata (a) fields: exercises the returned-rdata routing on top of the fdata path.
+struct RecM
+    a::Float64
+    b::Vector{Float64}
+end
+@noinline recm_inner(m::RecM) = m.a * sum(m.b)
+recm_outer(x) = recm_inner(RecM(x[1], x))
+
+@noinline rectup_inner(t) = sum(t[1]) + 2sum(t[2])
+rectup_outer(x) = rectup_inner((x, 2 .* x))
+
+@noinline recnt_inner(nt) = sum(nt.p) * nt.q
+recnt_outer(x) = recnt_inner((p = x, q = x[1] * 3))
+
+# Negative case: struct built from a non-const global. Explicitly typed so the argument type stays
+# concrete (unlike `dyncallee` above) and the bail comes from the provenance check, not an earlier
+# non-concrete-type guard.
+global_recw_v::Vector{Float64} = [10.0, 20.0, 30.0]
+recw_untraced_outer(x) = recw_inner(RecW(global_recw_v)) + sum(x)
+
 @testset "reverse mode: recursion into a hand-written rule" begin
     # A surviving high-level call differentiates via the recursive rrule support below (sin
     # resolves to the hand-written rule in rrules.jl, not raw recursion into its internals).
@@ -555,4 +583,37 @@ end
     @test length(invokes_to_rrule) == 1
     ctx_arg = only(invokes_to_rrule).args[4]
     @test ctx_arg isa DifferReverse.Ctx{Nothing}
+end
+
+@testset "reverse mode: recursion into an fdata-carrying immutable argument" begin
+    v = [1.0, 2.0, 3.0]
+
+    _, dw = rev_gradient(recw_outer, v)
+    @test dw ≈ [1.0, 1.0, 1.0]
+    checkverify_rev(recw_outer, (Vector{Float64},))
+    check_stack_balance(recw_outer, v)
+
+    _, dm = rev_gradient(recm_outer, v)
+    @test dm ≈ [7.0, 1.0, 1.0]
+    checkverify_rev(recm_outer, (Vector{Float64},))
+    check_stack_balance(recm_outer, v)
+
+    _, dt = rev_gradient(rectup_outer, v)
+    @test dt ≈ [5.0, 5.0, 5.0]
+    checkverify_rev(rectup_outer, (Vector{Float64},))
+    check_stack_balance(rectup_outer, v)
+
+    _, dnt = rev_gradient(recnt_outer, v)
+    @test dnt ≈ [21.0, 3.0, 3.0]
+    checkverify_rev(recnt_outer, (Vector{Float64},))
+    check_stack_balance(recnt_outer, v)
+
+    err = try
+        build_ctx(recw_untraced_outer, (Vector{Float64},))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("provenance is not traceable", err.msg)
 end

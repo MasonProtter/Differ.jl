@@ -551,3 +551,34 @@ end
     checkverify_rev(g_m_read, (Float64, Vector{M}))
     check_stack_balance(g_m_read, 0.5, v_m)
 end
+
+@testset "reverse mode: hcat/vcat (recursion into collect(::Generator))" begin
+    # `hcat(v, 2v)` lowers to `collect(::Generator{ProductIterator,closure})`, whose closure captures
+    # both vectors — an immutable argument carrying fdata across a recursive call.
+    v = [1.0, 2.0, 3.0]
+
+    g_hcat(v) = sum(hcat(v, 2v))
+    _, dh = rev_gradient(g_hcat, v)
+    @test dh ≈ [3.0, 3.0, 3.0]
+    checkverify_rev(g_hcat, (Vector{Float64},))
+    check_stack_balance(g_hcat, v)
+
+    # Comms fusion moves the `collect` call's `:subtape` item onto a successor block's stack here.
+    g_hcat_abs2(v) = sum(abs2, hcat(v, 2v))
+    _, dha = rev_gradient(g_hcat_abs2, v)
+    @test dha ≈ [10.0, 20.0, 30.0]
+    checkverify_rev(g_hcat_abs2, (Vector{Float64},))
+    check_stack_balance(g_hcat_abs2, v)
+
+    g_hcat_sin(v) = sum(sin.(hcat(v, 2v)))
+    _, dhs = rev_gradient(g_hcat_sin, v)
+    @test dhs ≈ cos.(v) .+ 2 .* cos.(2v)
+    checkverify_rev(g_hcat_sin, (Vector{Float64},))
+    check_stack_balance(g_hcat_sin, v)
+
+    g_vcat_abs2(v) = sum(abs2, vcat(v, 2v))
+    _, dva = rev_gradient(g_vcat_abs2, v)
+    @test dva ≈ [10.0, 20.0, 30.0]
+    checkverify_rev(g_vcat_abs2, (Vector{Float64},))
+    check_stack_balance(g_vcat_abs2, v)
+end

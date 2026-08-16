@@ -1392,23 +1392,17 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
             return nothing
         end
         if fdtype(iworld, P) !== NoFData
-            # An array or mutable-struct argument is allowed through, but only if its identity is
-            # statically traceable back to a tracked function argument (or a tracked local `%new`),
-            # so the emission side always has a real shadow value to thread through the recursive
-            # `:invoke` rather than a detached `NoFData()`. A mutable-struct argument needs no rdata
-            # back from the inner call: its rule accumulates into the shared `MutableTangent` in
-            # place, so the gradient is already there once the call returns.
-            if !(fdata_type(_tt(iworld, P)) <: Array || ismutabletype(P))
-                reason[] = "recursive call with a non-array, non-mutable-struct argument ($(P)) " *
-                           "whose tangent carries fdata is not supported yet at %$i: " *
-                           "`$(_stmt_str(s))`"
-                return nothing
-            end
+            # Any fdata shape is allowed through: fdata is the identity-carrying half of a tangent,
+            # so an immutable aggregate's is a value wrapper whose leaves are the caller's own shared
+            # shadow arrays/`MutableTangent`s — a callee accumulates into the caller's real buffers
+            # either way, and the value half comes back as the call's returned rdata. What must be
+            # guarded is that the fdata is the caller's real shadow and not a detached zero, which is
+            # the provenance check below.
             a = actual[j]
             tracked_here = isa(a, Core.Argument) ? (a.n <= length(arg_tracked) && arg_tracked[a.n]) :
                            isa(a, Core.SSAValue) ? fdata_tracked[a.id] : false
             if !tracked_here
-                reason[] = "recursive call with an array/mutable-struct argument ($(P)) whose " *
+                reason[] = "recursive call with an fdata-carrying argument ($(P)) whose " *
                            "provenance is not traceable to a function argument is not supported " *
                            "yet at %$i: `$(_stmt_str(s))`"
                 return nothing
@@ -2025,12 +2019,11 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
     # they must agree exactly, since it decides which comms items exist.
-    # Neither `block_hoisted_refs` nor `block_fused_refs` needs handling here: both relocate an item
-    # into some other block's `nodes`/`types`, so this builder emits every item like any other comms
-    # item, from whichever block now owns it. A fused value is computed in the block that dominates
-    # its host, so `presolve` still finds it in `primal_map` unchanged. Only the pullback side needs
-    # to know anything moved.
-    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, _, _, _,
+    # `block_hoisted_refs` needs no handling here: a hoisted `:primal` item is emitted from whichever
+    # block now owns it, same as any other comms item. `block_fused_refs` is bound (not discarded):
+    # the `:subtape` inner-tape recycling lookup below reads a block's comms stack directly rather
+    # than through `presolve`, so it needs to know where a fused item actually landed.
+    block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, _, _, block_fused_refs,
         regions, quiet = scan
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions, quiet)
@@ -2560,12 +2553,20 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                 elseif is_self_edge
                     icall!(_inner_self_ctx, Ctx{TapeT}, (Stack{TapeT},), subtapes_ssa)
                 else
-                    ST = comms_stack_ty[bidx]
+                    # Comms fusion may have moved this `(:subtape, %i)` item off `bidx`'s own comms
+                    # stack onto a control-equivalent successor's; `block_fused_refs[bidx]` records
+                    # where it landed. Fall back to `bidx` itself when it wasn't fused.
+                    item = (:subtape, Core.SSAValue(i))
+                    fused = findfirst(fr -> fr[1] == item, block_fused_refs[bidx])
+                    host_b, k = fused === nothing ? (bidx, nothing) : block_fused_refs[bidx][fused][2:3]
+                    ST = comms_stack_ty[host_b]
                     @assert ST <: Stack "a `:subtape` comms item must force a real `Stack` (never " *
                                         "isbits/singleton — a `Tape` is always mutable), got $(ST)"
-                    k = findfirst(nd -> nd == (:subtape, Core.SSAValue(i)), block_comms_nodes[bidx])
+                    if k === nothing
+                        k = findfirst(nd -> nd == item, block_comms_nodes[host_b])
+                    end
                     icall!(_inner_ctx, Ctx{InnerTapeT}, (ST, Val{k}, Type{InnerTapeT}),
-                           comms_stack_ssa[bidx], Val(k), InnerTapeT)
+                           comms_stack_ssa[host_b], Val(k), InnerTapeT)
                 end
                 pair = emit!(Expr(:invoke, ci, callee_val, fcodual, ctx_val, argcoduals...),
                             Tuple{InnerFCoDualT,InnerTapeT})
@@ -3138,8 +3139,15 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                             icall(_rr_realize_rdata, (zero_like_rdata_type(_widen(Ti)), Type{RDataT}),
                                   acc, RDataT),
                             RDataT)
-                        NT = fields_type(RDataT)
-                        data_id = emit!(Expr(:call, getf, real_acc, 1), NT)
+                        # `rdata_type` wraps a general struct's rdata as `RData{NamedTuple}`, but for
+                        # `T <: Union{Tuple,NamedTuple}` it's already the bare field container.
+                        if RDataT <: Union{Tuple,NamedTuple}
+                            NT = RDataT
+                            data_id = real_acc
+                        else
+                            NT = fields_type(RDataT)
+                            data_id = emit!(Expr(:call, getf, real_acc, 1), NT)
+                        end
                         for j in eachindex(args)
                             Fty = rdtype(iworld, fieldtype(T, j))
                             Fty === NoRData && continue
