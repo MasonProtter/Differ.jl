@@ -82,6 +82,11 @@ fallback that derives the rule from `f`'s IR. `ctx::`[`AbstractCtx`](@ref) carri
 reusable one with [`build_ctx`](@ref)); a hand rule that needs no tape ignores it. A hand rule
 **must** declare its `ctx` slot as `::AbstractCtx` (never a concrete subtype) — that's what keeps
 dispatch against the fallback unambiguous.
+
+Contract for an fdata-carrying result (an array or mutable struct): the returned `CoDual`'s shadow
+must be the exact object the rule's own pullback reads back, never a detached copy — a caller may
+accumulate into it in place before the pullback runs. Every hand-written array rule already
+follows this (`rules_broadcast.jl`, `rules_reductions.jl`, `rules_indexing.jl`, `rules_linalg.jl`).
 """
 function rrule!! end
 
@@ -537,13 +542,63 @@ function resolve_reverse_primal(interp::ContextualInterpreter, codualparams::Vec
         reason[] = "the resolved primal match is not a concrete Method"
         return nothing
     end
-    if pmatch.method.isva
-        reason[] = "the primal method $(pmatch.method) is a vararg method (not yet supported)"
-        return nothing
-    end
     primal_mi = specialize_method(pmatch.method, pmatch.spec_types, pmatch.sparams)::MethodInstance
     CC.add_inlining_edge!(edges, primal_mi)
-    return (primal_mi, length(codualparams))
+    # `nfixed`: declared primal slots before the vararg tail (matches `_impl_argtypes`'s formula).
+    # `-1` for non-vararg — not `nfixed == length(codualparams)`, since a vararg primal called with
+    # zero trailing arguments has `nfixed == length(codualparams)` too (its IR still has a real,
+    # empty, packed tail slot).
+    nfixed = pmatch.method.isva ? Int(pmatch.method.nargs) - 1 : -1
+    return (primal_mi, length(codualparams), nfixed)
+end
+
+# The primal IR indexes its own arguments in *packed* space: Julia's own lowering of a vararg
+# method already binds the trailing parameters to one tuple slot, `Core.Argument(nfixed+1)`. Every
+# reverse-mode helper that resolves a `Core.Argument` found *in the primal IR* needs the codual
+# argument types in that packed shape, not the flat shape the carrier's own call arguments come in.
+# `nfixed < 0` (see `resolve_reverse_primal`) means non-vararg: identity. Not `nfixed == n`: a
+# *vararg* primal called with zero trailing arguments also has `nfixed == n`, but the primal IR
+# still has a real (empty-tuple) packed tail slot in that case, so it must still pack.
+function _packed_codualparams(iworld::UInt, codualparams::Vector{Any}, nfixed::Int)
+    nfixed < 0 && return codualparams
+    tailP = Tuple{(_codual_primal_type(P) for P in codualparams[(nfixed + 1):end])...}
+    return Any[codualparams[1:nfixed]..., _fcdtype(iworld, tailP)]
+end
+
+# Packs a prologue's own flat `parg`/`farg` (positions `nfixed+1:end`) into one slot at
+# `nfixed+1` and truncates both to packed length. Shared between the fwds and pullback prologues.
+function _pack_vararg_args!(emit!::F, ctuple, parg::Vector{Any}, farg::Vector{Any},
+                            codualparams::Vector{Any}, iworld::UInt, nfixed::Int) where {F}
+    nfixed < 0 && return nothing
+    n = length(codualparams)
+    tailP = Tuple{(_codual_primal_type(codualparams[k]) for k in (nfixed + 1):n)...}
+    # Read the flat tail before resizing: with zero trailing arguments, `nfixed+1` is one past
+    # `parg`/`farg`'s current length, so the slot doesn't exist to assign into until after `resize!`.
+    packed_primal = emit!(Expr(:call, ctuple, (parg[k] for k in (nfixed + 1):n)...), tailP)
+    tailFT = fdtype(iworld, tailP)
+    packed_fdata = if tailFT === NoFData
+        # `tangent_type` collapses an all-`NoTangent`/`Tuple{}` tail to `NoTangent`, so this needs
+        # the literal `NoFData()` — an emitted `Core.tuple(NoFData(), ...)` has type
+        # `Tuple{NoFData,...}`, not `NoFData`.
+        NoFData()
+    else
+        emit!(Expr(:call, ctuple,
+            ((isassigned(farg, k) ? farg[k] : NoFData()) for k in (nfixed + 1):n)...), tailFT)
+    end
+    resize!(parg, nfixed + 1)
+    resize!(farg, nfixed + 1)
+    parg[nfixed + 1] = packed_primal
+    farg[nfixed + 1] = packed_fdata
+    return nothing
+end
+
+# Splits the packed tail's one rdata accumulator (`arg_ref_id[nfixed+1]`) back across a flat
+# position `j` at the pullback's return, since the return arity is flat. `acc` is a real per-field
+# tuple, or a collapsed `NoRData`/`ZeroRData` when the tail carries no real rdata.
+@noinline function _pb_vararg_tail_rdata(acc, ::Val{j}, ::Type{Pj}) where {j,Pj}
+    acc isa NoRData && return NoRData()
+    acc isa ZeroRData && return zero_like_rdata_from_type(Pj)
+    return getfield(acc, j)
 end
 
 # The primal's optimized `IRCode`, mirroring `Core.Compiler.typeinf_ircode`'s own body so
@@ -595,10 +650,10 @@ function build_reverse_fwds_ir(interp::ContextualInterpreter, impl_mi::MethodIns
         codualparams = Any[p[2], p[4:end]...]
         info = resolve_reverse_primal(interp, codualparams, reason, edges)
         info === nothing && return nothing
-        primal_mi, n = info
+        primal_mi, n, nfixed = info
         pir = _optimized_primal_ir(interp, primal_mi, reason, edges)
         pir === nothing && return nothing
-        return reverse_fwds_to_ircode(interp, impl_mi, pir, n, primal_mi; reason, edges)
+        return reverse_fwds_to_ircode(interp, impl_mi, pir, n, nfixed, primal_mi; reason, edges)
     finally
         delete!(interp.custom_state.in_progress, impl_mi)
     end
@@ -623,10 +678,10 @@ function build_reverse_pullback_ir(interp::ContextualInterpreter, impl_mi::Metho
         codualparams = Any[ArgsTT.parameters...]
         info = resolve_reverse_primal(interp, codualparams, reason, edges)
         info === nothing && return nothing
-        primal_mi, n = info
+        primal_mi, n, nfixed = info
         pir = _optimized_primal_ir(interp, primal_mi, reason, edges)
         pir === nothing && return nothing
-        return reverse_pullback_to_ircode(interp, impl_mi, pir, n, primal_mi; reason, edges)
+        return reverse_pullback_to_ircode(interp, impl_mi, pir, n, nfixed, primal_mi; reason, edges)
     finally
         delete!(interp.custom_state.in_progress, impl_mi)
     end
@@ -1229,6 +1284,12 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
                         tracked[i] = all(j -> fdtype(iworld, fieldtype(T, j)) === NoFData || provenance_tracked(actual[j]),
                                          eachindex(actual))
                     end
+                elseif !(f isa Core.Builtin) && !(f isa Core.IntrinsicFunction) &&
+                       fdtype(iworld, pir.stmts[i][:type]) !== NoFData
+                    # A derived recursive call's array/mutable-struct result now gets a real shadow
+                    # (`shadow_map`). Over-approximates (a callee that fails to resolve bails the
+                    # whole build anyway), so can't produce a wrong gradient.
+                    tracked[i] = true
                 end
             end
             tracked[i] && !was && (changed = true)
@@ -1261,7 +1322,7 @@ _call_parts(s::Expr) = s.head === :invoke ? (s.args[2], @view s.args[3:end]) : (
 # static (no compilation): resolves the callee value and argument/result types only. Returns
 # `(fval, ftype, argtypes)` on success or `nothing` (with `reason[]` set) otherwise.
 #
-# Three guards, in order:
+# Two guards, in order:
 #  1. Callee must be statically resolvable to a concrete, non-tangent-carrying value (an ordinary
 #     top-level function/singleton, never a closure with differentiable captures or a
 #     dynamically-dispatched callee) — what lets the recursive invoke pass `CoDual{ftype,NoFData}`
@@ -1270,8 +1331,9 @@ _call_parts(s::Expr) = s.head === :invoke ? (s.args[2], @view s.args[3:end]) : (
 #     mutable struct whose identity is traceable back to a tracked function argument. A correctness
 #     guard, not just missing-feature: passing a freshly-zeroed fdata with no link to the real
 #     shadow would be silently wrong, not just unsupported.
-#  3. The call's own result type must likewise carry trivial fdata — array-valued results from a
-#     recursive call are a separate, unimplemented feature (nowhere to route a result shadow today).
+#
+# The call's own result may carry fdata (an array/mutable-struct return) — the emission side routes
+# its shadow into `shadow_map` for the caller to accumulate into.
 function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{String},
                                  arg_tracked::BitVector, fdata_tracked::BitVector)
     fpos, actual = _call_parts(s)
@@ -1353,11 +1415,7 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
             end
         end
     end
-    if fdtype(iworld, pir.stmts[i][:type]) !== NoFData
-        reason[] = "recursive call with a non-trivial-fdata result ($(pir.stmts[i][:type])) is not " *
-                   "supported yet at %$i: `$(_stmt_str(s))`"
-        return nothing
-    end
+    # No result-fdata guard here; a mismatch is caught at the emission site instead.
     return (fval, ftype, argtypes)
 end
 
@@ -1933,7 +1991,8 @@ end
 # `dualize_to_ircode` is, minus any shadow/tangent — see this file's header), instrumented with the
 # block-stack/comms pushes described above.
 # ===========================================================================
-function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, primal_mi::MethodInstance;
+function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nfixed::Int,
+                                primal_mi::MethodInstance;
                                 reason::Ref{String}=Ref(""), edges::Vector{Any}=Any[])
     pstmts = pir.stmts
     N = length(pstmts)
@@ -1959,8 +2018,9 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     codualparams = Any[impl_mi.specTypes.parameters[2], impl_mi.specTypes.parameters[4:end]...]
     vararg_tt = Tuple{impl_mi.specTypes.parameters[4:end]...}
     ArgsTT = Tuple{codualparams...}
+    packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed)
 
-    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, codualparams, reason, edges)
+    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges)
     scan === nothing && return nothing
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
@@ -1977,8 +2037,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
-    fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
-    arg_tracked = _arg_fdata_tracked(iworld, n, codualparams)
+    fdata_tracked = _fdata_tracked(pir, iworld, length(packed_codualparams), packed_codualparams)
+    arg_tracked = _arg_fdata_tracked(iworld, length(packed_codualparams), packed_codualparams)
 
     getf = GlobalRef(Core, :getfield)
     setf = GlobalRef(Core, :setfield!)
@@ -2019,6 +2079,9 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
         parg[i] = emit!(Expr(:call, getf, ci, 1), Pi)
         Fi !== NoFData && (farg[i] = emit!(Expr(:call, getf, ci, 2), Fi))
     end
+    # `carg`/`args_tup_ssa`/`ArgsTT` stay flat: the tape and the pullback's return arity are keyed
+    # by the caller's actual argument list.
+    _pack_vararg_args!(emit!, ctuple, parg, farg, codualparams, iworld, nfixed)
     # Packed once here rather than at each use: both tape shapes below need it, and the
     # pre-allocated shape stores it in the prologue (not at the return) so an early bail can't sink
     # the store past a point where the tape is already visible to the caller.
@@ -2106,7 +2169,9 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
         emit!(Expr(:call, getf, tape_ssa, 3), Vector{Any})
     end
     for k in sort!(collect(bulk_args))
-        Pk = _widen(_codual_primal_type(codualparams[k]))
+        # `bulk_args` is packed-space; never the tail slot (`_bulk_save_args` only bulk-saves an
+        # `Array`/`Memory`, never a `Tuple`).
+        Pk = _widen(_codual_primal_type(packed_codualparams[k]))
         icall!(_bulk_save!, Nothing, (Vector{Any}, Int, Pk), bufs_ssa, bulk_slot[k], parg[k])
     end
 
@@ -2506,6 +2571,18 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                             Tuple{InnerFCoDualT,InnerTapeT})
                 result_cd = emit!(Expr(:call, getf, pair, 1), InnerFCoDualT)
                 primal_map[i] = emit!(Expr(:call, getf, result_cd, 1), Ti)
+                if fdtype(iworld, Ti) !== NoFData
+                    # Route the callee's returned shadow so a caller can accumulate into it; bail
+                    # if its declared fdata type doesn't match this call's inferred one.
+                    InnerFT = InnerFCoDualT.parameters[2]
+                    if InnerFT !== fdtype(iworld, Ti)
+                        reason[] = "recursive call's resolved result fdata type ($(InnerFT)) does " *
+                                   "not match this call's own inferred fdata type " *
+                                   "($(fdtype(iworld, Ti))) at %$i: `$(_stmt_str(s))`"
+                        return nothing
+                    end
+                    shadow_map[i] = emit!(Expr(:call, getf, result_cd, 2), InnerFT)
+                end
                 inner_tape_ssa = emit!(Expr(:call, getf, pair, 2), InnerTapeT)
                 if is_self_edge
                     # Pushed immediately at the call site rather than deferred to `emit_epilogue!` like
@@ -2628,7 +2705,7 @@ end
 @noinline _rr_realize_rdata(acc, ::Type{RDataT}) where {RDataT} =
     (acc isa ZeroRData ? zero_rdata_from_type(RDataT) : acc)::RDataT
 
-function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int,
+function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nfixed::Int,
                                     primal_mi::MethodInstance;
                                     reason::Ref{String}=Ref(""), edges::Vector{Any}=Any[])
     pstmts = pir.stmts
@@ -2651,8 +2728,9 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     codualparams = Any[ArgsTT.parameters...]
     CS = TapeT.parameters[2]
     comms_stack_ty = Any[CS.parameters...]
+    packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed)
 
-    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, codualparams, reason, edges)
+    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges)
     scan === nothing && return nothing
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element — derived inside the scan so both builders agree.
@@ -2666,8 +2744,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
-    fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
-    arg_tracked = _arg_fdata_tracked(iworld, n, codualparams)
+    fdata_tracked = _fdata_tracked(pir, iworld, length(packed_codualparams), packed_codualparams)
+    arg_tracked = _arg_fdata_tracked(iworld, length(packed_codualparams), packed_codualparams)
 
     getf = GlobalRef(Core, :getfield)
     setf = GlobalRef(Core, :setfield!)
@@ -2752,16 +2830,20 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             Fk !== NoFData && (farg_pb[k] = eemit!(Expr(:call, getf, cd, 2), Fk))
         end
     end
+    _pack_vararg_args!(eemit!, ctuple, parg_pb, farg_pb, codualparams, iworld, nfixed)
 
-    arg_ref_id = Vector{Any}(undef, n)
-    for k in 1:n
-        Pk = _codual_primal_type(codualparams[k])
+    npacked = length(packed_codualparams)
+    arg_ref_id = Vector{Any}(undef, npacked)
+    for k in 1:npacked
+        Pk = _codual_primal_type(packed_codualparams[k])
         # `zero_like_rdata_type`/`zero_like_rdata_from_type`, not `rdtype`/`zero_rdata_from_type`: when
         # `Pk` isn't concrete enough to produce a real zero rdata from its type alone (e.g. an
         # abstractly-typed argument slot), the ref's element type must include `ZeroRData` and the zero
         # literal must be `ZeroRData()` instead of crashing (`zero_rdata_from_type` returns the
         # `CannotProduceZeroRDataFromType` sentinel in that case, which `:new`'s field-type check below
-        # rejects). Both collapse to the old behavior exactly when `Pk` is concrete.
+        # rejects). Both collapse to the old behavior exactly when `Pk` is concrete. The packed
+        # vararg-tail slot's accumulator is one combined `Tuple`-shaped rdata, split at the
+        # pullback's return (`_pb_vararg_tail_rdata`).
         RT = zero_like_rdata_type(Pk)
         arg_ref_id[k] = eemit!(Expr(:new, Base.RefValue{RT}, zero_like_rdata_from_type(Pk)), Base.RefValue{RT})
     end
@@ -3209,16 +3291,31 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             if !isempty(bulk_args)
                 bufs_id = emit!(Expr(:call, getf, Core.Argument(2), 3), Vector{Any})
                 for k in sort!(collect(bulk_args))
-                    Pk = _widen(_codual_primal_type(codualparams[k]))
+                    Pk = _widen(_codual_primal_type(packed_codualparams[k]))
                     emit!(icall(_bulk_restore!, (Vector{Any}, Int, Pk),
                                 bufs_id, bulk_slot[k], parg_pb[k]), Nothing)
                 end
             end
-            # Read out every argument's accumulated rdata and return them as a tuple.
+            # Read out every argument's accumulated rdata and return them as a tuple, flat arity.
+            # `nfixed_eff` is `n` when non-vararg, so the tail branch below never fires.
+            is_vararg = nfixed >= 0
+            nfixed_eff = is_vararg ? nfixed : n
             result_ids = Vector{Any}(undef, n)
-            for k in 1:n
+            for k in 1:nfixed_eff
                 Pk = _codual_primal_type(codualparams[k])
                 result_ids[k] = emit!(Expr(:call, getf, arg_ref_id[k], 1), zero_like_rdata_type(Pk))
+            end
+            if is_vararg
+                tailPk = _codual_primal_type(packed_codualparams[nfixed_eff + 1])
+                tailRT = zero_like_rdata_type(tailPk)
+                tail_acc = emit!(Expr(:call, getf, arg_ref_id[nfixed_eff + 1], 1), tailRT)
+                for k in (nfixed_eff + 1):n
+                    Pk = _codual_primal_type(codualparams[k])
+                    RTk = zero_like_rdata_type(Pk)
+                    j = k - nfixed_eff
+                    result_ids[k] = emit!(icall(_pb_vararg_tail_rdata, (tailRT, Val{j}, Type{Pk}),
+                                                tail_acc, Val(j), Pk), RTk)
+                end
             end
             res = emit!(Expr(:call, ctuple, result_ids...),
                        Tuple{(zero_like_rdata_type(_codual_primal_type(c)) for c in codualparams)...})

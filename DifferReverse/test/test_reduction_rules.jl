@@ -15,12 +15,9 @@ include(joinpath(@__DIR__, "testutils.jl"))
         x = [1.0, 2.0, -3.0, 4.5, 0.5]
 
         # y = cumsum(x) is array-valued, so its rdata is NoRData; gradient flows through its fdata
-        # (see the comment on the rule in rules_reductions.jl). Reading y[i] back out of a
-        # hand-ruled call's result inside a larger differentiated function needs the static
-        # provenance scan to recognize the call's result as a provenance root, which it doesn't for
-        # arbitrary calls — a separate, pre-existing engine limitation, not fixable from a rules
-        # file. So the rule is exercised directly: seed the output fdata dy and confirm the
-        # pullback computes the reverse cumulative sum into dx.
+        # (see the comment on the rule in rules_reductions.jl). Exercised directly here: seed the
+        # output fdata dy and confirm the pullback computes the reverse cumulative sum into dx.
+        # `sum(cumsum(x))` (below) exercises the same rule mid-expression, through the full engine.
         dx = zeros(length(x))
         ycd, pb = rrule!!(zero_fcodual(cumsum), Ctx(), CoDual(x, dx))
         @test primal(ycd) == cumsum(x)
@@ -37,6 +34,24 @@ include(joinpath(@__DIR__, "testutils.jl"))
         n = length(x)
         J = [i <= j ? 1.0 : 0.0 for i in 1:n, j in 1:n]   # dy[j]/dx[i] = 1 for i <= j
         @test dx ≈ J * seed
+    end
+
+    @testset "cumsum mid-expression (not the function's final return)" begin
+        # `cumsum`'s own rule always followed the "caller accumulates into the shadow I returned"
+        # contract; the engine previously couldn't route a recursive call's own result shadow at
+        # all, so this only ever worked when `cumsum(x)` was itself the function's return value.
+        f_cs(x) = sum(cumsum(x))
+        x = [1.0, 2.0, -3.0, 4.5, 0.5]
+        _, dx = rev_gradient(f_cs, x)
+        for k in eachindex(x)
+            xp = copy(x); xp[k] += 1e-6
+            xm = copy(x); xm[k] -= 1e-6
+            @test dx[k] ≈ (f_cs(xp) - f_cs(xm)) / 2e-6 rtol = 1e-5
+        end
+        # d(sum(cumsum(x)))/dx_i = number of cumsum entries that include x_i = n - i + 1
+        @test dx ≈ Float64[length(x) - i + 1 for i in eachindex(x)]
+        checkverify_rev(f_cs, (Vector{Float64},))
+        check_stack_balance(f_cs, x)
     end
 
     @testset "extrema" begin

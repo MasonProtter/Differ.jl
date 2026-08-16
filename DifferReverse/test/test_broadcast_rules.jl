@@ -8,17 +8,10 @@ include(joinpath(@__DIR__, "testutils.jl"))
 # same rules live in DifferForwards/test/test_broadcast_rules.jl.
 #
 # A note on test shape, since it differs from most other rule test files: `map(f, x)` returns an
-# array, and Differ's reverse-mode engine has two pre-existing, general (not `map`-specific)
-# limitations that this uncovers:
-#
-#   1. `rev_gradient`/`value_and_gradient!` seed the top-level return with `one(y)`, which doesn't
-#      exist for a `Vector`, so `rev_gradient(map, f, x)` can't be called at all.
-#   2. The general recursive-call dispatcher unconditionally bails on any call whose result carries
-#      fdata (an array). So a composite function that calls `map`/`map!` internally (e.g.
-#      `f(x) = sum(map(sin, x))`) cannot be differentiated in reverse mode via `rev_gradient(f, x)`
-#      today: the `map(sin, x)` call site bails before the engine ever consults `map`'s hand rule.
-#      Confirmed empirically below (last testset): a clean, located `ErrorException`, not a crash.
-#      A general engine limitation, not specific to `map`/`map!`.
+# array, and `rev_gradient`/`value_and_gradient!` seed the top-level return with `one(y)`, which
+# doesn't exist for a `Vector` — so `rev_gradient(map, f, x)` can't be called directly. (Composing
+# `map` inside a scalar-returning function, e.g. `f(x) = sum(map(sin, x))`, works fine — see the
+# last testset.)
 #
 # So reverse-mode `map`/`map!` correctness below is tested by calling `rrule!!` directly, following
 # the same fdata convention every array-returning value uses: an array's cotangent is supplied by
@@ -145,19 +138,19 @@ end
     @test occursin("map!", err2.value.msg)
 end
 
-@testset "reverse mode: composing map inside rev_gradient bails cleanly (documented engine gap)" begin
-    # See the module-level note: `map`'s hand rule is correct (tested directly above), but a `map`
-    # call result is an array with no provenance traceable to a function argument, which the
-    # engine has no way to thread a real shadow for. So composing `map` inside a differentiated
-    # function still bails, before `map`'s hand rule is ever consulted. This is a `map`-independent
-    # engine limitation, out of scope for this rule file; asserted here as a clean, located
-    # `ErrorException`, not a crash.
+@testset "reverse mode: composing map inside rev_gradient" begin
+    # `map`'s hand rule returns its shadow for the caller to accumulate into and its own pullback
+    # to read back — so `sum`'s recursion into it can now route a real gradient through, even
+    # though `map(sin, x)` is not itself the function's final return.
     f(x) = sum(map(sin, x))
-    e = try
-        rev_gradient(f, [0.3, 1.2, -0.7])
-        nothing
-    catch e
-        e
+    x = [0.3, 1.2, -0.7]
+    _, dx = rev_gradient(f, x)
+    @test dx ≈ cos.(x)
+    for k in eachindex(x)
+        xp = copy(x); xp[k] += 1e-6
+        xm = copy(x); xm[k] -= 1e-6
+        @test dx[k] ≈ (f(xp) - f(xm)) / 2e-6 rtol = 1e-5
     end
-    @test e isa ErrorException
+    checkverify_rev(f, (Vector{Float64},))
+    check_stack_balance(f, x)
 end

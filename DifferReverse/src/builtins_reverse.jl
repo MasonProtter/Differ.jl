@@ -139,20 +139,25 @@ function builtin_rrule_comms(::Val{Core.getfield}, actual, Ti, ctx)
     P = ctx.optype(obj)
     dyn = !_bi_literal_index(actual[2])
     if dyn && ctx.tt(_widen(Ti)) !== NoTangent
-        # Dynamic (non-literal) field index into a differentiable field: only supported when every
-        # field of the object shares one pure-rdata tangent type (`_bi_homog_tangent_type`) — a
-        # homogeneous immutable Tuple/NamedTuple or homogeneous mutable struct. A heterogeneous
-        # object has no such guarantee — bail rather than guess. Deliberate scope boundary (mirrors
-        # Mooncake's `is_homogeneous_and_immutable`), not a TODO.
-        ok = P isa DataType && isconcretetype(P) && (P <: Tuple || P <: NamedTuple || ismutabletype(P)) &&
-             ctx.fdtype(Ti) === NoFData && _bi_homog_tangent_type(ctx.tt, P) === ctx.tt(Ti)
-        if !ok
+        # Dynamic (non-literal) field index into a differentiable field: two accepted shapes, both
+        # requiring a homogeneous Tuple/NamedTuple (or mutable struct, pure-rdata case only) —
+        # pure-rdata (`_bi_homog_tangent_type`, mirrors Mooncake's `is_homogeneous_and_immutable`),
+        # or fdata-carrying with no rdata (every array element type). Heterogeneous bails rather
+        # than guessing — deliberate scope boundary, not a TODO.
+        homog_pure_rdata = P isa DataType && isconcretetype(P) &&
+            (P <: Tuple || P <: NamedTuple || ismutabletype(P)) &&
+            ctx.fdtype(Ti) === NoFData && _bi_homog_tangent_type(ctx.tt, P) === ctx.tt(Ti)
+        homog_fdata_tuple = P isa DataType && isconcretetype(P) && (P <: Tuple || P <: NamedTuple) &&
+            ctx.rdtype(Ti) === NoRData && ctx.fdtype(Ti) !== NoFData &&
+            _bi_homog_tangent_type(ctx.fdtype, P) === ctx.fdtype(Ti)
+        if !(homog_pure_rdata || homog_fdata_tuple)
             ctx.reason[] = "reverse mode `getfield` with a dynamic (non-literal) field index is only " *
                            "supported for a homogeneous Tuple/NamedTuple/mutable struct whose fields " *
-                           "all share one pure-rdata tangent type — a deliberate limitation matching " *
-                           "Mooncake's `is_homogeneous_and_immutable` restriction on dynamic getfield " *
-                           "(Mooncake.jl/src/rules/builtins.jl), not an unfinished TODO; got object " *
-                           "type $(P), field type $(Ti) at %$(ctx.ssa.id)"
+                           "all share one pure-rdata tangent type, or a homogeneous Tuple/NamedTuple " *
+                           "whose fields all share one fdata type and carry no rdata — a deliberate " *
+                           "limitation matching Mooncake's `is_homogeneous_and_immutable` restriction " *
+                           "on dynamic getfield (Mooncake.jl/src/rules/builtins.jl), not an unfinished " *
+                           "TODO; got object type $(P), field type $(Ti) at %$(ctx.ssa.id)"
             return false
         end
     end
@@ -193,14 +198,14 @@ function apply_builtin_rrule_fwds!(::Val{Core.getfield}, actual, Ti, ctx)
     shadow = nothing
     if _bi_tracked(ctx.ssa, ctx)
         P = ctx.optype(obj)
-        if P isa DataType && P <: Array
-            # Same-shape shadow array: mirror the primal `.ref` access on the shadow directly.
+        if (P isa DataType && P <: Array) || !_bi_literal_index(actual[2])
+            # Array shadow, or a homogeneous fdata-tuple's own dynamic-index shadow (both a plain
+            # `getfield` at `ctx.fdtype(Ti)` — homogeneity makes the result type static).
             shadow = ctx.emit!(Expr(:call, _getfieldg, ctx.sresolve(obj), ctx.presolve(actual[2])), ctx.fdtype(Ti))
         else
-            # General struct: pull the field's fdata out of the object's fdata handle, covering an
-            # `FData`-wrapped immutable struct and a raw `MutableTangent` uniformly. `actual[2]` is
-            # always a literal here: `builtin_rrule_comms` bails on a dynamic index whenever
-            # `fdtype(Ti) !== NoFData`, i.e. whenever this branch would run.
+            # General struct, literal index: pull the field's fdata out of the object's fdata
+            # handle, covering an `FData`-wrapped immutable struct and a raw `MutableTangent`
+            # uniformly.
             fname = _bi_fieldname(actual[2])
             shadow = ctx.icall!(_rr_get_fdata_field, ctx.fdtype(Ti), (ctx.fdtype(P), typeof(fname)),
                                 ctx.sresolve(obj), actual[2])

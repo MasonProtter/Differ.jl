@@ -9,11 +9,6 @@
 # instead — a fresh zero array `dy` returned as `y`'s shadow, accumulated into in place by
 # downstream reads/writes. By the time this pullback runs, `dy` holds the total seed vector, and
 # `dx[i] += sum(dy[i:end])` is the reverse cumulative sum, computed here as a running suffix sum.
-#
-# Known limitation: using `cumsum(x)`'s result (e.g. indexing into it) inside another
-# differentiated function fails in reverse mode — the static provenance scan (`_fdata_tracked`)
-# doesn't recognize a hand-ruled call's result as a differentiable-array provenance root, so
-# downstream reads off `y` are rejected as untracked. Not fixable from here.
 
 struct CumsumPullback{X<:Array}
     dx::X

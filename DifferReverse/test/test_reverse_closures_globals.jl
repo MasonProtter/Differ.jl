@@ -11,7 +11,10 @@ using DifferForwards: Dual, frule!!, primal, tangent
     # and a `throw_undef_if_not` marker. This used to crash reverse mode with a `MethodError` from
     # deep inside `set_to_zero_internal!!` (no method for `FData`/`RData`); it now bails cleanly
     # with a located `ErrorException` instead (reverse mode's own, separate limitation on
-    # `setfield!` of a field whose tangent carries fdata).
+    # dynamic dispatch through an `Any`-typed box).
+    #
+    # `y += x` lowers to a dynamic `%box_contents + x` call (both operands typed `Any`/`Float64`,
+    # not concrete enough to resolve statically), which is what actually bails.
     err = try
         let y = 1.0
             rev_gradient(1.0) do x
@@ -25,7 +28,7 @@ using DifferForwards: Dual, frule!!, primal, tangent
     end
     @test err isa ErrorException
     @test !(err isa MethodError)
-    @test occursin("setfield!", err.msg)
+    @test occursin("non-concrete argument type", err.msg)
     @test occursin("at %", err.msg)
 
     # Forward mode fully supports this case (Phase 1): `Core.isdefined` is a registered builtin

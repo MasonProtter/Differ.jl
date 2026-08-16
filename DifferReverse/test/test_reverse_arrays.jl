@@ -3,6 +3,7 @@ using DifferReverse
 using DifferReverse: rev_gradient, MutableTangent, rdata_type, tangent_type, NoTangent
 using DifferReverse: zero_rdata_from_type, zero_like_rdata_from_type, CannotProduceZeroRDataFromType
 using DifferReverse: ZeroRData, NoRData, increment!!
+using DifferReverse: rrule!!, Ctx, CoDual, primal, tangent
 using DifferForwards: Dual, frule!!
 
 include(joinpath(@__DIR__, "testutils.jl"))
@@ -301,6 +302,68 @@ end
     check_stack_balance(arr_alias, [3.0, 4.0])
     check_stack_balance(f_sumdo, [1.0, 2.0])
     check_stack_balance(arr_via_mut, MPoint(1.0, 2.0))
+end
+
+@testset "reverse mode: recursive call with an array-valued result" begin
+    # The engine used to drop a recursive call's own returned shadow on the floor (nowhere to
+    # route it), so a caller could never accumulate into it — this only worked when the array-
+    # returning call was itself the function's final return. `@noinline` (not `sum(sin.([1,2].*x))`
+    # from the array-construction testset above) so this really exercises a recursive `:invoke`
+    # rather than getting inlined into a single straight-line block.
+    @noinline function vecconstruct(x::Float64)
+        return [x, 2x, 3x, 4x, 5x, 6x, 7x, 8x, 9x, 10x]
+    end
+    f_vecsum(x) = sum(vecconstruct(x))
+
+    x0 = 1.5
+    _, dx = rev_gradient(f_vecsum, x0)
+    @test dx ≈ central_diff(f_vecsum, x0) rtol = 1e-5
+    @test dx == sum(1:10)   # d/dx sum_i(i*x) = sum_i(i)
+
+    # Confirm the call actually survives as a real recursive `:invoke` to `reverse_fwds_impl`
+    # specialized on `vecconstruct`, not inlined away — dump the primal IR and look for it, rather
+    # than assuming `@noinline` was honored.
+    ir = code_reverse_fwds_ircode(f_vecsum, (Float64,))[1]
+    @test any(st -> isa(st, Expr) && st.head === :invoke && occursin("vecconstruct", string(st)),
+              ir.stmts.stmt)
+
+    checkverify_rev(f_vecsum, (Float64,))
+    check_stack_balance(f_vecsum, x0)
+
+    # Aliasing: the shadow the caller (`sum`'s recursion into `mapreduce_impl`) accumulates into
+    # must be `===` the object `vecconstruct`'s own pullback reads at pullback time. Proven
+    # directly, without going through `sum` at all: seed `vecconstruct`'s own returned shadow by
+    # writing into it externally, then confirm its own pullback reads exactly that mutation.
+    ctx = Ctx()
+    ycd_inner, pb_inner = rrule!!(CoDual(vecconstruct, NoFData()), ctx, CoDual(2.0, NoFData()))
+    dv = tangent(ycd_inner)
+    @test dv == zeros(10)
+    dv .= Float64.(1:10)   # externally accumulate into the exact returned shadow object
+    _, dx_inner = pb_inner(NoRData())
+    @test dx_inner == sum((1:10) .^ 2)   # element i's coefficient is i, seeded dv[i] = i
+end
+
+@testset "reverse mode: dynamic getfield over a homogeneous tuple of arrays" begin
+    # `getfield(vs::Tuple{Vector{Float64},...}, i::Int)` with `i` a runtime value (not a literal
+    # field index) — the shape `vcat`/`hcat`'s own unrolled-free loop over their vararg tuple
+    # compiles down to. Only supported when the tuple is homogeneous (every element the same
+    # array type), which is what makes the result type static despite the dynamic index.
+    @noinline function tupsum(vs::Tuple{Vector{Float64},Vector{Float64},Vector{Float64}})
+        s = 0.0
+        for j in 1:3
+            v = vs[j]
+            for i in eachindex(v)
+                s += v[i]
+            end
+        end
+        return s
+    end
+    x = (Float64.(1:3), Float64.(4:6), Float64.(7:9))
+
+    _, dx = rev_gradient(tupsum, x)
+    @test dx == (ones(3), ones(3), ones(3))
+    checkverify_rev(tupsum, (Tuple{Vector{Float64},Vector{Float64},Vector{Float64}},))
+    check_stack_balance(tupsum, x)
 end
 
 @testset "zero_like_rdata_from_type for a non-concrete (Union) closure type" begin

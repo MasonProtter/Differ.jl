@@ -237,16 +237,72 @@ end
 end
 
 @testset "reverse mode: build_ctx reports the recorded bail reason" begin
+    # `dyncallee` (dynamic-dispatch callee, above) reliably bails; a vararg primal (`vasum`) used to
+    # be this test's vehicle but no longer bails at all now that reverse mode supports vararg
+    # primals — see the vararg testset below.
     err = try
-        build_ctx(vasum, (Float64, Float64))
+        build_ctx(dyncallee, (Float64,))
         nothing
     catch e
         e
     end
     @test err isa ErrorException
-    @test occursin("vararg method", err.msg)
-    @test occursin("vasum", err.msg)
+    @test occursin("is not a concrete DataType", err.msg)
+    @test occursin("dyncallee", err.msg)
     @test !occursin("prealloc=false", err.msg)
+end
+
+@testset "reverse mode: vararg primal" begin
+    # `_static_recursible_call`'s guards apply to a vararg call the same as any other; `vasum`
+    # itself, and the flat<->packed argument-space split (`resolve_reverse_primal`, the fwds/
+    # pullback prologues), are what let this build at all.
+    _, dx2, dx3 = rev_gradient(vasum, 2.0, 3.0)
+    @test dx2 == 1.0 && dx3 == 1.0
+    checkverify_rev(vasum, (Float64, Float64))
+    check_stack_balance(vasum, 2.0, 3.0)
+
+    # 0 trailing arguments: the packed tail is `Tuple{}`, the `NoTangent`/`NoFData` collapse case.
+    # (`vasum` itself can't be called with zero args: `sum(())` throws in plain Julia too.)
+    vasum0(x, ys...) = x * sum(ys; init = 1.0)
+    _, dx0 = rev_gradient(vasum0, 3.0)
+    @test dx0 == 1.0
+    checkverify_rev(vasum0, (Float64,))
+    check_stack_balance(vasum0, 3.0)
+
+    # All-`NoTangent` trailing arguments (an `Int` vararg): every trailing gradient is `NoTangent`.
+    viasum(x, ys::Int...) = x * sum(ys; init = 0)
+    _, dxv, dy1, dy2 = rev_gradient(viasum, 1.5, 2, 3)
+    @test dxv == 5.0   # sum(ys) == 5
+    @test dy1 === NoTangent() && dy2 === NoTangent()
+    checkverify_rev(viasum, (Float64, Int, Int))
+    check_stack_balance(viasum, 1.5, 2, 3)
+
+    # fdata-carrying trailing arguments (an array vararg): the scatter case — one packed rdata
+    # accumulator (trivial here, arrays have no rdata) plus the per-argument array shadows. Loops
+    # over the packed tuple by dynamic index, the same shape `vcat`'s own body uses — `sum(f,
+    # ::Tuple)` recurses into `Base.afoldl` (itself vararg) and currently hits a separate, unrelated
+    # `verify_ir` gap; not this feature's concern.
+    @noinline function vvsum(x::Float64, vs::Vector{Float64}...)
+        s = 0.0
+        for j in 1:length(vs)
+            v = vs[j]
+            for i in eachindex(v)
+                s += v[i]
+            end
+        end
+        return x * s
+    end
+    v1, v2 = [1.0, 2.0], [3.0, 4.0]
+    _, dxvv, dv1, dv2 = rev_gradient(vvsum, 2.0, v1, v2)
+    @test dxvv == sum(v1) + sum(v2)
+    @test dv1 == fill(2.0, 2) && dv2 == fill(2.0, 2)
+    for k in eachindex(v1)
+        v1p = copy(v1); v1p[k] += 1e-6
+        v1m = copy(v1); v1m[k] -= 1e-6
+        @test dv1[k] ≈ (vvsum(2.0, v1p, v2) - vvsum(2.0, v1m, v2)) / 2e-6 rtol = 1e-5
+    end
+    checkverify_rev(vvsum, (Float64, Vector{Float64}, Vector{Float64}))
+    check_stack_balance(vvsum, 2.0, v1, v2)
 end
 
 @testset "reverse mode: dynamic (non-literal) getfield index" begin
