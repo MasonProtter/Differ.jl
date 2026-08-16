@@ -337,3 +337,53 @@ end
     @test new_grdata isa ZeroRData
     @test increment!!(new_grdata, 1.0) == 1.0
 end
+
+@testset "reverse mode: array-valued return" begin
+    f_sinvec(x) = sin.(x)
+    f_id(x) = x
+    f_scale2!(x) = (x .*= 2; x)
+    f_mixed(x) = (sum(x), 2 .* x)
+
+    x = [1.0, 2.0, 3.0]
+    dx = zeros(3)
+    ctx = build_ctx(f_sinvec, (Vector{Float64},))
+    ycd, pb = rrule!!(zero_fcodual(f_sinvec), ctx, CoDual(x, dx))
+    ybar = [0.5, 1.5, -2.0]     # non-uniform, so a wrong-but-plausible scaling can't pass
+    increment!!(tangent(ycd), fdata(ybar))
+    pb(rdata(ybar))
+    @test dx ≈ cos.(x) .* ybar
+
+    # Returning an argument: the result shadow must be that argument's own buffer.
+    x2, dx2 = [1.0, 2.0, 3.0], zeros(3)
+    ctx2 = build_ctx(f_id, (Vector{Float64},))
+    ycd2, pb2 = rrule!!(zero_fcodual(f_id), ctx2, CoDual(x2, dx2))
+    @test tangent(ycd2) === dx2
+    ybar2 = [1.0, 2.0, 3.0]
+    increment!!(tangent(ycd2), fdata(ybar2))
+    pb2(rdata(ybar2))
+    @test dx2 ≈ ybar2
+
+    x3, dx3 = [1.0, 2.0, 3.0], zeros(3)
+    ctx3 = build_ctx(f_scale2!, (Vector{Float64},))
+    ycd3, pb3 = rrule!!(zero_fcodual(f_scale2!), ctx3, CoDual(x3, dx3))
+    @test tangent(ycd3) === dx3
+    ybar3 = [1.0, 1.0, 1.0]
+    increment!!(tangent(ycd3), fdata(ybar3))
+    pb3(rdata(ybar3))
+    @test dx3 ≈ 2 .* ybar3
+
+    # Tuple return mixing a pure-rdata element (`sum`) with an fdata-carrying one (`2 .* x`).
+    x4, dx4 = [1.0, 2.0, 3.0], zeros(3)
+    ctx4 = build_ctx(f_mixed, (Vector{Float64},))
+    ycd4, pb4 = rrule!!(zero_fcodual(f_mixed), ctx4, CoDual(x4, dx4))
+    ybar4 = (2.0, [1.0, 2.0, 3.0])
+    increment!!(tangent(ycd4), fdata(ybar4))
+    pb4(rdata(ybar4))
+    @test dx4 ≈ 2.0 .* ones(3) .+ 2 .* ybar4[2]
+
+    checkverify_rev(f_sinvec, (Vector{Float64},))
+    checkverify_rev(f_id, (Vector{Float64},))
+    checkverify_rev(f_scale2!, (Vector{Float64},))
+    checkverify_rev(f_mixed, (Vector{Float64},))
+    check_stack_balance(f_sinvec, [1.0, 2.0, 3.0]; seed=NoRData())
+end

@@ -1,6 +1,7 @@
 using Test
 using DifferReverse
 using DifferReverse: rev_gradient
+using LinearAlgebra: Diagonal
 import DifferentiationInterface as DI
 
 include(joinpath(@__DIR__, "testutils.jl"))
@@ -36,4 +37,21 @@ end
     @test y2 ≈ fvec(v2)
     @test result2 === dx
     @test dx ≈ rev_gradient(fvec, v2)[2]
+end
+
+@testset "DI reverse: pullback and jacobian for a vector-valued function" begin
+    fvec(x) = sin.(x)
+    x = [0.3, -1.1, 2.4]
+
+    (dx1,) = DI.pullback(fvec, AutoDifferReverse(), x, ([1.0, 0.0, 0.0],))
+    @test dx1 ≈ [cos(x[1]), 0.0, 0.0]
+    (dx2,) = DI.pullback(fvec, AutoDifferReverse(), x, ([0.0, 1.0, 0.0],))
+    @test dx2 ≈ [0.0, cos(x[2]), 0.0]
+
+    J = DI.jacobian(fvec, AutoDifferReverse(), x)
+    @test J ≈ Diagonal(cos.(x))
+
+    y, (dx3,) = DI.value_and_pullback(fvec, AutoDifferReverse(), x, ([1.0, 1.0, 1.0],))
+    @test y ≈ sin.(x)
+    @test dx3 ≈ cos.(x)
 end

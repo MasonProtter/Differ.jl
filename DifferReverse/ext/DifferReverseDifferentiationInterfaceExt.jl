@@ -2,7 +2,7 @@ module DifferReverseDifferentiationInterfaceExt
 
 import DifferentiationInterface as DI
 using DifferReverse: DifferReverse, AutoDifferReverse, CoDual, primal, tangent, rrule!!, Ctx, build_ctx,
-    zero_fcodual, set_to_zero!!, ZeroRData, zero_rdata
+    zero_fcodual, set_to_zero!!, ZeroRData, zero_rdata, fdata, rdata, increment!!
 
 DI.check_available(::AutoDifferReverse) = true
 
@@ -22,6 +22,12 @@ struct DifferPullbackPrep{SIG,CtxT} <: DI.PullbackPrep{SIG}
     _sig::Val{SIG}
     ctx::CtxT
 end
+
+# `pb` restores pre-write primal values in place, so an fdata-carrying result must be copied out
+# before it runs. Mooncake's `_copy_output` does the same.
+_di_out_copy(y::AbstractArray) = copy(y)
+_di_out_copy(y::Tuple) = map(_di_out_copy, y)
+_di_out_copy(y) = y
 
 function DI.prepare_pullback_nokwarg(
         strict::Val, f::F, backend::AutoDifferReverse, x, ty::NTuple, contexts::Vararg{DI.Context,C}
@@ -48,9 +54,12 @@ function DI.value_and_pullback!(
         xcd = CoDual(x, buf)
         ccds = map(zero_fcodual, cargs)
         ycd, pb = rrule!!(fcd, prep.ctx, xcd, ccds...)
-        rdatas = pb(ty[i])
+        y = _di_out_copy(primal(ycd))
+        seed = ty[i]
+        increment!!(tangent(ycd), fdata(seed))
+        rdatas = pb(rdata(seed))
         rd_x = rdatas[2] isa ZeroRData ? zero_rdata(x) : rdatas[2]
-        (primal(ycd), tangent(tangent(xcd), rd_x))
+        (y, tangent(tangent(xcd), rd_x))
     end
     return outs[1][1], map(last, outs)
 end

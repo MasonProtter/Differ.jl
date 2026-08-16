@@ -2269,7 +2269,18 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
             # lattice-faithful and can return a `Core.PartialStruct` (e.g. a tuple return narrowed by
             # const-prop), but `fcodual_type` below needs a bare `Type`.
             R = isa(s.val, GlobalRef) ? Core.Typeof(ret_val) : _widen(_optype(pir, s.val))
-            result_cd = icall!(zerofcodual_g, _fcdtype(iworld, R), (R,), ret_val)
+            FR = _fcdtype(iworld, R)
+            has_shadow = isa(s.val, Core.SSAValue) ? isassigned(shadow_map, s.val.id) :
+                         isa(s.val, Core.Argument) ? isassigned(farg, s.val.n) : false
+            result_cd = if fdtype(iworld, R) === NoFData
+                icall!(zerofcodual_g, FR, (R,), ret_val)
+            elseif has_shadow
+                emit!(Expr(:new, FR, ret_val, sresolve(s.val)), FR)
+            else
+                reason[] = "reverse mode cannot return a value carrying fdata ($(R)) whose shadow " *
+                           "is not traceable to a function argument at %$i: `$(_stmt_str(s))`"
+                return nothing
+            end
             # Pre-allocated mode returns the caller's own tape object; otherwise `%new` one around the
             # stacks the prologue just built.
             tape = tape_ssa
@@ -2278,7 +2289,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, pr
                 tape = emit!(Expr(:new, TapeT, block_stack_ssa, comms_tuple, bufs_ssa, subtapes_ssa,
                                   args_tup_ssa), TapeT)
             end
-            final = emit!(Expr(:call, ctuple, result_cd, tape), Tuple{_fcdtype(iworld, R),TapeT})
+            final = emit!(Expr(:call, ctuple, result_cd, tape), Tuple{FR,TapeT})
             emit!(Core.ReturnNode(final), Any)
         elseif isa(s, Core.PiNode)
             primal_map[i] = presolve(s.val)
