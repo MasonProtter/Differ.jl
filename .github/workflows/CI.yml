@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # Cancel superseded runs on PRs/branches, but never on master.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.package.name }} - julia ${{ matrix.version }} - ${{ matrix.os }} - check-bounds=${{ matrix.check_bounds }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - { name: Contextual,     project: Contextual }
+          - { name: DifferCore,     project: DifferCore }
+          - { name: DifferForwards, project: DifferForwards }
+          - { name: DifferReverse,  project: DifferReverse }
+          - { name: Differ,         project: . }
+        os:
+          - ubuntu-latest
+          - macos-latest
+        version:
+          - '1.13'
+        # `yes` is what `Pkg.test()` does by default. It can hide a bug where an
+        # emitted bounds check was meant to replace one inherited from the primal
+        # but never fires: `yes` turns that into a clean BoundsError, `auto` (the
+        # real-world default) corrupts memory or segfaults. So run both.
+        check_bounds:
+          - 'yes'
+          - 'auto'
+        exclude:
+          # The `auto` lane only needs one OS.
+          - os: macos-latest
+            check_bounds: 'auto'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+          # 1.13 is still at -rc; drop this once 1.13.0 is out.
+          include-all-prereleases: true
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+        with:
+          project: ${{ matrix.package.project }}
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          project: ${{ matrix.package.project }}
+          check_bounds: ${{ matrix.check_bounds }}
+          # Coverage instrumentation rewrites the IR this package differentiates,
+          # so it is off here.
+          coverage: false
