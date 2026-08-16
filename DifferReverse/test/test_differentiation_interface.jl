@@ -85,6 +85,28 @@ end
     end
 end
 
+@testset "DI reverse: two-arg (in-place) pullback/jacobian" begin
+    f!(y, x) = (map!(sin, y, x); nothing)
+    x = [0.3, -1.1, 2.4]
+
+    prep = DI.prepare_pullback(f!, zeros(3), AutoDifferReverse(), x, (ones(3),))
+
+    y1 = zeros(3)
+    DI.value_and_pullback(f!, y1, prep, AutoDifferReverse(), x, (ones(3),))
+    (dx1,) = DI.pullback(f!, zeros(3), prep, AutoDifferReverse(), x, (ones(3),))
+    @test y1 ≈ sin.(x)   # `y` holds `f!`'s output on return, not the pullback's restored zeros
+    @test dx1 ≈ cos.(x)
+
+    y2 = zeros(3)
+    tx = (zeros(3),)
+    DI.value_and_pullback!(f!, y2, tx, prep, AutoDifferReverse(), x, (ones(3),))
+    @test y2 ≈ sin.(x)
+    @test tx[1] ≈ cos.(x)
+
+    J = DI.jacobian(f!, zeros(3), AutoDifferReverse(), x)
+    @test J ≈ Diagonal(cos.(x))
+end
+
 @testset "DI reverse: arr_to_num_linalg pullback (literal exponent)" begin
     x = [0.386, 1.520, 1.979, 0.528]
 

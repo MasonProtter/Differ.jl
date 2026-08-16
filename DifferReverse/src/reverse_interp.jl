@@ -1285,7 +1285,7 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
                                          eachindex(actual))
                     end
                 elseif !(f isa Core.Builtin) && !(f isa Core.IntrinsicFunction) &&
-                       fdtype(iworld, _stype(pir.stmts, i)) !== NoFData
+                       fdtype(iworld, _stype_invoke(pir.stmts, i)) !== NoFData
                     # A derived recursive call's array/mutable-struct result now gets a real shadow
                     # (`shadow_map`). Over-approximates (a callee that fails to resolve bails the
                     # whole build anyway), so can't produce a wrong gradient.
@@ -1853,7 +1853,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, fdata_tracked)
             info === nothing && continue
             _, ftype, argtypes = info
-            R = _stype(pir.stmts, i)
+            R = _stype_invoke(pir.stmts, i)
             resolved = reverse_fwds_recursive_ci(interp, scan_impl_mi, primal_mi, ftype, argtypes, R,
                                                  edges, reason)
             if resolved === nothing
@@ -2515,6 +2515,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                     return nothing
                 end
             else
+                Ti = _stype_invoke(pstmts, i)
                 info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked)
                 info === nothing && return nothing
                 fval, ftype, argtypes = info
@@ -2863,8 +2864,9 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         needs_ref(i) || continue
         # `_widen`: a statement's inferred type can be a lattice element (`Core.PartialStruct`), not a
         # bare `Type` — e.g. a `Core.memorynew` call with a literal length — and `zero_rdata_from_type`
-        # (like `tangent_type`) is only ever defined on `Type`s.
-        Ti = _stype(pstmts, i)
+        # (like `tangent_type`) is only ever defined on `Type`s. `_stype_invoke`: this ref's declared
+        # type must match what the recursion branch below reads and zeroes it at.
+        Ti = _stype_invoke(pstmts, i)
         # See the `arg_ref_id` prologue above for why `zero_like_rdata_type`/`zero_like_rdata_from_type`.
         RT = zero_like_rdata_type(Ti)
         ssa_ref_id[i] = eemit!(Expr(:new, Base.RefValue{RT}, zero_like_rdata_from_type(Ti)), Base.RefValue{RT})
@@ -3236,6 +3238,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                         return nothing
                     end
                 else
+                    Ti = _stype_invoke(pstmts, i)
                     info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked)
                     info === nothing && return nothing
                     _, ftype, argtypes = info

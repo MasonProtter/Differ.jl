@@ -1,7 +1,7 @@
 using Test
 using DifferReverse
 using DifferReverse: NoTangent, NoRData, NoFData, rev_gradient, rev_gradient!
-using DifferReverse: MutableTangent, get_tangent_field, zero_tangent, zero_fcodual, rrule!!, Ctx
+using DifferReverse: MutableTangent, get_tangent_field, zero_tangent, zero_fcodual, rrule!!, Ctx, increment!!
 # `Dual`/`frule!!` here are DifferForwards' forward-mode carrier, used purely as an independent
 # numerical oracle.
 using DifferForwards: Dual, frule!!
@@ -518,4 +518,31 @@ end
     @test dx_b ≈ 6.0
     checkverify_rev(bits_two, (Float64,))
     check_stack_balance(bits_two, 1.5)
+end
+
+@testset "reverse mode: discarded non-inlined call result" begin
+    # `map!`'s result is discarded, so inference widens this statement's type to `Any`. Returns
+    # `nothing`, so `rev_gradient`'s `one(y)` seeding doesn't apply — drive `rrule!!` directly.
+    discard_map!(y::Vector{Float64}, x::Vector{Float64}) = (map!(sin, y, x); nothing)
+
+    x0 = [0.7, 1.3]
+    y0, dy0, dx0 = zeros(2), zeros(2), zeros(2)
+    ycd, pb = rrule!!(zero_fcodual(discard_map!), Ctx(),
+                      DifferReverse.CoDual(y0, dy0), DifferReverse.CoDual(x0, dx0))
+    @test DifferReverse.primal(ycd) === nothing
+    @test y0 ≈ sin.(x0)
+    increment!!(dy0, ones(2))
+    pb(NoRData())
+    @test dx0 ≈ cos.(x0)
+    h = 1e-6
+    for k in eachindex(x0)
+        xp = copy(x0); xp[k] += h
+        xm = copy(x0); xm[k] -= h
+        yp, ym = zeros(2), zeros(2)
+        discard_map!(yp, xp); discard_map!(ym, xm)
+        @test dx0[k] ≈ (sum(yp) - sum(ym)) / 2h rtol = 1e-5
+    end
+
+    checkverify_rev(discard_map!, (Vector{Float64}, Vector{Float64}))
+    check_stack_balance(discard_map!, zeros(2), [0.7, 1.3]; seed=NoRData())
 end

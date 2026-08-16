@@ -44,6 +44,18 @@ _optype(pir, @nospecialize x) = isa(x, Core.SSAValue) ? pir.stmts[x.id][:type] :
 # type-parameter position and a false fact once stamped on a shadow/tangent instruction.
 _stype(stmts, i::Int) = _widen(stmts[i][:type])
 
+# `_stype`, but recovers an `:invoke`'s real result type when inference widened it to `Any` because
+# the caller discards it (`call_result_unused`). The callee's own `rettype` is not widened.
+function _stype_invoke(stmts, i::Int)
+    T = _stype(stmts, i)
+    T === Any || return T
+    s = stmts[i][:stmt]
+    (isa(s, Expr) && s.head === :invoke) || return T
+    ci = s.args[1]
+    isa(ci, Core.CodeInstance) || return T
+    return ci.rettype
+end
+
 # The type of the *value* an operand denotes, as a bare (widened) `Type`: `_optype` alone reports
 # `GlobalRef`/`QuoteNode` as the node's own type rather than the value it denotes, and can return a
 # lattice element (`Core.Const`/`PartialStruct`) for an `SSAValue`/`Argument` rather than a bare

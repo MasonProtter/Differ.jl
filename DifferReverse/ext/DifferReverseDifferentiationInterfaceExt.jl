@@ -95,4 +95,80 @@ end
 # (src/first_order/gradient.jl) calls pullback with seed `oneunit(typeof(y))`, exactly what
 # `rev_gradient`'s own `pb(one(y))` does internally.
 
+# Two-argument (in-place) primal f!(y, x). `pullback_performance(::ReverseMode) === PullbackFast()`,
+# so DI's generic `PullbackSlow`-only `_prepare_pullback_aux` doesn't cover this backend — `prepare`/
+# `value_and_pullback[!]` need their own overloads here; two-arg `jacobian`/`derivative`/
+# `pushforward` are generic over `PullbackPrep` and come for free.
+#
+# No `call_and_return` wrapper (unlike Mooncake's extension): `rrule!!` takes the argument coduals
+# directly, so `y`'s own fdata buffer is seeded instead.
+
+struct DifferTwoArgPullbackPrep{SIG,CtxT,DY} <: DI.PullbackPrep{SIG}
+    _sig::Val{SIG}
+    ctx::CtxT
+    dy::DY
+end
+
+function DI.prepare_pullback_nokwarg(
+        strict::Val, f!::F, y, backend::AutoDifferReverse, x, ty::NTuple, contexts::Vararg{DI.Context,C}
+    ) where {F,C}
+    _sig = DI.signature(f!, y, backend, x, ty, contexts...; strict)
+    cargs = map(DI.unwrap, contexts)
+    ctx = build_ctx(f!, (typeof(y), typeof(x), map(typeof, cargs)...))
+    dy = tangent(zero_fcodual(y))
+    return DifferTwoArgPullbackPrep(_sig, ctx, dy)
+end
+
+function DI.value_and_pullback!(
+        f!::F, y, tx::NTuple{B}, prep::DifferTwoArgPullbackPrep, backend::AutoDifferReverse, x, ty::NTuple{B},
+        contexts::Vararg{DI.Context,C},
+    ) where {F,B,C}
+    DI.check_prep(f!, y, prep, backend, x, ty, contexts...)
+    cargs = map(DI.unwrap, contexts)
+    outs = ntuple(Val(B)) do i
+        fcd = zero_fcodual(f!)
+        set_to_zero!!(prep.dy)
+        buf = tx[i]
+        set_to_zero!!(buf)
+        xcd = CoDual(x, buf)
+        ccds = map(zero_fcodual, cargs)
+        ycd, pb = rrule!!(fcd, prep.ctx, CoDual(y, prep.dy), xcd, ccds...)
+        y_out = copy(y)   # `pb` restores `y`'s pre-write values, so copy the output out first
+        seed = ty[i]
+        increment!!(prep.dy, fdata(seed))
+        rdatas = pb(zero_rdata(primal(ycd)))   # DI ignores f!'s own return value, so its seed is zero
+        rd_x = rdatas[3] isa ZeroRData ? zero_rdata(x) : rdatas[3]
+        copyto!(y, y_out)
+        (y_out, tangent(tangent(xcd), rd_x))
+    end
+    return y, map(last, outs)
+end
+
+function DI.value_and_pullback(
+        f!::F, y, prep::DifferTwoArgPullbackPrep, backend::AutoDifferReverse, x, ty::NTuple{B},
+        contexts::Vararg{DI.Context,C},
+    ) where {F,B,C}
+    DI.check_prep(f!, y, prep, backend, x, ty, contexts...)
+    tx = ntuple(Val(B)) do _
+        tangent(zero_fcodual(x))
+    end
+    return DI.value_and_pullback!(f!, y, tx, prep, backend, x, ty, contexts...)
+end
+
+function DI.pullback(
+        f!::F, y, prep::DifferTwoArgPullbackPrep, backend::AutoDifferReverse, x, ty::NTuple,
+        contexts::Vararg{DI.Context,C},
+    ) where {F,C}
+    DI.check_prep(f!, y, prep, backend, x, ty, contexts...)
+    return DI.value_and_pullback(f!, y, prep, backend, x, ty, contexts...)[2]
+end
+
+function DI.pullback!(
+        f!::F, y, tx::NTuple, prep::DifferTwoArgPullbackPrep, backend::AutoDifferReverse, x, ty::NTuple,
+        contexts::Vararg{DI.Context,C},
+    ) where {F,C}
+    DI.check_prep(f!, y, prep, backend, x, ty, contexts...)
+    return DI.value_and_pullback!(f!, y, tx, prep, backend, x, ty, contexts...)[2]
+end
+
 end # module DifferReverseDifferentiationInterfaceExt
