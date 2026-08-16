@@ -79,15 +79,14 @@ function _bi_mem_ptr_field_regime(@nospecialize(Pobj), @nospecialize(Tobj), ctx)
     return :address
 end
 
-# `_getfieldg`/`_setfieldg`/`_ctupleg` now come from `DifferCore` (shared with reverse mode's
-# `builtins_reverse.jl`); the rest are forward-mode-only.
+# `_getfieldg`/`_setfieldg`/`_ctupleg`/`_ifelseg` now come from `DifferCore` (shared with reverse
+# mode's `builtins_reverse.jl`); the rest are forward-mode-only.
 const _memnewg    = GlobalRef(Core, :memorynew)
 const _memrefnewg = GlobalRef(Core, :memoryrefnew)
 const _memrefgetg = GlobalRef(Core, :memoryrefget)
 const _memrefsetg = GlobalRef(Core, :memoryrefset!)
 const _eqeqg      = GlobalRef(Core, :(===))
 const _isdefinedg = GlobalRef(Core, :isdefined)
-const _ifelseg    = GlobalRef(Core, :ifelse)
 
 # getfield(obj, name[, ordering][, boundscheck]) — trailing operands beyond (obj, name) are forwarded
 # verbatim (faithful primal reconstruction; harmless on the same-shape shadow branches too, since no

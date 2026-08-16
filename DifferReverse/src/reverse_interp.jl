@@ -402,7 +402,7 @@ end
 # regardless of apparent cost.
 #
 # Covers the two carriers and the hand-written `rrule!!` primitives. A hand-written pullback has no
-# common supertype to test (it's a method on the rule author's own type, e.g. `SinPullback`), so those
+# common supertype to test (it's a method on the closure's own compiler-generated type), so those
 # are blocked at the call site instead: the emitted pullback-recursion `:invoke` carries
 # `CC.IR_FLAG_NOINLINE`, which `resolve_todo` honours regardless of the callee's type.
 _is_reverse_carrier_mi(mi::MethodInstance) = isa(mi.def, Method) && isa(mi.specTypes, DataType) &&
@@ -1635,7 +1635,7 @@ function reverse_pullback_recursive_ci(interp, impl_mi::MethodInstance, @nospeci
     # Mirrors the fwds side's two shapes. A derived inner pullback is a `Tape`, so we target its
     # carrier directly rather than the generated `(t::Tape)(seed)` entry — the entry is only a
     # one-line `:invoke` wrapper, and skipping it keeps this a single static call. A hand-written
-    # pullback is a method on the rule author's own type, so the object is its own callee.
+    # pullback is a method on its own compiler-generated closure type, so the object is its own callee.
     derived = InnerTapeT isa Type && InnerTapeT <: Tape
     tt = derived ? Tuple{typeof(reverse_pullback_impl),InnerTapeT,InnerSeedT} :
                    Tuple{InnerTapeT,InnerSeedT}

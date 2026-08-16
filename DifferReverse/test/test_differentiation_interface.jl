@@ -6,6 +6,15 @@ import DifferentiationInterface as DI
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
+# `arr_to_num_linalg`, ported from DifferentiationInterfaceTest's default scenario set: a regression
+# pin for the reverse `^(::Union{Float32,Float64}, ::Integer)` rule at the DI level. `α`/`β` must stay
+# module-level `const`s, not literals — a literal integer exponent (`x .^ 4`) goes through Julia's
+# `Base.literal_pow` broadcast fusion (a different, currently-unsupported `RefValue`-boxed shape),
+# while a `const` global exponent compiles to a plain broadcasted `^` call, matching the DIT scenario.
+const _arr_to_num_α = 4
+const _arr_to_num_β = 6
+arr_to_num_linalg(x::AbstractArray) = sum(vec(x .^ _arr_to_num_α) .* transpose(vec(x .^ _arr_to_num_β)))
+
 @testset "DI reverse: gradient matches rev_gradient" begin
     fscalar(x) = sin(x) * x * x
     x = 1.3
@@ -57,4 +66,16 @@ end
     y, (dx3,) = DI.value_and_pullback(fvec, AutoDifferReverse(), x, ([1.0, 1.0, 1.0],))
     @test y ≈ sin.(x)
     @test dx3 ≈ cos.(x)
+end
+
+@testset "DI reverse: arr_to_num_linalg pullback" begin
+    x = [0.386, 1.520, 1.979, 0.528]
+
+    (dx,) = DI.pullback(arr_to_num_linalg, AutoDifferReverse(), x, (1.0,))
+    @test dx ≈ rev_gradient(arr_to_num_linalg, x)[2]
+    for k in eachindex(x)
+        xp = copy(x); xp[k] += 1e-6
+        xm = copy(x); xm[k] -= 1e-6
+        @test dx[k] ≈ (arr_to_num_linalg(xp) - arr_to_num_linalg(xm)) / 2e-6 rtol = 1e-4
+    end
 end

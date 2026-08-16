@@ -402,8 +402,18 @@ pair — the latter declares which operand positions a rule actually reads, so `
 skip recording an operand no rule ever consults (a linear rule like `add_float` needs none of its
 operands, the whole point of linearity).
 
-**`Core.ifelse` has no reverse rule yet** (ISSUES #66) — forward mode's does. This blocks e.g.
-`sum(x -> x^n, v)` for non-literal integer `n` (`Base.Math.pow_body`'s branchless fast-path selection).
+**`Core.ifelse`** has a reverse rule (ISSUES #66): in scope only when both branches share the result
+type's own concrete, fdata-free shape, routing the accumulated rdata branchlessly to whichever branch
+the tape-recorded primal condition selected (a `(:primal, cond)` comms item), zero to the other. An
+fdata-carrying result (array/mutable-struct select) is a deliberate, located bail — soundly
+expressible via shadow aliasing, not implemented, since no real primal exercises it. Note
+`sum(x -> x^n, v)` for non-literal integer `n` doesn't actually reach this rule at all any more:
+`^(x::Union{Float32,Float64}, n::Integer)` (`rules_math.jl`) has its own hand rule now, which keeps
+`^` un-inlined (a hand rule blocks inlining) so `Base.Math.pow_body`'s branchless fast-path selection
+— the `Core.ifelse` call that originally motivated this rule — never gets dualized in the first
+place. Same category as the `bitcast`/`reinterpret` rationale (`DifferForwards/src/intrinsics.jl:254-
+259`): a bit-twiddling kernel gets a hand rule for the affected function rather than teaching the
+engine to dualize the bit-level machinery generically.
 
 ## `:gc_preserve_begin`/`:gc_preserve_end`
 
@@ -629,7 +639,6 @@ index (block numbering shifts with unrelated optimizer changes).
   intermediate that today gets none. A genuine tradeoff, not a strict improvement — explicitly deferred,
   not scheduled. ISSUES #86/#87 (phi and immutable-`%new` provenance roots) narrow this bail family —
   `.`-broadcast no longer falls into it — but don't remove it.
-- **`Core.ifelse`** has no reverse rule (ISSUES #66) — see "The builtin-rule dispatch layer" above.
 - **A dynamic (non-literal) index outside a loop crashes, both read and write.** `memoryrefset!`
   (ISSUES #67) and `memoryrefget` (ISSUES #93, the read-side companion, found while testing broadcast
   support) both segfault with `Unreachable reached` inside `Stack.push!` (`stack.jl:37`) for this

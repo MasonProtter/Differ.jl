@@ -28,7 +28,7 @@ apply_foreigncall_rrule!(::Val{F}, fc, Ti, ctx) where {F} = nothing
 # `memmove`/`memcpy`: `dst = copy(src)` in reverse is `src̄ += d̄st`, not a mirrored copy. Destination
 # tangent starts at zero after the call; the pullback walks the accumulated destination cotangent
 # into the source, then restores what the destination held before (same old-tangent-restore
-# discipline as `Base.memoryrefset!`'s rule and `MapBangPullback`, `rules_broadcast.jl`).
+# discipline as `Base.memoryrefset!`'s rule and `mapbang_pullback`, `rules_broadcast.jl`).
 #
 # Both buffers must be provenance-tracked (`_bi_tracked`, `builtins_reverse.jl`) — same requirement
 # `memoryrefget`/`memoryrefset!`/`setfield!` already impose.

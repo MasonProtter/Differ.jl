@@ -338,6 +338,57 @@ function apply_builtin_rrule!(::Val{Core.tuple}, actual, Ti, ctx)
 end
 
 # ---------------------------------------------------------------------------
+# `Core.ifelse` — branchless select. In scope only when both branches share `Ti`'s own concrete,
+# fdata-free type; an fdata-carrying `ifelse` (array/mutable-struct select) is a deliberate, located
+# bail — soundly expressible via shadow aliasing, but not implemented here. Routes the accumulated
+# rdata to whichever branch primally ran, zero to the other, with no block splitting.
+# ---------------------------------------------------------------------------
+
+function builtin_rrule_comms(::Val{Core.ifelse}, actual, Ti, ctx)
+    ctx.tt(_widen(Ti)) === NoTangent && return nothing
+    P = _widen(Ti)
+    if !(isconcretetype(P) && _widen(ctx.optype(actual[2])) === P && _widen(ctx.optype(actual[3])) === P)
+        ctx.reason[] = "reverse mode `ifelse` requires both branches to share the concrete result " *
+                       "type $(P) at %$(ctx.ssa.id)"
+        return false
+    end
+    if !can_produce_zero_rdata_from_type(P)
+        ctx.reason[] = "reverse mode `ifelse` requires a type whose zero rdata is derivable from " *
+                       "the type alone, got $(P) at %$(ctx.ssa.id)"
+        return false
+    end
+    if ctx.fdtype(P) !== NoFData
+        ctx.reason[] = "reverse mode `ifelse` does not support an fdata-carrying result ($(P)) at " *
+                       "%$(ctx.ssa.id)"
+        return false
+    end
+    ctx.rdtype(Ti) === NoRData && return Tuple{Any,Any}[]
+    cond = actual[1]
+    (isa(cond, Core.SSAValue) || isa(cond, Core.Argument)) || return Tuple{Any,Any}[]
+    return Tuple{Any,Any}[((:primal, cond), _widen(ctx.optype(cond)))]
+end
+
+function apply_builtin_rrule_fwds!(::Val{Core.ifelse}, actual, Ti, ctx)
+    ctx.tt(_widen(Ti)) === NoTangent && return nothing
+    p = ctx.emit!(Expr(:call, _ifelseg, ctx.presolve(actual[1]),
+                       ctx.presolve(actual[2]), ctx.presolve(actual[3])), Ti)
+    return p, nothing, Dict{Any,Any}()
+end
+
+function apply_builtin_rrule!(::Val{Core.ifelse}, actual, Ti, ctx)
+    ctx.tt(_widen(Ti)) === NoTangent && return nothing
+    ctx.rdtype(Ti) === NoRData && return (nothing, nothing, nothing)
+    P = _widen(Ti)
+    RT = zero_like_rdata_type(P)
+    cnd = ctx.fetch_primal(actual[1])
+    acc = ctx.deref_and_zero!(Ti)
+    z = ctx.emit!(zero_like_rdata_from_type(P), RT)
+    ca = ctx.emit!(Expr(:call, _ifelseg, cnd, acc, z), RT)
+    cb = ctx.emit!(Expr(:call, _ifelseg, cnd, z, acc), RT)
+    return (nothing, ca, cb)
+end
+
+# ---------------------------------------------------------------------------
 # `Core.memorynew` — array allocation step 1: allocates a fresh, uninitialized `Memory{P}`. Its own
 # rdata is always `NoRData` (a handle, not a differentiable value); the shadow allocates a
 # same-length, uninitialized `Memory{tangent_type(P)}`, safe because every element the primal ever

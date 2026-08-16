@@ -95,6 +95,27 @@ end
     check_binary(^, ((0.5, 0.3), (1.5, 2.0), (2.0, -1.5)))
 end
 
+@testset "^ (Float32/Float64, Integer exponent)" begin
+    for (x, n) in ((2.0, 0), (2.0, 1), (2.0, 2), (2.0, -3), (-2.0, 3), (-2.0, -3), (0.0, 0), (0.0, 2))
+        f(x) = x^n
+        _, gx = rev_gradient(f, x)
+        if n == 0
+            # short-circuited in the pullback: n*x^(n-1) would be 0*Inf==NaN at x==0 otherwise.
+            @test gx == 0.0
+        else
+            @test gx ≈ central_diff(f, x) rtol = 1e-6
+        end
+        wrapped(x) = f(x)
+        checkverify_rev(wrapped, (Float64,))
+    end
+
+    f32(x::Float32) = x^3
+    _, gx32 = rev_gradient(f32, 2.0f0)
+    @test gx32 isa Float32
+    @test gx32 ≈ 3 * 2.0f0^2
+    checkverify_rev(f32, (Float32,))
+end
+
 @testset "hypot" begin
     check_binary(hypot, ((3.0, 4.0), (1.0, 2.0), (-3.0, 4.0)))
 end

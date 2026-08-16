@@ -54,6 +54,28 @@ include(joinpath(@__DIR__, "testutils.jl"))
         check_stack_balance(f_cs, x)
     end
 
+    @testset "sum(f, x) with a closure over a non-differentiable capture" begin
+        # `f`'s type is a non-singleton `DataType` (a closure struct with an `Int` field), exercising
+        # the argument-position-callee path through the default derived (non-hand-ruled) reduction:
+        # `sum(f, v)` recurses into Base's own `mapreduce`/`mapreduce_impl`, calling this closure per
+        # element. `n` non-literal means `x^n` runs through the `^(x, ::Integer)` hand rule rather
+        # than being constant-folded away.
+        n = 3
+        v = [0.3, -1.2, 2.0, 0.75]
+        sumpown(v) = sum(x -> x^n, v)
+
+        _, dv = rev_gradient(sumpown, v)
+        @test dv ≈ n .* v .^ (n - 1)
+        for k in eachindex(v)
+            vp = copy(v); vp[k] += 1e-6
+            vm = copy(v); vm[k] -= 1e-6
+            @test dv[k] ≈ (sumpown(vp) - sumpown(vm)) / 2e-6 rtol = 1e-5
+        end
+
+        checkverify_rev(sumpown, (Vector{Float64},))
+        check_stack_balance(sumpown, v)
+    end
+
     @testset "extrema" begin
         x = [3.0, -1.0, 5.0, 2.0]
 

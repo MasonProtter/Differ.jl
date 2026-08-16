@@ -117,6 +117,7 @@ _widen(@nospecialize T) = T isa Type ? T : CC.widenconst(T)
 const _getfieldg = GlobalRef(Core, :getfield)
 const _setfieldg = GlobalRef(Core, :setfield!)
 const _ctupleg   = GlobalRef(Core, :tuple)
+const _ifelseg   = GlobalRef(Core, :ifelse)
 
 # `:foreigncall` IR-inspection helpers, shared by DifferForwards/DifferReverse via a `ctx` NamedTuple
 # (pstmt/calleeval/optype/tt/reason).

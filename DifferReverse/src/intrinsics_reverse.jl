@@ -78,6 +78,15 @@ for op in (:mul_float, :mul_float_fast)
     end
 end
 
+# `fma_float`/`muladd_float`: z = a·b + c  =>  da = b·dz, db = a·dz, dc = dz
+for op in (:fma_float, :muladd_float)
+    @eval intrinsic_rrule_operands(::Val{Core.Intrinsics.$op}) = (1, 2)
+    @eval function apply_intrinsic_rrule!(::Val{Core.Intrinsics.$op}, pvals, dz, Ti, ctx)
+        a, b = pvals[1], pvals[2]
+        return ctx.opf(:mul_float, Ti, b, dz), ctx.opf(:mul_float, Ti, a, dz), dz
+    end
+end
+
 # Quotient rule (`div_float`): z = a/b  =>  da = dz/b, db = -a·dz/b²
 for (div, neg, mul) in ((:div_float, :neg_float, :mul_float), (:div_float_fast, :neg_float_fast, :mul_float_fast))
     @eval intrinsic_rrule_operands(::Val{Core.Intrinsics.$div}) = (1, 2)

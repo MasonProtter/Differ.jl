@@ -270,10 +270,13 @@ Known-current, verified-open bail/crash points worth knowing about before you st
 - Reverse mode still bails on any vararg primal method (ISSUES #59, open) — the carrier-side
   flat→packed mapping exists (`_impl_argtypes`), but the pullback additionally needs an rdata
   *scatter* back across the flat per-argument accumulators, which hasn't been built.
-- No `Core.ifelse` reverse rule (ISSUES #66, open) — forward mode has one
-  (`DifferForwards/src/builtins.jl`); reverse mode's version would be small (route incoming rdata to
-  whichever operand the tape-recorded primal condition selected, zero to the other — no block
-  splitting, so it doesn't touch the 1:1-vs-reversed-topology distinction at all).
+- `Core.ifelse` has a reverse rule (ISSUES #66, fixed) — routes incoming rdata to whichever operand
+  the tape-recorded primal condition selected, zero to the other; declines with its own located
+  reason (not this rule) for an fdata-carrying result. A `pow_body`-class bit-twiddling kernel
+  (`Base.Math.pow_body`, reached from `^` with a non-literal integer exponent) gets a hand rule
+  instead of relying on this — see `rules_math.jl`'s `^(x::Union{Float32,Float64}, n::Integer)`,
+  which keeps `^` un-inlined so `pow_body` never gets dualized, matching the forward-mode
+  `bitcast`/`reinterpret` rationale (`DifferForwards/src/intrinsics.jl:254-259`).
 - `memoryrefset!` with a dynamic index *outside* a loop crashes rather than bailing (ISSUES #67,
   open, unreproduced-as-fixed) — `x[i] = a` for a genuine runtime `i` segfaults with "Unreachable
   reached" inside `Stack`/`CommsCell` when the write isn't inside a loop; the identical write inside a

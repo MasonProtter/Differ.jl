@@ -179,10 +179,10 @@ dispatch (via a runtime `dynamic_frule` dispatcher), higher-order differentiatio
 still unsupported and how to close a gap.
 
 **Reverse mode** (`DifferReverse`) supports: the same core (branches/loops, array indexing/mutation
-via a shadow-chain comms scheme, mutable-struct field mutation, `Core.tuple`, `@simd`/`:loopinfo`),
-direct self-recursion (closed-form `Tape` type) and argument-position callees, but not yet: mutual
-recursion, dynamic dispatch (no `dynamic_rrule` equivalent), vararg primal methods, `Core.Box`/
-abstract-field `setfield!`, or a `Core.ifelse` rule. See `differ-reverse-engine` for the engine and
+via a shadow-chain comms scheme, mutable-struct field mutation, `Core.tuple`, `Core.ifelse`,
+`@simd`/`:loopinfo`), direct self-recursion (closed-form `Tape` type) and argument-position callees,
+but not yet: mutual recursion, dynamic dispatch (no `dynamic_rrule` equivalent), vararg primal
+methods, or `Core.Box`/abstract-field `setfield!`. See `differ-reverse-engine` for the engine and
 `differ-extending-reverse-support` for the exact gap list.
 
 **Known limitations, documented in `ISSUES.md`, not being actively chased right now:**
