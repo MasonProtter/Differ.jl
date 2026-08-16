@@ -3,6 +3,7 @@ using DifferReverse
 using DifferReverse: rev_gradient, MutableTangent, rdata_type, tangent_type, NoTangent
 using DifferReverse: zero_rdata_from_type, zero_like_rdata_from_type, CannotProduceZeroRDataFromType
 using DifferReverse: ZeroRData, NoRData, increment!!
+using DifferForwards: Dual, frule!!
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
@@ -386,4 +387,104 @@ end
     checkverify_rev(f_scale2!, (Vector{Float64},))
     checkverify_rev(f_mixed, (Vector{Float64},))
     check_stack_balance(f_sinvec, [1.0, 2.0, 3.0]; seed=NoRData())
+end
+
+@testset "reverse mode: array whose element tangent type differs from element type" begin
+    # Shadow-side `MemoryRef`/`.ref` statements used to be declared at the primal's type; every
+    # case here crashed with an illegal instruction before that was fixed.
+    function g_int_read(x, v::Vector{Int})
+        return v[1] * x
+    end
+    function g_int_sum(x, v::Vector{Int})
+        return sum(v) * x
+    end
+
+    x_i, v_i = 0.5, [3, 4]
+    _, dx_ir, dv_ir = rev_gradient(g_int_read, x_i, v_i)
+    @test dx_ir == 3.0
+    @test dv_ir == [NoTangent(), NoTangent()]
+    _, dx_is, dv_is = rev_gradient(g_int_sum, x_i, v_i)
+    @test dx_is == 7.0
+    @test dv_is == [NoTangent(), NoTangent()]
+    checkverify_rev(g_int_read, (Float64, Vector{Int}))
+    checkverify_rev(g_int_sum, (Float64, Vector{Int}))
+    check_stack_balance(g_int_read, 0.5, [3, 4])
+    check_stack_balance(g_int_sum, 0.5, [3, 4])
+
+    function g_bool(x, v::Vector{Bool})
+        return v[1] ? 2x : 3x
+    end
+    _, dx_bt = rev_gradient(g_bool, 0.5, [true, false])
+    @test dx_bt == 2.0
+    _, dx_bf = rev_gradient(g_bool, 0.5, [false, true])
+    @test dx_bf == 3.0
+    checkverify_rev(g_bool, (Float64, Vector{Bool}))
+    check_stack_balance(g_bool, 0.5, [true, false])
+
+    # `Int`-element array construction and write, scalar-output form.
+    f_vecconstruct(x) = sum(sin.([1, 2] .* x))
+    x0 = 0.7
+    _, dx_vc = rev_gradient(f_vecconstruct, x0)
+    @test dx_vc ≈ central_diff(f_vecconstruct, x0) rtol = 1e-5
+    @test dx_vc ≈ frule!!(Dual(f_vecconstruct, NoTangent()), Dual(x0, 1.0)).dx
+    # Scalar broadcast operand: pullback reflection is a pre-existing gap, the carrier itself is fine.
+    checkverify_rev_no_pb_reflection(f_vecconstruct, (Float64,))
+    check_stack_balance(f_vecconstruct, x0)
+
+    # A shadow array stores `Tangent{...}` elements, not `RData{...}`; the pullback used to assume
+    # otherwise and crashed on every struct or `ComplexF64` element type.
+    struct P2; a::Float64; b::Float64; end
+    g_p2_read(x, v::Vector{P2}) = v[1].a * x
+
+    v_p2 = [P2(3.0, 4.0), P2(1.0, 2.0)]
+    _, dx_p2, dv_p2 = rev_gradient(g_p2_read, 0.5, v_p2)
+    @test dx_p2 == v_p2[1].a
+    @test dv_p2[1].fields.a == 0.5 && dv_p2[1].fields.b == 0.0
+    @test dv_p2[2].fields.a == 0.0 && dv_p2[2].fields.b == 0.0
+    checkverify_rev(g_p2_read, (Float64, Vector{P2}))
+    check_stack_balance(g_p2_read, 0.5, v_p2)
+
+    # Accumulate into the same element's rdata twice: exercises `increment_rdata!!` on a non-zero
+    # starting tangent, not only a fresh zero.
+    g_p2_double(x, v::Vector{P2}) = v[1].a * x + v[1].b * x
+
+    _, dx_p2d, dv_p2d = rev_gradient(g_p2_double, 0.5, v_p2)
+    @test dx_p2d == v_p2[1].a + v_p2[1].b
+    @test dv_p2d[1].fields.a == 0.5 && dv_p2d[1].fields.b == 0.5
+    @test dv_p2d[2].fields.a == 0.0 && dv_p2d[2].fields.b == 0.0
+    checkverify_rev(g_p2_double, (Float64, Vector{P2}))
+    check_stack_balance(g_p2_double, 0.5, v_p2)
+
+    # A dynamic (loop) index routes through the `:shadow_ref` comms item rather than a statically
+    # re-derived handle.
+    g_p2_loop(x, v::Vector{P2}) = sum(e.a for e in v) * x
+
+    _, dx_p2l, dv_p2l = rev_gradient(g_p2_loop, 0.5, v_p2)
+    @test dx_p2l == v_p2[1].a + v_p2[2].a
+    @test dv_p2l[1].fields.a == 0.5 && dv_p2l[2].fields.a == 0.5
+    checkverify_rev(g_p2_loop, (Float64, Vector{P2}))
+    check_stack_balance(g_p2_loop, 0.5, v_p2)
+
+    g_complex_read(x, v::Vector{ComplexF64}) = real(v[1]) * x
+
+    v_c = ComplexF64[3.0+1.0im, 4.0]
+    _, dx_c, dv_c = rev_gradient(g_complex_read, 0.5, v_c)
+    @test dx_c == real(v_c[1])
+    @test dv_c[1].fields.re == 0.5 && dv_c[1].fields.im == 0.0
+    @test dv_c[2].fields.re == 0.0 && dv_c[2].fields.im == 0.0
+    checkverify_rev(g_complex_read, (Float64, Vector{ComplexF64}))
+    check_stack_balance(g_complex_read, 0.5, v_c)
+
+    # Element whose tangent splits across fdata (`v`) and rdata (`s`) — the shape that caught the
+    # same defect on the forwards read side.
+    struct M; v::Vector{Float64}; s::Float64; end
+    g_m_read(x, v::Vector{M}) = v[1].s * x
+
+    v_m = [M([1.0], 2.0), M([3.0], 4.0)]
+    _, dx_m, dv_m = rev_gradient(g_m_read, 0.5, v_m)
+    @test dx_m == v_m[1].s
+    @test dv_m[1].fields.s == 0.5 && dv_m[1].fields.v == [0.0]
+    @test dv_m[2].fields.s == 0.0 && dv_m[2].fields.v == [0.0]
+    checkverify_rev(g_m_read, (Float64, Vector{M}))
+    check_stack_balance(g_m_read, 0.5, v_m)
 end

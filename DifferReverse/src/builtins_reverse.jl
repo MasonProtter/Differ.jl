@@ -67,6 +67,7 @@ _bi_tracked(@nospecialize(node), ctx) =
 @noinline _rr_increment_field_rdata!(dx, dy, v) = increment_field_rdata!(dx, dy, v)
 @noinline _rr_rdata(t) = rdata(t)
 @noinline _rr_fdata(t) = fdata(t)
+@noinline _rr_increment_rdata!!(t, r) = increment_rdata!!(t, r)
 
 @noinline _rr_zero_tangent2(p, f) = zero_tangent(p, f)
 @noinline _rr_build_tangent(::Type{P}, fields...) where {P} = build_tangent(P, fields...)
@@ -105,6 +106,23 @@ function _emit_rdata!(ctx, @nospecialize(TT), @nospecialize(RT), cur_tangent)
     ctx.rdtype(TT) === NoRData && return ctx.emit!(QuoteNode(NoRData()), RT)
     (RT === TT && ctx.rdtype(TT) === TT) && return cur_tangent
     return ctx.emit!(ctx.icall(_rr_rdata, (TT,), cur_tangent), RT)
+end
+
+# Fold an rdata contribution `acc::RT` into a tangent `cur::TT`. `ZeroRData` means nothing was
+# accumulated, and `increment_rdata!!` has no method for it anyway.
+function _emit_increment_rdata!(ctx, @nospecialize(TT), @nospecialize(RT), cur, acc)
+    ctx.rdtype(TT) === NoRData && return cur
+    RT === ZeroRData && return cur
+    ctx.rdtype(TT) === TT && return ctx.emit!(ctx.icall(increment!!, (TT, RT), cur, acc), TT)
+    return ctx.emit!(ctx.icall(_rr_increment_rdata!!, (TT, RT), cur, acc), TT)
+end
+
+# `fdata` of a tangent loaded at its own type `TT`, at the declared fdata type `FT`. Mirror of
+# `_emit_rdata!` above, same fast paths.
+function _emit_fdata!(ctx, @nospecialize(TT), @nospecialize(FT), cur_tangent)
+    ctx.fdtype(TT) === NoFData && return ctx.emit!(QuoteNode(NoFData()), FT)
+    (FT === TT && ctx.fdtype(TT) === TT) && return cur_tangent
+    return ctx.icall!(_rr_fdata, FT, (TT,), cur_tangent)
 end
 
 # ---------------------------------------------------------------------------
@@ -177,7 +195,7 @@ function apply_builtin_rrule_fwds!(::Val{Core.getfield}, actual, Ti, ctx)
         P = ctx.optype(obj)
         if P isa DataType && P <: Array
             # Same-shape shadow array: mirror the primal `.ref` access on the shadow directly.
-            shadow = ctx.emit!(Expr(:call, _getfieldg, ctx.sresolve(obj), ctx.presolve(actual[2])), Ti)
+            shadow = ctx.emit!(Expr(:call, _getfieldg, ctx.sresolve(obj), ctx.presolve(actual[2])), ctx.fdtype(Ti))
         else
             # General struct: pull the field's fdata out of the object's fdata handle, covering an
             # `FData`-wrapped immutable struct and a raw `MutableTangent` uniformly. `actual[2]` is
@@ -362,7 +380,7 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefnew}, actual, Ti, ctx)
                 push!(shadow_args, ctx.presolve(a))
             end
         end
-        shadow = ctx.emit!(Expr(:call, Base.memoryrefnew, shadow_args...), Ti)
+        shadow = ctx.emit!(Expr(:call, Base.memoryrefnew, shadow_args...), ctx.fdtype(Ti))
     end
     return p, shadow, Dict{Any,Any}()
 end
@@ -389,7 +407,7 @@ function builtin_rrule_comms(::Val{Base.memoryrefget}, actual, Ti, ctx)
     # handle, keeping the comms tuple empty for static-index reads. A dynamic (loop) index still
     # needs its own value on the tape, as a plain `Int` rather than the 16-byte `MemoryRef`.
     d = ctx.static_ref(ref_node)
-    d === nothing && return Tuple{Any,Any}[((:shadow_ref, ref_node), ctx.optype(ref_node))]
+    d === nothing && return Tuple{Any,Any}[((:shadow_ref, ref_node), ctx.fdtype(ctx.optype(ref_node)))]
     idx = d[2]
     return isa(idx, Core.SSAValue) ? Tuple{Any,Any}[((:primal, idx), Int)] : Tuple{Any,Any}[]
 end
@@ -402,8 +420,11 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefget}, actual, Ti, ctx)
     p = ctx.emit!(Expr(:call, Base.memoryrefget, (ctx.presolve(a) for a in actual)...), Ti)
     shadow = nothing
     if _bi_tracked(ctx.ssa, ctx)
-        shadow = ctx.emit!(Expr(:call, Base.memoryrefget, ctx.sresolve(actual[1]),
-                                (ctx.presolve(a) for a in actual[2:end])...), Ti)
+        # The shadow array stores elements at their own tangent type, not at `fdtype(Ti)`.
+        TT = ctx.tt(_widen(Ti))
+        cur = ctx.emit!(Expr(:call, Base.memoryrefget, ctx.sresolve(actual[1]),
+                             (ctx.presolve(a) for a in actual[2:end])...), TT)
+        shadow = _emit_fdata!(ctx, TT, ctx.fdtype(Ti), cur)
     end
     return p, shadow, Dict{Any,Any}()
 end
@@ -413,13 +434,13 @@ function apply_builtin_rrule!(::Val{Base.memoryrefget}, actual, Ti, ctx)
     ctx.rdtype(Ti) === NoRData && return nores
     acc = ctx.deref_and_zero!(Ti)
     shadow_ref = ctx.fetch_shadow(actual[1])
-    # This rule only ever reaches a "bits" (rdata-carrying-directly) element, so ordinarily
-    # `rdtype(Ti) == Ti` — but an array with an abstract eltype (e.g. `Vector{Real}`) makes `Ti`
-    # non-concrete, in which case `acc`'s actual type is `zero_like_rdata_type(Ti)`, not bare `Ti`.
+    # Shadow elements are stored at their tangent type, which equals `Ti`'s rdata type only for a
+    # bits scalar. `acc` may be `ZeroRData` when `Ti` isn't concrete.
+    TT = ctx.tt(_widen(Ti))
     RT = zero_like_rdata_type(_widen(Ti))
-    cur = ctx.emit!(Expr(:call, Base.memoryrefget, shadow_ref, QuoteNode(:not_atomic), false), RT)
-    new = ctx.emit!(ctx.icall(increment!!, (RT, RT), cur, acc), RT)
-    ctx.emit!(Expr(:call, Base.memoryrefset!, shadow_ref, new, QuoteNode(:not_atomic), false), RT)
+    cur = ctx.emit!(Expr(:call, Base.memoryrefget, shadow_ref, QuoteNode(:not_atomic), false), TT)
+    new = _emit_increment_rdata!(ctx, TT, RT, cur, acc)
+    ctx.emit!(Expr(:call, Base.memoryrefset!, shadow_ref, new, QuoteNode(:not_atomic), false), TT)
     return nores
 end
 
@@ -560,22 +581,26 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     length(actual) < 2 && return false
     elt = Ti
     ref_node, val_node = actual[1], actual[2]
-    if ctx.fdtype(elt) !== NoFData
-        if !_bi_tracked(val_node, ctx)
-            ctx.reason[] = "reverse mode `memoryrefset!` of a non-bits element ($(elt)) requires the " *
-                           "assigned value's own fdata to be traceable to a function argument at " *
+    # No tangent at all (e.g. an `Int` element): no shadow traffic, no provenance requirement.
+    notangent = ctx.tt(_widen(elt)) === NoTangent
+    if !notangent
+        if ctx.fdtype(elt) !== NoFData
+            if !_bi_tracked(val_node, ctx)
+                ctx.reason[] = "reverse mode `memoryrefset!` of a non-bits element ($(elt)) requires the " *
+                               "assigned value's own fdata to be traceable to a function argument at " *
+                               "%$(ctx.ssa.id)"
+                return false
+            end
+        elseif ctx.rdtype(elt) !== ctx.tt(_widen(elt))
+            ctx.reason[] = "reverse mode does not support array mutation of element type ($(elt)) at " *
                            "%$(ctx.ssa.id)"
             return false
         end
-    elseif ctx.rdtype(elt) !== ctx.tt(_widen(elt))
-        ctx.reason[] = "reverse mode does not support array mutation of element type ($(elt)) at " *
-                       "%$(ctx.ssa.id)"
-        return false
-    end
-    if !(isa(ref_node, Core.SSAValue) && ref_node.id <= length(ctx.tracked) && ctx.tracked[ref_node.id])
-        ctx.reason[] = "array write has no differentiable provenance traceable to a function " *
-                       "argument at %$(ctx.ssa.id)"
-        return false
+        if !(isa(ref_node, Core.SSAValue) && ref_node.id <= length(ctx.tracked) && ctx.tracked[ref_node.id])
+            ctx.reason[] = "array write has no differentiable provenance traceable to a function " *
+                           "argument at %$(ctx.ssa.id)"
+            return false
+        end
     end
     # A statically-derivable `MemoryRef` is re-derived in the pullback, so neither its shadow nor
     # primal handle is pushed — only the overwritten values remain. A dynamic (loop) index still
@@ -585,7 +610,9 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     derivable = d !== nothing
     items = Tuple{Any,Any}[]
     if !derivable
-        push!(items, ((:shadow_ref, ref_node), ctx.optype(ref_node)))
+        if !notangent
+            push!(items, ((:shadow_ref, ref_node), ctx.fdtype(ctx.optype(ref_node))))
+        end
     elseif isa(d[2], Core.SSAValue)
         push!(items, ((:primal, d[2]), Int))
     end
@@ -601,20 +628,29 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
         end
         push!(items, ((:old_primal, ctx.ssa), elt))
     end
-    push!(items, ((:old_tangent, ctx.ssa), ctx.tt(_widen(elt))))
+    if !notangent
+        push!(items, ((:old_tangent, ctx.ssa), ctx.tt(_widen(elt))))
+    end
     return items
 end
 
 function apply_builtin_rrule_fwds!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     ref_node, val_node = actual[1], actual[2]
     rest = @view actual[3:end]
-    pref, sref = ctx.presolve(ref_node), ctx.sresolve(ref_node)
+    pref = ctx.presolve(ref_node)
     TT = ctx.tt(_widen(Ti))
     bulk = ctx.bulk_saved(ref_node)
     # The old primal is read only to put it back one element at a time; a bulk-saved array already has
     # its pre-call contents copied aside in the prologue, so this load is pure waste there.
     old_primal = bulk ? nothing :
         ctx.emit!(Expr(:call, Base.memoryrefget, pref, (ctx.presolve(a) for a in rest)...), Ti)
+    if TT === NoTangent
+        p = ctx.emit!(Expr(:call, Base.memoryrefset!, pref, ctx.presolve(val_node), (ctx.presolve(a) for a in rest)...), Ti)
+        saved = Dict{Any,Any}()
+        bulk || (saved[(:old_primal, ctx.ssa)] = old_primal)
+        return p, nothing, saved
+    end
+    sref = ctx.sresolve(ref_node)
     old_tangent = ctx.emit!(Expr(:call, Base.memoryrefget, sref, (ctx.presolve(a) for a in rest)...), TT)
     # `zero_tangent(p, f)` embeds `f` (the assigned value's own fdata) directly rather than
     # fabricating a fresh zero when the element carries fdata — the alias that makes later in-place
@@ -635,10 +671,19 @@ end
 # to `old_primal`/`old_tangent` is the same operation either way.
 function apply_builtin_rrule!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     ref_node = actual[1]
-    sref = ctx.fetch_shadow(ref_node)
     bulk = ctx.bulk_saved(ref_node)
-    old_tangent = ctx.fetch_saved((:old_tangent, ctx.ssa))
+    nores = ntuple(_ -> nothing, length(actual))
     TT = ctx.tt(_widen(Ti))
+    if TT === NoTangent
+        if !bulk
+            pref = ctx.fetch_primal(ref_node)
+            old_primal = ctx.fetch_saved((:old_primal, ctx.ssa))
+            ctx.emit!(Expr(:call, Base.memoryrefset!, pref, old_primal, QuoteNode(:not_atomic), false), Ti)
+        end
+        return nores
+    end
+    sref = ctx.fetch_shadow(ref_node)
+    old_tangent = ctx.fetch_saved((:old_tangent, ctx.ssa))
     # `zero_like_rdata_type`, not `rdtype`: `acc` may be `ZeroRData` when `Ti` isn't concrete (e.g.
     # an array with an abstract eltype). `cur_rdata` is always a real value regardless, so declaring
     # it at the same (possibly wider) `RT` is harmless.

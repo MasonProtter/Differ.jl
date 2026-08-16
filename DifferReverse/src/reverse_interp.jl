@@ -2918,13 +2918,14 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             arr = shadow ? farg_pb[k] : parg_pb[k]
             arr === nothing && return nothing        # argument carries no fdata
             reft = _optype(pir, a)
-            base = emit!(Expr(:call, getf, arr, QuoteNode(:ref)), reft)
+            rt = shadow ? fdtype(iworld, reft) : reft
+            base = emit!(Expr(:call, getf, arr, QuoteNode(:ref)), rt)
             # A literal index is baked in directly; a dynamic one was pushed as a plain `Int` comms
             # item and comes back through `pb_presolve` (never re-enters here — an `Int`-typed node
             # never matches `_static_ref_derivation`'s `MemoryRef` shape).
             idx_val = isa(idx, Core.SSAValue) ? pb_presolve(idx) : idx
             # Shadow ref forces boundscheck `true`; primal ref keeps the primal's own.
-            return emit!(Expr(:call, Base.memoryrefnew, base, idx_val, shadow ? true : bc), reft)
+            return emit!(Expr(:call, Base.memoryrefnew, base, idx_val, shadow ? true : bc), rt)
         end
 
         pb_fetch_shadow(@nospecialize a) =

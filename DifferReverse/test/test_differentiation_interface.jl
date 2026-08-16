@@ -18,6 +18,9 @@ include(joinpath(@__DIR__, "testutils.jl"))
 
     # Regression test for `.`-broadcast through the derived path; d/dx sum(x .+ x) = 2 elementwise.
     @test DI.gradient(x -> sum(x .+ x), AutoDifferReverse(), [1.0, 2.0]) ≈ [2.0, 2.0]
+
+    # `Int`-element array literal construction and read.
+    @test DI.derivative(x -> sin.([1, 2] .* x), AutoDifferReverse(), 0.7) ≈ [cos(0.7), 2cos(1.4)]
 end
 
 @testset "DI reverse: prepared pullback! accumulates in place" begin
