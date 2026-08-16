@@ -7,13 +7,18 @@ import DifferentiationInterface as DI
 include(joinpath(@__DIR__, "testutils.jl"))
 
 # `arr_to_num_linalg`, ported from DifferentiationInterfaceTest's default scenario set: a regression
-# pin for the reverse `^(::Union{Float32,Float64}, ::Integer)` rule at the DI level. `α`/`β` must stay
-# module-level `const`s, not literals — a literal integer exponent (`x .^ 4`) goes through Julia's
-# `Base.literal_pow` broadcast fusion (a different, currently-unsupported `RefValue`-boxed shape),
-# while a `const` global exponent compiles to a plain broadcasted `^` call, matching the DIT scenario.
+# pin for the reverse `^(::Union{Float32,Float64}, ::Integer)` rule at the DI level. `α`/`β` are
+# module-level `const`s, not literals, matching the DIT scenario exactly: a `const` global exponent
+# compiles to a plain broadcasted `^` call, while a literal integer exponent (`x .^ 4`) goes through
+# Julia's `Base.literal_pow` broadcast fusion (a `RefValue`-boxed shape) instead — see
+# `arr_to_num_linalg_literal` below for that form.
 const _arr_to_num_α = 4
 const _arr_to_num_β = 6
 arr_to_num_linalg(x::AbstractArray) = sum(vec(x .^ _arr_to_num_α) .* transpose(vec(x .^ _arr_to_num_β)))
+
+# Same computation, literal exponents instead of `const` globals — exercises `Base.literal_pow`'s
+# `RefValue`-boxed broadcast shape at the DI level.
+arr_to_num_linalg_literal(x::AbstractArray) = sum(vec(x .^ 4) .* transpose(vec(x .^ 6)))
 
 @testset "DI reverse: gradient matches rev_gradient" begin
     fscalar(x) = sin(x) * x * x
@@ -77,5 +82,17 @@ end
         xp = copy(x); xp[k] += 1e-6
         xm = copy(x); xm[k] -= 1e-6
         @test dx[k] ≈ (arr_to_num_linalg(xp) - arr_to_num_linalg(xm)) / 2e-6 rtol = 1e-4
+    end
+end
+
+@testset "DI reverse: arr_to_num_linalg pullback (literal exponent)" begin
+    x = [0.386, 1.520, 1.979, 0.528]
+
+    (dx,) = DI.pullback(arr_to_num_linalg_literal, AutoDifferReverse(), x, (1.0,))
+    @test dx ≈ rev_gradient(arr_to_num_linalg_literal, x)[2]
+    for k in eachindex(x)
+        xp = copy(x); xp[k] += 1e-6
+        xm = copy(x); xm[k] -= 1e-6
+        @test dx[k] ≈ (arr_to_num_linalg_literal(xp) - arr_to_num_linalg_literal(xm)) / 2e-6 rtol = 1e-4
     end
 end

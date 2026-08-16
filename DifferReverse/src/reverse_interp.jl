@@ -2357,9 +2357,14 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             # e.g. `%new(Main.MPoint, ...)`) at the inference world; a literal `DataType` passes
             # through unchanged.
             T = _calleeval(s.args[1], iworld)
-            if !(T isa DataType) || !is_always_fully_initialised(T)
-                reason[] = "reverse mode does not support structs with possibly-undef fields " *
-                           "($(T)) at %$i: `$(_stmt_str(s))`"
+            if !(T isa DataType)
+                reason[] = "reverse mode `%new` needs a statically-resolvable type at %$i: " *
+                           "`$(_stmt_str(s))`"
+                return nothing
+            end
+            if !is_always_fully_initialised(T) && length(s.args) - 1 != fieldcount(T)
+                reason[] = "reverse mode does not support a partially-initialised `%new` of a " *
+                           "struct with possibly-undef fields ($(T)) at %$i: `$(_stmt_str(s))`"
                 return nothing
             end
             args = @view s.args[2:end]

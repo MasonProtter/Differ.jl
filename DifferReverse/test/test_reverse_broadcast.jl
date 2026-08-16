@@ -148,6 +148,55 @@ end
     check_stack_balance(wrapsum, copy(v9))
 end
 
+@testset "reverse mode: literal integer exponent (`x .^ p`)" begin
+    # `x .^ 4` (syntactic literal) lowers through `Base.literal_pow`, which broadcasting wraps as
+    # `broadcasted(literal_pow, Ref(^), x, Ref(Val(p)))` — a different shape from a `const`-exponent
+    # broadcast (`arr_to_num_linalg` in test_differentiation_interface.jl), since both `^` and
+    # `Val(p)` arrive boxed in a `Base.RefValue`. `p == 2`/`3` hit Base's own dedicated small-exponent
+    # `literal_pow` methods (plain multiplications), a different path from the general `Val{p}` one.
+    f_p2(x) = sum(x .^ 2)
+    f_p3(x) = sum(x .^ 3)
+    f_p4(x) = sum(x .^ 4)
+    f_p5(x) = sum(x .^ 5)
+
+    for (f, dfdx) in ((f_p2, x -> 2 .* x), (f_p3, x -> 3 .* x .^ 2),
+                      (f_p4, x -> 4 .* x .^ 3), (f_p5, x -> 5 .* x .^ 4))
+        _, dv = rev_gradient(f, v9)
+        @test dv ≈ dfdx(v9)
+        @test dv ≈ cdiff_vec(f, v9) rtol = 1e-5
+        checkverify_rev(f, (Vector{Float64},))
+        check_stack_balance(f, copy(v9))
+    end
+
+    # The motivating case from the plan, pinned exactly.
+    _, dsum4 = rev_gradient(x -> sum(x .^ 4), [1.0, 2.0])
+    @test dsum4 == [4.0, 32.0]
+end
+
+@testset "reverse mode: partially-initialised `%new` still bails" begin
+    # The gate change only widens the fully-initialised case; a genuine partial `%new` (fewer operands
+    # than fields) must still bail, with the more precise message. `Partial2`'s inner constructor
+    # supplies only `a`, leaving `b` undef; returning `p` itself (rather than a field read) keeps the
+    # `%new` from being optimised away by SROA.
+    mutable struct Partial2_9
+        a::Float64
+        b::Float64
+        Partial2_9(x) = new(x)
+    end
+    f_partial(x) = Partial2_9(x)
+
+    err = try
+        rev_gradient(f_partial, 3.0)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("partially-initialised", err.msg)
+    @test occursin("possibly-undef fields", err.msg)
+    @test occursin("Partial2_9", err.msg)
+end
+
 gb_global9 = [1.0, 2.0, 3.0]
 
 @testset "reverse mode: bail quality on a non-const global (not a crash)" begin
