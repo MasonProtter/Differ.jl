@@ -155,6 +155,57 @@ end
     @test_throws ArgumentError frule!!(Dual(guarded,     NoTangent()), Dual(0.0, 1.0))
 end
 
+@testset "inactive builtins (isa, <:, nfields, sizeof, typeof, fieldtype)" begin
+    # `sum(::Generator)` lowers to `Base._foldl_impl`, whose `_InitialValue` sentinel check is a
+    # `Core.isa` builtin on a union-typed value (the invoke's own `Union{_InitialValue,Float64}`
+    # return type) — the repro that motivated `@inactive_builtin`.
+    gensum(x) = sum(sin(xi) + xi^2 for xi in x)
+    x = [0.3, 0.7]
+    gd = frule!!(Dual(gensum, NoTangent()), Dual(x, [1.0, 1.0]))
+    @test gd.x ≈ gensum(x)
+    @test gd.dx ≈ sum(cos.(x) .+ 2 .* x)
+    checkverify(gensum, (Vector{Float64},))
+
+    # `isa` against a locally-defined struct type, checked on a value whose static type is a
+    # genuine runtime union (an `@noinline` call's `Union{A,B}` return) so the compiler can't fold
+    # the check away — this is what exercises `vpresolve` on a value-position `GlobalRef` into this
+    # module, as opposed to a `Base`/`Core` type.
+    struct IsaA; v::Float64; end
+    struct IsaB; v::Float64; end
+    @noinline mk_isa(x, flag) = flag ? IsaA(x) : IsaB(x)
+    function isa_guard(x, flag)
+        r = mk_isa(x, flag)
+        r isa IsaA ? r.v : 2*r.v
+    end
+    ia = frule!!(Dual(isa_guard, NoTangent()), Dual(3.0, 1.0), Dual(true, NoTangent()))
+    @test ia.x == 3.0 && ia.dx == 1.0
+    ib = frule!!(Dual(isa_guard, NoTangent()), Dual(3.0, 1.0), Dual(false, NoTangent()))
+    @test ib.x == 6.0 && ib.dx == 2.0
+    checkverify(isa_guard, (Float64, Bool))
+
+    # `<:`/`typeof`/`nfields`/`fieldtype` from ordinary code, on a `Union`-typed argument so none
+    # of them fold away at compile time. All four results are inactive (`Type`/`Int`/`Bool`), only
+    # the final `Float64(c)` carries a tangent.
+    struct ReflA; a::Int; end
+    struct ReflB; a::Float64; b::Int; end
+    function reflect_guard(y)
+        T = typeof(y)
+        n = nfields(y)
+        isint = fieldtype(T, 1) <: Integer
+        c = (T <: ReflA && isint) ? n : -n
+        Float64(c)
+    end
+    checkverify(reflect_guard, (Union{ReflA,ReflB},))
+
+    # `sizeof` on a genuinely runtime `DataType` argument (not folded, unlike `sizeof` of a small
+    # concrete `Union`, which the optimizer union-splits into per-arm literals before it ever
+    # becomes a `Core.Builtin` call).
+    sizeof_guard(T::DataType) = Float64(sizeof(T))
+    sd = frule!!(Dual(sizeof_guard, NoTangent()), Dual(Float64, NoTangent()))
+    @test sd.x == 8.0 && sd.dx == 0.0
+    checkverify(sizeof_guard, (DataType,))
+end
+
 @testset "exception handling (try/catch)" begin
     # try/catch dualizes: UpsilonNode/PhiCNode are duplicated into primal + shadow copies, and
     # EnterNode/:leave/:pop_exception carry over as control markers (block topology preserved

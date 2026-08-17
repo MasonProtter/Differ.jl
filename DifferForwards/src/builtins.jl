@@ -1,7 +1,8 @@
 # ===========================================================================
 # Builtin rules — dispatch-based, direct-IR-emission handling of `Core.Builtin`s
 # (`getfield`, `setfield!`, `Core.tuple`, `Core.ifelse`, the `memorynew`/`memoryref*` array-allocation
-# builtins, `===`).
+# builtins, `===`/`isdefined`, and the non-differentiable group registered via `@inactive_builtin`
+# — `isa`, `<:`, `nfields`, `sizeof`, `typeof`, `fieldtype`).
 #
 # Mirrors `intrinsics.jl`: `Core.Builtin` is a single type too (dispatch on `typeof(f)` can't tell
 # `getfield` from `setfield!` apart), so each specific builtin is named via `Val{f}` and picked out by
@@ -13,6 +14,8 @@
 # `ctx` is a `NamedTuple` of the closures `dualize_to_ircode` builds once per call:
 #   * `ctx.emit!(ex, ty)`          — emit a typed IR statement
 #   * `ctx.presolve(x)`/`ctx.tresolve(x)` — resolve an operand AST node to its primal/shadow SSA
+#   * `ctx.vpresolve(x)`           — like `presolve`, but for a value-position operand: routes a
+#                                    `GlobalRef` through `gref_operand!` instead of embedding it raw
 #   * `ctx.optype(x)`              — the primal IR's own declared type of operand `x`
 #   * `ctx.tt(T)`                  — tangent type of primal type `T`
 #   * `ctx.zero_shadow(Ti, primal_ssa)` — the zero tangent of a computed non-differentiable result
@@ -363,6 +366,10 @@ function apply_builtin_frule!(::Val{Core.memoryrefset!}, actual, Ti, ctx)
     p, t
 end
 
+# `===` and `isdefined` stay hand-written rather than joining `@inactive_builtin` below: both use
+# `presolve`, not `vpresolve` — `isdefined`'s first operand can be an undefined binding, and routing
+# it through `vpresolve` would turn the definedness query into a global load (a runtime error).
+#
 # Identity/egal — always Bool, never differentiable.
 function apply_builtin_frule!(::Val{Core.:(===)}, actual, Ti, ctx)
     p = ctx.emit!(Expr(:call, _eqeqg, ctx.presolve(actual[1]), ctx.presolve(actual[2])), Ti)
@@ -402,4 +409,25 @@ function apply_builtin_frule!(::Val{Core.ifelse}, actual, Ti, ctx)
     t = TT === NoTangent ? NoTangent() :
         ctx.emit!(Expr(:call, _ifelseg, ctx.presolve(cond), ctx.tresolve(a), ctx.tresolve(b)), TT)
     p, t
+end
+
+# Non-differentiable builtins whose result is always a `Bool`/`Int`/`Type`: reconstruct the primal
+# from the argument primals, give the result a zero tangent. Same shape as `@inactive_intrinsic`
+# (`src/intrinsics.jl`).
+#
+# `vpresolve`, not `presolve`: these take a type operand in value position (`x isa T`,
+# `fieldtype(T, i)`), and a bare `GlobalRef` to a user module there is a `verify_ir` reject.
+macro inactive_builtin(name)
+    bi = :(Core.$name)
+    gr = GlobalRef(Core, name)
+    esc(quote
+        function apply_builtin_frule!(::Val{$bi}, actual, Ti, ctx)
+            p = ctx.emit!(Expr(:call, $gr, (ctx.vpresolve(a) for a in actual)...), Ti)
+            p, ctx.zero_shadow(Ti, p)
+        end
+    end)
+end
+
+for name in (:isa, :(<:), :nfields, :sizeof, :typeof, :fieldtype)
+    @eval @inactive_builtin $name
 end
