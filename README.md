@@ -1,6 +1,6 @@
 # Differ.jl
 
-[![Documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://masonprotter.github.io/Differ.jl/)
+[![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://masonprotter.github.io/Differ.jl/)
 
 Differ is a (highly experimental) attempt at a Julia-level automatic differentiation engine over optimized, typed IR. It is partially descended from Mooncake, in particular it inherits Mooncake's `FData`/`RData`/`Tangent` system with minor tweaks, and while the actual compiler passes are not based on Mooncake's exact designs, a lot of inspiration and lessons were taken from how Mooncake's compiler passes were written. In future work, I hope to encorporate more of Enzyme's compiler-level analysis and optimization passes in order to better approach its performance.
 
