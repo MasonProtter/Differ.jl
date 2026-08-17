@@ -1,0 +1,15 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+DocumenterCodeBlocks = "b6400b83-267f-4b55-9fd8-bffc853bdfd8"
+Contextual = "229be6ac-9b2d-4fc6-978e-5be963aa322f"
+DifferCore = "b1e82f89-b04a-4ab9-a6bf-30478a31d0bf"
+DifferForwards = "34f6438e-af45-4f3f-ad00-3f9fa4b9edc3"
+DifferReverse = "0c588a63-e2e3-4c17-88ed-37ea1a5468a1"
+Differ = "9a064b49-4095-411d-8a9b-7f0ffe69f23b"
+
+[sources]
+Contextual = {path = "../Contextual"}
+DifferCore = {path = "../DifferCore"}
+DifferForwards = {path = "../DifferForwards"}
+DifferReverse = {path = "../DifferReverse"}
+Differ = {path = ".."}

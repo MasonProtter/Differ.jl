@@ -71,7 +71,7 @@ The need for this split is explained in the docs; for now, just look at what fda
 
 `Int`s are non-differentiable types, so there is nothing to pass around on the forwards- or reverse-pass.
 Therefore
-```jldoctest; setup = :(using Mooncake: tangent_type, fdata_type, rdata_type)
+```jldoctest; setup = :(using DifferCore)
 julia> fdata_type(tangent_type(Int)), rdata_type(tangent_type(Int))
 (NoFData, NoRData)
 ```
@@ -80,7 +80,7 @@ julia> fdata_type(tangent_type(Int)), rdata_type(tangent_type(Int))
 
 The tangent type of `Float64` is `Float64`.
 `Float64`s are identified by their value / have no fixed address, so
-```jldoctest; setup = :(using Mooncake: fdata_type, rdata_type)
+```jldoctest; setup = :(using DifferCore)
 julia> (fdata_type(Float64), rdata_type(Float64))
 (NoFData, Float64)
 ```
@@ -89,7 +89,7 @@ julia> (fdata_type(Float64), rdata_type(Float64))
 
 The tangent type of `Vector{Float64}` is `Vector{Float64}`.
 A `Vector{Float64}` is identified by its address, so
-```jldoctest; setup = :(using Mooncake: fdata_type, rdata_type)
+```jldoctest; setup = :(using DifferCore)
 julia> (fdata_type(Vector{Float64}), rdata_type(Vector{Float64}))
 (Vector{Float64}, NoRData)
 ```
@@ -103,7 +103,7 @@ The tangent type for `Tuple{Float64, Vector{Float64}, Int}` is
 `Tuple{Float64, Vector{Float64}, NoTangent}`.
 `Tuple`s have no fixed memory address, so we interrogate each field on its own.
 We have already established the fdata and rdata types for each element, so we recurse to obtain:
-```jldoctest; setup = :(using Mooncake: tangent_type, fdata_type, rdata_type)
+```jldoctest; setup = :(using DifferCore)
 julia> T = tangent_type(Tuple{Float64, Vector{Float64}, Int})
 Tuple{Float64, Vector{Float64}, NoTangent}
 
@@ -120,7 +120,7 @@ In this example, `t` contains a mixture of data, some of which is identified by 
 
 Structs are handled in more-or-less the same way as `Tuple`s, albeit with the possibility of undefined fields needing to be explicitly handled.
 For example, a struct such as
-```jldoctest foo_fdata; setup = :(using Mooncake: tangent_type, fdata_type, rdata_type)
+```jldoctest foo_fdata; setup = :(using DifferCore)
 julia> struct Foo
            x::Float64
            y
@@ -128,14 +128,14 @@ julia> struct Foo
        end
 ```
 has tangent type
-```jldoctest foo_fdata; setup = :(using Mooncake: tangent_type, fdata_type, rdata_type)
+```jldoctest foo_fdata; setup = :(using DifferCore)
 julia> tangent_type(Foo)
 Tangent{@NamedTuple{x::Float64, y, z::NoTangent}}
 ```
 Its fdata and rdata are given by special `FData` and `RData` types:
 ```jldoctest foo_fdata
 julia> (fdata_type(tangent_type(Foo)), rdata_type(tangent_type(Foo)))
-(Mooncake.FData{@NamedTuple{x::NoFData, y, z::NoFData}}, Mooncake.RData{@NamedTuple{x::Float64, y, z::NoRData}})
+(FData{@NamedTuple{x::NoFData, y, z::NoFData}}, RData{@NamedTuple{x::Float64, y, z::NoRData}})
 ```
 Practically speaking, `FData` and `RData` both have the same structure as `Tangent`s and are just used in different contexts.
 
@@ -144,7 +144,7 @@ Practically speaking, `FData` and `RData` both have the same structure as `Tange
 The fdata for a `mutable struct`s is its tangent, and it has no rdata.
 This is because `mutable struct`s have fixed memory addresses, and can therefore be incremented in-place.
 For example,
-```jldoctest bar_fdata; setup = :(using Mooncake: tangent_type, fdata_type, rdata_type)
+```jldoctest bar_fdata; setup = :(using DifferCore)
 julia> mutable struct Bar
            x::Float64
            y
@@ -152,7 +152,7 @@ julia> mutable struct Bar
        end
 ```
 has tangent type
-```jldoctest bar_fdata; setup = :(using Mooncake: tangent_type, fdata_type, rdata_type)
+```jldoctest bar_fdata; setup = :(using DifferCore)
 julia> tangent_type(Bar)
 MutableTangent{@NamedTuple{x::Float64, y, z::NoTangent}}
 ```
