@@ -433,7 +433,19 @@ an inactive container — is a located bail, never a silent zero. Deliberately, 
 
 Entry points take `inactive=(positions...)` (1-based, arguments only, not `f`): `build_ctx`,
 `tape_type`, `code_reverse_fwds_ircode`, `code_reverse_pullback_ircode`. See ISSUES #112, and
-#113-#115 for the open follow-ups.
+#114-#116 for the open follow-ups.
+
+**`ctx.inactive`/`_inactive_arg_root`** (all five ctx bundles: the three `:foreigncall` ones and two
+builtin ones) ask a different question than `_bi_tracked`: not "can a shadow be resolved back to an
+argument" but "does this node provably alias an argument the caller declared constant" — the same
+transparent-view chain `_fc_ptr_origin` walks toward a raw pointer, walked here toward a bare
+`Core.Argument` instead (`PiNode`, `Ptr->Ptr` bitcast, `Core.getfield(x, :ref)`,
+`Base.memoryrefnew`). Never through a `PhiNode` (a phi merging an inactive edge with an active one is
+genuinely active) and never through anything else (a global read, a generic call result) — only an
+argument carries the no-aliasing promise. This is the gate `memmove`/`Core.tuple`/`Core.setfield!`/
+`Base.memoryrefset!`'s third modes use to decide when a shadow can be zeroed instead of routed
+(ISSUES #113); using `_bi_tracked` there instead would be unsound, since it's false both for a
+genuinely constant value and for one that's active but merely untraceable.
 
 ## The builtin-rule dispatch layer
 
@@ -516,11 +528,18 @@ to it yet. The pullback does `src[i] = increment!!(src[i], dst[i])` over the ran
 saved old destination tangent — the same old-tangent-restore discipline `memoryrefset!`'s rule and
 `MapBangPullback` already use, so a buffer mutated more than once still threads correctly through the
 reversed tape. All loop bodies are `@noinline` helpers taking shadow `MemoryRef`s, never raw pointers —
-the usual re-embedded-`GlobalRef` reason (see "`verify_ir` gotchas" below). Both buffers must be
-provenance-tracked (`_fdata_tracked`); the both-sides-`NoTangent` case (`copy(::Vector{Int})`, a `Bool`
-mask) emits the primal call alone with no shadow work, and a mixed pair bails. Deliberately deferred:
-offset pointers (`add_ptr`/`sub_ptr` — `_fc_ptr_origin` already ends its walk there) and any target
-other than `memmove`/`memcpy` (ISSUES #94).
+the usual re-embedded-`GlobalRef` reason (see "`verify_ir` gotchas" below).
+
+Three modes, decided by `ctx.inactive(src_ref)` (never `_bi_tracked` — see "`_activity`" below for
+why): both buffers provenance-tracked (`_fdata_tracked`) as above; both-sides-`NoTangent`
+(`copy(::Vector{Int})`, a `Bool` mask), which emits the primal call alone with no shadow work; and
+destination tracked with source inactive (a constant array reaching `copy`/`.`-broadcast's
+`unalias`), which skips the source's own checks and `:fshadow` item and drops the destination's
+accumulated cotangent on the floor via a restore-only pullback helper (`_fc_restore!`, beside
+`_fc_accum_restore!`). A mixed active-but-untracked pair still bails. The symmetric "source tracked,
+destination inactive" mode stays a deliberate bail, the same shape `memoryrefset!`/`setfield!` already
+make one. Deliberately deferred: offset pointers (`add_ptr`/`sub_ptr` — `_fc_ptr_origin` already ends
+its walk there) and any target other than `memmove`/`memcpy` (ISSUES #94).
 
 ## Recursion
 
@@ -734,16 +753,21 @@ index (block numbering shifts with unrelated optimizer changes).
   shadow element at its rdata/fdata type instead of its own tangent type; see the "companion invariant"
   in "Mutation: the shadow-chain comms scheme" above.
 
-- **Activity follow-ups** (ISSUES #113-#115): an inactive array reaching a `.`-broadcast still bails
-  in the `memmove` rule, which has only "both tracked" and "both `NoTangent`" modes and treats an
-  inactive buffer as a mixed pair (non-broadcast array paths work today); `intrinsic_rrule_operands`
-  is not activity-conditional, so `mul_float` still records an operand whose contribution is
-  discarded; and hand-written *multi-argument* rules stop matching an inactive argument and silently
-  fall through to the derived transform, so they need `CoDual{P,<:Union{NoFData,NoTangent}}` slots
-  plus `@ifactive`. Unary rules need nothing — an inactive sole argument makes the whole callsite
-  inactive, and primal replay fires before dispatch. ISSUES #116: an inactive element in a vararg
-  primal's packed tail only bails (`_packed_codualparams`), never miscompiles — real support would
-  need per-element activity threaded through five sites across both carriers.
+- **Activity follow-ups**: ISSUES #113 fixed the `memmove`/`Core.tuple`/`Core.setfield!`/
+  `Base.memoryrefset!` third modes (`ctx.inactive`/`_inactive_arg_root`, above), but `sum(v .* w)` as
+  literally written still bails — ISSUES #117, a `PhiNode` merging an inactive edge with an active,
+  tracked one comes out active-but-untracked, the shape `Broadcast.unalias` produces for a constant
+  array operand; adjacent to #91, same `_fdata_tracked` `PhiNode` arm. ISSUES #118: `Core.tuple`'s
+  inactive-slot zero allocates every call; intended fix is one allocation per argument shape hung off
+  the `Tape`, not a shared sink (rejected — undermines the no-`increment_internal!!(::NoTangent,x)`
+  invariant). `intrinsic_rrule_operands` is not activity-conditional (ISSUES #114), so `mul_float`
+  still records an operand whose contribution is discarded; and hand-written *multi-argument* rules
+  stop matching an inactive argument and silently fall through to the derived transform (ISSUES #115),
+  so they need `CoDual{P,<:Union{NoFData,NoTangent}}` slots plus `@ifactive`. Unary rules need
+  nothing — an inactive sole argument makes the whole callsite inactive, and primal replay fires before
+  dispatch. ISSUES #116: an inactive element in a vararg primal's packed tail only bails
+  (`_packed_codualparams`), never miscompiles — real support would need per-element activity threaded
+  through five sites across both carriers.
 
 Growable-array mutation (`push!`/`resize!`), non-bits array elements, and any `Core.Builtin` with no
 registered rule remain out of scope for both modes (`differ-extending-ir-support`).
@@ -768,4 +792,7 @@ registered rule remain out of scope for both modes (`differ-extending-ir-support
   Search `#105`-`#108` for `hcat`'s own fix (the recursion argument-fdata-kind restriction was the
   sole blocker, not `collect(::Generator)`) and the two latent bugs it exposed: comms fusion vs.
   `:subtape` inner-tape recycling (#107), and the immutable-`%new` pullback's bare-`Tuple`/`NamedTuple`
-  rdata crash (#108).
+  rdata crash (#108). Search `## 🟢 Reverse-mode activity analysis` and `#112`-`#120` for constant
+  arguments (#112), the `memmove`/`Core.tuple`/`Core.setfield!`/`Base.memoryrefset!` third modes and
+  `ctx.inactive`/`_inactive_arg_root` (#113), and the open follow-ups (#114-#120, including the
+  `PhiNode`-merge gap #117 and the `_rr_zero_fdata` allocation #118).

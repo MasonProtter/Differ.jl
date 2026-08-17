@@ -2,7 +2,7 @@ module DifferReverseDifferentiationInterfaceExt
 
 import DifferentiationInterface as DI
 using DifferReverse: DifferReverse, AutoDifferReverse, CoDual, primal, tangent, rrule!!, Ctx, build_ctx,
-    zero_fcodual, set_to_zero!!, ZeroRData, zero_rdata, fdata, rdata, increment!!
+    zero_fcodual, set_to_zero!!, ZeroRData, zero_rdata, fdata, rdata, increment!!, NoTangent
 
 DI.check_available(::AutoDifferReverse) = true
 
@@ -29,12 +29,23 @@ _di_out_copy(y::AbstractArray) = copy(y)
 _di_out_copy(y::Tuple) = map(_di_out_copy, y)
 _di_out_copy(y) = y
 
+# Only `DI.Constant` maps to an inactive `CoDual` — not `Cache` (its own docstring example writes an
+# *active* argument into it), not `ConstantOrCache` (conservatively active), not `FunctionContext`
+# (may carry a function with differentiable captures). Never dispatch on `GeneralizedConstant`.
+_ctx_codual(c::DI.Constant) = CoDual(DI.unwrap(c), NoTangent())
+_ctx_codual(c::DI.Context) = zero_fcodual(DI.unwrap(c))
+
+# Context positions among `build_ctx`'s `inactive=` argument list: `offset` is 1 for the one-arg
+# prepare (`x, cargs...`), 2 for the two-arg prepare (`y, x, cargs...`).
+_inactive_ctx_positions(offset::Int, contexts::Tuple) =
+    Tuple(offset + j for (j, c) in enumerate(contexts) if c isa DI.Constant)
+
 function DI.prepare_pullback_nokwarg(
         strict::Val, f::F, backend::AutoDifferReverse, x, ty::NTuple, contexts::Vararg{DI.Context,C}
     ) where {F,C}
     _sig = DI.signature(f, backend, x, ty, contexts...; strict)
     cargs = map(DI.unwrap, contexts)
-    ctx = build_ctx(f, (typeof(x), map(typeof, cargs)...))
+    ctx = build_ctx(f, (typeof(x), map(typeof, cargs)...); inactive=_inactive_ctx_positions(1, contexts))
     return DifferPullbackPrep(_sig, ctx)
 end
 
@@ -43,7 +54,6 @@ function DI.value_and_pullback!(
         contexts::Vararg{DI.Context,C},
     ) where {F,B,C}
     DI.check_prep(f, prep, backend, x, ty, contexts...)
-    cargs = map(DI.unwrap, contexts)
     # `y` must come out of the closure's return value, not a reassigned outer variable — assigning
     # to a captured variable from inside a closure forces Julia to heap-box it, and a closure that
     # calls out to `rrule!!` (non-inlinable) is exactly the case escape analysis can't undo.
@@ -52,7 +62,7 @@ function DI.value_and_pullback!(
         buf = tx[i]
         set_to_zero!!(buf)
         xcd = CoDual(x, buf)
-        ccds = map(zero_fcodual, cargs)
+        ccds = map(_ctx_codual, contexts)
         ycd, pb = rrule!!(fcd, prep.ctx, xcd, ccds...)
         y = _di_out_copy(primal(ycd))
         seed = ty[i]
@@ -114,7 +124,8 @@ function DI.prepare_pullback_nokwarg(
     ) where {F,C}
     _sig = DI.signature(f!, y, backend, x, ty, contexts...; strict)
     cargs = map(DI.unwrap, contexts)
-    ctx = build_ctx(f!, (typeof(y), typeof(x), map(typeof, cargs)...))
+    ctx = build_ctx(f!, (typeof(y), typeof(x), map(typeof, cargs)...);
+                    inactive=_inactive_ctx_positions(2, contexts))
     dy = tangent(zero_fcodual(y))
     return DifferTwoArgPullbackPrep(_sig, ctx, dy)
 end
@@ -124,14 +135,13 @@ function DI.value_and_pullback!(
         contexts::Vararg{DI.Context,C},
     ) where {F,B,C}
     DI.check_prep(f!, y, prep, backend, x, ty, contexts...)
-    cargs = map(DI.unwrap, contexts)
     outs = ntuple(Val(B)) do i
         fcd = zero_fcodual(f!)
         set_to_zero!!(prep.dy)
         buf = tx[i]
         set_to_zero!!(buf)
         xcd = CoDual(x, buf)
-        ccds = map(zero_fcodual, cargs)
+        ccds = map(_ctx_codual, contexts)
         ycd, pb = rrule!!(fcd, prep.ctx, CoDual(y, prep.dy), xcd, ccds...)
         y_out = copy(y)   # `pb` restores `y`'s pre-write values, so copy the output out first
         seed = ty[i]

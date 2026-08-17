@@ -1,6 +1,7 @@
 using Test
 using DifferReverse
-using DifferReverse: rev_gradient, value_and_gradient!
+using DifferReverse: rev_gradient, value_and_gradient!, increment!!
+import DifferentiationInterface as DI
 include("testutils.jl")
 
 # Declaring an argument constant: `NoTangent` in a `CoDual`'s shadow slot. Activity propagates from
@@ -199,4 +200,153 @@ end
     _, pb = rrule!!(zero_fcodual(vasum), Ctx(), CoDual(v, dv))
     @test pb(1.0) == (NoRData(), NoRData())
     @test dv == ones(3)
+end
+
+# An inactive source is handled by `memmove`/`memcpy` and by `Core.tuple`/`Core.setfield!`/
+# `Base.memoryrefset!`, all gated on `ctx.inactive` rather than `_bi_tracked`.
+#
+# `sum(v .* w)` itself still bails: `Broadcast.unalias` lowers to a `PhiNode` merging the inactive
+# argument with the copied buffer, and `_fdata_tracked`'s `PhiNode` arm has no inactive case. These
+# tests reach the four fixed sites without routing through that phi.
+
+@testset "activity: memmove third mode — destination tracked, source inactive" begin
+    f(v, w) = sum(v) + sum(copy(w))
+    v, w = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    dv = zeros(3)
+    y, pb = rrule!!(zero_fcodual(f), Ctx(), CoDual(copy(v), dv), const_codual(w))
+    @test primal(y) == f(v, w)
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData())
+    @test dv == ones(3)   # the constant `w`'s copy contributes nothing; `v`'s own gradient is unaffected
+
+    checkverify_rev(f, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    check_stack_balance(f, copy(v), copy(w))
+
+    # Tape shrink: dropping the source `:fshadow` item is required, not incidental.
+    full = comms_element_types(tape_type(f, (Vector{Float64}, Vector{Float64})))
+    cut = comms_element_types(tape_type(f, (Vector{Float64}, Vector{Float64}); inactive=(2,)))
+    @test sum(fieldcount, full) > sum(fieldcount, cut)
+
+    # Mode A (both-`NoTangent`) gains its first direct test: unaffected by the third mode.
+    fA(x) = sum(copy(x))
+    y2, pb2 = rrule!!(zero_fcodual(fA), Ctx(), CoDual([1, 2, 3], NoTangent()))
+    @test primal(y2) == 6
+    @test pb2(1.0) == (NoRData(), NoRData())
+    checkverify_rev(fA, (Vector{Int},))
+
+    # An "active but untraceable source must still bail at memmove specifically" case was attempted
+    # and dropped, not silently omitted: every construction tried either (a) got optimized away before
+    # reaching an untracked state, (b) hit an unrelated bail first (`Vector{Any}`'s element type kills
+    # `copy`'s own inlining into a foreigncall before memmove dispatch ever runs; `Core.typeassert` has
+    # no reverse rule at all, so it bails at its own point of use before reaching `copy`), or (c) turned
+    # out to be *order-dependent* (`Base.inferencebarrier` + a typeassert reaches memmove's bail in
+    # isolation, but a different, unrelated bail once other code in the same file has already
+    # differentiated through `Base.copy`/`Vector{Float64}` for a different activity signature — an
+    # inlining-cost-model artifact, not a property of the fix, and not a reliable regression test).
+    # `Vector{Vector{Float64}}` indexing (the obvious "read out of a container" candidate) turned out
+    # to be already tracked (the nested-array-read chain), not untracked, so it isn't this case either.
+    # The general principle — the gate is an activity test, not a trackedness test — does get a stable,
+    # reproducible demonstration below, via `Core.tuple`'s identical gate and the real (documented,
+    # structural) phi-merge gap: see "broadcast through a constant array still bails" below.
+end
+
+@testset "activity: DI.Constant round trip through memmove's third mode" begin
+    f(x, w) = sum(x) + sum(copy(w))
+    x, w = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    g = DI.gradient(f, AutoDifferReverse(), x, DI.Constant(w))
+    @test g ≈ ones(3)
+    @test g ≈ rev_gradient(f, x, w)[2]   # agrees with `w` treated as an ordinary active argument
+
+    # `DI.Cache` stays active — not made inactive by Part 2's `_ctx_codual`.
+    fcache(x, c) = sum(x .* c)
+    gc = DI.gradient(fcache, AutoDifferReverse(), x, DI.Cache(copy(w)))
+    @test gc ≈ w
+end
+
+@testset "activity: Core.tuple synthesises a zero for an inactive operand" begin
+    # `(v, w)` survives optimization as a literal `Core.tuple` when returned directly (SROA otherwise
+    # eliminates an immediately-destructured tuple, which would test nothing).
+    tuple_pair(v, w) = (v, w)
+    v, w = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    dv = zeros(3)
+    y, pb = rrule!!(zero_fcodual(tuple_pair), Ctx(), CoDual(copy(v), dv), const_codual(w))
+    @test primal(y) == (v, w)
+    # The inactive slot's shadow is a real (synthesised), unaliased zero array — not a crash, not the
+    # active slot's own shadow.
+    @test tangent(y)[1] === dv
+    @test tangent(y)[2] == zeros(3) && tangent(y)[2] !== dv
+
+    increment!!(tangent(y), (ones(3), ones(3)))
+    @test dv == ones(3)   # flows through the aliased slot
+    @test pb(NoRData()) == (NoRData(), NoRData(), NoRData())
+    @test dv == ones(3)   # the inactive slot's increment went nowhere — no leak, no crash
+
+    checkverify_rev(tuple_pair, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    check_stack_balance(tuple_pair, copy(v), copy(w); seed=NoRData())
+end
+
+@testset "activity: setfield!/memoryrefset! zero the destination shadow, not skip it" begin
+    # Adversarial staleness check: give the destination slot a real, non-zero (aliased) shadow first,
+    # then overwrite with a constant, then read again. A "skip the check" implementation would leave
+    # the stale alias in place and let the second read's contribution leak into the first value's
+    # gradient — 4*ones(3) instead of ones(3). "Zero the shadow" severs it correctly.
+    function stale_element(active_arr::Vector{Float64}, const_arr::Vector{Float64})
+        buf = Vector{Vector{Float64}}(undef, 1)
+        buf[1] = active_arr
+        s1 = sum(buf[1])
+        buf[1] = const_arr
+        s2 = sum(buf[1])
+        return s1 + 3 * s2
+    end
+    av, cv = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    dav = zeros(3)
+    y, pb = rrule!!(zero_fcodual(stale_element), Ctx(), CoDual(copy(av), dav), const_codual(cv))
+    @test primal(y) == sum(av) + 3 * sum(cv)
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData())
+    @test dav == ones(3)
+    checkverify_rev(stale_element, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    check_stack_balance(stale_element, copy(av), copy(cv))
+
+    mutable struct StaleBox113
+        v::Vector{Float64}
+    end
+    function stale_field(active_arr::Vector{Float64}, const_arr::Vector{Float64})
+        b = StaleBox113(zeros(length(active_arr)))
+        b.v = active_arr
+        s1 = sum(b.v)
+        b.v = const_arr
+        s2 = sum(b.v)
+        return s1 + 3 * s2
+    end
+    dav2 = zeros(3)
+    y2, pb2 = rrule!!(zero_fcodual(stale_field), Ctx(), CoDual(copy(av), dav2), const_codual(cv))
+    @test primal(y2) == sum(av) + 3 * sum(cv)
+    @test pb2(1.0) == (NoRData(), NoRData(), NoRData())
+    @test dav2 == ones(3)
+    checkverify_rev(stale_field, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    check_stack_balance(stale_field, copy(av), copy(cv))
+end
+
+@testset "activity: broadcast through a constant array still bails (phi gap, not yet fixed)" begin
+    # This is the real-world instance of verification point 3 (an active-but-untraceable operand must
+    # still bail, gated on activity not trackedness) — no synthetic construction needed. `.`-broadcast's
+    # `Broadcast.unalias` builds a `PhiNode` merging one inactive edge (the untouched constant argument)
+    # with one active, tracked edge (the memmove-copied buffer); the merged value is therefore ACTIVE
+    # (any tracked incoming edge makes a phi active) but `_fdata_tracked`'s `PhiNode` arm still requires
+    # *every* edge tracked, so it comes out untracked — exactly the shape this whole feature has to keep
+    # bailing on. Had the fix at any of the four sites relaxed on trackedness instead of activity, a
+    # case shaped like this one would have silently gone through with a wrong (too-small) gradient
+    # instead of raising this error.
+    #
+    # Regression pin, not a design choice: if this starts passing, `_fdata_tracked`'s `PhiNode` arm
+    # (and the fwds carrier's phi-shadow-merge codegen) has been taught about `ctx.inactive` — a
+    # deliberate future fix, not a regression. Revisit this test (and its framing above) when that
+    # lands; it is not meant to hold as a permanent invariant.
+    f(v, w) = sum(v .* w)
+    err = try
+        rrule!!(zero_fcodual(f), Ctx(), CoDual([1.0, 2.0, 3.0], zeros(3)), const_codual([4.0, 5.0, 6.0]))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
 end

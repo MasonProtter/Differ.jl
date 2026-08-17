@@ -72,6 +72,8 @@ _bi_tracked(@nospecialize(node), ctx) =
 @noinline _rr_increment_rdata!!(t, r) = increment_rdata!!(t, r)
 
 @noinline _rr_zero_tangent2(p, f) = zero_tangent(p, f)
+# An inactive value's shadow slot: a fresh zero, since there is no real shadow to alias.
+@noinline _rr_zero_fdata(p) = fdata(zero_tangent(p))
 @noinline _rr_build_tangent(::Type{P}, fields...) where {P} = build_tangent(P, fields...)
 
 # Save/restore of a `Memory` slot that may not be assigned yet: a fresh array's `Core.memorynew`
@@ -312,6 +314,8 @@ function builtin_rrule_comms(::Val{Core.tuple}, actual, Ti, ctx)
         for j in eachindex(actual)
             ctx.fdtype(fieldtype(T, j)) === NoFData && continue
             _bi_tracked(actual[j], ctx) && continue
+            # Inactive: the fwds pass synthesises a fresh zero for this slot instead of aliasing.
+            ctx.inactive(actual[j]) && continue
             ctx.reason[] = "reverse mode `tuple` operand $(j) (type $(fieldtype(T, j))) carries " *
                            "fdata but has no provenance traceable to a function argument at " *
                            "%$(ctx.ssa.id)"
@@ -329,7 +333,16 @@ function apply_builtin_rrule_fwds!(::Val{Core.tuple}, actual, Ti, ctx)
         T = _widen(Ti)
         FT = ctx.fdtype(T)
         shadow = ctx.emit!(Expr(:call, _ctupleg,
-                     (ctx.fdtype(fieldtype(T, j)) === NoFData ? NoFData() : ctx.sresolve(actual[j])
+                     (begin
+                          FTj = ctx.fdtype(fieldtype(T, j))
+                          if FTj === NoFData
+                              NoFData()
+                          elseif ctx.inactive(actual[j])
+                              ctx.icall!(_rr_zero_fdata, FTj, (fieldtype(T, j),), ctx.presolve(actual[j]))
+                          else
+                              ctx.sresolve(actual[j])
+                          end
+                      end
                       for j in eachindex(actual))...), FT)
     end
     return p, shadow, Dict{Any,Any}()
@@ -553,7 +566,8 @@ function builtin_rrule_comms(::Val{Core.setfield!}, actual, Ti, ctx)
     fname = _bi_fieldname(actual[2])
     if ctx.fdtype(ctx.tt(fieldtype(P, fname))) !== NoFData
         val_node = actual[3]
-        if !_bi_tracked(val_node, ctx)
+        # Inactive: the fwds pass zeroes the field's shadow instead, severing the gradient chain.
+        if !_bi_tracked(val_node, ctx) && !ctx.inactive(val_node)
             ctx.reason[] = "reverse mode `setfield!` of a field whose tangent carries fdata " *
                            "($(fieldtype(P, fname))) requires the assigned value's own fdata to be " *
                            "traceable to a function argument at %$(ctx.ssa.id)"
@@ -586,8 +600,12 @@ function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
         if FTi === NoFData && TF <: IEEEFloat
             zt = ctx.emit!(zero(TF), TF)
         else
-            fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
-            zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTi), ctx.presolve(val_node), fdata_val)
+            # Inactive forces the fresh-zero branch; `FTarg` must then be `NoFData`, not `FTi` —
+            # it declares `fdata_val`'s actual runtime type.
+            inact = ctx.inactive(val_node)
+            fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.sresolve(val_node)
+            FTarg = (FTi === NoFData || inact) ? NoFData : FTi
+            zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTarg), ctx.presolve(val_node), fdata_val)
         end
         _emit_stf!(ctx, mt, slot, zt)
     else
@@ -596,9 +614,11 @@ function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
         # fabricating a fresh zero when the field carries fdata — that embedding is the alias that
         # makes later in-place accumulation into this field flow into the assigned value's own
         # shadow. `f = NoFData()` for a pure-rdata field collapses to the original fresh-zero
-        # behavior.
-        fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
-        zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTi), ctx.presolve(val_node), fdata_val)
+        # behavior — also what an inactive `val_node` forces, since it has no real shadow to embed.
+        inact = ctx.inactive(val_node)
+        fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.sresolve(val_node)
+        FTarg = (FTi === NoFData || inact) ? NoFData : FTi
+        zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTarg), ctx.presolve(val_node), fdata_val)
         ctx.icall!(_rr_set_tangent_field!, TF, (ctx.fdtype(P), Int, TF), mt, fieldidx, zt)
     end
     p = ctx.emit!(Expr(:call, _setfieldg, ctx.presolve(obj), name_node, ctx.presolve(val_node)), Ti)
@@ -657,7 +677,8 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     notangent = ctx.tt(_widen(elt)) === NoTangent
     if !notangent
         if ctx.fdtype(elt) !== NoFData
-            if !_bi_tracked(val_node, ctx)
+            # Inactive: the fwds pass zeroes the element's shadow instead.
+            if !_bi_tracked(val_node, ctx) && !ctx.inactive(val_node)
                 ctx.reason[] = "reverse mode `memoryrefset!` of a non-bits element ($(elt)) requires the " *
                                "assigned value's own fdata to be traceable to a function argument at " *
                                "%$(ctx.ssa.id)"
@@ -733,10 +754,13 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     # `zero_tangent(p, f)` embeds `f` (the assigned value's own fdata) directly rather than
     # fabricating a fresh zero when the element carries fdata — the alias that makes later in-place
     # accumulation into this element flow into the assigned value's own shadow. `f = NoFData()` for
-    # a pure-rdata element collapses to the original fresh-zero behavior.
+    # a pure-rdata element collapses to the original fresh-zero behavior — also what an inactive
+    # `val_node` forces, since it has no real shadow to embed.
     FTi = ctx.fdtype(Ti)
-    fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
-    zt = ctx.icall!(_rr_zero_tangent2, TT, (Ti, FTi), ctx.presolve(val_node), fdata_val)
+    inact = ctx.inactive(val_node)
+    fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.sresolve(val_node)
+    FTarg = (FTi === NoFData || inact) ? NoFData : FTi
+    zt = ctx.icall!(_rr_zero_tangent2, TT, (Ti, FTarg), ctx.presolve(val_node), fdata_val)
     ctx.emit!(Expr(:call, Base.memoryrefset!, sref, zt, (ctx.presolve(a) for a in rest)...), TT)
     p = ctx.emit!(Expr(:call, Base.memoryrefset!, pref, ctx.presolve(val_node), (ctx.presolve(a) for a in rest)...), Ti)
     saved = Dict{Any,Any}((:old_tangent, ctx.ssa) => old_tangent)

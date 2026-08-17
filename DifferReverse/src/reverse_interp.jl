@@ -1275,6 +1275,36 @@ function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
     return arg_active, active
 end
 
+# Whether `node` is a transparent view onto an argument the caller declared constant, walking the
+# same steps `_fc_ptr_origin` recognizes (in the opposite direction, so the two must stay in step).
+# Never through a `PhiNode`: a phi merging an inactive edge with an active one is active, and must
+# keep bailing rather than be zeroed. A global read or call result stops the walk — only an argument
+# carries the caller's no-aliasing promise.
+function _inactive_arg_root(@nospecialize(node), pir, iworld::UInt, arg_active::BitVector, n::Int,
+                            depth::Int = 0)
+    isa(node, Core.Argument) && return node.n <= n && !arg_active[node.n]
+    (depth > 8 || !isa(node, Core.SSAValue)) && return false
+    s = pir.stmts[node.id][:stmt]
+    if isa(s, Core.PiNode)
+        return _inactive_arg_root(s.val, pir, iworld, arg_active, n, depth + 1)
+    elseif isa(s, Expr) && s.head === :call && length(s.args) >= 2
+        f = _calleeval(s.args[1], iworld)
+        if f === Core.Intrinsics.bitcast && length(s.args) == 3
+            Pin = _optype(pir, s.args[3])
+            (Pin isa DataType && Pin <: Ptr) || return false
+            return _inactive_arg_root(s.args[3], pir, iworld, arg_active, n, depth + 1)
+        elseif f === Core.getfield && length(s.args) >= 3
+            nm = s.args[3]
+            isa(nm, QuoteNode) && (nm = nm.value)
+            nm === :ref || return false
+            return _inactive_arg_root(s.args[2], pir, iworld, arg_active, n, depth + 1)
+        elseif f === Base.memoryrefnew && length(s.args) >= 2
+            return _inactive_arg_root(s.args[2], pir, iworld, arg_active, n, depth + 1)
+        end
+    end
+    return false
+end
+
 # Which top-level (fwds-carrier) arguments carry non-trivial fdata. Factored out of `_fdata_tracked`
 # so `_static_recursible_call`'s array-argument-recursion guard can check a bare `Core.Argument`
 # operand directly without recomputing this. Gated on activity: an inactive argument has no shadow at
@@ -1301,6 +1331,9 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any},
     provenance_tracked(@nospecialize node) =
         isa(node, Core.SSAValue) ? tracked[node.id] :
         isa(node, Core.Argument) ? (node.n <= n && arg_tracked[node.n]) : false
+    # `Core.tuple` synthesises a fresh zero for an inactive operand rather than aliasing a shadow, so
+    # such an operand must not fail the tuple's trackedness the way an untraceable-but-active one does.
+    operand_inactive(@nospecialize node) = _inactive_arg_root(node, pir, iworld, arg_active, n)
     # `tracked` is monotone (false -> true only), so a loop-carried `PhiNode` reading a
     # not-yet-computed back-edge is handled by rescanning to a fixpoint rather than a separate
     # pre-pass. Least fixpoint = "provably traceable"; anything left untracked bails at point of use.
@@ -1385,7 +1418,8 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any},
                     if fdtype(iworld, Ti) !== NoFData && T isa DataType && T <: Tuple && isconcretetype(T) &&
                        !(!isempty(T.parameters) && isa(last(T.parameters), Core.TypeofVararg)) &&
                        fieldcount(T) == length(actual)
-                        tracked[i] = all(j -> fdtype(iworld, fieldtype(T, j)) === NoFData || provenance_tracked(actual[j]),
+                        tracked[i] = all(j -> fdtype(iworld, fieldtype(T, j)) === NoFData ||
+                                              provenance_tracked(actual[j]) || operand_inactive(actual[j]),
                                          eachindex(actual))
                     end
                 elseif !(f isa Core.Builtin) && !(f isa Core.IntrinsicFunction) &&
@@ -1885,7 +1919,8 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                   calleeval=(@nospecialize x) -> _calleeval(x, iworld),
                   optype=(@nospecialize x) -> _widen(_optype(pir, x)), reason=reason,
                   tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
-                  tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i))
+                  tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i),
+                  inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, n))
             if fc === nothing
                 reason[] = "reverse mode does not support a `:foreigncall` with a runtime function " *
                            "pointer target at %$i: `$(_stmt_str(s))`"
@@ -1944,7 +1979,8 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                   fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
                   # A `MemoryRef` statically re-derivable from an argument + literal index need not
                   # be pushed (see `_static_ref_derivation`). Consulted by `builtins_reverse.jl`.
-                  static_ref=(@nospecialize x) -> _static_ref_derivation(pir, iworld, x))
+                  static_ref=(@nospecialize x) -> _static_ref_derivation(pir, iworld, x),
+                  inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, n))
             result = builtin_rrule_comms(Val(f), actual, _stype(pir.stmts, i), ctx)
             result === false && return nothing
             if result !== nothing
@@ -2586,7 +2622,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                     calleeval=(@nospecialize x) -> _calleeval(x, iworld),
                     tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                     fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
-                    tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i))
+                    tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i),
+                    inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, n))
             result = fc === nothing ? nothing : apply_foreigncall_rrule_fwds!(Val(fc.name), fc, Ti, fcctx)
             if result === nothing
                 reason[] = "reverse mode does not support foreigncall target " *
@@ -2609,7 +2646,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                        ssa=Core.SSAValue(i), bulk_saved=pb_bulk_saved,
                        tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                        rdtype=(@nospecialize(T) -> rdtype(iworld, T)),
-                       fdtype=(@nospecialize(T) -> fdtype(iworld, T)))
+                       fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
+                       inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, n))
                 # `_scan_block_comms` skips an inactive statement, so a rule firing here would push
                 # comms items that were never declared.
                 result = active[i] ? apply_builtin_rrule_fwds!(Val(f), actual, Ti, bctx) : nothing
@@ -3237,7 +3275,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                         ssa=Core.SSAValue(i), ref_for,
                         tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                         rdtype=(@nospecialize(T) -> rdtype(iworld, T)),
-                        fdtype=(@nospecialize(T) -> fdtype(iworld, T)))
+                        fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
+                        inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, n))
                 contribs = fc === nothing ? nothing : apply_foreigncall_rrule!(Val(fc.name), fc, Ti, fcctx)
                 if contribs === nothing
                     reason[] = "reverse mode does not support foreigncall target " *
