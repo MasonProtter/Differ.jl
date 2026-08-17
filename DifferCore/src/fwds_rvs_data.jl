@@ -410,6 +410,13 @@ Base.copy(::NoRData) = NoRData()
 
 @inline increment_field!!(::NoRData, y, ::Val) = NoRData()
 
+"""
+    RData(data::NamedTuple)
+
+The component of a `struct`'s tangent which is *not* propagated on the forwards-pass of reverse-
+mode AD, produced only going backwards by a pullback — the complement of [`FData`](@ref). For
+example, a `Float64` field's tangent has no fdata, so it is entirely rdata.
+"""
 struct RData{T<:NamedTuple}
     data::T
 end

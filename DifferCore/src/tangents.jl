@@ -129,6 +129,14 @@ end
     return Expr(:call, :tuple, tangent_field_types_exprs(P)...)
 end
 
+"""
+    build_tangent(::Type{P}, fields...) -> tangent_type(P)
+
+Builds a tangent for primal type `P` out of per-field tangents, in `fieldnames(P)` order. The
+moral equivalent of calling `P`'s constructor, but for its tangent type — fields that
+`tangent_type` says are [`PossiblyUninitTangent`](@ref) get wrapped automatically, and trailing
+fields may be omitted to leave them uninitialized.
+"""
 function build_tangent(::Type{P}, fields::Vararg{Any,N}) where {P,N}
     TP = tangent_type(P)
     _ftypes = tangent_field_types(P)

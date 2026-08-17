@@ -70,6 +70,13 @@ include("rules_indexing.jl")
 include("rules_linalg.jl")
 include("reflection.jl")
 
+"""
+    AutoDifferReverse <: ADTypes.AbstractADType
+
+Selects Differ's reverse mode for DifferentiationInterface.jl. Method implementations live in
+`DifferReverse.jl`'s own `DifferReverseDifferentiationInterfaceExt` package extension, loaded when
+`DifferentiationInterface` is.
+"""
 struct AutoDifferReverse <: ADTypes.AbstractADType end
 ADTypes.mode(::AutoDifferReverse) = ADTypes.ReverseMode()
 
