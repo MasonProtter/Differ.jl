@@ -46,4 +46,23 @@ include(joinpath(@__DIR__, "testutils.jl"))
         end
         checkverify(extrema_wrap, (Vector{Float64},))
     end
+
+    @testset "sum(::Generator)" begin
+        # No hand-written `sum` rule is loaded here — this goes through the generic composite
+        # path, which has to dualize `Base._foldl_impl`'s `Base._InitialValue` sentinel check (a
+        # `Core.isa` builtin; see `test_forward_control_flow.jl`'s "inactive builtins" testset).
+        x = [1.0, 2.0, -3.0, 4.5]
+
+        gs(x) = sum(xi^2 for xi in x)
+        d1 = frule!!(zero_dual(gs), Dual(x, ones(length(x))))
+        @test d1.x ≈ gs(x)
+        @test d1.dx ≈ sum(2 .* x)
+        checkverify(gs, (Vector{Float64},))
+
+        eig(x) = sum(x[i]*i for i in eachindex(x))
+        d2 = frule!!(zero_dual(eig), Dual(x, ones(length(x))))
+        @test d2.x ≈ eig(x)
+        @test d2.dx ≈ sum(eachindex(x))
+        checkverify(eig, (Vector{Float64},))
+    end
 end

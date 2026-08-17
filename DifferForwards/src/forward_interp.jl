@@ -970,10 +970,10 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # (`getfield`, `setfield!`, `Core.tuple`, `Core.ifelse`, array allocation, `===`). `fsel_*` are the
     # forward-over-reverse coupling hooks funnelled through `at_world` — `getfield`/`setfield!` on a
     # foreign self-similar-shadow type need the same answers the `%new` arm gets.
-    builtin_ctx = (emit! =emit!, presolve=presolve, tresolve=tresolve, zero_shadow=zero_shadow,
-                   optype=optype, tt=tt, emit_invoke! =emit_invoke!, opf=opf, reason=reason,
-                   fsel_shadow_type=fsel_shadow_type, fsel_shadow_field=fsel_shadow_field,
-                   fsel_mirror_field=fsel_mirror_field)
+    builtin_ctx = (emit! =emit!, presolve=presolve, tresolve=tresolve, vpresolve=vpresolve,
+                   zero_shadow=zero_shadow, optype=optype, tt=tt, emit_invoke! =emit_invoke!,
+                   opf=opf, reason=reason, fsel_shadow_type=fsel_shadow_type,
+                   fsel_shadow_field=fsel_shadow_field, fsel_mirror_field=fsel_mirror_field)
     # And for `apply_foreigncall_frule!` (`src/foreigncalls.jl`). Two extra members for the
     # pointer-provenance walk: `pstmt` reads a primal statement back out of `pir` (old numbering), and
     # `calleeval` resolves a callee node so the walk can recognise `bitcast`/`getfield` in the chain.
