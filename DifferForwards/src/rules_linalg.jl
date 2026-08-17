@@ -42,7 +42,7 @@ function frule!!(::Dual{typeof(LinearAlgebra.norm)}, xd::Dual{Vector{Float64}})
 end
 
 # ---------------------------------------------------------------------------
-# tr(A) — explicit diagonal loop, mirroring `SumPullback`'s shape in `rrules.jl`.
+# tr(A) — explicit diagonal loop, mirroring `sum_pullback`'s shape in `DifferReverse/src/rules_perf_backstop.jl`.
 # ---------------------------------------------------------------------------
 
 function frule!!(::Dual{typeof(LinearAlgebra.tr)}, Ad::Dual{Matrix{Float64}})

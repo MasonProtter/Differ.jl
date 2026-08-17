@@ -3,6 +3,8 @@ using DifferReverse
 using DifferReverse: rev_gradient, MutableTangent, rdata_type, tangent_type, NoTangent
 using DifferReverse: zero_rdata_from_type, zero_like_rdata_from_type, CannotProduceZeroRDataFromType
 using DifferReverse: ZeroRData, NoRData, increment!!
+using DifferReverse: rrule!!, Ctx, CoDual, primal, tangent
+using DifferForwards: Dual, frule!!
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
@@ -302,6 +304,68 @@ end
     check_stack_balance(arr_via_mut, MPoint(1.0, 2.0))
 end
 
+@testset "reverse mode: recursive call with an array-valued result" begin
+    # The engine used to drop a recursive call's own returned shadow on the floor (nowhere to
+    # route it), so a caller could never accumulate into it — this only worked when the array-
+    # returning call was itself the function's final return. `@noinline` (not `sum(sin.([1,2].*x))`
+    # from the array-construction testset above) so this really exercises a recursive `:invoke`
+    # rather than getting inlined into a single straight-line block.
+    @noinline function vecconstruct(x::Float64)
+        return [x, 2x, 3x, 4x, 5x, 6x, 7x, 8x, 9x, 10x]
+    end
+    f_vecsum(x) = sum(vecconstruct(x))
+
+    x0 = 1.5
+    _, dx = rev_gradient(f_vecsum, x0)
+    @test dx ≈ central_diff(f_vecsum, x0) rtol = 1e-5
+    @test dx == sum(1:10)   # d/dx sum_i(i*x) = sum_i(i)
+
+    # Confirm the call actually survives as a real recursive `:invoke` to `reverse_fwds_impl`
+    # specialized on `vecconstruct`, not inlined away — dump the primal IR and look for it, rather
+    # than assuming `@noinline` was honored.
+    ir = code_reverse_fwds_ircode(f_vecsum, (Float64,))[1]
+    @test any(st -> isa(st, Expr) && st.head === :invoke && occursin("vecconstruct", string(st)),
+              ir.stmts.stmt)
+
+    checkverify_rev(f_vecsum, (Float64,))
+    check_stack_balance(f_vecsum, x0)
+
+    # Aliasing: the shadow the caller (`sum`'s recursion into `mapreduce_impl`) accumulates into
+    # must be `===` the object `vecconstruct`'s own pullback reads at pullback time. Proven
+    # directly, without going through `sum` at all: seed `vecconstruct`'s own returned shadow by
+    # writing into it externally, then confirm its own pullback reads exactly that mutation.
+    ctx = Ctx()
+    ycd_inner, pb_inner = rrule!!(CoDual(vecconstruct, NoFData()), ctx, CoDual(2.0, NoFData()))
+    dv = tangent(ycd_inner)
+    @test dv == zeros(10)
+    dv .= Float64.(1:10)   # externally accumulate into the exact returned shadow object
+    _, dx_inner = pb_inner(NoRData())
+    @test dx_inner == sum((1:10) .^ 2)   # element i's coefficient is i, seeded dv[i] = i
+end
+
+@testset "reverse mode: dynamic getfield over a homogeneous tuple of arrays" begin
+    # `getfield(vs::Tuple{Vector{Float64},...}, i::Int)` with `i` a runtime value (not a literal
+    # field index) — the shape `vcat`/`hcat`'s own unrolled-free loop over their vararg tuple
+    # compiles down to. Only supported when the tuple is homogeneous (every element the same
+    # array type), which is what makes the result type static despite the dynamic index.
+    @noinline function tupsum(vs::Tuple{Vector{Float64},Vector{Float64},Vector{Float64}})
+        s = 0.0
+        for j in 1:3
+            v = vs[j]
+            for i in eachindex(v)
+                s += v[i]
+            end
+        end
+        return s
+    end
+    x = (Float64.(1:3), Float64.(4:6), Float64.(7:9))
+
+    _, dx = rev_gradient(tupsum, x)
+    @test dx == (ones(3), ones(3), ones(3))
+    checkverify_rev(tupsum, (Tuple{Vector{Float64},Vector{Float64},Vector{Float64}},))
+    check_stack_balance(tupsum, x)
+end
+
 @testset "zero_like_rdata_from_type for a non-concrete (Union) closure type" begin
     # A pullback producing a zero rdata for a closure type `G` normally sees `G` bound to the
     # closure's concrete runtime type, but the derived recursion glue can resolve a rule via a
@@ -336,4 +400,212 @@ end
     new_grdata = zero_like_rdata_from_type(G2)
     @test new_grdata isa ZeroRData
     @test increment!!(new_grdata, 1.0) == 1.0
+end
+
+@testset "reverse mode: array-valued return" begin
+    f_sinvec(x) = sin.(x)
+    f_id(x) = x
+    f_scale2!(x) = (x .*= 2; x)
+    f_mixed(x) = (sum(x), 2 .* x)
+
+    x = [1.0, 2.0, 3.0]
+    dx = zeros(3)
+    ctx = build_ctx(f_sinvec, (Vector{Float64},))
+    ycd, pb = rrule!!(zero_fcodual(f_sinvec), ctx, CoDual(x, dx))
+    ybar = [0.5, 1.5, -2.0]     # non-uniform, so a wrong-but-plausible scaling can't pass
+    increment!!(tangent(ycd), fdata(ybar))
+    pb(rdata(ybar))
+    @test dx ≈ cos.(x) .* ybar
+
+    # Returning an argument: the result shadow must be that argument's own buffer.
+    x2, dx2 = [1.0, 2.0, 3.0], zeros(3)
+    ctx2 = build_ctx(f_id, (Vector{Float64},))
+    ycd2, pb2 = rrule!!(zero_fcodual(f_id), ctx2, CoDual(x2, dx2))
+    @test tangent(ycd2) === dx2
+    ybar2 = [1.0, 2.0, 3.0]
+    increment!!(tangent(ycd2), fdata(ybar2))
+    pb2(rdata(ybar2))
+    @test dx2 ≈ ybar2
+
+    x3, dx3 = [1.0, 2.0, 3.0], zeros(3)
+    ctx3 = build_ctx(f_scale2!, (Vector{Float64},))
+    ycd3, pb3 = rrule!!(zero_fcodual(f_scale2!), ctx3, CoDual(x3, dx3))
+    @test tangent(ycd3) === dx3
+    ybar3 = [1.0, 1.0, 1.0]
+    increment!!(tangent(ycd3), fdata(ybar3))
+    pb3(rdata(ybar3))
+    @test dx3 ≈ 2 .* ybar3
+
+    # Tuple return mixing a pure-rdata element (`sum`) with an fdata-carrying one (`2 .* x`).
+    x4, dx4 = [1.0, 2.0, 3.0], zeros(3)
+    ctx4 = build_ctx(f_mixed, (Vector{Float64},))
+    ycd4, pb4 = rrule!!(zero_fcodual(f_mixed), ctx4, CoDual(x4, dx4))
+    ybar4 = (2.0, [1.0, 2.0, 3.0])
+    increment!!(tangent(ycd4), fdata(ybar4))
+    pb4(rdata(ybar4))
+    @test dx4 ≈ 2.0 .* ones(3) .+ 2 .* ybar4[2]
+
+    checkverify_rev(f_sinvec, (Vector{Float64},))
+    checkverify_rev(f_id, (Vector{Float64},))
+    checkverify_rev(f_scale2!, (Vector{Float64},))
+    checkverify_rev(f_mixed, (Vector{Float64},))
+    check_stack_balance(f_sinvec, [1.0, 2.0, 3.0]; seed=NoRData())
+end
+
+@testset "reverse mode: array whose element tangent type differs from element type" begin
+    # Shadow-side `MemoryRef`/`.ref` statements used to be declared at the primal's type; every
+    # case here crashed with an illegal instruction before that was fixed.
+    function g_int_read(x, v::Vector{Int})
+        return v[1] * x
+    end
+    function g_int_sum(x, v::Vector{Int})
+        return sum(v) * x
+    end
+
+    x_i, v_i = 0.5, [3, 4]
+    _, dx_ir, dv_ir = rev_gradient(g_int_read, x_i, v_i)
+    @test dx_ir == 3.0
+    @test dv_ir == [NoTangent(), NoTangent()]
+    _, dx_is, dv_is = rev_gradient(g_int_sum, x_i, v_i)
+    @test dx_is == 7.0
+    @test dv_is == [NoTangent(), NoTangent()]
+    checkverify_rev(g_int_read, (Float64, Vector{Int}))
+    checkverify_rev(g_int_sum, (Float64, Vector{Int}))
+    check_stack_balance(g_int_read, 0.5, [3, 4])
+    check_stack_balance(g_int_sum, 0.5, [3, 4])
+
+    function g_bool(x, v::Vector{Bool})
+        return v[1] ? 2x : 3x
+    end
+    _, dx_bt = rev_gradient(g_bool, 0.5, [true, false])
+    @test dx_bt == 2.0
+    _, dx_bf = rev_gradient(g_bool, 0.5, [false, true])
+    @test dx_bf == 3.0
+    checkverify_rev(g_bool, (Float64, Vector{Bool}))
+    check_stack_balance(g_bool, 0.5, [true, false])
+
+    # `Int`-element array construction and write, scalar-output form.
+    f_vecconstruct(x) = sum(sin.([1, 2] .* x))
+    x0 = 0.7
+    _, dx_vc = rev_gradient(f_vecconstruct, x0)
+    @test dx_vc ≈ central_diff(f_vecconstruct, x0) rtol = 1e-5
+    @test dx_vc ≈ frule!!(Dual(f_vecconstruct, NoTangent()), Dual(x0, 1.0)).dx
+    # Scalar broadcast operand: pullback reflection is a pre-existing gap, the carrier itself is fine.
+    checkverify_rev_no_pb_reflection(f_vecconstruct, (Float64,))
+    check_stack_balance(f_vecconstruct, x0)
+
+    # A shadow array stores `Tangent{...}` elements, not `RData{...}`; the pullback used to assume
+    # otherwise and crashed on every struct or `ComplexF64` element type.
+    struct P2; a::Float64; b::Float64; end
+    g_p2_read(x, v::Vector{P2}) = v[1].a * x
+
+    v_p2 = [P2(3.0, 4.0), P2(1.0, 2.0)]
+    _, dx_p2, dv_p2 = rev_gradient(g_p2_read, 0.5, v_p2)
+    @test dx_p2 == v_p2[1].a
+    @test dv_p2[1].fields.a == 0.5 && dv_p2[1].fields.b == 0.0
+    @test dv_p2[2].fields.a == 0.0 && dv_p2[2].fields.b == 0.0
+    checkverify_rev(g_p2_read, (Float64, Vector{P2}))
+    check_stack_balance(g_p2_read, 0.5, v_p2)
+
+    # Accumulate into the same element's rdata twice: exercises `increment_rdata!!` on a non-zero
+    # starting tangent, not only a fresh zero.
+    g_p2_double(x, v::Vector{P2}) = v[1].a * x + v[1].b * x
+
+    _, dx_p2d, dv_p2d = rev_gradient(g_p2_double, 0.5, v_p2)
+    @test dx_p2d == v_p2[1].a + v_p2[1].b
+    @test dv_p2d[1].fields.a == 0.5 && dv_p2d[1].fields.b == 0.5
+    @test dv_p2d[2].fields.a == 0.0 && dv_p2d[2].fields.b == 0.0
+    checkverify_rev(g_p2_double, (Float64, Vector{P2}))
+    check_stack_balance(g_p2_double, 0.5, v_p2)
+
+    # A dynamic (loop) index routes through the `:shadow_ref` comms item rather than a statically
+    # re-derived handle.
+    g_p2_loop(x, v::Vector{P2}) = sum(e.a for e in v) * x
+
+    _, dx_p2l, dv_p2l = rev_gradient(g_p2_loop, 0.5, v_p2)
+    @test dx_p2l == v_p2[1].a + v_p2[2].a
+    @test dv_p2l[1].fields.a == 0.5 && dv_p2l[2].fields.a == 0.5
+    checkverify_rev(g_p2_loop, (Float64, Vector{P2}))
+    check_stack_balance(g_p2_loop, 0.5, v_p2)
+
+    g_complex_read(x, v::Vector{ComplexF64}) = real(v[1]) * x
+
+    v_c = ComplexF64[3.0+1.0im, 4.0]
+    _, dx_c, dv_c = rev_gradient(g_complex_read, 0.5, v_c)
+    @test dx_c == real(v_c[1])
+    @test dv_c[1].fields.re == 0.5 && dv_c[1].fields.im == 0.0
+    @test dv_c[2].fields.re == 0.0 && dv_c[2].fields.im == 0.0
+    checkverify_rev(g_complex_read, (Float64, Vector{ComplexF64}))
+    check_stack_balance(g_complex_read, 0.5, v_c)
+
+    # Element whose tangent splits across fdata (`v`) and rdata (`s`) — the shape that caught the
+    # same defect on the forwards read side.
+    struct M; v::Vector{Float64}; s::Float64; end
+    g_m_read(x, v::Vector{M}) = v[1].s * x
+
+    v_m = [M([1.0], 2.0), M([3.0], 4.0)]
+    _, dx_m, dv_m = rev_gradient(g_m_read, 0.5, v_m)
+    @test dx_m == v_m[1].s
+    @test dv_m[1].fields.s == 0.5 && dv_m[1].fields.v == [0.0]
+    @test dv_m[2].fields.s == 0.0 && dv_m[2].fields.v == [0.0]
+    checkverify_rev(g_m_read, (Float64, Vector{M}))
+    check_stack_balance(g_m_read, 0.5, v_m)
+end
+
+@testset "reverse mode: hcat/vcat (recursion into collect(::Generator))" begin
+    # `hcat(v, 2v)` lowers to `collect(::Generator{ProductIterator,closure})`, whose closure captures
+    # both vectors — an immutable argument carrying fdata across a recursive call.
+    v = [1.0, 2.0, 3.0]
+
+    g_hcat(v) = sum(hcat(v, 2v))
+    _, dh = rev_gradient(g_hcat, v)
+    @test dh ≈ [3.0, 3.0, 3.0]
+    checkverify_rev(g_hcat, (Vector{Float64},))
+    check_stack_balance(g_hcat, v)
+
+    # Comms fusion moves the `collect` call's `:subtape` item onto a successor block's stack here.
+    g_hcat_abs2(v) = sum(abs2, hcat(v, 2v))
+    _, dha = rev_gradient(g_hcat_abs2, v)
+    @test dha ≈ [10.0, 20.0, 30.0]
+    checkverify_rev(g_hcat_abs2, (Vector{Float64},))
+    check_stack_balance(g_hcat_abs2, v)
+
+    g_hcat_sin(v) = sum(sin.(hcat(v, 2v)))
+    _, dhs = rev_gradient(g_hcat_sin, v)
+    @test dhs ≈ cos.(v) .+ 2 .* cos.(2v)
+    checkverify_rev(g_hcat_sin, (Vector{Float64},))
+    check_stack_balance(g_hcat_sin, v)
+
+    g_vcat_abs2(v) = sum(abs2, vcat(v, 2v))
+    _, dva = rev_gradient(g_vcat_abs2, v)
+    @test dva ≈ [10.0, 20.0, 30.0]
+    checkverify_rev(g_vcat_abs2, (Vector{Float64},))
+    check_stack_balance(g_vcat_abs2, v)
+end
+
+@testset "reverse mode: `PartialStruct`-typed statement" begin
+    # The `memoryrefset!` storing a not-yet-escaped `%new` is typed `Core.PartialStruct`, not a bare
+    # `Type`; that reached `Tuple{block_comms_types[b]...}` raw and threw.
+    function ps_ref_in_vec(x)
+        r = Ref(x)
+        v = Base.RefValue{Float64}[r]
+        return v[1][] * 2.0
+    end
+    _, dx_ps = rev_gradient(ps_ref_in_vec, 1.5)
+    @test dx_ps ≈ 2.0
+    @test dx_ps ≈ central_diff(ps_ref_in_vec, 1.5) rtol = 1e-5
+    checkverify_rev(ps_ref_in_vec, (Float64,))
+    check_stack_balance(ps_ref_in_vec, 1.5)
+
+    # Element read twice, so the pullback accumulates through the stored `Ref`.
+    function ps_ref_squared(x)
+        r = Ref(x)
+        v = Base.RefValue{Float64}[r]
+        return v[1][] * v[1][]
+    end
+    _, dx_sq = rev_gradient(ps_ref_squared, 1.5)
+    @test dx_sq ≈ 3.0
+    @test dx_sq ≈ central_diff(ps_ref_squared, 1.5) rtol = 1e-5
+    checkverify_rev(ps_ref_squared, (Float64,))
+    check_stack_balance(ps_ref_squared, 1.5)
 end

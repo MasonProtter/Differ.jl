@@ -12,11 +12,6 @@
 # any pointer it's handed, so "compute the primal, hand back a zero tangent" isn't sound — a
 # `memmove` given that treatment would leave the destination's tangent stale rather than zero.
 #
-# Statement layout (Julia 1.13, `Compiler/src/tfuncs.jl`'s `FOREIGNCALL_ARG_START`):
-#
-#   Expr(:foreigncall, name, RT, ATs::SimpleVector, nreq, cconv, args..., roots...)
-#   #                   1     2    3                 4     5      6:5+length(ATs)   rest
-#
 # `name` is `Expr(:tuple, QuoteNode(:memmove))` (optionally with a library operand), or an
 # `SSAValue`/`Argument` for a runtime function pointer — the latter names nothing dispatchable, and
 # `_fc_parse` rejects it.
@@ -25,146 +20,13 @@
 # same closures the builtin rules get (`emit!`/`opf`/`presolve`/`tresolve`/`optype`/`tt`/
 # `zero_shadow`/`emit_invoke!`/`reason`) plus two the provenance walk below needs: `pstmt(x)`, the
 # primal statement node behind an old `SSAValue`, and `calleeval(x)`, the resolved callee value.
+#
+# Parsing/provenance helpers (`_fc_parse`, `_fc_stmt`, `_fc_ptr_origin`, `_fc_same_stride`,
+# `_fc_check_extent`, `_fc_copy_sig_ok`, `_FC_COPY_ATS`) live in `DifferCore/src/shared_ir_helpers.jl`,
+# shared with `DifferReverse`'s foreigncall layer.
 # ===========================================================================
 
 apply_foreigncall_frule!(::Val{F}, fc, Ti, ctx) where {F} = nothing
-
-# Split a foreigncall statement into its parts, or `nothing` when the target isn't a literal symbol
-# (a runtime function pointer). `args`/`roots` split at `5 + length(ATs)` — the argument-type `svec`
-# is what says how many of the trailing operands are values rather than GC roots.
-function _fc_parse(s::Expr)
-    length(s.args) >= 5 || return nothing
-    nm = s.args[1]
-    name = nm; lib = nothing
-    if isa(nm, Expr) && nm.head === :tuple
-        length(nm.args) in (1, 2) || return nothing
-        name = nm.args[1]
-        length(nm.args) == 2 && (lib = nm.args[2])
-    end
-    isa(name, QuoteNode) && (name = name.value)
-    isa(name, String) && (name = Symbol(name))
-    isa(name, Symbol) || return nothing
-    ATs = s.args[3]
-    isa(ATs, Core.SimpleVector) || return nothing
-    nval = 5 + length(ATs)
-    length(s.args) >= nval || return nothing
-    return (name = name, lib = lib, name_node = nm, RT = s.args[2], ATs = ATs,
-            nreq = s.args[4], cconv = s.args[5],
-            args = s.args[6:nval], roots = s.args[(nval + 1):end])
-end
-
-# Rebuild a foreigncall statement with substituted value operands. The name node is *copied* rather
-# than shared: it is a mutable `Expr` owned by the cached primal `IRCode`, which is reused across
-# dualizations (including higher orders), and every other arm of the dispatch chain builds fresh
-# `Expr`s for the same reason.
-_fc_stmt(fc, args, roots) =
-    Expr(:foreigncall,
-         isa(fc.name_node, Expr) ? Expr(fc.name_node.head, fc.name_node.args...) : fc.name_node,
-         fc.RT, fc.ATs, fc.nreq, fc.cconv, args..., roots...)
-
-# ---------------------------------------------------------------------------
-# Pointer provenance
-# ---------------------------------------------------------------------------
-
-# Walk the *primal* IR back from a pointer operand to the `Memory`/`MemoryRef` its address was read
-# out of, returning `(P, ref_operand)` — the buffer's element type and the (old-numbered) operand
-# naming the buffer. `nothing` if the chain is anything else.
-#
-# Only `PiNode` and a `Ptr`→`Ptr` `bitcast` are followed. `add_ptr`/`sub_ptr` end the walk
-# deliberately: the address they produce is still fine, but the extent check below is relative to the
-# originating ref, and an offset pointer breaks that relationship. (Real `copyto!`/broadcast IR never
-# has one — the offset is baked into the `memoryrefnew` upstream.)
-#
-# `ctx.optype` reads the *primal* `IRCode` in its own numbering (`_optype(pir, x)`), so this is safe
-# to call from a rule after the pass has already emitted interleaved shadow statements.
-function _fc_ptr_origin(@nospecialize(x), ctx, depth::Int = 0)
-    depth > 8 && return nothing
-    isa(x, Core.SSAValue) || return nothing
-    s = ctx.pstmt(x)
-    if isa(s, Core.PiNode)
-        return _fc_ptr_origin(s.val, ctx, depth + 1)
-    elseif isa(s, Expr) && s.head === :call && length(s.args) >= 2
-        f = ctx.calleeval(s.args[1])
-        if f === Core.Intrinsics.bitcast && length(s.args) == 3
-            Pin = ctx.optype(s.args[3])
-            (Pin isa DataType && Pin <: Ptr) || return nothing
-            return _fc_ptr_origin(s.args[3], ctx, depth + 1)
-        elseif f === Core.getfield && length(s.args) >= 3
-            Pobj = ctx.optype(s.args[2])
-            # `isa(…, DataType)` first: `optype` can hand back a `Core.Const`/`Core.PartialStruct`
-            # lattice element, on which `<:` is a hard `TypeError` rather than a bail.
-            (Pobj isa DataType && (Pobj <: MemoryRef || Pobj <: Memory)) || return nothing
-            nm = s.args[3]
-            isa(nm, QuoteNode) && (nm = nm.value)
-            (nm === :ptr_or_offset || nm === :ptr) || return nothing
-            P = eltype(Pobj)
-            return P isa Type ? (P, s.args[2]) : nothing
-        end
-    end
-    return nothing
-end
-
-# Whether a *byte* count means the same thing for `P`'s tangent storage as for `P` itself.
-#
-# Keyed on the element type recovered by the provenance walk, **not** the pointer's own declared
-# `Ptr{…}` parameter — deliberately the opposite of `add_ptr`'s gate (`src/intrinsics.jl`), and what
-# makes order ≥2 work: there the shadow pointer is a `Ptr{NoTangent}` (stride 0) reached by `bitcast`
-# from a `MemoryRef{Float64}`, and the `Float64` is what governs. Don't unify the two gates.
-# Takes the caller's `tangent_type` funnel (`ctx.tt`) rather than calling `tangent_type` directly —
-# transform-time dispatch is pinned to the generator's world. See Contextual's world-age contract.
-function _fc_same_stride(tt, @nospecialize(P))
-    T = tt(P)
-    return isbitstype(P) && isbitstype(T) && Base.aligned_sizeof(P) == Base.aligned_sizeof(T) > 0
-end
-
-# Raises a catchable `BoundsError` when a shadow buffer is shorter than the bulk copy about to run on
-# it. `Dual`'s constructor only checks `tangent_type(P) == T`, never that a caller's tangent array has
-# its primal's *length*, and a raw `memmove` has no bounds check of its own — a short destination
-# tangent segfaults, and a short source tangent silently reads uninitialised heap.
-#
-# The literal `true` boundscheck argument is what forces the check: Julia's own `@boundscheck` guards
-# in `unsafe_copyto!` sit inside an `@inbounds` block and get elided under the default
-# `--check-bounds=auto`, so they can't be relied on.
-#
-# `@noinline` for the usual reason (`__pop_blk_stack!`, `_rr_get_tangent_field`, …): the branch must
-# live inside a helper, since emitting it inline would split a basic block and break the 1:1
-# block-topology invariant `dualize_to_ircode` relies on.
-@noinline function _fc_check_extent(ref::MemoryRef, nelem::Int)
-    if nelem > 0
-        Core.memoryrefnew(ref, nelem, true)
-    end
-    return nothing
-end
-@noinline function _fc_check_extent(mem::Memory, nelem::Int)
-    if nelem > 0
-        Core.memoryrefnew(Core.memoryrefnew(mem), nelem, true)
-    end
-    return nothing
-end
-
-# ---------------------------------------------------------------------------
-# Bulk memory copies: `memmove`/`memcpy`.
-#
-# This is the target that blocks real code: `copyto!`, `copy`, `Base.unsafe_copyto!` — hence
-# broadcast — all bottom out in one. A copy is linear and structure-preserving, so the identical copy
-# between the two shadow buffers is exactly the tangent of copying the primals; the rule is that
-# mirror plus the preconditions that make it meaningful.
-# ---------------------------------------------------------------------------
-
-const _FC_COPY_ATS = Core.svec(Ptr{Cvoid}, Ptr{Cvoid}, Csize_t)
-
-# A bare target symbol says nothing about arity or types, so check the *whole* signature before
-# treating operands 6/7/8 as (dst, src, nbytes). Without this, a same-named foreigncall with a
-# different `ATs`/`nreq`/`cconv` would have its operands silently mis-assigned.
-function _fc_copy_sig_ok(fc, ctx, what::String)
-    ok = fc.lib === nothing && fc.cconv === QuoteNode(:ccall) && fc.nreq === 0 &&
-         fc.RT === Ptr{Cvoid} && fc.ATs == _FC_COPY_ATS && length(fc.args) == 3
-    ok || (ctx.reason[] = "`$what` with an unrecognised signature — expected the 3-argument " *
-                          "`(dst, src, nbytes)` form returning `Ptr{Cvoid}` via `:ccall`, with no " *
-                          "library and no varargs, but got return type `$(fc.RT)` and argument " *
-                          "types `$(fc.ATs)`")
-    return ok
-end
 
 for op in (:memmove, :memcpy)
     @eval function apply_foreigncall_frule!(::Val{$(QuoteNode(op))}, fc, Ti, ctx)

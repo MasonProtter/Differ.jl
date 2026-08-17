@@ -114,3 +114,38 @@ scaled(z) = debug_mode_enabled() ? 2z : z   # d/dz = 1 (branch resolves statical
     @test tangent(d2) ≈ 1.0
     @test flag_check_count[] == 1
 end
+
+# A `view` inlines to a `%new(SubArray{…})` whose statement type is a `Core.PartialStruct`
+# (`indices[2]` pinned to `Core.Const(1)`). That SSAValue is then an operand of a non-builtin
+# `:invoke`, where `optype` used to hand the raw lattice element to `Tuple{…}`.
+@noinline _fill_col!(v, x) = (@inbounds for i in eachindex(v); v[i] = sin(x); end; nothing)
+function _two_cols!(y, x)
+    _fill_col!(view(y, :, 1), x)
+    _fill_col!(view(y, :, 2), 3x)
+    nothing
+end
+
+@testset "PartialStruct-typed SSAValue operand (view -> non-builtin invoke)" begin
+    ir, rt = code_dual_ircode(_two_cols!, (Matrix{Float64}, Float64))
+    Core.Compiler.verify_ir(ir)
+    y = zeros(2, 2)
+    dy = zeros(2, 2)
+    d = frule!!(Dual(_two_cols!, NoTangent()), Dual(y, dy), Dual(3.0, 1.0))
+    @test y[:, 1] ≈ [sin(3.0), sin(3.0)]
+    @test y[:, 2] ≈ [sin(9.0), sin(9.0)]
+    @test dy[:, 1] ≈ [cos(3.0), cos(3.0)]
+    @test dy[:, 2] ≈ [3cos(9.0), 3cos(9.0)]
+end
+
+# A call whose *result* type is a PartialStruct, with concrete callee and args — hits the static
+# path's `dualt(R)` rather than the dynamic path's `Tuple{…}`. A separate crash site.
+@noinline _mkpair(x::Float64) = (x, 1)
+_pairfirst(x) = _mkpair(x)[1] * 2
+
+@testset "PartialStruct-typed call result (dualt on R)" begin
+    ir, rt = code_dual_ircode(_pairfirst, (Float64,))
+    Core.Compiler.verify_ir(ir)
+    d = frule!!(Dual(_pairfirst, NoTangent()), Dual(3.0, 1.0))
+    @test primal(d) ≈ 6.0
+    @test tangent(d) ≈ 2.0
+end

@@ -9,301 +9,206 @@
 # (`Base.sin`, not `sin`): these bodies get inlined into synthetic carrier IR, where a bare name
 # re-embeds as an implicit-`using` GlobalRef that `Core.Compiler.verify_ir` rejects. Arithmetic/
 # comparison operators stay unqualified since they lower to intrinsics, not generic-function
-# GlobalRefs, matching `SumPullback`/`SumMapPullback` in `rrules.jl`.
+# GlobalRefs, matching `sum_pullback`/`sum_map_pullback` in `rules_perf_backstop.jl`.
 
 # ===========================================================================
 # exp
 # ===========================================================================
 
-struct ExpPullback
-    y::Float64
-end
-(pb::ExpPullback)(seed::Float64) = (NoRData(), pb.y*seed)
-
-function rrule!!(::CoDual{typeof(exp),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    y = Base.exp(primal(xcd))
-    return CoDual(y, NoFData()), ExpPullback(y)
+function rrule!!(::CoDual{typeof(exp),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    y = Base.exp(x)
+    exp_pullback(dy) = (NoRData(), y*dy)
+    CoDual(y, NoFData()), exp_pullback
 end
 
 # ===========================================================================
 # log
 # ===========================================================================
 
-struct LogPullback
-    x::Float64
-end
-(pb::LogPullback)(seed::Float64) = (NoRData(), seed/pb.x)
-
-function rrule!!(::CoDual{typeof(log),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.log(x), NoFData()), LogPullback(x)
+function rrule!!(::CoDual{typeof(log),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    log_pullback(dy) = (NoRData(), dy/x)
+    CoDual(Base.log(x), NoFData()), log_pullback
 end
 
 # ===========================================================================
 # log1p
 # ===========================================================================
 
-struct Log1pPullback
-    x::Float64
-end
-(pb::Log1pPullback)(seed::Float64) = (NoRData(), seed/(1+pb.x))
-
-function rrule!!(::CoDual{typeof(log1p),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.log1p(x), NoFData()), Log1pPullback(x)
+function rrule!!(::CoDual{typeof(log1p),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    log1p_pullback(dy) = (NoRData(), dy/(1+x))
+    CoDual(Base.log1p(x), NoFData()), log1p_pullback
 end
 
 # ===========================================================================
 # expm1
 # ===========================================================================
 
-struct Expm1Pullback
-    x::Float64
-end
-(pb::Expm1Pullback)(seed::Float64) = (NoRData(), Base.exp(pb.x)*seed)
-
-function rrule!!(::CoDual{typeof(expm1),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.expm1(x), NoFData()), Expm1Pullback(x)
+function rrule!!(::CoDual{typeof(expm1),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    expm1_pullback(dy) = (NoRData(), Base.exp(x)*dy)
+    CoDual(Base.expm1(x), NoFData()), expm1_pullback
 end
 
 # ===========================================================================
 # log2
 # ===========================================================================
 
-struct Log2Pullback
-    x::Float64
-end
-(pb::Log2Pullback)(seed::Float64) = (NoRData(), seed/(pb.x*Base.log(2)))
-
-function rrule!!(::CoDual{typeof(log2),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.log2(x), NoFData()), Log2Pullback(x)
+function rrule!!(::CoDual{typeof(log2),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    log2_pullback(dy) = (NoRData(), dy/(x*Base.log(2)))
+    CoDual(Base.log2(x), NoFData()), log2_pullback
 end
 
 # ===========================================================================
 # log10
 # ===========================================================================
 
-struct Log10Pullback
-    x::Float64
-end
-(pb::Log10Pullback)(seed::Float64) = (NoRData(), seed/(pb.x*Base.log(10)))
-
-function rrule!!(::CoDual{typeof(log10),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.log10(x), NoFData()), Log10Pullback(x)
+function rrule!!(::CoDual{typeof(log10),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    log10_pullback(dy) = (NoRData(), dy/(x*Base.log(10)))
+    CoDual(Base.log10(x), NoFData()), log10_pullback
 end
 
 # ===========================================================================
 # exp2
 # ===========================================================================
 
-struct Exp2Pullback
-    y::Float64
-end
-(pb::Exp2Pullback)(seed::Float64) = (NoRData(), pb.y*Base.log(2)*seed)
-
-function rrule!!(::CoDual{typeof(exp2),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    y = Base.exp2(primal(xcd))
-    return CoDual(y, NoFData()), Exp2Pullback(y)
+function rrule!!(::CoDual{typeof(exp2),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    y = Base.exp2(x)
+    exp2_pullback(dy) = (NoRData(), y*Base.log(2)*dy)
+    CoDual(y, NoFData()), exp2_pullback
 end
 
 # ===========================================================================
 # exp10
 # ===========================================================================
 
-struct Exp10Pullback
-    y::Float64
-end
-(pb::Exp10Pullback)(seed::Float64) = (NoRData(), pb.y*Base.log(10)*seed)
-
-function rrule!!(::CoDual{typeof(exp10),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    y = Base.exp10(primal(xcd))
-    return CoDual(y, NoFData()), Exp10Pullback(y)
+function rrule!!(::CoDual{typeof(exp10),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    y = Base.exp10(x)
+    exp10_pullback(dy) = (NoRData(), y*Base.log(10)*dy)
+    CoDual(y, NoFData()), exp10_pullback
 end
 
 # ===========================================================================
 # sinh / cosh / tanh
 # ===========================================================================
 
-struct SinhPullback
-    x::Float64
-end
-(pb::SinhPullback)(seed::Float64) = (NoRData(), Base.cosh(pb.x)*seed)
-
-function rrule!!(::CoDual{typeof(sinh),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.sinh(x), NoFData()), SinhPullback(x)
+function rrule!!(::CoDual{typeof(sinh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    sinh_pullback(dy) = (NoRData(), Base.cosh(x)*dy)
+    CoDual(Base.sinh(x), NoFData()), sinh_pullback
 end
 
-struct CoshPullback
-    x::Float64
-end
-(pb::CoshPullback)(seed::Float64) = (NoRData(), Base.sinh(pb.x)*seed)
-
-function rrule!!(::CoDual{typeof(cosh),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.cosh(x), NoFData()), CoshPullback(x)
+function rrule!!(::CoDual{typeof(cosh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    cosh_pullback(dy) = (NoRData(), Base.sinh(x)*dy)
+    CoDual(Base.cosh(x), NoFData()), cosh_pullback
 end
 
-struct TanhPullback
-    y::Float64
-end
-(pb::TanhPullback)(seed::Float64) = (NoRData(), (1-pb.y^2)*seed)
-
-function rrule!!(::CoDual{typeof(tanh),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    y = Base.tanh(primal(xcd))
-    return CoDual(y, NoFData()), TanhPullback(y)
+function rrule!!(::CoDual{typeof(tanh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    y = Base.tanh(x)
+    tanh_pullback(dy) = (NoRData(), (1-y^2)*dy)
+    CoDual(y, NoFData()), tanh_pullback
 end
 
 # ===========================================================================
 # asinh / acosh / atanh
 # ===========================================================================
 
-struct AsinhPullback
-    x::Float64
-end
-(pb::AsinhPullback)(seed::Float64) = (NoRData(), seed/Base.sqrt(pb.x^2+1))
-
-function rrule!!(::CoDual{typeof(asinh),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.asinh(x), NoFData()), AsinhPullback(x)
+function rrule!!(::CoDual{typeof(asinh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    asinh_pullback(dy) = (NoRData(), dy/Base.sqrt(x^2+1))
+    CoDual(Base.asinh(x), NoFData()), asinh_pullback
 end
 
-struct AcoshPullback
-    x::Float64
-end
-(pb::AcoshPullback)(seed::Float64) = (NoRData(), seed/Base.sqrt(pb.x^2-1))
-
-function rrule!!(::CoDual{typeof(acosh),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.acosh(x), NoFData()), AcoshPullback(x)
+function rrule!!(::CoDual{typeof(acosh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    acosh_pullback(dy) = (NoRData(), dy/Base.sqrt(x^2-1))
+    CoDual(Base.acosh(x), NoFData()), acosh_pullback
 end
 
-struct AtanhPullback
-    x::Float64
-end
-(pb::AtanhPullback)(seed::Float64) = (NoRData(), seed/(1-pb.x^2))
-
-function rrule!!(::CoDual{typeof(atanh),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.atanh(x), NoFData()), AtanhPullback(x)
+function rrule!!(::CoDual{typeof(atanh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    atanh_pullback(dy) = (NoRData(), dy/(1-x^2))
+    CoDual(Base.atanh(x), NoFData()), atanh_pullback
 end
 
 # ===========================================================================
 # asin / acos
 # ===========================================================================
 
-struct AsinPullback
-    x::Float64
-end
-(pb::AsinPullback)(seed::Float64) = (NoRData(), seed/Base.sqrt(1-pb.x^2))
-
-function rrule!!(::CoDual{typeof(asin),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.asin(x), NoFData()), AsinPullback(x)
+function rrule!!(::CoDual{typeof(asin),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    asin_pullback(dy) = (NoRData(), dy/Base.sqrt(1-x^2))
+    CoDual(Base.asin(x), NoFData()), asin_pullback
 end
 
-struct AcosPullback
-    x::Float64
-end
-(pb::AcosPullback)(seed::Float64) = (NoRData(), -seed/Base.sqrt(1-pb.x^2))
-
-function rrule!!(::CoDual{typeof(acos),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.acos(x), NoFData()), AcosPullback(x)
+function rrule!!(::CoDual{typeof(acos),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    acos_pullback(dy) = (NoRData(), -dy/Base.sqrt(1-x^2))
+    CoDual(Base.acos(x), NoFData()), acos_pullback
 end
 
 # ===========================================================================
 # atan (1-arg and 2-arg)
 # ===========================================================================
 
-struct AtanPullback
-    x::Float64
-end
-(pb::AtanPullback)(seed::Float64) = (NoRData(), seed/(1+pb.x^2))
-
-function rrule!!(::CoDual{typeof(atan),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.atan(x), NoFData()), AtanPullback(x)
-end
-
-struct Atan2Pullback
-    x::Float64
-    y::Float64
-end
-function (pb::Atan2Pullback)(seed::Float64)
-    x, y = pb.x, pb.y
-    r2 = x^2+y^2
-    return (NoRData(), x*seed/r2, -y*seed/r2)
+function rrule!!(::CoDual{typeof(atan),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    atan_pullback(dy) = (NoRData(), dy/(1+x^2))
+    CoDual(Base.atan(x), NoFData()), atan_pullback
 end
 
 function rrule!!(
     ::CoDual{typeof(atan),NoFData}, ::AbstractCtx,
-    ycd::CoDual{Float64,NoFData}, xcd::CoDual{Float64,NoFData},
+    (; y)::CoDual{Float64,NoFData}, (; x)::CoDual{Float64,NoFData},
 )
-    y, x = primal(ycd), primal(xcd)
-    return CoDual(Base.atan(y, x), NoFData()), Atan2Pullback(x, y)
+    r2 = x^2+y^2
+    atan2_pullback(dz) = (NoRData(), x*dz/r2, -y*dz/r2)
+    CoDual(Base.atan(y, x), NoFData()), atan2_pullback
 end
 
 # ===========================================================================
 # cbrt
 # ===========================================================================
 
-struct CbrtPullback
-    y::Float64
-end
-(pb::CbrtPullback)(seed::Float64) = (NoRData(), seed/(3*pb.y^2))
-
-function rrule!!(::CoDual{typeof(cbrt),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    y = Base.cbrt(primal(xcd))
-    return CoDual(y, NoFData()), CbrtPullback(y)
+function rrule!!(::CoDual{typeof(cbrt),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    y = Base.cbrt(x)
+    cbrt_pullback(dy) = (NoRData(), dy/(3*y^2))
+    CoDual(y, NoFData()), cbrt_pullback
 end
 
 # ===========================================================================
 # ^ (x::Float64, y::Float64) — non-literal real exponent
 # ===========================================================================
 
-struct PowPullback
-    x::Float64
-    y::Float64
-    yp::Float64
+function rrule!!(
+    ::CoDual{typeof(^),NoFData}, ::AbstractCtx,
+    (; x)::CoDual{Float64,NoFData}, (; y)::CoDual{Float64,NoFData},
+)
+    yp = Base.:^(x, y)
+    pow_pullback(dz) = (NoRData(), y*Base.:^(x, y-1)*dz, yp*Base.log(x)*dz)
+    CoDual(yp, NoFData()), pow_pullback
 end
-function (pb::PowPullback)(seed::Float64)
-    x, y, yp = pb.x, pb.y, pb.yp
-    return (NoRData(), y*Base.:^(x, y-1)*seed, yp*Base.log(x)*seed)
-end
+
+# ===========================================================================
+# ^ (x::Union{Float32,Float64}, n::Integer) — keeps `^` un-inlined (hand rules block inlining, see
+# `src_inlining_policy`) so the branchless bit-twiddling of `Base.Math.pow_body` never surfaces.
+# ===========================================================================
 
 function rrule!!(
     ::CoDual{typeof(^),NoFData}, ::AbstractCtx,
-    xcd::CoDual{Float64,NoFData}, ycd::CoDual{Float64,NoFData},
-)
-    x, y = primal(xcd), primal(ycd)
-    yp = Base.:^(x, y)
-    return CoDual(yp, NoFData()), PowPullback(x, y, yp)
+    (; x)::CoDual{P,NoFData}, (; y)::CoDual{N,NoFData},
+) where {P<:Union{Float32,Float64},N<:Integer}
+    n = Int(y)
+    function intpow_pullback(dy)
+        # n == 0 short-circuits: `n*x^(n-1)` would be `0 * Inf == NaN` at x == 0.
+        dx = iszero(n) ? zero(P) : P(n) * (x^(n - 1))
+        return (NoRData(), dx * dy, NoRData())
+    end
+    CoDual(x^n, NoFData()), intpow_pullback
 end
 
 # ===========================================================================
 # hypot(x, y)
 # ===========================================================================
 
-struct HypotPullback
-    x::Float64
-    y::Float64
-    r::Float64
-end
-function (pb::HypotPullback)(seed::Float64)
-    return (NoRData(), pb.x/pb.r*seed, pb.y/pb.r*seed)
-end
-
 function rrule!!(
     ::CoDual{typeof(hypot),NoFData}, ::AbstractCtx,
-    xcd::CoDual{Float64,NoFData}, ycd::CoDual{Float64,NoFData},
+    (; x)::CoDual{Float64,NoFData}, (; y)::CoDual{Float64,NoFData},
 )
-    x, y = primal(xcd), primal(ycd)
     r = Base.hypot(x, y)
-    return CoDual(r, NoFData()), HypotPullback(x, y, r)
+    hypot_pullback(dz) = (NoRData(), x/r*dz, y/r*dz)
+    CoDual(r, NoFData()), hypot_pullback
 end
 
 # ===========================================================================
@@ -313,23 +218,17 @@ end
 # Reverse mode for a holomorphic scalar map f: the output rdata seed s = sr + i*si (read straight
 # off the (re, im) fields, no conjugation) pulls back via conj(f'(z)) * s — the standard adjoint of
 # the real 2x2 Jacobian of a holomorphic map.
-struct SqrtComplexPullback
-    z::ComplexF64
-    y::ComplexF64
-end
-function (pb::SqrtComplexPullback)(seed::RData{@NamedTuple{re::Float64,im::Float64}})
-    s = Base.Complex(seed.data.re, seed.data.im)
-    fprime = 1/(2*pb.y)
-    dz = Base.conj(fprime)*s
-    return (NoRData(), RData((re=Base.real(dz), im=Base.imag(dz))))
-end
-
 function rrule!!(
-    ::CoDual{typeof(sqrt),NoFData}, ::AbstractCtx, zcd::CoDual{ComplexF64,NoFData}
+    ::CoDual{typeof(sqrt),NoFData}, ::AbstractCtx, (; z)::CoDual{ComplexF64,NoFData}
 )
-    z = primal(zcd)
     y = Base.sqrt(z)
-    return CoDual(y, NoFData()), SqrtComplexPullback(z, y)
+    function sqrt_pullback(dy)
+        s = Base.Complex(dy.data.re, dy.data.im)
+        fprime = 1/(2*y)
+        dz = Base.conj(fprime)*s
+        return (NoRData(), RData((re=Base.real(dz), im=Base.imag(dz))))
+    end
+    CoDual(y, NoFData()), sqrt_pullback
 end
 
 # ===========================================================================
@@ -337,117 +236,65 @@ end
 # a chance to fire. Forward mode already handles them via `src/intrinsics.jl`.
 # ===========================================================================
 
-struct AbsPullback
-    x::Float64
-end
-(pb::AbsPullback)(seed::Float64) = (NoRData(), Base.sign(pb.x)*seed)
-
-function rrule!!(::CoDual{typeof(abs),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.abs(x), NoFData()), AbsPullback(x)
-end
-
-struct MaxPullback
-    x::Float64
-    y::Float64
-end
-function (pb::MaxPullback)(seed::Float64)
-    x_wins = pb.x >= pb.y
-    return (NoRData(), x_wins ? seed : 0.0, x_wins ? 0.0 : seed)
+function rrule!!(::CoDual{typeof(abs),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    abs_pullback(dy) = (NoRData(), Base.sign(x)*dy)
+    CoDual(Base.abs(x), NoFData()), abs_pullback
 end
 
 function rrule!!(
     ::CoDual{typeof(max),NoFData}, ::AbstractCtx,
-    xcd::CoDual{Float64,NoFData}, ycd::CoDual{Float64,NoFData},
+    (; x)::CoDual{Float64,NoFData}, (; y)::CoDual{Float64,NoFData},
 )
-    x, y = primal(xcd), primal(ycd)
-    return CoDual(Base.max(x, y), NoFData()), MaxPullback(x, y)
-end
-
-struct MinPullback
-    x::Float64
-    y::Float64
-end
-function (pb::MinPullback)(seed::Float64)
-    x_wins = pb.x <= pb.y
-    return (NoRData(), x_wins ? seed : 0.0, x_wins ? 0.0 : seed)
+    x_wins = x >= y
+    max_pullback(dz) = (NoRData(), x_wins ? dz : 0.0, x_wins ? 0.0 : dz)
+    CoDual(Base.max(x, y), NoFData()), max_pullback
 end
 
 function rrule!!(
     ::CoDual{typeof(min),NoFData}, ::AbstractCtx,
-    xcd::CoDual{Float64,NoFData}, ycd::CoDual{Float64,NoFData},
+    (; x)::CoDual{Float64,NoFData}, (; y)::CoDual{Float64,NoFData},
 )
-    x, y = primal(xcd), primal(ycd)
-    return CoDual(Base.min(x, y), NoFData()), MinPullback(x, y)
+    x_wins = x <= y
+    min_pullback(dz) = (NoRData(), x_wins ? dz : 0.0, x_wins ? 0.0 : dz)
+    CoDual(Base.min(x, y), NoFData()), min_pullback
 end
 
-struct SignPullback end
-(pb::SignPullback)(::Float64) = (NoRData(), 0.0)
-
-function rrule!!(::CoDual{typeof(sign),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    return CoDual(Base.sign(primal(xcd)), NoFData()), SignPullback()
-end
-
-struct CopysignPullback
-    x::Float64
-    y::Float64
-end
-function (pb::CopysignPullback)(seed::Float64)
-    return (NoRData(), Base.sign(pb.x)*Base.sign(pb.y)*seed, 0.0)
+function rrule!!(::CoDual{typeof(sign),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    sign_pullback(_) = (NoRData(), 0.0)
+    CoDual(Base.sign(x), NoFData()), sign_pullback
 end
 
 function rrule!!(
     ::CoDual{typeof(copysign),NoFData}, ::AbstractCtx,
-    xcd::CoDual{Float64,NoFData}, ycd::CoDual{Float64,NoFData},
+    (; x)::CoDual{Float64,NoFData}, (; y)::CoDual{Float64,NoFData},
 )
-    x, y = primal(xcd), primal(ycd)
-    return CoDual(Base.copysign(x, y), NoFData()), CopysignPullback(x, y)
+    copysign_pullback(dz) = (NoRData(), Base.sign(x)*Base.sign(y)*dz, 0.0)
+    CoDual(Base.copysign(x, y), NoFData()), copysign_pullback
 end
-
-struct FmaPullback
-    x::Float64
-    y::Float64
-end
-(pb::FmaPullback)(seed::Float64) = (NoRData(), pb.y*seed, pb.x*seed, seed)
 
 function rrule!!(
     ::CoDual{typeof(fma),NoFData}, ::AbstractCtx,
-    xcd::CoDual{Float64,NoFData}, ycd::CoDual{Float64,NoFData}, zcd::CoDual{Float64,NoFData},
+    (; x)::CoDual{Float64,NoFData}, (; y)::CoDual{Float64,NoFData}, (; z)::CoDual{Float64,NoFData},
 )
-    x, y, z = primal(xcd), primal(ycd), primal(zcd)
-    return CoDual(Base.fma(x, y, z), NoFData()), FmaPullback(x, y)
+    fma_pullback(dw) = (NoRData(), y*dw, x*dw, dw)
+    CoDual(Base.fma(x, y, z), NoFData()), fma_pullback
 end
-
-struct MuladdPullback
-    x::Float64
-    y::Float64
-end
-(pb::MuladdPullback)(seed::Float64) = (NoRData(), pb.y*seed, pb.x*seed, seed)
 
 function rrule!!(
     ::CoDual{typeof(muladd),NoFData}, ::AbstractCtx,
-    xcd::CoDual{Float64,NoFData}, ycd::CoDual{Float64,NoFData}, zcd::CoDual{Float64,NoFData},
+    (; x)::CoDual{Float64,NoFData}, (; y)::CoDual{Float64,NoFData}, (; z)::CoDual{Float64,NoFData},
 )
-    x, y, z = primal(xcd), primal(ycd), primal(zcd)
-    return CoDual(Base.muladd(x, y, z), NoFData()), MuladdPullback(x, y)
+    muladd_pullback(dw) = (NoRData(), y*dw, x*dw, dw)
+    CoDual(Base.muladd(x, y, z), NoFData()), muladd_pullback
 end
 
-struct Abs2Pullback
-    x::Float64
-end
-(pb::Abs2Pullback)(seed::Float64) = (NoRData(), 2*pb.x*seed)
-
-function rrule!!(::CoDual{typeof(abs2),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.abs2(x), NoFData()), Abs2Pullback(x)
+function rrule!!(::CoDual{typeof(abs2),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    abs2_pullback(dy) = (NoRData(), 2*x*dy)
+    CoDual(Base.abs2(x), NoFData()), abs2_pullback
 end
 
-struct InvPullback
-    y::Float64
-end
-(pb::InvPullback)(seed::Float64) = (NoRData(), -pb.y^2*seed)
-
-function rrule!!(::CoDual{typeof(inv),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    y = Base.inv(primal(xcd))
-    return CoDual(y, NoFData()), InvPullback(y)
+function rrule!!(::CoDual{typeof(inv),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    y = Base.inv(x)
+    inv_pullback(dy) = (NoRData(), -y^2*dy)
+    CoDual(y, NoFData()), inv_pullback
 end

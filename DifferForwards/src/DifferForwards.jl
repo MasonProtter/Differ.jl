@@ -18,7 +18,9 @@ import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangen
     uninit_tangent,
     _globalref_val, _globalref_isconst, _calleeval, _optype, _optype_w, _stmt_str,
     _bi_literal_index, _bi_homog_tangent_type, _tangent_field_slot, _widen,
-    _getfieldg, _setfieldg, _ctupleg
+    _getfieldg, _setfieldg, _ctupleg, _ifelseg,
+    _fc_parse, _fc_stmt, _fc_ptr_origin, _fc_same_stride, _fc_check_extent,
+    _fc_copy_sig_ok, _FC_COPY_ATS
 
 using Core: MethodInstance, CodeInstance, CodeInfo, Compiler
 const CC = Core.Compiler

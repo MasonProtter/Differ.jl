@@ -4,7 +4,7 @@
 # first and only builds a derived rule when there isn't one.
 #
 # A rule returns `(ycd, pullback)`; the pullback closure IS the tape for the derived path, but a
-# hand rule's pullback can be any opaque struct (never inspected, only called) — cheaper than the
+# hand rule's pullback can be any opaque callable (never inspected, only called) — cheaper than the
 # `Stack`-based `Tape{ArgsTT,CS}` the derived path needs to handle arbitrary control flow. Each rule
 # gets its own pullback type so dispatch can't collide between rules remembering the same primal
 # value type.
@@ -16,24 +16,14 @@
 # A hand rule's `::AbstractCtx` slot (never a concrete `Ctx{...}`) is what keeps it unambiguous
 # against the `@generated` derived fallback under dispatch — see `reverse_interp.jl`.
 
-struct SinPullback
-    x::Float64
-end
-(pb::SinPullback)(seed::Float64) = (NoRData(), Base.cos(pb.x) * seed)
-
-function rrule!!(::CoDual{typeof(sin),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.sin(x), NoFData()), SinPullback(x)
+function rrule!!(::CoDual{typeof(sin),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    sin_pullback(dy) = (NoRData(), Base.cos(x) * dy)
+    CoDual(Base.sin(x), NoFData()), sin_pullback
 end
 
-struct CosPullback
-    x::Float64
-end
-(pb::CosPullback)(seed::Float64) = (NoRData(), -Base.sin(pb.x) * seed)
-
-function rrule!!(::CoDual{typeof(cos),NoFData}, ::AbstractCtx, xcd::CoDual{Float64,NoFData})
-    x = primal(xcd)
-    return CoDual(Base.cos(x), NoFData()), CosPullback(x)
+function rrule!!(::CoDual{typeof(cos),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+    cos_pullback(dy) = (NoRData(), -Base.sin(x) * dy)
+    CoDual(Base.cos(x), NoFData()), cos_pullback
 end
 
 

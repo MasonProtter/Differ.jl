@@ -566,9 +566,12 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # Same treatment for the other two entry points this transform calls on primal types: `dual_type`
     # calls `tangent_type` internally, and `zero_tangent` dispatches to `zero_tangent_internal`
     # (extended by DifferReverse) — the *nested* dispatch has to land at `interp.world` too.
+    # `dualt` gets its argument straight from `pstmts[i][:type]` (via `frule_split!`'s `R`), so it
+    # sees the same lattice elements `tt` does — widen for the same reason.
     function dualt(@nospecialize T)
-        mt_edge!(edges, Tuple{typeof(tangent_type),Type{T}})
-        return at_world(interp, dual_type, T)
+        W = _widen(T)
+        mt_edge!(edges, Tuple{typeof(tangent_type),Type{W}})
+        return at_world(interp, dual_type, W)
     end
     function zt(@nospecialize v)
         mt_edge!(edges, Tuple{typeof(zero_tangent),Core.Typeof(v)})
@@ -830,9 +833,11 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # vararg slot's type is the tuple this pass reconstructed above; (3) a `GlobalRef` operand:
     # `_optype`'s literal fallback would report `GlobalRef`, the node's type, not the bound value's —
     # a silent miscompile (`getfield(Main.CONST_VEC, :ref)` would wrongly take the general-struct
-    # branch). Take the type from the binding instead. `_optype` still handles `SSAValue`s/literals.
+    # branch). Take the type from the binding instead. `_optype` still handles `SSAValue`s/literals,
+    # but an `SSAValue`'s statement type is itself a lattice element, not necessarily a bare `Type`;
+    # widen it, since the result here is used as a genuine type parameter (`Tuple{…}`, `Dual{P,…}`).
     optype(@nospecialize x) = isa(x, Core.Argument) ? argty[x.n] :
-                              isa(x, GlobalRef) ? gref_optype(x) : _optype(pir, x)
+                              isa(x, GlobalRef) ? gref_optype(x) : _widen(_optype(pir, x))
 
     function frule_split!(fpos, actual, R)
         # Dual(callee, NoTangent()) and each Dual(arg_primal, arg_tangent), constructed via %new.
@@ -1165,7 +1170,10 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 # `Dual{typeof(sin),NoTangent}` be re-dualized at higher order.
                 tf = Any[_nondiff_field(interp, edges, fieldtype(T, j)) ? vpresolve(args[j]) : tresolve(args[j])
                          for j in eachindex(args)]
-                shadow[i] = emit!(Expr(:new, T, tf...), Ti)
+                # `_widen(Ti)`, not `Ti`: `Ti` is the *primal*'s statement type. If it's a
+                # `PartialStruct` pinning a field, that fact is false for the shadow, whose fields are
+                # tangents, not primal values.
+                shadow[i] = emit!(Expr(:new, T, tf...), _widen(Ti))
             elseif fsel_shadow_type(T)
                 # Self-similar-shadow bookkeeping types owned by a different AD-mode package (e.g.
                 # DifferReverse's `Stack`/`Tape`) — reached under forward-over-reverse, whose own

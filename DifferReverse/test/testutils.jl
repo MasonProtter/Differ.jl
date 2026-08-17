@@ -43,6 +43,13 @@ function checkverify_rev(f, at)
     checkverify_prealloc(f, at)
 end
 
+# `checkverify_rev` minus the `code_reverse_pullback_ircode` check — that reflection helper alone
+# fails `verify_ir` on a broadcast with a scalar operand; the real carrier is unaffected.
+function checkverify_rev_no_pb_reflection(f, at)
+    Core.Compiler.verify_ir(code_reverse_fwds_ircode(f, at)[1])
+    checkverify_prealloc(f, at)
+end
+
 # Recursively assert every `Tape` reachable from a tape's own comms is stack-balanced: its
 # `block_stack` and every `Stack`-backed comms slot back at position 0. Walks into a `Stack`'s
 # *whole* backing memory (not just up to `position`, already back at 0 by now) since a `Stack`

@@ -8,3 +8,4 @@ using SafeTestsets
 # whole re-exported namespace.
 @safetestset "backedges: derivative invalidation" begin include("test_backedges.jl") end
 @safetestset "rules: no ambiguities" begin include("test_rule_ambiguities.jl") end
+@safetestset "DifferentiationInterfaceTest" begin include("dit.jl") end

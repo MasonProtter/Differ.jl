@@ -26,10 +26,12 @@ import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangen
     SetToZeroCache, tuple_map, @foldable, zero_like_rdata_type, zero_like_rdata_from_type,
     zero_rdata_from_type, _get_fdata_field, increment_field!!, increment_field_rdata!,
     increment_rdata!!, is_always_fully_initialised, split_union_tuple_type, ZeroRData,
-    CannotProduceZeroRDataFromType,
-    _globalref_val, _globalref_isconst, _calleeval, _optype, _optype_w, _stmt_str,
+    CannotProduceZeroRDataFromType, can_produce_zero_rdata_from_type,
+    _globalref_val, _globalref_isconst, _calleeval, _optype, _optype_w, _stype, _stype_invoke, _stmt_str,
     _bi_literal_index, _bi_homog_tangent_type, _tangent_field_slot, _widen,
-    _getfieldg, _setfieldg, _ctupleg
+    _getfieldg, _setfieldg, _ctupleg, _ifelseg,
+    _fc_parse, _fc_stmt, _fc_ptr_origin, _fc_same_stride, _fc_check_extent,
+    _fc_copy_sig_ok, _FC_COPY_ATS
 
 # `Reverse` is the plugin owner type identifying DifferReverse to `Contextual`'s
 # `ContextualInterpreter{T,S}`. `owner` doubles as the `cache_owner` partition key, so
@@ -58,6 +60,7 @@ include("stack.jl")
 include("cfg_ir.jl")
 include("intrinsics_reverse.jl")
 include("builtins_reverse.jl")
+include("foreigncalls_reverse.jl")
 include("reverse_interp.jl")
 include("rrules.jl")
 include("rules_math.jl")

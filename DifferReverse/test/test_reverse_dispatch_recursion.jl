@@ -57,6 +57,34 @@ usencg(v) = sum(nonconst_g, v)
 
 vasum(x...) = sum(x)
 
+# fdata-carrying immutable arguments to a recursive call (struct/tuple/NamedTuple wrapping a
+# tracked array) — module-level per the file's convention.
+struct RecW
+    v::Vector{Float64}
+end
+@noinline recw_inner(w::RecW) = sum(w.v)
+recw_outer(x) = recw_inner(RecW(x))
+
+# Mixed fdata (b) + rdata (a) fields: exercises the returned-rdata routing on top of the fdata path.
+struct RecM
+    a::Float64
+    b::Vector{Float64}
+end
+@noinline recm_inner(m::RecM) = m.a * sum(m.b)
+recm_outer(x) = recm_inner(RecM(x[1], x))
+
+@noinline rectup_inner(t) = sum(t[1]) + 2sum(t[2])
+rectup_outer(x) = rectup_inner((x, 2 .* x))
+
+@noinline recnt_inner(nt) = sum(nt.p) * nt.q
+recnt_outer(x) = recnt_inner((p = x, q = x[1] * 3))
+
+# Negative case: struct built from a non-const global. Explicitly typed so the argument type stays
+# concrete (unlike `dyncallee` above) and the bail comes from the provenance check, not an earlier
+# non-concrete-type guard.
+global_recw_v::Vector{Float64} = [10.0, 20.0, 30.0]
+recw_untraced_outer(x) = recw_inner(RecW(global_recw_v)) + sum(x)
+
 @testset "reverse mode: recursion into a hand-written rule" begin
     # A surviving high-level call differentiates via the recursive rrule support below (sin
     # resolves to the hand-written rule in rrules.jl, not raw recursion into its internals).
@@ -237,16 +265,72 @@ end
 end
 
 @testset "reverse mode: build_ctx reports the recorded bail reason" begin
+    # `dyncallee` (dynamic-dispatch callee, above) reliably bails; a vararg primal (`vasum`) used to
+    # be this test's vehicle but no longer bails at all now that reverse mode supports vararg
+    # primals — see the vararg testset below.
     err = try
-        build_ctx(vasum, (Float64, Float64))
+        build_ctx(dyncallee, (Float64,))
         nothing
     catch e
         e
     end
     @test err isa ErrorException
-    @test occursin("vararg method", err.msg)
-    @test occursin("vasum", err.msg)
+    @test occursin("is not a concrete DataType", err.msg)
+    @test occursin("dyncallee", err.msg)
     @test !occursin("prealloc=false", err.msg)
+end
+
+@testset "reverse mode: vararg primal" begin
+    # `_static_recursible_call`'s guards apply to a vararg call the same as any other; `vasum`
+    # itself, and the flat<->packed argument-space split (`resolve_reverse_primal`, the fwds/
+    # pullback prologues), are what let this build at all.
+    _, dx2, dx3 = rev_gradient(vasum, 2.0, 3.0)
+    @test dx2 == 1.0 && dx3 == 1.0
+    checkverify_rev(vasum, (Float64, Float64))
+    check_stack_balance(vasum, 2.0, 3.0)
+
+    # 0 trailing arguments: the packed tail is `Tuple{}`, the `NoTangent`/`NoFData` collapse case.
+    # (`vasum` itself can't be called with zero args: `sum(())` throws in plain Julia too.)
+    vasum0(x, ys...) = x * sum(ys; init = 1.0)
+    _, dx0 = rev_gradient(vasum0, 3.0)
+    @test dx0 == 1.0
+    checkverify_rev(vasum0, (Float64,))
+    check_stack_balance(vasum0, 3.0)
+
+    # All-`NoTangent` trailing arguments (an `Int` vararg): every trailing gradient is `NoTangent`.
+    viasum(x, ys::Int...) = x * sum(ys; init = 0)
+    _, dxv, dy1, dy2 = rev_gradient(viasum, 1.5, 2, 3)
+    @test dxv == 5.0   # sum(ys) == 5
+    @test dy1 === NoTangent() && dy2 === NoTangent()
+    checkverify_rev(viasum, (Float64, Int, Int))
+    check_stack_balance(viasum, 1.5, 2, 3)
+
+    # fdata-carrying trailing arguments (an array vararg): the scatter case — one packed rdata
+    # accumulator (trivial here, arrays have no rdata) plus the per-argument array shadows. Loops
+    # over the packed tuple by dynamic index, the same shape `vcat`'s own body uses — `sum(f,
+    # ::Tuple)` recurses into `Base.afoldl` (itself vararg) and currently hits a separate, unrelated
+    # `verify_ir` gap; not this feature's concern.
+    @noinline function vvsum(x::Float64, vs::Vector{Float64}...)
+        s = 0.0
+        for j in 1:length(vs)
+            v = vs[j]
+            for i in eachindex(v)
+                s += v[i]
+            end
+        end
+        return x * s
+    end
+    v1, v2 = [1.0, 2.0], [3.0, 4.0]
+    _, dxvv, dv1, dv2 = rev_gradient(vvsum, 2.0, v1, v2)
+    @test dxvv == sum(v1) + sum(v2)
+    @test dv1 == fill(2.0, 2) && dv2 == fill(2.0, 2)
+    for k in eachindex(v1)
+        v1p = copy(v1); v1p[k] += 1e-6
+        v1m = copy(v1); v1m[k] -= 1e-6
+        @test dv1[k] ≈ (vvsum(2.0, v1p, v2) - vvsum(2.0, v1m, v2)) / 2e-6 rtol = 1e-5
+    end
+    checkverify_rev(vvsum, (Float64, Vector{Float64}, Vector{Float64}))
+    check_stack_balance(vvsum, 2.0, v1, v2)
 end
 
 @testset "reverse mode: dynamic (non-literal) getfield index" begin
@@ -499,4 +583,37 @@ end
     @test length(invokes_to_rrule) == 1
     ctx_arg = only(invokes_to_rrule).args[4]
     @test ctx_arg isa DifferReverse.Ctx{Nothing}
+end
+
+@testset "reverse mode: recursion into an fdata-carrying immutable argument" begin
+    v = [1.0, 2.0, 3.0]
+
+    _, dw = rev_gradient(recw_outer, v)
+    @test dw ≈ [1.0, 1.0, 1.0]
+    checkverify_rev(recw_outer, (Vector{Float64},))
+    check_stack_balance(recw_outer, v)
+
+    _, dm = rev_gradient(recm_outer, v)
+    @test dm ≈ [7.0, 1.0, 1.0]
+    checkverify_rev(recm_outer, (Vector{Float64},))
+    check_stack_balance(recm_outer, v)
+
+    _, dt = rev_gradient(rectup_outer, v)
+    @test dt ≈ [5.0, 5.0, 5.0]
+    checkverify_rev(rectup_outer, (Vector{Float64},))
+    check_stack_balance(rectup_outer, v)
+
+    _, dnt = rev_gradient(recnt_outer, v)
+    @test dnt ≈ [21.0, 3.0, 3.0]
+    checkverify_rev(recnt_outer, (Vector{Float64},))
+    check_stack_balance(recnt_outer, v)
+
+    err = try
+        build_ctx(recw_untraced_outer, (Vector{Float64},))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("provenance is not traceable", err.msg)
 end

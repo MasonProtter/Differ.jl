@@ -207,3 +207,27 @@ end
     # (the index and `v[i]`) fuses onto one stack, same as `loopdot`.
     check_tape_size(loopinv, (Float64, Vector{Float64}); bytes=16, isbits=true, stacks=1)
 end
+
+@testset "reverse mode: value-producing block terminator" begin
+    # A `::T` return annotation leaves the entry block ending in the call itself — a fallthrough
+    # terminator owning that block's `:subtape` comms item (ISSUES #98).
+    f1(x::Number)::Number = sin(x)
+    f2(x)::Float64 = sin(2x)
+    @noinline ninner(x) = sin(x) * x
+    f3(x::Number)::Number = ninner(x)   # derived callee, not a hand rule
+
+    for (f, x) in ((f1, 0.7), (f2, 0.7), (f3, 0.7))
+        _, dx = rev_gradient(f, x)
+        h = 1e-6
+        @test dx ≈ (f(x + h) - f(x - h)) / 2h rtol = 1e-5
+        @test dx ≈ frule!!(Dual(f, NoTangent()), Dual(x, 1.0)).dx rtol = 1e-8
+    end
+
+    checkverify_rev(f1, (Float64,))
+    checkverify_rev(f2, (Float64,))
+    checkverify_rev(f3, (Float64,))
+
+    check_stack_balance(f1, 0.7)
+    check_stack_balance(f2, 0.7)
+    check_stack_balance(f3, 0.7)
+end

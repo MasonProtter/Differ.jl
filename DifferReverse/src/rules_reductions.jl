@@ -9,56 +9,30 @@
 # instead — a fresh zero array `dy` returned as `y`'s shadow, accumulated into in place by
 # downstream reads/writes. By the time this pullback runs, `dy` holds the total seed vector, and
 # `dx[i] += sum(dy[i:end])` is the reverse cumulative sum, computed here as a running suffix sum.
-#
-# Known limitation: using `cumsum(x)`'s result (e.g. indexing into it) inside another
-# differentiated function fails in reverse mode — the static provenance scan (`_fdata_tracked`)
-# doesn't recognize a hand-ruled call's result as a differentiable-array provenance root, so
-# downstream reads off `y` are rejected as untracked. Not fixable from here.
-
-struct CumsumPullback{X<:Array}
-    dx::X
-    dy::X
-end
-function (pb::CumsumPullback)(seed)
-    dx, dy = pb.dx, pb.dy
-    running = zero(eltype(dy))
-    for i in length(dy):-1:1
-        running += dy[i]
-        dx[i] = increment!!(dx[i], running)
-    end
-    return (NoRData(), NoRData())
-end
 
 function rrule!!(
-    ::CoDual{typeof(cumsum),NoFData}, ::AbstractCtx, xcd::CoDual{X,X}
+    ::CoDual{typeof(cumsum),NoFData}, ::AbstractCtx, (; x, dx)::CoDual{X,X}
 ) where {X<:Array{<:IEEEFloat}}
-    x = primal(xcd)
-    dx = tangent(xcd)
     y = cumsum(x)
     dy = zero_tangent(y)
-    return CoDual(y, dy), CumsumPullback{X}(dx, dy)
+    function cumsum_pullback(_)
+        running = zero(eltype(dy))
+        for i in length(dy):-1:1
+            running += dy[i]
+            dx[i] = increment!!(dx[i], running)
+        end
+        return (NoRData(), NoRData())
+    end
+    return CoDual(y, dy), cumsum_pullback
 end
 
 # ---- extrema ----
 # Unlike arrays, a `Tuple`'s rdata is a plain tuple of its fields' rdata, so the pullback receives
 # a real `(seed_min, seed_max)` seed directly — no fdata-aliasing trick needed, unlike `cumsum`.
 
-struct ExtremaPullback{X<:Array}
-    dx::X
-    imn::Int
-    imx::Int
-end
-function (pb::ExtremaPullback)((seed_mn, seed_mx))
-    pb.dx[pb.imn] = increment!!(pb.dx[pb.imn], seed_mn)
-    pb.dx[pb.imx] = increment!!(pb.dx[pb.imx], seed_mx)
-    return (NoRData(), NoRData())
-end
-
 function rrule!!(
-    ::CoDual{typeof(extrema),NoFData}, ::AbstractCtx, xcd::CoDual{X,X}
+    ::CoDual{typeof(extrema),NoFData}, ::AbstractCtx, (; x, dx)::CoDual{X,X}
 ) where {X<:Array{<:IEEEFloat}}
-    x = primal(xcd)
-    dx = tangent(xcd)
     n = length(x)
     n == 0 && error("Differ: extrema of an empty array is not supported by this rule")
     mn = x[1]
@@ -75,5 +49,12 @@ function rrule!!(
             imx = i
         end
     end
-    return zero_fcodual((mn, mx)), ExtremaPullback{X}(dx, imn, imx)
+    # single-assignment copies: `imn`/`imx` are reassigned in the loop above and must not be captured
+    min_idx, max_idx = imn, imx
+    function extrema_pullback((dmn, dmx))
+        dx[min_idx] = increment!!(dx[min_idx], dmn)
+        dx[max_idx] = increment!!(dx[max_idx], dmx)
+        return (NoRData(), NoRData())
+    end
+    return zero_fcodual((mn, mx)), extrema_pullback
 end
