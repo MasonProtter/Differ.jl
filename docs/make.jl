@@ -17,4 +17,5 @@ makedocs(;
 deploydocs(;
     repo = "github.com/MasonProtter/Differ.jl.git",
     devbranch = "master",
+    push_preview = false,
 )
