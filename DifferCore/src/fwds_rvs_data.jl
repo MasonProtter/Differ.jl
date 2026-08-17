@@ -411,6 +411,20 @@ Base.copy(::NoRData) = NoRData()
 @inline increment_field!!(::NoRData, y, ::Val) = NoRData()
 
 """
+    @ifactive dx expr
+
+`expr` if the shadow `dx` is active, `NoRData()` otherwise. `NoTangent` is a singleton so the test
+folds away — the two activity specialisations of a rule compile separately, with no `Union` result.
+
+For a pullback component in a hand-written `rrule!!`:
+
+    mul_pullback(dz) = (NoRData(), @ifactive(dx, dz * y), @ifactive(dy, dz * x))
+"""
+macro ifactive(dx, expr)
+    return :(isactive($(esc(dx))) ? $(esc(expr)) : NoRData())
+end
+
+"""
     RData(data::NamedTuple)
 
 The component of a `struct`'s tangent which is *not* propagated on the forwards-pass of reverse-
@@ -982,6 +996,9 @@ end
 Reconstruct the tangent `t` for which `fdata(t) == f` and `rdata(t) == r`.
 """
 tangent(::NoFData, ::NoRData) = NoTangent()
+# An inactive slot: `NoTangent` in the shadow position means the value was held constant, so the
+# reconstruction is `NoTangent()` however differentiable the primal type is.
+tangent(::NoTangent, ::NoRData) = NoTangent()
 tangent(::NoFData, r::IEEEFloat) = r
 tangent(f::Array, ::NoRData) = f
 tangent(f::Ptr, ::NoRData) = f

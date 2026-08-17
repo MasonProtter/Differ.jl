@@ -28,5 +28,6 @@ export increment!!, set_to_zero!!
 export build_tangent, get_tangent_field, set_tangent_field!
 export as_tangent, unit_tangent
 export LazyZeroRData
+export isactive, @ifactive
 
 end # module DifferCore

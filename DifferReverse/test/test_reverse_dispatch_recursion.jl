@@ -79,11 +79,22 @@ rectup_outer(x) = rectup_inner((x, 2 .* x))
 @noinline recnt_inner(nt) = sum(nt.p) * nt.q
 recnt_outer(x) = recnt_inner((p = x, q = x[1] * 3))
 
-# Negative case: struct built from a non-const global. Explicitly typed so the argument type stays
-# concrete (unlike `dyncallee` above) and the bail comes from the provenance check, not an earlier
-# non-concrete-type guard.
+# Struct built from a non-const global. Nothing in the call reaches `x`, so activity analysis marks
+# it inactive and the whole call is replayed primally rather than differentiated — no provenance
+# question arises.
 global_recw_v::Vector{Float64} = [10.0, 20.0, 30.0]
 recw_untraced_outer(x) = recw_inner(RecW(global_recw_v)) + sum(x)
+
+# Negative case: a struct mixing a traceable field with an untraceable one. The call *is* active (it
+# reaches `x`), so it goes through recursion resolution and the provenance check fires. Explicitly
+# typed so the argument type stays concrete (unlike `dyncallee` above) and the bail comes from the
+# provenance check, not an earlier non-concrete-type guard.
+struct RecMix
+    a::Vector{Float64}
+    b::Vector{Float64}
+end
+@noinline recmix_inner(m::RecMix) = sum(m.a) + 2 * sum(m.b)
+recmix_untraced_outer(x) = recmix_inner(RecMix(x, global_recw_v))
 
 @testset "reverse mode: recursion into a hand-written rule" begin
     # A surviving high-level call differentiates via the recursive rrule support below (sin
@@ -608,8 +619,16 @@ end
     checkverify_rev(recnt_outer, (Vector{Float64},))
     check_stack_balance(recnt_outer, v)
 
+    # Reached only through a global, so inactive: replayed primally, and the gradient comes from
+    # `sum(x)` alone. The replayed call still computes the real primal value.
+    ctx = build_ctx(recw_untraced_outer, (Vector{Float64},))
+    y, gs = value_and_gradient!(ctx, zero_fcodual(recw_untraced_outer), zero_fcodual(v))
+    @test y ≈ recw_untraced_outer(v)
+    @test gs[2] ≈ [1.0, 1.0, 1.0]
+    check_stack_balance(recw_untraced_outer, v)
+
     err = try
-        build_ctx(recw_untraced_outer, (Vector{Float64},))
+        build_ctx(recmix_untraced_outer, (Vector{Float64},))
         nothing
     catch e
         e

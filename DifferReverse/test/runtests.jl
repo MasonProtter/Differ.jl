@@ -9,6 +9,7 @@ using SafeTestsets
 @safetestset "reverse: mutation & aliasing" begin include("test_reverse_mutation_aliasing.jl") end
 @safetestset "reverse: tuples" begin include("test_reverse_tuples.jl") end
 @safetestset "reverse: Core.ifelse" begin include("test_reverse_ifelse.jl") end
+@safetestset "reverse: activity (constant arguments)" begin include("test_reverse_activity.jl") end
 @safetestset "reverse: closures & globals" begin include("test_reverse_closures_globals.jl") end
 @safetestset "cfg / IR" begin include("test_cfg_ir.jl") end
 @safetestset "rules: math" begin include("test_math_rules.jl") end

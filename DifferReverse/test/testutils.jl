@@ -13,6 +13,14 @@ using DifferForwards: code_dual_ircode
 # Forward-mode dualized IR is legal (order-1).
 checkverify(f, at) = Core.Compiler.verify_ir(code_dual_ircode(f, at)[1])
 
+# The `CoDual` for an argument held constant: `NoTangent` in the shadow slot (see `CoDual`).
+const_codual(x) = DifferReverse.CoDual(x, NoTangent())
+
+# The argument `CoDual` types a call with these constant positions will be built from.
+arg_codual_types(f, at; inactive=()) =
+    DifferReverse._arg_codual_types(Base.get_world_counter(), at,
+                                    DifferReverse._inactive_positions(inactive, length(at)))
+
 # Central finite difference, one argument.
 central_diff(f, x; h=1e-6) = (f(x + h) - f(x - h)) / 2h
 
@@ -23,12 +31,12 @@ central_diff(f, x, y, k::Int; h=1e-6) =
 # `code_reverse_fwds_ircode`/`code_reverse_pullback_ircode` inspect the tape-*allocating* carrier
 # shape (`Ctx{Nothing}`). A `build_ctx(...; prealloc=true)` context compiles a different prologue
 # (reads the caller's stacks out of the ctx and resets them), so it needs its own check.
-function checkverify_prealloc(f, at)
-    ctx = build_ctx(f, at)
+function checkverify_prealloc(f, at; inactive=())
+    ctx = build_ctx(f, at; inactive)
     interp = DifferReverse.build_reverse_interp()
     tt = Tuple{typeof(DifferReverse.reverse_fwds_impl),
                DifferReverse.fcodual_type(DifferReverse._typeof(f)), typeof(ctx),
-               (DifferReverse.fcodual_type(T) for T in at)...}
+               arg_codual_types(f, at; inactive)...}
     mi = Base.specialize_method(
         Core.Compiler.findall(tt, Core.Compiler.method_table(interp))[1])
     reason = Ref("no specific reason recorded")
@@ -37,10 +45,10 @@ function checkverify_prealloc(f, at)
     Core.Compiler.verify_ir(ir)
 end
 
-function checkverify_rev(f, at)
-    Core.Compiler.verify_ir(code_reverse_fwds_ircode(f, at)[1])
-    Core.Compiler.verify_ir(code_reverse_pullback_ircode(f, at)[1])
-    checkverify_prealloc(f, at)
+function checkverify_rev(f, at; inactive=())
+    Core.Compiler.verify_ir(code_reverse_fwds_ircode(f, at; inactive)[1])
+    Core.Compiler.verify_ir(code_reverse_pullback_ircode(f, at; inactive)[1])
+    checkverify_prealloc(f, at; inactive)
 end
 
 # `checkverify_rev` minus the `code_reverse_pullback_ircode` check — that reflection helper alone

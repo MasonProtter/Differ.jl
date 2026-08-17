@@ -374,6 +374,67 @@ Fails safe (a located bail, not a wrong gradient) but is a real gap — a phi th
 provenance across loop iterations, not just a value that never changes, is exactly what the fixpoint
 was added to handle, and this specific shape of it still isn't reachable.
 
+## `_activity`: constant arguments
+
+`NoTangent` in a `CoDual`'s shadow slot means the caller declared that value **constant**:
+`CoDual(x, NoTangent())`. This is a third flavour of the carrier alongside `fcodual_type`'s fdata form
+and `codual_type`'s full-tangent form, and it needs no new type — for a differentiable `P`,
+`CoDual{P,NoTangent}` was simply an unused encoding, and `CoDual` has no inner constructor to relax
+(unlike `Dual`, which enforces `tangent_type(P) == T` and will have to be loosened before forward mode
+can carry one). `isactive(dx) = !isa(dx, NoTangent)` and `@ifactive(dx, expr)` (`DifferCore`) are the
+rule-author predicates. **`isactive` is not decidable from the fdata type**: an active `Float64`'s
+shadow is `NoFData()`, since a scalar's whole tangent is rdata.
+
+Activity is **type-level at function boundaries, a dataflow analysis inside a function**. Because the
+`@generated` `rrule!!` fallback keys on the `CoDual` argument types, each activity signature gets its
+own carrier, `Tape` type and `CodeInstance` for free; `Tape{ArgsTT,CS}`'s `ArgsTT` is what lets the
+pullback carrier recover the same seed the fwds carrier used, so the two agree with no extra channel.
+Inside a function there are no intermediate `CoDual`s, so `_activity(pir, iworld, n, codualparams)`
+returns a `BitVector` over SSA ids — a monotone least-fixpoint scan of exactly the same shape as
+`_fdata_tracked`, and for the same reason (loop-carried phis). Its conservatism runs the *other* way,
+though: it grows "may be active", so an unrecognised value-producing statement must default to
+**active**. It is computed at all three sites (`_scan_block_comms` and both builders) from identical
+inputs, exactly as `_fdata_tracked` already is.
+
+`_arg_fdata_tracked` is gated on activity, which untracks the whole derivation chain off an inactive
+argument — that is what routes those reads to primal replay rather than a bail, and `_fdata_tracked`
+itself skips inactive statements so it can't promise a shadow the fwds pass won't build.
+
+**The main payoff is coverage, not tape size.** An all-inactive `:call`/`:invoke` is replayed primally
+*before* `_static_recursible_call` runs, so its concrete-argtype / traceable-provenance /
+resolvable-callee gates never fire on code the derivative doesn't depend on — logging, `Dict`
+bookkeeping, string handling. Secondarily, an inactive statement gets no rdata `Ref`, no comms item,
+and no accumulate, and an inactive argument's slot in the pullback's return tuple is a `NoRData()`
+literal.
+
+**Four rules that are load-bearing, three of them learned the hard way:**
+
+- **"Result type has no tangent space ⇒ inactive" is valid only for a pure value producer.** A generic
+  call routinely returns `Nothing` while writing through an argument — `push!` lowers to
+  `Base._growend_internal!`, exactly this shape — so applying the gate there marks a mutation inactive
+  and turns a clean bail into a runtime `BoundsError`. Generic calls are decided by their operands
+  alone. A rule-less `Core.Builtin`/intrinsic *does* keep the shortcut: without it `x === y` on active
+  operands would have no rule and bail.
+- **A locally allocated mutable object is an activity root**, not a function of its initialiser
+  operands (`%new` of a mutable type, `Core.memorynew`) — an active value may be written into it later.
+  The same roots `_fdata_tracked` treats as provenance roots.
+- **`:foreigncall` is unconditionally active.** Native code can write through any pointer it is handed,
+  and keeping it active is what lets the comms scan, fwds pass and pullback stay uniformly
+  activity-gated without an exemption that would desynchronise a push/pop pair.
+- **The packed vararg tail always keeps its rdata accumulator** — the scatter at the pullback's return
+  reads it unconditionally, and an all-`NoTangent` tail (`Tuple{}`, an `Int` vararg) is inactive by
+  type.
+
+**Aliasing is a user obligation**, as in Enzyme: an inactive value must not share memory with an active
+one, and that is not checkable here. The one statically detectable case — writing an active value into
+an inactive container — is a located bail, never a silent zero. Deliberately, there is **no** absorbing
+`increment_internal!!(::NoTangent, x)` arm: its absence is what turns an analysis bug into a
+`MethodError` instead of a dropped gradient. Do not add one as a convenience.
+
+Entry points take `inactive=(positions...)` (1-based, arguments only, not `f`): `build_ctx`,
+`tape_type`, `code_reverse_fwds_ircode`, `code_reverse_pullback_ircode`. See ISSUES #112, and
+#113-#115 for the open follow-ups.
+
 ## The builtin-rule dispatch layer
 
 `builtins_reverse.jl` mirrors `intrinsics_reverse.jl`'s `Val(f)`-dispatch trick but three-sided, since
@@ -672,6 +733,15 @@ index (block numbering shifts with unrelated optimizer changes).
 - **ISSUES #102** (fixed) — `memoryrefget`'s pullback and fwds-carrier read side both loaded/stored the
   shadow element at its rdata/fdata type instead of its own tangent type; see the "companion invariant"
   in "Mutation: the shadow-chain comms scheme" above.
+
+- **Activity follow-ups** (ISSUES #113-#115): an inactive array reaching a `.`-broadcast still bails
+  in the `memmove` rule, which has only "both tracked" and "both `NoTangent`" modes and treats an
+  inactive buffer as a mixed pair (non-broadcast array paths work today); `intrinsic_rrule_operands`
+  is not activity-conditional, so `mul_float` still records an operand whose contribution is
+  discarded; and hand-written *multi-argument* rules stop matching an inactive argument and silently
+  fall through to the derived transform, so they need `CoDual{P,<:Union{NoFData,NoTangent}}` slots
+  plus `@ifactive`. Unary rules need nothing — an inactive sole argument makes the whole callsite
+  inactive, and primal replay fires before dispatch.
 
 Growable-array mutation (`push!`/`resize!`), non-bits array elements, and any `Core.Builtin` with no
 registered rule remain out of scope for both modes (`differ-extending-ir-support`).
