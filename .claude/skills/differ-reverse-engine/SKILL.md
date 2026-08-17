@@ -741,7 +741,9 @@ index (block numbering shifts with unrelated optimizer changes).
   discarded; and hand-written *multi-argument* rules stop matching an inactive argument and silently
   fall through to the derived transform, so they need `CoDual{P,<:Union{NoFData,NoTangent}}` slots
   plus `@ifactive`. Unary rules need nothing — an inactive sole argument makes the whole callsite
-  inactive, and primal replay fires before dispatch.
+  inactive, and primal replay fires before dispatch. ISSUES #116: an inactive element in a vararg
+  primal's packed tail only bails (`_packed_codualparams`), never miscompiles — real support would
+  need per-element activity threaded through five sites across both carriers.
 
 Growable-array mutation (`push!`/`resize!`), non-bits array elements, and any `Core.Builtin` with no
 registered rule remain out of scope for both modes (`differ-extending-ir-support`).

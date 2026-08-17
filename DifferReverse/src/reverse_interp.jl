@@ -559,8 +559,15 @@ end
 # `nfixed < 0` (see `resolve_reverse_primal`) means non-vararg: identity. Not `nfixed == n`: a
 # *vararg* primal called with zero trailing arguments also has `nfixed == n`, but the primal IR
 # still has a real (empty-tuple) packed tail slot in that case, so it must still pack.
-function _packed_codualparams(iworld::UInt, codualparams::Vector{Any}, nfixed::Int)
+function _packed_codualparams(iworld::UInt, codualparams::Vector{Any}, nfixed::Int,
+                              reason::Ref{String})
     nfixed < 0 && return codualparams
+    if any(_codual_fdata_type(codualparams[k]) === NoTangent for k in (nfixed + 1):length(codualparams))
+        reason[] = "reverse mode cannot hold a vararg primal's trailing argument constant: " *
+            "positions $(nfixed + 1)..$(length(codualparams)) are bound to one packed tuple slot, " *
+            "whose shadow must be uniformly active"
+        return nothing
+    end
     tailP = Tuple{(_codual_primal_type(P) for P in codualparams[(nfixed + 1):end])...}
     return Any[codualparams[1:nfixed]..., _fcdtype(iworld, tailP)]
 end
@@ -2118,7 +2125,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     codualparams = Any[impl_mi.specTypes.parameters[2], impl_mi.specTypes.parameters[4:end]...]
     vararg_tt = Tuple{impl_mi.specTypes.parameters[4:end]...}
     ArgsTT = Tuple{codualparams...}
-    packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed)
+    packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed, reason)
+    packed_codualparams === nothing && return nothing
 
     scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges)
     scan === nothing && return nothing
@@ -2853,7 +2861,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     codualparams = Any[ArgsTT.parameters...]
     CS = TapeT.parameters[2]
     comms_stack_ty = Any[CS.parameters...]
-    packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed)
+    packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed, reason)
+    packed_codualparams === nothing && return nothing
 
     scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges)
     scan === nothing && return nothing
@@ -2994,12 +3003,19 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         ssa_ref_id[i] = eemit!(Expr(:new, Base.RefValue{RT}, zero_like_rdata_from_type(Ti)), Base.RefValue{RT})
     end
 
-    # An unassigned slot is an inactive statement/argument; `route!` discards a `nothing` target,
-    # exactly as it already does for a literal operand.
-    ref_for(@nospecialize node) =
-        isa(node, Core.SSAValue) ? (isassigned(ssa_ref_id, node.id) ? ssa_ref_id[node.id] : nothing) :
-        isa(node, Core.Argument) ? (isassigned(arg_ref_id, node.n) ? arg_ref_id[node.n] : nothing) :
-        nothing
+    # An unassigned slot *in range* is an inactive statement/argument; `route!` discards a `nothing`
+    # target, exactly as it already does for a literal operand. Out of range is an internal error, not
+    # inactivity — `isassigned` alone can't tell the two apart.
+    function ref_for(@nospecialize node)
+        if isa(node, Core.SSAValue)
+            node.id <= N || error("Differ internal error: SSA %$(node.id) is out of range")
+            return isassigned(ssa_ref_id, node.id) ? ssa_ref_id[node.id] : nothing
+        elseif isa(node, Core.Argument)
+            node.n <= npacked || error("Differ internal error: argument $(node.n) is out of range")
+            return isassigned(arg_ref_id, node.n) ? arg_ref_id[node.n] : nothing
+        end
+        return nothing
+    end
 
     # One small routing block per exit: seed *that* exit's own return-value `Ref` from `seed`, then
     # jump to its reverse code. Which one runs is chosen by the switch below, popping the block
@@ -3718,11 +3734,10 @@ function _build_tape_body(world::UInt, source, self, ftype, argst, inactivet)
     inactive = inactivet.parameters[1]
     interp = build_reverse_interp(; world)
     codualtys = Any[_fcdtype(world, ftype)]
-    try
-        append!(codualtys, _arg_codual_types(world, ArgsT.parameters, inactive))
-    catch
-        return bail("Differ.build_ctx: argtypes must be a tuple of types")
+    for T in ArgsT.parameters
+        (T isa Type) || return bail("Differ.build_ctx: argtypes must be a tuple of types")
     end
+    append!(codualtys, _arg_codual_types(world, ArgsT.parameters, inactive))
     # Carrier layout is `reverse_fwds_impl(fcd, ctx, argcds...)`: fcd first, then `Ctx{Nothing}`
     # (tape-allocating mode — this only reads its return type), then the argument coduals.
     primal_tt = Tuple{ftype,ArgsT.parameters...}
