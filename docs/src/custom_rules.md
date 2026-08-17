@@ -17,7 +17,7 @@ end
 ```
 then forwards mode automatic differentiation is concerned with calculating `dfoo/dx` by re-writing this into a new function of the form
 ```julia
-function frule!!(::Dual{typeof(foo)}, (;x, dx)::Dual{Float64})
+function DifferForwards.frule!!(::Dual{typeof(foo)}, (;x, dx)::Dual{Float64})
     (; y, dy) = Dual(sin(x), var"d(sin(x))/dx" * dx)
     (; z, dz) = Dual(y^2, var"d(y^2)/dx" * dy)
     return Dual(z+1, var"d(z+1)/dz" * dz)
@@ -40,7 +40,7 @@ This is harder to see with scalar code, but `frule!!` on `Dual`s is essentially 
 ```julia
 frule!!(::Dual(f, NoTangent()), Dual(a, b))
 ```
-will calculate ``J[f](a) \cdot b`` where $J_f(a)$ is the Jacobian of `f` evaluated at `a`. By evaulating the `frule!!` across a whole basis, we can generate the whole Jacobian.
+will calculate ``J[f](a) \cdot b`` where ``J[f](a)`` is the Jacobian of `f` evaluated at `a`. By evaulating the `frule!!` across a whole basis, we can generate the whole Jacobian.
 
 Handling of mutation in forwards mode is also easy: if you mutate `x`, then you do the equivalent derivative mutations to `dx`. Suppose we have the function
 ```julia
@@ -61,7 +61,7 @@ end
 
 ## Writing a `rrule!!` for reverse mode AD
 
-Reverse mode AD is the *transpose* of forwards mode AD. Instead of calculating a JVP (Jacobian-vector-product) ``J_{f}(a) \cdot b``, reverse mode calculates the VJP (vector-jacobian product) ``b^\dagger J_f(a)``. This is a trivial difference in simple programs, but it's enormously consequential for complicated programs.
+Reverse mode AD is the *transpose* of forwards mode AD. Instead of calculating a JVP (Jacobian-vector-product) ``J[f](a) \cdot b``, reverse mode calculates the VJP (vector-jacobian product) ``b^\dagger J[f](a)``. This is a trivial difference in simple programs, but it's enormously consequential for complicated programs.
 
 For a function with many inputs and few outputs, the full jacobian can be reconstructed with fewer VJP evaluations than JVP evaluations, which is the reason that this technique is so impactful in fields like optimization where there is a scalar cost function, and unboundedly large parameter sets one may wish to differentiate with respect to.
 
@@ -78,7 +78,7 @@ We take our regular primal function, and have to run it *backwards* in order to 
 In the simplest case with a function like `sin`, that just looks like
 
 ```julia
-function rrule!!(::CoDual{typeof(sin),NoFData}, ctx::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+function DifferReverse.rrule!!(::CoDual{typeof(sin),NoFData}, ctx::AbstractCtx, (; x)::CoDual{Float64,NoFData})
     sinx, cosx = sincos(x)
     fwd_result = CoDual(sinx, NoFData())
     sin_pullback(dy) = (NoRData(), dy * cosx) # dy * d/dx sin(x)
