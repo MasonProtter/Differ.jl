@@ -333,8 +333,8 @@ end
 # `tt` calls tangent_type on every argtype, unsafe for arbitrary callees `src_inlining_policy`
 # probes: the generic-struct fallback isn't guaranteed to terminate on a self-referential type
 # (`DifferCore/src/tangents.jl`). `has_hand_reverse_rule` guards via `_hand_rule_ftype_candidate` first.
-function hand_reverse_rule_match(interp::ContextualInterpreter, @nospecialize(ftype), argtypes)
-    tt = Tuple{typeof(rrule!!),CoDual{ftype,NoFData},Ctx{Nothing},(_fcdtype(interp.world, P) for P in argtypes)...}
+function hand_reverse_rule_match(interp::ContextualInterpreter, @nospecialize(ftype), argcodualtys)
+    tt = Tuple{typeof(rrule!!),CoDual{ftype,NoFData},Ctx{Nothing},argcodualtys...}
     m, _ = CC.findsup(tt, CC.method_table(interp))
     (m === nothing || !isa(m.method, Method)) && return nothing
     is_generated_reverse_fwds_fallback(m.method) && return nothing
@@ -384,7 +384,8 @@ function has_hand_reverse_rule(interp::ContextualInterpreter, callee_mi::MethodI
               "argument while building a reverse-mode pass")
     # Skip callees no hand rule could apply to before touching argtypes' tangent_type.
     _hand_rule_ftype_candidate(interp, ftype) || return false
-    return hand_reverse_rule_match(interp, ftype, argtypes) !== nothing
+    argcodualtys = Any[_fcdtype(interp.world, P) for P in argtypes]
+    return hand_reverse_rule_match(interp, ftype, argcodualtys) !== nothing
 end
 
 # Is `mi` itself a `reverse_fwds_impl`/`reverse_pullback_impl` specialization — the target of one of
@@ -1509,7 +1510,7 @@ _call_parts(s::Expr) = s.head === :invoke ? (s.args[2], @view s.args[3:end]) : (
 # The call's own result may carry fdata (an array/mutable-struct return) — the emission side routes
 # its shadow into `shadow_map` for the caller to accumulate into.
 function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{String},
-                                 arg_tracked::BitVector, fdata_tracked::BitVector)
+                                 arg_tracked::BitVector, fdata_tracked::BitVector, has_sink)
     fpos, actual = _call_parts(s)
     fval = _calleeval(fpos, iworld)
     # `_calleeval` returns `nothing` for a callee in argument position (an `Argument`/`SSAValue`,
@@ -1552,6 +1553,12 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
     # resolves and annotate the `%new(CoDual{...}, ...)` the emission side builds — a node-shaped
     # answer would both misresolve the rule and emit IR whose declared type doesn't match the value.
     argtypes = Any[_optype_w(pir, iworld, a) for a in actual]
+    # `mask[j]`: operand `j` is differentiable but has no rdata sink (an inactive value from this
+    # callsite's perspective) — passed to the callee as `CoDual{P,NoTangent}` rather than the real
+    # fdata carrier. Restricted to `SSAValue`/`Argument` operands: a literal/`GlobalRef` operand's
+    # contribution is already discarded by `route!` at no cost (`has_sink` is `false` for those too,
+    # for an unrelated reason — no node to accumulate into — so it must not be read as "inactive").
+    mask = falses(length(argtypes))
     for (j, P) in enumerate(argtypes)
         if !(P isa DataType && isconcretetype(P))
             reason[] = "recursive call has a non-concrete argument type $(P) at %$i: `$(_stmt_str(s))`"
@@ -1565,14 +1572,17 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
                        "supported yet at %$i: `$(_stmt_str(s))`"
             return nothing
         end
-        if fdtype(iworld, P) !== NoFData
+        a = actual[j]
+        mask[j] = isa(a, Union{Core.SSAValue,Core.Argument}) && _tt(iworld, P) !== NoTangent &&
+                  !has_sink(a)
+        if fdtype(iworld, P) !== NoFData && !mask[j]
             # Any fdata shape is allowed through: fdata is the identity-carrying half of a tangent,
             # so an immutable aggregate's is a value wrapper whose leaves are the caller's own shared
             # shadow arrays/`MutableTangent`s — a callee accumulates into the caller's real buffers
             # either way, and the value half comes back as the call's returned rdata. What must be
             # guarded is that the fdata is the caller's real shadow and not a detached zero, which is
-            # the provenance check below.
-            a = actual[j]
+            # the provenance check below. Masked positions skip this: no shadow is threaded through
+            # for them at all.
             tracked_here = isa(a, Core.Argument) ? (a.n <= length(arg_tracked) && arg_tracked[a.n]) :
                            isa(a, Core.SSAValue) ? fdata_tracked[a.id] : false
             if !tracked_here
@@ -1584,7 +1594,7 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
         end
     end
     # No result-fdata guard here; a mismatch is caught at the emission site instead.
-    return (fval, ftype, argtypes)
+    return (fval, ftype, argtypes, mask)
 end
 
 # Resolve (and compile, under the caller's own `interp`) the `CodeInstance` for the callee's
@@ -1642,7 +1652,8 @@ end
 function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_primal_mi::MethodInstance,
                                    @nospecialize(ftype), argtypes::Vector{Any}, @nospecialize(R),
                                    edges::Vector{Any}, reason::Ref{String};
-                                   @nospecialize(own_TapeT=nothing))
+                                   @nospecialize(own_TapeT=nothing),
+                                   mask::BitVector=falses(length(argtypes)))
     # `has_hand_reverse_rule` already rejects a surviving call with a `Dual` callee/argument during
     # inlining, so this shouldn't be reachable — kept as a `reason[]`-based fallback in case some path
     # reaches recursion without going through that check, rather than crashing in `fcodual_type` below.
@@ -1655,8 +1666,12 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
         reason[] = msg
         return nothing
     end
-    argcodualtys = Any[_fcdtype(interp.world, P) for P in argtypes]
-    hand = hand_reverse_rule_match(interp, ftype, argtypes)
+    # Masked position `j`: the operand is inactive at this callsite, so the callee sees
+    # `CoDual{P,NoTangent}` rather than the caller's own fdata carrier — same encoding as a
+    # top-level constant argument.
+    argcodualtys = Any[mask[j] ? CoDual{argtypes[j],NoTangent} : _fcdtype(interp.world, argtypes[j])
+                       for j in eachindex(argtypes)]
+    hand = hand_reverse_rule_match(interp, ftype, argcodualtys)
     if hand !== nothing
         tt, fm = hand
         callee_val = rrule!!
@@ -1785,7 +1800,8 @@ end
 # type, so it resolves via the literal-identity branch and terminates.
 function reverse_pullback_recursive_ci(interp, impl_mi::MethodInstance, @nospecialize(own_TapeT),
                                        own_codualparams::Vector{Any}, @nospecialize(InnerTapeT),
-                                       @nospecialize(InnerSeedT), edges::Vector{Any}, reason::Ref{String})
+                                       @nospecialize(InnerSeedT), edges::Vector{Any}, reason::Ref{String},
+                                       nargs::Int)
     if InnerTapeT === Tape
         tt = Tuple{typeof(reverse_pullback_impl),own_TapeT,InnerSeedT}
         push!(edges, tt, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
@@ -1828,6 +1844,17 @@ function reverse_pullback_recursive_ci(interp, impl_mi::MethodInstance, @nospeci
                 "the pullback resolved for `$(tt)` never returns — either its own derived build " *
                 "bailed, or it cannot run on that tape/seed" :
                 "the pullback resolved for `$(tt)` returned `$(ci.rettype)`, not a tuple of rdatas"
+        return nothing
+    end
+    # A wrong-arity hand pullback (the derived path always gets this right by construction) would
+    # otherwise fail as a `getfield` error inside generated IR once the emission side indexes past it.
+    # Not `isconcretetype`: a derived pullback's own slots are `zero_like_rdata_type`s, which include
+    # `ZeroRData` unions whenever an argument type isn't concrete enough to zero from its type alone.
+    expected = nargs + 1
+    if Base.isvatuple(ci.rettype) || length(ci.rettype.parameters) != expected
+        reason[] = "the pullback resolved for `$(tt)` returned `$(ci.rettype)`, expected a " *
+                   "$(expected)-element tuple of rdatas (one slot per primal argument, plus the " *
+                   "callee's own)"
         return nothing
     end
     CC.add_invoke_edge!(edges, tt, ci)
@@ -1928,6 +1955,8 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
     bulk_args = _bulk_save_args(pir, iworld, arg_primal_types)
     bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
     block_of = _stmt_block_map(pir)
+    has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable,
+                                                    block_of, n, nfixed)
     for i in 1:length(pir.stmts)
         b = block_of[i]
         unreachable[b] && continue
@@ -2035,12 +2064,12 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             # A surviving high-level call: attempt static recursion. Not qualifying is not an error
             # at scan time (mirrors how an unregistered intrinsic isn't flagged here either); only a
             # genuine attempted-and-failed resolution propagates as a real bail here.
-            info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, fdata_tracked)
+            info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, fdata_tracked, has_sink)
             info === nothing && continue
-            _, ftype, argtypes = info
+            _, ftype, argtypes, mask = info
             R = _stype_invoke(pir.stmts, i)
             resolved = reverse_fwds_recursive_ci(interp, scan_impl_mi, primal_mi, ftype, argtypes, R,
-                                                 edges, reason)
+                                                 edges, reason; mask)
             if resolved === nothing
                 reason[] *= " — at %$i: `$(_stmt_str(s))`"
                 return nothing
@@ -2225,6 +2254,10 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                                    arg_active, active)
     arg_tracked = _arg_fdata_tracked(iworld, length(packed_codualparams), packed_codualparams,
                                      arg_active)
+    block_of = _stmt_block_map(pir)
+    npacked = length(packed_codualparams)
+    has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable_block,
+                                                    block_of, npacked, nfixed)
 
     getf = GlobalRef(Core, :getfield)
     setf = GlobalRef(Core, :setfield!)
@@ -2716,12 +2749,12 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                 primal_map[i] = emit!(Expr(:call, fv, (presolve(a) for a in actual)...), Ti)
             else
                 Ti = _stype_invoke(pstmts, i)
-                info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked)
+                info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked, has_sink)
                 info === nothing && return nothing
-                fval, ftype, argtypes = info
+                fval, ftype, argtypes, mask = info
                 R = _widen(Ti)
                 resolved = reverse_fwds_recursive_ci(interp, impl_mi, primal_mi, ftype, argtypes, R,
-                                                     edges, reason; own_TapeT=TapeT)
+                                                     edges, reason; own_TapeT=TapeT, mask)
                 if resolved === nothing
                     reason[] *= " — at %$i: `$(_stmt_str(s))`"
                     return nothing
@@ -2739,6 +2772,13 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                 fcodual = emit!(Expr(:new, FCT, fval === nothing ? presolve(fpos) : fval, NoFData()), FCT)
                 argcoduals = Any[]
                 for (j, a) in enumerate(actual)
+                    if mask[j]
+                        # Inactive at this callsite: no shadow to resolve at all (there is none to
+                        # `sresolve` — that call is today's `foreigncall`/provenance bail).
+                        Cj = CoDual{argtypes[j],NoTangent}
+                        push!(argcoduals, emit!(Expr(:new, Cj, presolve(a), NoTangent()), Cj))
+                        continue
+                    end
                     Cj = _fcdtype(iworld, argtypes[j])
                     # Thread the argument's real shadow through when its fdata is non-trivial (an
                     # array whose identity `_static_recursible_call` already confirmed is traceable
@@ -2988,6 +3028,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # always have `NoRData`, so skipping them here just avoids a useless allocation — not load-bearing).
     needs_ref(i) = _has_rdata_sink(Core.SSAValue(i), pir, active, arg_active, unreachable_block,
                                    stmt_block, npacked, nfixed)
+    has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable_block,
+                                                    stmt_block, npacked, nfixed)
 
     entry_id = ID()
     block_id = [ID() for _ in 1:nblocks]
@@ -3474,9 +3516,9 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     end
                 else
                     Ti = _stype_invoke(pstmts, i)
-                    info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked)
+                    info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked, has_sink)
                     info === nothing && return nothing
-                    _, ftype, argtypes = info
+                    _, ftype, argtypes, mask = info
                     acc = deref_and_zero!(ssa_ref_id[i], Ti)   # this call's own seed for the inner pullback
                     # A direct self-recursive call's inner tape was pushed onto `Tape.subtapes` (fwds
                     # side), not a per-block comms item. Pop it back off `subtapes_id` directly
@@ -3493,7 +3535,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     # its own exit-route `increment!!` already tolerates `ZeroRData` generically.
                     SeedT = zero_like_rdata_type(_widen(Ti))
                     pb_resolved = reverse_pullback_recursive_ci(interp, impl_mi, TapeT, codualparams,
-                                                                 InnerTapeT, SeedT, edges, reason)
+                                                                 InnerTapeT, SeedT, edges, reason,
+                                                                 length(argtypes))
                     if pb_resolved === nothing
                         reason[] *= " — at %$i: `$(_stmt_str(s))`"
                         return nothing
@@ -3512,12 +3555,28 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     # Slot 1 is the callee's own rdata — guaranteed `NoRData` by
                     # `_static_recursible_call`'s callee guard, discarded exactly like `ref_for` already
                     # discards any literal operand's contribution — so routing starts at 2.
+                    if InnerRdatasT.parameters[1] !== NoRData
+                        reason[] = "recursive pullback returns its own rdata as " *
+                                   "`$(InnerRdatasT.parameters[1])`, expected `NoRData` at %$i: " *
+                                   "`$(_stmt_str(s))`"
+                        return nothing
+                    end
                     for (j, a) in enumerate(actual)
+                        # Masked position: the callee saw `CoDual{P,NoTangent}` for this argument, so
+                        # its slot is `NoRData` regardless of what `argtypes[j]`'s own rdata type would
+                        # otherwise be — nothing to route, and `route!` would discard it anyway.
+                        mask[j] && continue
                         # `zero_like_rdata_type`: the callee's own `argtypes[j]`-th argument rdata (this
                         # same function, recursively, for the callee) can likewise be `ZeroRData` when
                         # that argument's type isn't concrete enough.
                         Fty = zero_like_rdata_type(_widen(argtypes[j]))
                         Fty === NoRData && continue
+                        RTj = InnerRdatasT.parameters[j + 1]
+                        if !(RTj <: Fty)
+                            reason[] = "recursive pullback returns argument $(j)'s rdata as `$(RTj)`, " *
+                                       "not a subtype of the declared `$(Fty)` at %$i: `$(_stmt_str(s))`"
+                            return nothing
+                        end
                         contrib = emit!(Expr(:call, getf, inner_rdatas, j + 1), Fty)
                         route!(a, contrib, Fty)
                     end

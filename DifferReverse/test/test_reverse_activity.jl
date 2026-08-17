@@ -1,7 +1,9 @@
 using Test
 using DifferReverse
 using DifferReverse: rev_gradient, value_and_gradient!, increment!!,
-                     _intrinsic_needed_operands, intrinsic_rrule_deps
+                     _intrinsic_needed_operands, intrinsic_rrule_deps,
+                     code_reverse_fwds_ircode, rrule!!
+using LinearAlgebra: dot
 import DifferentiationInterface as DI
 include("testutils.jl")
 
@@ -470,4 +472,54 @@ end
     @test intrinsic_rrule_deps(Val(Core.Intrinsics.not_int)) === nothing
     @test needed(Core.Intrinsics.not_int, 1, j -> true) === nothing
     @test needed(mul, 3, j -> true) === nothing
+end
+
+# A nested call into a hand-ruled function with a constant argument keeps the closed-form rule: the
+# engine passes a `CoDual{P,NoTangent}` through instead of bailing on untraceable provenance.
+
+@testset "activity: nested hand rule with a constant argument" begin
+    f(v, w) = dot(v, w)
+    v, w = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
+    dv = zeros(3)
+    y, dvout = value_and_gradient!(build_ctx(f, (Vector{Float64}, Vector{Float64}); inactive=(2,)),
+                                    zero_fcodual(f), CoDual(v, dv), const_codual(w))
+    @test y == dot(v, w)
+    @test dvout == (NoTangent(), w, NoTangent())
+    @test dv == w
+    checkverify_rev(f, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+
+    # Without the assertion below, the test above passes for the wrong reason — silently via the
+    # derived path instead of the hand rule.
+    ir = code_reverse_fwds_ircode(f, (Vector{Float64}, Vector{Float64}); inactive=(2,))[1]
+    invokes_to_rrule = [stmt for stmt in ir.stmts.stmt
+                        if isa(stmt, Expr) && stmt.head === :invoke &&
+                           length(stmt.args) >= 2 && stmt.args[2] === rrule!!]
+    @test length(invokes_to_rrule) == 1
+end
+
+# `reverse_pullback_recursive_ci`'s arity/slot-type check: a wrong-arity hand pullback must produce
+# a located bail rather than a `getfield` error inside generated IR. The rule is defined here (before
+# anything differentiates `badarity_f`), so the world-age caveat around later rule additions doesn't
+# apply.
+
+badarity_f(x, y) = x + y
+
+function DifferReverse.rrule!!(::CoDual{typeof(badarity_f),NoFData}, ::AbstractCtx,
+                               xcd::CoDual{Float64,NoFData}, ycd::CoDual{Float64,NoFData})
+    z = primal(xcd) + primal(ycd)
+    badarity_pullback(dz) = (NoRData(), dz)   # wrong: should be a 3-tuple (own rdata + 2 arguments)
+    return CoDual(z, NoFData()), badarity_pullback
+end
+
+@testset "activity: recursive-pullback arity check catches a wrong-length hand pullback" begin
+    outer_badarity(x, y) = badarity_f(x, y) + 1.0
+    err = try
+        rev_gradient(outer_badarity, 1.0, 2.0)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    # Pins that the arity check is what fired, not some unrelated error.
+    @test occursin("3-element tuple of rdatas", err.msg)
 end

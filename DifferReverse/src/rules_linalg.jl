@@ -20,16 +20,17 @@
 function rrule!!(
     ::CoDual{typeof(LinearAlgebra.dot),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Vector{Float64},Vector{Float64}},
-    (; y, dy)::CoDual{Vector{Float64},Vector{Float64}},
+    (; x, dx)::CoDual{Vector{Float64},<:Union{Vector{Float64},NoTangent}},
+    (; y, dy)::CoDual{Vector{Float64},<:Union{Vector{Float64},NoTangent}},
 )
     Base.length(x) == Base.length(y) ||
         throw(DimensionMismatch("dot: vectors have different lengths"))
     s = LinearAlgebra.dot(x, y)
+    xactive, yactive = isactive(dx), isactive(dy)
     function dot_pullback(dz)
-        for i in Base.eachindex(x, y, dx, dy)
-            dx[i] = increment!!(dx[i], dz * y[i])
-            dy[i] = increment!!(dy[i], dz * x[i])
+        for i in Base.eachindex(x, y)
+            xactive && (dx[i] = increment!!(dx[i], dz * y[i]))
+            yactive && (dy[i] = increment!!(dy[i], dz * x[i]))
         end
         return (NoRData(), NoRData(), NoRData())
     end
@@ -90,23 +91,28 @@ end
 function rrule!!(
     ::CoDual{typeof(Base.:*),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Matrix{Float64},Matrix{Float64}},
-    (; y, dy)::CoDual{Vector{Float64},Vector{Float64}},
+    (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
+    (; y, dy)::CoDual{Vector{Float64},<:Union{Vector{Float64},NoTangent}},
 )
     z = Base.:*(x, y)
     zcd = zero_fcodual(z)
     dz = tangent(zcd)
     m, n = Base.size(x)
+    xactive, yactive = isactive(dx), isactive(dy)
     function matvecmul_pullback(::NoRData)
-        for i in 1:m, j in 1:n
-            dx[i, j] = increment!!(dx[i, j], dz[i] * y[j])
-        end
-        for j in 1:n
-            s = 0.0
-            for i in 1:m
-                s += x[i, j] * dz[i]
+        if xactive
+            for i in 1:m, j in 1:n
+                dx[i, j] = increment!!(dx[i, j], dz[i] * y[j])
             end
-            dy[j] = increment!!(dy[j], s)
+        end
+        if yactive
+            for j in 1:n
+                s = 0.0
+                for i in 1:m
+                    s += x[i, j] * dz[i]
+                end
+                dy[j] = increment!!(dy[j], s)
+            end
         end
         return (NoRData(), NoRData(), NoRData())
     end
@@ -118,21 +124,26 @@ end
 function rrule!!(
     ::CoDual{typeof(Base.:*),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Matrix{Float64},Matrix{Float64}},
-    (; y, dy)::CoDual{Matrix{Float64},Matrix{Float64}},
+    (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
+    (; y, dy)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
 )
     z = Base.:*(x, y)
     zcd = zero_fcodual(z)
     dz = tangent(zcd)
+    xactive, yactive = isactive(dx), isactive(dy)
     function matmul_pullback(::NoRData)
         # dx += dz*y',  dy += x'*dz
-        gx = Base.:*(dz, Base.adjoint(y))
-        gy = Base.:*(Base.adjoint(x), dz)
-        for i in Base.eachindex(dx, gx)
-            dx[i] = increment!!(dx[i], gx[i])
+        if xactive
+            gx = Base.:*(dz, Base.adjoint(y))
+            for i in Base.eachindex(dx, gx)
+                dx[i] = increment!!(dx[i], gx[i])
+            end
         end
-        for i in Base.eachindex(dy, gy)
-            dy[i] = increment!!(dy[i], gy[i])
+        if yactive
+            gy = Base.:*(Base.adjoint(x), dz)
+            for i in Base.eachindex(dy, gy)
+                dy[i] = increment!!(dy[i], gy[i])
+            end
         end
         return (NoRData(), NoRData(), NoRData())
     end
@@ -151,24 +162,34 @@ end
 function rrule!!(
     ::CoDual{typeof(LinearAlgebra.mul!),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Vector{Float64},Vector{Float64}},
-    (; y, dy)::CoDual{Matrix{Float64},Matrix{Float64}},
-    (; z, dz)::CoDual{Vector{Float64},Vector{Float64}},
+    (; x, dx)::CoDual{Vector{Float64},<:Union{Vector{Float64},NoTangent}},
+    (; y, dy)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
+    (; z, dz)::CoDual{Vector{Float64},<:Union{Vector{Float64},NoTangent}},
 )
+    # `dx` carries both the backward seed and the result's shadow, so a constant destination would
+    # silently drop the sources' gradients. A write-only buffer needs a zeroed shadow, not `NoTangent`.
+    isactive(dx) || error("Differ: `mul!` into a destination declared constant (`NoTangent` shadow) " *
+                          "would discard the gradient flowing to the factors — pass a zeroed shadow " *
+                          "buffer instead of declaring the destination constant")
     old_dx = Base.copy(dx)
     LinearAlgebra.mul!(x, y, z)
     Base.fill!(dx, 0.0)
     m, n = Base.size(y)
+    yactive, zactive = isactive(dy), isactive(dz)
     function mulmatvec_pullback(::NoRData)
-        for i in 1:m, j in 1:n
-            dy[i, j] = increment!!(dy[i, j], dx[i] * z[j])
-        end
-        for j in 1:n
-            s = 0.0
-            for i in 1:m
-                s += y[i, j] * dx[i]
+        if yactive
+            for i in 1:m, j in 1:n
+                dy[i, j] = increment!!(dy[i, j], dx[i] * z[j])
             end
-            dz[j] = increment!!(dz[j], s)
+        end
+        if zactive
+            for j in 1:n
+                s = 0.0
+                for i in 1:m
+                    s += y[i, j] * dx[i]
+                end
+                dz[j] = increment!!(dz[j], s)
+            end
         end
         dx .= old_dx
         return (NoRData(), NoRData(), NoRData(), NoRData())
@@ -181,22 +202,32 @@ end
 function rrule!!(
     ::CoDual{typeof(LinearAlgebra.mul!),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Matrix{Float64},Matrix{Float64}},
-    (; y, dy)::CoDual{Matrix{Float64},Matrix{Float64}},
-    (; z, dz)::CoDual{Matrix{Float64},Matrix{Float64}},
+    (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
+    (; y, dy)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
+    (; z, dz)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
 )
+    # See the matrix-vector rule above: a constant destination would silently drop the factors'
+    # gradients.
+    isactive(dx) || error("Differ: `mul!` into a destination declared constant (`NoTangent` shadow) " *
+                          "would discard the gradient flowing to the factors — pass a zeroed shadow " *
+                          "buffer instead of declaring the destination constant")
     old_dx = Base.copy(dx)
     LinearAlgebra.mul!(x, y, z)
     Base.fill!(dx, 0.0)
+    yactive, zactive = isactive(dy), isactive(dz)
     function mulmatmat_pullback(::NoRData)
         # dy += dx*z',  dz += y'*dx
-        gy = Base.:*(dx, Base.adjoint(z))
-        gz = Base.:*(Base.adjoint(y), dx)
-        for i in Base.eachindex(dy, gy)
-            dy[i] = increment!!(dy[i], gy[i])
+        if yactive
+            gy = Base.:*(dx, Base.adjoint(z))
+            for i in Base.eachindex(dy, gy)
+                dy[i] = increment!!(dy[i], gy[i])
+            end
         end
-        for i in Base.eachindex(dz, gz)
-            dz[i] = increment!!(dz[i], gz[i])
+        if zactive
+            gz = Base.:*(Base.adjoint(y), dx)
+            for i in Base.eachindex(dz, gz)
+                dz[i] = increment!!(dz[i], gz[i])
+            end
         end
         dx .= old_dx
         return (NoRData(), NoRData(), NoRData(), NoRData())

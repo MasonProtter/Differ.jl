@@ -598,10 +598,11 @@ directly — no such dependency).
 
 `has_hand_reverse_rule` (used by `src_inlining_policy` to keep a call from being inlined away before it
 reaches recursion dispatch) is called on **every** callee Julia's optimizer considers inlining while
-optimizing a primal — not just calls that survive into the final IR. Its strict check
-(`hand_reverse_rule_match`) builds a probe signature via `_fcdtype`/`tangent_type` on every one of the
-callee's argument types, which is fine for a call that actually survives into the primal (concrete,
-primal-relevant types) but not safe to run unconditionally on any inlining candidate: `tangent_type`'s
+optimizing a primal — not just calls that survive into the final IR. Its strict check builds a probe
+signature (`argcodualtys`, via `_fcdtype`/`tangent_type` on every one of the callee's argument types)
+and hands it to `hand_reverse_rule_match`, which just assembles the `Tuple` and queries the method
+table — fine for a call that actually survives into the primal (concrete, primal-relevant types) but
+not safe to run unconditionally on any inlining candidate: `tangent_type`'s
 generic struct fallback has no termination guarantee against an arbitrary self-referential type
 (`Base.ImmutableDict`'s literal self-reference is a real, reachable example — its `parent` field is the
 same type, and unlike `GlobalRef`'s cycle it doesn't converge, ISSUES #92), and Julia's inference
@@ -618,8 +619,10 @@ AbstractCtx, Vararg{Any}}` — `CoDual{ftype,NoFData}` is already concrete, so t
 `tangent_type` on anything argument-related). A negative answer is always sound: the loose probe is a
 superset of every concrete `tt` the strict check could ever build for this `ftype`, so if only the
 generated fallback matches the loose probe, the strict check would find nothing either.
-`has_hand_reverse_rule` checks this first and returns `false` immediately on failure, before
-`hand_reverse_rule_match`'s per-argument `tangent_type` calls ever run.
+`has_hand_reverse_rule` checks this first and returns `false` immediately on failure, before it builds
+`argcodualtys` (its own per-argument `tangent_type` calls) and calls `hand_reverse_rule_match`.
+`reverse_fwds_recursive_ci` builds its own `argcodualtys` the same way, except a masked (inactive)
+position gets `CoDual{P,NoTangent}` in place of `_fcdtype(P)` — see ISSUES #115 below.
 
 **Hazard for any future change here**: `tangent_type` is `@assume_effects :foldable` — no mutable
 state, no depth counters, nothing that would falsify `:consistent`/`:effect_free`. A global recursion-
@@ -768,13 +771,28 @@ index (block numbering shifts with unrelated optimizer changes).
   (`intrinsic_rrule_deps`/`_intrinsic_needed_operands`/`_has_rdata_sink`) rather than a flat
   "positions read" set, so `mul_float`/`div_float`/`fma_float`'s crossed dependencies drop the
   correct operand (not necessarily the inactive/literal one itself) instead of always keeping both.
-  Hand-written *multi-argument* rules still stop matching an inactive argument and silently fall
-  through to the derived transform (ISSUES #115), so they need
-  `CoDual{P,<:Union{NoFData,NoTangent}}` slots plus `@ifactive`. Unary rules need
-  nothing — an inactive sole argument makes the whole callsite inactive, and primal replay fires before
-  dispatch. ISSUES #116: an inactive element in a vararg primal's packed tail only bails
-  (`_packed_codualparams`), never miscompiles — real support would need per-element activity threaded
-  through five sites across both carriers.
+  ISSUES #115 (fixed): hand-written *multi-argument* rules now match an inactive argument, both at
+  the top level and through a nested recursive call. Rules-side, the affected slots widen to
+  `CoDual{P,<:Union{NoFData,NoTangent}}` (scalar) or `CoDual{X,<:Union{X,NoTangent}}` (fdata-carrying)
+  plus `@ifactive`/an `isactive(dx)` loop guard; unary rules need nothing, since an inactive sole
+  argument makes the whole callsite inactive and primal replay fires before dispatch. Engine-side,
+  `_static_recursible_call` computes a per-operand `mask` (`_has_rdata_sink` on the operand, restricted
+  to `SSAValue`/`Argument` so a literal/`GlobalRef` operand stays active) and threads it through
+  `reverse_fwds_recursive_ci`/`hand_reverse_rule_match` (which now takes prebuilt codual types, not
+  argtypes) and both emission loops, so a masked operand is passed as `CoDual{P,NoTangent}` instead of
+  tripping the fdata-provenance guard that used to bail the nested case outright. The same change added
+  a pullback recursion arity/slot-type check (`reverse_pullback_recursive_ci`): a wrong-arity or
+  wrong-slot-type hand pullback is now a located bail instead of a `getfield` error in generated IR.
+  An **overwriting** rule (`mul!`/`map!`) with an inactive *destination* returns a `NoTangent`-shadowed
+  codual whose primal type still carries fdata; a **nested** recursive call into such a rule trips a
+  separate, pre-existing check in `reverse_fwds_recursive_ci` ("recursive call's resolved result fdata
+  type does not match this call's own inferred fdata type") that compares the callsite's static primal
+  type against the resolved callee's return type without accounting for activity. Top-level dispatch
+  (calling the rule's `rrule!!` directly, what `rev_gradient`/DI actually use) is unaffected — this is
+  open only for the *nested* shape, found while testing #115, not itself fixed. ISSUES #116: an
+  inactive element in a vararg primal's packed tail only bails (`_packed_codualparams`), never
+  miscompiles — real support would need per-element activity threaded through five sites across both
+  carriers.
 
 Growable-array mutation (`push!`/`resize!`), non-bits array elements, and any `Core.Builtin` with no
 registered rule remain out of scope for both modes (`differ-extending-ir-support`).

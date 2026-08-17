@@ -161,3 +161,57 @@ end
     check_unary(abs2, (-2.0, 0.5, 3.0))
     check_unary(inv, (-2.0, 0.5, 3.0))
 end
+
+# A caller-declared-constant argument still matches these rules' widened slots, keeping the
+# closed-form pullback instead of falling through to the derived transform. One inactive-argument
+# gradient check per family, plus a direct `rrule!!` call confirming the inactive slot comes back
+# `NoRData()` and the active one matches the closed-form value.
+@testset "activity: widened multi-argument math rules" begin
+    y0, x0 = 2.0, 3.0
+    _, gycd = rev_gradient(atan, y0, x0)
+    ycd, pb = rrule!!(zero_fcodual(atan), Ctx(), CoDual(y0, NoFData()), const_codual(x0))
+    @test pb(1.0) == (NoRData(), gycd, NoRData())
+    checkverify_rev((y, x) -> atan(y, x), (Float64, Float64); inactive=(2,))
+
+    _, gx, gy = rev_gradient(^, 2.0, 3.0)
+    ycd, pb = rrule!!(zero_fcodual(^), Ctx(), CoDual(2.0, NoFData()), const_codual(3.0))
+    @test pb(1.0) == (NoRData(), gx, NoRData())
+    checkverify_rev((x, y) -> x^y, (Float64, Float64); inactive=(2,))
+
+    _, gxn, _ = rev_gradient((x, n) -> x^n, 2.0, 3)
+    ycd, pb = rrule!!(zero_fcodual(^), Ctx(), const_codual(2.0), CoDual(3, NoFData()))
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData())   # `x` inactive: nothing to route
+    _, pb2 = rrule!!(zero_fcodual(^), Ctx(), CoDual(2.0, NoFData()), CoDual(3, NoFData()))
+    @test pb2(1.0)[2] ≈ gxn
+    checkverify_rev((x, n) -> x^n, (Float64, Int); inactive=(1,))
+
+    _, ghx, ghy = rev_gradient(hypot, 3.0, 4.0)
+    ycd, pb = rrule!!(zero_fcodual(hypot), Ctx(), CoDual(3.0, NoFData()), const_codual(4.0))
+    @test pb(1.0) == (NoRData(), ghx, NoRData())
+    checkverify_rev((x, y) -> hypot(x, y), (Float64, Float64); inactive=(2,))
+
+    _, gmaxx, gmaxy = rev_gradient(max, 1.0, 2.0)
+    ycd, pb = rrule!!(zero_fcodual(max), Ctx(), CoDual(1.0, NoFData()), const_codual(2.0))
+    @test pb(1.0) == (NoRData(), gmaxx, NoRData())
+    checkverify_rev((x, y) -> max(x, y), (Float64, Float64); inactive=(2,))
+
+    _, gminx, gminy = rev_gradient(min, 1.0, 2.0)
+    ycd, pb = rrule!!(zero_fcodual(min), Ctx(), CoDual(1.0, NoFData()), const_codual(2.0))
+    @test pb(1.0) == (NoRData(), gminx, NoRData())
+    checkverify_rev((x, y) -> min(x, y), (Float64, Float64); inactive=(2,))
+
+    _, gcopyx, gcopyy = rev_gradient(copysign, 3.0, -2.0)
+    ycd, pb = rrule!!(zero_fcodual(copysign), Ctx(), CoDual(3.0, NoFData()), const_codual(-2.0))
+    @test pb(1.0) == (NoRData(), gcopyx, NoRData())
+    checkverify_rev((x, y) -> copysign(x, y), (Float64, Float64); inactive=(2,))
+
+    _, gfx, gfy, gfz = rev_gradient(fma, 2.0, 3.0, 4.0)
+    ycd, pb = rrule!!(zero_fcodual(fma), Ctx(), CoDual(2.0, NoFData()), const_codual(3.0), CoDual(4.0, NoFData()))
+    @test pb(1.0) == (NoRData(), gfx, NoRData(), gfz)
+    checkverify_rev((x, y, z) -> fma(x, y, z), (Float64, Float64, Float64); inactive=(2,))
+
+    _, gmx, gmy, gmz = rev_gradient(muladd, 2.0, 3.0, 4.0)
+    ycd, pb = rrule!!(zero_fcodual(muladd), Ctx(), CoDual(2.0, NoFData()), const_codual(3.0), CoDual(4.0, NoFData()))
+    @test pb(1.0) == (NoRData(), gmx, NoRData(), gmz)
+    checkverify_rev((x, y, z) -> muladd(x, y, z), (Float64, Float64, Float64); inactive=(2,))
+end

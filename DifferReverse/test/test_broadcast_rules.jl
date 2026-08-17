@@ -138,6 +138,73 @@ end
     @test occursin("map!", err2.value.msg)
 end
 
+@testset "activity: map(f, x) unary, x held constant" begin
+    # Nested case: `x` is constant at the top level, `map`'s own call is reached through recursion.
+    f(x) = sum(map(sin, x))
+    x = [0.3, 1.2, -0.7]
+    checkverify_rev(f, (Vector{Float64},); inactive=(1,))
+
+    xcd = const_codual(x)
+    ycd, pb = rrule!!(zero_fcodual(map), Ctx(), zero_fcodual(sin), xcd)
+    @test primal(ycd) == sin.(x)
+    tangent(ycd) .= 1.0
+    @test pb(NoRData()) == (NoRData(), NoRData(), NoRData())   # x constant, sin has no params
+end
+
+@testset "activity: map(f, x, y) binary, y held constant" begin
+    x = [0.3, 1.2, -0.7]
+    y = [1.0, -2.0, 0.5]
+    dx = zeros(3)
+    outcd, pb = rrule!!(zero_fcodual(map), Ctx(), zero_fcodual(*), CoDual(x, dx), const_codual(y))
+    @test primal(outcd) == x .* y
+    tangent(outcd) .= 1.0
+    pb(NoRData())
+    @test dx ≈ y   # d/dx (x*y) = y — the still-active argument accumulates normally
+    checkverify_rev((x, y) -> sum(map(*, x, y)), (Vector{Float64}, Vector{Float64}); inactive=(2,))
+end
+
+@testset "activity: map!(f, dest, x) unary, source held constant" begin
+    x = [0.3, 1.2, -0.7]
+    dest, ddest = zeros(3), zeros(3)
+    destycd, pb = rrule!!(zero_fcodual(map!), Ctx(), zero_fcodual(sin), CoDual(dest, ddest), const_codual(x))
+    @test dest == sin.(x)
+    tangent(destycd) .= 1.0
+    @test pb(NoRData()) == (NoRData(), NoRData(), NoRData(), NoRData())
+    checkverify_rev((dest, x) -> map!(sin, dest, x), (Vector{Float64}, Vector{Float64}); inactive=(2,))
+end
+
+@testset "activity: map!(f, dest, x) with a constant destination is refused" begin
+    # `dest`'s shadow is both the per-element backward seed and the result's shadow, so writing into
+    # a constant one would silently zero the source's gradient. A write-only buffer wants a zeroed
+    # shadow, not `NoTangent`.
+    x = [0.3, 1.2, -0.7]
+    dest = zeros(3)
+    @test_throws "declared constant" rrule!!(zero_fcodual(map!), Ctx(), zero_fcodual(sin),
+                                             const_codual(dest), CoDual(x, zeros(3)))
+end
+
+@testset "activity: map!(f, dest, x, y) binary source, y held constant" begin
+    x = [0.3, 1.2, -0.7]
+    y = [1.0, -2.0, 0.5]
+    dest, ddest, dx = zeros(3), zeros(3), zeros(3)
+    destycd, pb = rrule!!(zero_fcodual(map!), Ctx(), zero_fcodual(+),
+                          CoDual(dest, ddest), CoDual(x, dx), const_codual(y))
+    @test dest == x .+ y
+    tangent(destycd) .= 1.0
+    @test pb(NoRData()) == (NoRData(), NoRData(), NoRData(), NoRData(), NoRData())
+    @test dx ≈ ones(3)
+    checkverify_rev((dest, x, y) -> map!(+, dest, x, y),
+                    (Vector{Float64}, Vector{Float64}, Vector{Float64}); inactive=(3,))
+end
+
+@testset "activity: map!(f, dest, x, y) with a constant destination is refused" begin
+    x, y = [0.3, 1.2, -0.7], [1.0, -2.0, 0.5]
+    dest = zeros(3)
+    @test_throws "declared constant" rrule!!(zero_fcodual(map!), Ctx(), zero_fcodual(+),
+                                             const_codual(dest), CoDual(x, zeros(3)),
+                                             CoDual(y, zeros(3)))
+end
+
 @testset "reverse mode: composing map inside rev_gradient" begin
     # `map`'s hand rule returns its shadow for the caller to accumulate into and its own pullback
     # to read back — so `sum`'s recursion into it can now route a real gradient through, even
