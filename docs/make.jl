@@ -9,8 +9,8 @@ makedocs(;
     doctest = true,
     pages = [
         "Home" => "index.md",
+        "Writing rules" => "custom_rules.md",
         "API Reference" => "reference.md",
-        "Writing rules" => "custom_rules.md"
     ],
 )
 
