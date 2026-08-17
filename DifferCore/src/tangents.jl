@@ -192,14 +192,14 @@ the tangent of a given type.
 
 Mooncake.jl differs from this.
 **It insists that each primal type is associated to a _single_ tangent type.**
-Furthermore, this type is _always_ given by the function `Mooncake.tangent_type(primal_type)`.
+Furthermore, this type is _always_ given by the function `DifferCore.tangent_type(primal_type)`.
 
 Some worked examples.
 
 #### Int
 
 `Int` is not a differentiable type, so its tangent type is [`NoTangent`](@ref):
-```jldoctest; setup = :(using Mooncake: tangent_type)
+```jldoctest; setup = :(using DifferCore)
 julia> tangent_type(Int)
 NoTangent
 ```
@@ -207,14 +207,14 @@ NoTangent
 #### Tuples
 
 The tangent type of a `Tuple` is defined recursively based on its field types. For example
-```jldoctest; setup = :(using Mooncake: tangent_type)
+```jldoctest; setup = :(using DifferCore)
 julia> tangent_type(Tuple{Float64, Vector{Float64}, Int})
 Tuple{Float64, Vector{Float64}, NoTangent}
 ```
 
 Edge case: if all fields of a `Tuple` are non-differentiable, the tangent type is
 `NoTangent`. For example,
-```jldoctest; setup = :(using Mooncake: tangent_type)
+```jldoctest; setup = :(using DifferCore)
 julia> tangent_type(Tuple{Int, Int})
 NoTangent
 ```
@@ -232,7 +232,7 @@ tracks how many fields are always defined, and the tangent for any field that mi
 wrapped in a `PossiblyUninitTangent`.
 
 Second, `struct`s can have fields with abstract static types. For example
-```jldoctest foo; setup = :(using Mooncake: tangent_type)
+```jldoctest foo; setup = :(using DifferCore)
 julia> struct Foo
            x
        end
@@ -254,7 +254,7 @@ it must itself be mutable. We use [`MutableTangent`](@ref), a `mutable struct` w
 shape as `Tangent`.
 
 For example, if you ask for the `tangent_type` of
-```jldoctest bar; setup = :(using Mooncake: tangent_type)
+```jldoctest bar; setup = :(using DifferCore)
 julia> mutable struct Bar
            x::Float64
        end
@@ -789,13 +789,6 @@ end
 
 @inline _already_tracked!(::NoCache, x) = false
 
-"""
-    increment!!(x::T, y::T) where {T}
-
-Add `x` to `y`. If `ismutabletype(T)`, then `increment!!(x, y) === x` must hold.
-That is, `increment!!` will mutate `x`.
-This must apply recursively if `T` is a composite type whose fields are mutable.
-"""
 # Use `require_tangent_cache` for the aliasing/circular-reference cache decision, same as
 # `zero_tangent` (`_tangent_cache`) and `set_to_zero!!`, keyed here on the tangent type `T`.
 # A bare `isbitstype(T)` is cruder: it allocates an `IdDict` for every non-bits tangent,
@@ -804,6 +797,14 @@ This must apply recursively if `T` is a composite type whose fields are mutable.
 # is needed.
 @inline _inc_cache(::Val{true}) = IdDict{Any,Bool}()
 @inline _inc_cache(::Val{false}) = NoCache()
+
+"""
+    increment!!(x::T, y::T) where {T}
+
+Add `x` to `y`. If `ismutabletype(T)`, then `increment!!(x, y) === x` must hold.
+That is, `increment!!` will mutate `x`.
+This must apply recursively if `T` is a composite type whose fields are mutable.
+"""
 function increment!!(x::T, y::T) where {T}
     return increment_internal!!(_inc_cache(require_tangent_cache(T)), x, y)
 end
@@ -811,7 +812,7 @@ end
 """
     increment_internal!!(c::IncCache, x::T, y::T) where {T}
 
-Implementation of [`Mooncake.increment!!`](@ref). Make use the cache `c` to avoid "double
+Implementation of [`increment!!`](@ref). Make use the cache `c` to avoid "double
 counting". If `c` is a `NoCache`, assume no aliasing or circular referencing.
 """
 increment_internal!!(::IncCache, ::NoTangent, ::NoTangent) = NoTangent()
@@ -843,11 +844,6 @@ function increment_internal!!(c::IncCache, x::T, y::T) where {T<:MutableTangent}
     return x
 end
 
-"""
-    set_to_zero!!(x)
-
-Set `x` to its zero element (`x` should be a tangent, so the zero must exist).
-"""
 # `set_to_zero!!` uses a more permissive cache decision than `require_tangent_cache`. Zeroing
 # is idempotent, so the `Vector{UInt}` visited-cache is only a perf optimization (skips
 # re-zeroing aliased mutable subtrees), never needed for correctness. `increment!!` shares
@@ -858,6 +854,11 @@ Set `x` to its zero element (`x` should be a tangent, so the zero must exist).
     Val{!isbitstype(Tfields)}()
 @inline _set_to_zero_cache(@nospecialize T) = require_tangent_cache(T)
 
+"""
+    set_to_zero!!(x)
+
+Set `x` to its zero element (`x` should be a tangent, so the zero must exist).
+"""
 set_to_zero!!(x) = set_to_zero!!(x, _set_to_zero_cache(typeof(x)))
 set_to_zero!!(x, ::Val{true}) = set_to_zero_internal!!(Vector{UInt}(), x)
 set_to_zero!!(x, ::Val{false}) = set_to_zero_internal!!(NoCache(), x)
@@ -878,7 +879,7 @@ end
 """
     set_to_zero_internal!!(c::SetToZeroCache, x)
 
-Implementation for [`Mooncake.set_to_zero!!`](@ref). Use `c` to ensure that circular
+Implementation for [`set_to_zero!!`](@ref). Use `c` to ensure that circular
 references are correctly handled. If `c` is a `NoCache`, assume no circular references.
 """
 set_to_zero_internal!!(::SetToZeroCache, ::NoTangent) = NoTangent()

@@ -13,7 +13,7 @@ DifferReverse = "0c588a63-e2e3-4c17-88ed-37ea1a5468a1"
 julia = "1.13"
 
 [workspace]
-projects = ["test", "bench", "Contextual", "DifferCore", "DifferForwards", "DifferReverse"]
+projects = ["test", "bench", "docs", "Contextual", "DifferCore", "DifferForwards", "DifferReverse"]
 
 [sources]
 Contextual = {path = "Contextual"}
