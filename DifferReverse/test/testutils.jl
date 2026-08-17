@@ -142,8 +142,8 @@ end
 # be pointer-free. `stacks` is the number of comms stacks — distinct from `bytes` because comms
 # fusion can merge two stacks' values onto one without changing the byte total.
 function check_tape_size(f, at; bytes::Union{Int,Nothing}=nothing, isbits::Union{Bool,Nothing}=nothing,
-                         stacks::Union{Int,Nothing}=nothing)
-    ts = comms_element_types(tape_type(f, at))
+                         stacks::Union{Int,Nothing}=nothing, inactive=())
+    ts = comms_element_types(tape_type(f, at; inactive))
     isbits === nothing || @test all(isbitstype, ts) == isbits
     bytes === nothing || @test sum(sizeof, ts; init=0) == bytes
     stacks === nothing || @test length(ts) == stacks

@@ -470,10 +470,14 @@ deref_and_zero!, optype, ssa, ref_for)` for `(c)`.
 Currently covers `Core.getfield`/`Core.setfield!`, `Core.tuple`, `Core.memorynew`,
 `Base.memoryrefnew`/`memoryrefget`/`memoryrefset!`. `intrinsics_reverse.jl` covers the differentiable
 float intrinsics (`add/sub/neg/mul/div_float[_fast]`, `sitofp`/`uitofp` as inactive-operand,
-`fpext`/`fptrunc`) via the analogous two-function `apply_intrinsic_rrule!`/`intrinsic_rrule_operands`
-pair — the latter declares which operand positions a rule actually reads, so `_scan_block_comms` can
-skip recording an operand no rule ever consults (a linear rule like `add_float` needs none of its
-operands, the whole point of linearity).
+`fpext`/`fptrunc`) via the analogous two-function `apply_intrinsic_rrule!`/`intrinsic_rrule_deps`
+pair — the latter declares, per contribution (one per operand), which operand primals that
+contribution's computation reads, so `_scan_block_comms` and the pullback can skip recording an
+operand no *wanted* contribution ever reads (`_has_rdata_sink` decides "wanted": whether that
+operand's own contribution has anywhere to route to). A linear rule like `add_float` needs none of
+its operands regardless (the whole point of linearity); `mul_float`/`div_float`/`fma_float` have a
+crossed dependency (e.g. `mul_float`'s `da` reads `b`, not `a`), so an inactive or literal operand
+can drop the *other* operand's recording instead of its own (ISSUES #114, fixed).
 
 **`Core.ifelse`** has a reverse rule (ISSUES #66): in scope only when both branches share the result
 type's own concrete, fdata-free shape, routing the accumulated rdata branchlessly to whichever branch
@@ -760,10 +764,13 @@ index (block numbering shifts with unrelated optimizer changes).
   array operand; adjacent to #91, same `_fdata_tracked` `PhiNode` arm. ISSUES #118: `Core.tuple`'s
   inactive-slot zero allocates every call; intended fix is one allocation per argument shape hung off
   the `Tape`, not a shared sink (rejected — undermines the no-`increment_internal!!(::NoTangent,x)`
-  invariant). `intrinsic_rrule_operands` is not activity-conditional (ISSUES #114), so `mul_float`
-  still records an operand whose contribution is discarded; and hand-written *multi-argument* rules
-  stop matching an inactive argument and silently fall through to the derived transform (ISSUES #115),
-  so they need `CoDual{P,<:Union{NoFData,NoTangent}}` slots plus `@ifactive`. Unary rules need
+  invariant). ISSUES #114 (fixed): intrinsic operand primal recording is now per-contribution
+  (`intrinsic_rrule_deps`/`_intrinsic_needed_operands`/`_has_rdata_sink`) rather than a flat
+  "positions read" set, so `mul_float`/`div_float`/`fma_float`'s crossed dependencies drop the
+  correct operand (not necessarily the inactive/literal one itself) instead of always keeping both.
+  Hand-written *multi-argument* rules still stop matching an inactive argument and silently fall
+  through to the derived transform (ISSUES #115), so they need
+  `CoDual{P,<:Union{NoFData,NoTangent}}` slots plus `@ifactive`. Unary rules need
   nothing — an inactive sole argument makes the whole callsite inactive, and primal replay fires before
   dispatch. ISSUES #116: an inactive element in a vararg primal's packed tail only bails
   (`_packed_codualparams`), never miscompiles — real support would need per-element activity threaded

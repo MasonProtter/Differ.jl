@@ -1,6 +1,7 @@
 using Test
 using DifferReverse
-using DifferReverse: rev_gradient, value_and_gradient!, increment!!
+using DifferReverse: rev_gradient, value_and_gradient!, increment!!,
+                     _intrinsic_needed_operands, intrinsic_rrule_deps
 import DifferentiationInterface as DI
 include("testutils.jl")
 
@@ -349,4 +350,124 @@ end
         e
     end
     @test err isa ErrorException
+end
+
+# Intrinsic operand *primal recording* is per-contribution: an operand whose rdata contribution has
+# no sink is not pushed onto the tape.
+
+@testset "activity: mul_float operand recording is per-contribution" begin
+    f(x, y) = x * y
+    checkverify_rev(f, (Float64, Float64); inactive=(2,))
+    x, y = 2.0, 3.0
+    _, pb = rrule!!(zero_fcodual(f), Ctx(), CoDual(x, NoFData()), const_codual(y))
+    @test pb(1.0) == (NoRData(), y, NoRData())
+
+    # Loop form: `x`'s per-iteration value is an SSA (a phi), not the bare `Argument` that
+    # `elide_argument_primal` already elides regardless of activity — this is where the tape shrink
+    # is actually observable (the plain two-argument form above never taped either operand's primal
+    # to begin with).
+    function floop(x, y)
+        acc = 0.0
+        for _ in 1:3
+            acc += x * y
+            x += 1.0
+        end
+        return acc
+    end
+    checkverify_rev(floop, (Float64, Float64); inactive=(2,))
+    full = comms_element_types(tape_type(floop, (Float64, Float64)))
+    cut = comms_element_types(tape_type(floop, (Float64, Float64); inactive=(2,)))
+    @test full == [Tuple{Float64}]   # `x`'s primal, recorded once per iteration
+    @test isempty(cut)                # `y` inactive discards `db`; `da` only needs `y` (free, an argument)
+
+    _, pbloop = rrule!!(zero_fcodual(floop), Ctx(), CoDual(x, NoFData()), const_codual(y))
+    @test pbloop(1.0) == (NoRData(), 3y, NoRData())
+end
+
+@testset "activity: multiply-by-literal records nothing" begin
+    # `x * 2.0` inside a loop, so a per-iteration slot would otherwise be pushed. `da` (routed to
+    # `x`) only reads the literal (free); `db` (routed to the literal) is discarded outright since a
+    # literal has no rdata sink — so neither contribution ever needs `x`'s own primal.
+    function g(x)
+        acc = 0.0
+        for _ in 1:3
+            acc += 3.0 * x
+            x += 1.0
+        end
+        return acc
+    end
+    checkverify_rev(g, (Float64,))
+    ts = comms_element_types(tape_type(g, (Float64,)))
+    @test isempty(ts)
+
+    _, pb = rrule!!(zero_fcodual(g), Ctx(), CoDual(2.0, 0.0))
+    @test pb(1.0) == (NoRData(), 9.0)
+end
+
+@testset "activity: div_float's crossed dependency" begin
+    # `da` (routed to the numerator) reads only the denominator; `db` (routed to the denominator)
+    # reads both. So an inactive numerator still needs the denominator's primal recorded (already
+    # true) *and* keeps the numerator's own primal recorded too, since `db` (wanted, `b` active)
+    # reads it — while an inactive denominator drops the numerator's primal entirely, since only
+    # `da` stays wanted and `da` never reads it. This is exactly the asymmetry a flat "positions
+    # read" declaration could not express.
+    function divloop(a, b)
+        acc = 0.0
+        for _ in 1:3
+            acc += a / b
+            a += 1.0
+        end
+        return acc
+    end
+    full = comms_element_types(tape_type(divloop, (Float64, Float64)))
+    num_inactive = comms_element_types(tape_type(divloop, (Float64, Float64); inactive=(1,)))
+    den_inactive = comms_element_types(tape_type(divloop, (Float64, Float64); inactive=(2,)))
+    @test full == [Tuple{Float64}]      # `a`'s primal; `b` is a bare `Argument`, always elided
+    @test num_inactive == full          # keeps both — `db` (wanted) still reads `a`
+    @test isempty(den_inactive)         # drops `a` — only `da` (wanted) survives, and it needs only `b`
+
+    checkverify_rev(divloop, (Float64, Float64); inactive=(1,))
+    checkverify_rev(divloop, (Float64, Float64); inactive=(2,))
+
+    a0, b0 = 2.0, 5.0
+    _, pb_num = rrule!!(zero_fcodual(divloop), Ctx(), const_codual(a0), CoDual(b0, 0.0))
+    r_num = pb_num(1.0)
+    @test r_num[1] == NoRData() && r_num[2] == NoRData()
+    @test r_num[3] ≈ -(3a0 + 3) / b0^2
+
+    _, pb_den = rrule!!(zero_fcodual(divloop), Ctx(), CoDual(a0, 0.0), const_codual(b0))
+    r_den = pb_den(1.0)
+    @test r_den[1] == NoRData() && r_den[3] == NoRData()
+    @test r_den[2] ≈ 3 / b0
+end
+
+@testset "activity: _intrinsic_needed_operands pins the deps table" begin
+    needed(f, nops, wanted) = _intrinsic_needed_operands(f, nops, wanted)
+    mul = Core.Intrinsics.mul_float
+    dv = Core.Intrinsics.div_float
+    fma = Core.Intrinsics.fma_float
+
+    # mul_float: crossed dependency — `da` (contribution 1, routed to operand 1) reads operand 2,
+    # `db` (contribution 2, routed to operand 2) reads operand 1.
+    @test needed(mul, 2, j -> true) == BitSet([1, 2])
+    @test needed(mul, 2, j -> j == 1) == BitSet([2])
+    @test needed(mul, 2, j -> j == 2) == BitSet([1])
+    @test needed(mul, 2, j -> false) == BitSet()
+
+    # div_float: asymmetric — `da` needs only the denominator, `db` needs both.
+    @test needed(dv, 2, j -> true) == BitSet([1, 2])
+    @test needed(dv, 2, j -> j == 1) == BitSet([2])
+    @test needed(dv, 2, j -> j == 2) == BitSet([1, 2])
+    @test needed(dv, 2, j -> false) == BitSet()
+
+    # fma_float: `da` needs `b`, `db` needs `a`, `dc` needs neither.
+    @test needed(fma, 3, j -> true) == BitSet([1, 2])
+    @test needed(fma, 3, j -> j == 1) == BitSet([2])
+    @test needed(fma, 3, j -> j == 2) == BitSet([1])
+    @test needed(fma, 3, j -> j == 3) == BitSet()
+
+    # No declaration, or an arity mismatch against the declared table: conservative `nothing`.
+    @test intrinsic_rrule_deps(Val(Core.Intrinsics.not_int)) === nothing
+    @test needed(Core.Intrinsics.not_int, 1, j -> true) === nothing
+    @test needed(mul, 3, j -> true) === nothing
 end

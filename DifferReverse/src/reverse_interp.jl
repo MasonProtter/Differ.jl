@@ -1305,6 +1305,42 @@ function _inactive_arg_root(@nospecialize(node), pir, iworld::UInt, arg_active::
     return false
 end
 
+# Whether `node`'s rdata contribution has anywhere to route to — the same test the pullback makes
+# at build time (`needs_ref`, the `arg_ref_id` gate, `ref_for`), recomputed here so
+# `_scan_block_comms`'s declared comms items and the pullback's actual routing agree by
+# construction rather than by coincidence. `stmt_block` is `_stmt_block_map(pir)`; `npacked` is the
+# packed argument count (`length(codualparams)` at every call site).
+function _has_rdata_sink(@nospecialize(node), pir, active::BitVector, arg_active::BitVector,
+                         unreachable::BitVector, stmt_block::Vector{Int}, npacked::Int, nfixed::Int)
+    if isa(node, Core.SSAValue)
+        i = node.id
+        active[i] || return false
+        unreachable[stmt_block[i]] && return false
+        s = pir.stmts[i][:stmt]
+        isa(s, Union{Core.GotoNode,Core.GotoIfNot,Core.ReturnNode}) && return false
+        isa(s, Expr) && s.head in (:boundscheck, :loopinfo) && return false
+        return true
+    elseif isa(node, Core.Argument)
+        return node.n <= npacked && (arg_active[node.n] || (nfixed >= 0 && node.n == nfixed + 1))
+    end
+    return false
+end
+
+# Operand positions whose primal must be recorded, given which contributions (`wanted(j)`, one per
+# operand — contributions are 1:1 with operands) actually have a sink. `nothing` (conservative:
+# every operand needed) when `intrinsic_rrule_deps` doesn't apply to this callee — no declaration,
+# or its arity disagrees with `nops`. Shared between `_scan_block_comms` (declares comms items) and
+# the pullback (builds `pvals`), so both agree on exactly what was recorded.
+function _intrinsic_needed_operands(f, nops::Int, wanted)
+    deps = intrinsic_rrule_deps(Val(f))
+    (deps === nothing || length(deps) != nops) && return nothing
+    needed = BitSet()
+    for j in 1:nops
+        wanted(j) && union!(needed, deps[j])
+    end
+    return needed
+end
+
 # Which top-level (fwds-carrier) arguments carry non-trivial fdata. Factored out of `_fdata_tracked`
 # so `_static_recursible_call`'s array-argument-recursion guard can check a bare `Core.Argument`
 # operand directly without recomputing this. Gated on activity: an inactive argument has no shadow at
@@ -1859,7 +1895,8 @@ end
 # mode-level singleton: a `CodeInstance` compiled while scanning from one builder's `interp` is
 # found, not recompiled, when the other builder's separate `interp` resolves the same callsite.
 function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::MethodInstance, pir, iworld,
-                           unreachable, codualparams::Vector{Any}, reason::Ref{String}, edges::Vector{Any})
+                           unreachable, codualparams::Vector{Any}, reason::Ref{String}, edges::Vector{Any},
+                           nfixed::Int)
     nblocks = length(pir.cfg.blocks)
     nodes = [Any[] for _ in 1:nblocks]
     # Widened on the way in: these become `Tuple{types[b]...}`, and the hoisting/fusion decisions
@@ -1949,13 +1986,16 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
         fpos, actual = _call_parts(s)
         f = _calleeval(fpos, iworld)
         if isa(f, Core.IntrinsicFunction)
-            # Two reasons an intrinsic operand needs no comms slot, both decided purely from the
+            # Three reasons an intrinsic operand needs no comms slot, all decided purely from the
             # primal IR so fwds and pullback builders derive identical tuple types: the statement
-            # carries no gradient at all (`NoRData` result), or the rule for this specific intrinsic
-            # doesn't read that operand (see `intrinsic_rrule_operands` — a linear op like
-            # `add_float` reads neither addend).
+            # carries no gradient at all (`NoRData` result); a linear op's rule never reads a given
+            # operand at all (`intrinsic_rrule_deps`); or every contribution that would read a given
+            # operand has nowhere to route to (`_has_rdata_sink` on the operand it routes to — an
+            # inactive argument or a discarded literal contribution).
             rdtype(iworld, _stype(pir.stmts, i)) === NoRData && continue
-            needed = intrinsic_rrule_operands(Val(f))
+            wanted = j -> _has_rdata_sink(actual[j], pir, active, arg_active, unreachable, block_of,
+                                          n, nfixed)
+            needed = _intrinsic_needed_operands(f, length(actual), wanted)
             for (k, a) in enumerate(actual)
                 (isa(a, Core.SSAValue) || isa(a, Core.Argument)) || continue
                 (needed === nothing || k in needed) || continue
@@ -2164,7 +2204,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed, reason)
     packed_codualparams === nothing && return nothing
 
-    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges)
+    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges, nfixed)
     scan === nothing && return nothing
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
@@ -2902,7 +2942,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed, reason)
     packed_codualparams === nothing && return nothing
 
-    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges)
+    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges, nfixed)
     scan === nothing && return nothing
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element — derived inside the scan so both builders agree.
@@ -2946,10 +2986,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # Every statement except a pure control marker (or one living in a throw-only block) gets a `Ref`
     # to accumulate rdata into; literal/GlobalRef/`:boundscheck`/`:loopinfo` operands never do (both
     # always have `NoRData`, so skipping them here just avoids a useless allocation — not load-bearing).
-    needs_ref(i) = active[i] &&
-                   !unreachable_block[stmt_block[i]] &&
-                   !isa(pstmts[i][:stmt], Union{Core.GotoNode,Core.GotoIfNot,Core.ReturnNode}) &&
-                   !(isa(pstmts[i][:stmt], Expr) && (pstmts[i][:stmt]::Expr).head in (:boundscheck, :loopinfo))
+    needs_ref(i) = _has_rdata_sink(Core.SSAValue(i), pir, active, arg_active, unreachable_block,
+                                   stmt_block, npacked, nfixed)
 
     entry_id = ID()
     block_id = [ID() for _ in 1:nblocks]
@@ -3014,7 +3052,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         # An inactive argument accumulates nothing and returns `NoRData()`, so it gets no `Ref`. The
         # packed vararg tail is exempt: the scatter at the pullback's return reads its accumulator
         # unconditionally, and an all-`NoTangent` tail is inactive by type anyway.
-        (arg_active[k] || (nfixed >= 0 && k == nfixed + 1)) || continue
+        _has_rdata_sink(Core.Argument(k), pir, active, arg_active, unreachable_block, stmt_block,
+                        npacked, nfixed) || continue
         Pk = _codual_primal_type(packed_codualparams[k])
         # `zero_like_rdata_type`/`zero_like_rdata_from_type`, not `rdtype`/`zero_rdata_from_type`: when
         # `Pk` isn't concrete enough to produce a real zero rdata from its type alone (e.g. an
@@ -3360,23 +3399,25 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     # exist and shouldn't — nothing flows backward through them.
                     if rdtype(iworld, Ti) !== NoRData
                         acc = deref_and_zero!(ssa_ref_id[i], Ti)
-                        # Operands the forwards pass deliberately didn't record (see
-                        # `intrinsic_rrule_operands`, consulted identically in `_scan_block_comms`) come
-                        # through as `UnrecordedOperand`, and `opf` refuses to emit anything referencing
-                        # one. So a rule whose declaration understates what it reads fails here, loudly
-                        # and located, instead of silently emitting IR against a value that was never put
-                        # on the tape.
-                        needed = intrinsic_rrule_operands(Val(f))
-                        pvals = Tuple((needed === nothing || k in needed) ? pb_presolve(a) :
-                                      UnrecordedOperand(k) for (k, a) in enumerate(actual))
+                        # `wanted(j)`: operand `j`'s own contribution has somewhere to route to —
+                        # `ref_for` here, `_has_rdata_sink` in the scan, same answer either way.
+                        # `needed`: which operand primals a wanted contribution reads, i.e. exactly
+                        # what the scan recorded.
+                        wanted = j -> ref_for(actual[j]) !== nothing
+                        needed = _intrinsic_needed_operands(f, length(actual), wanted)
+                        # A literal costs nothing to resolve, so `UnrecordedOperand` only ever stands
+                        # for a node the scan genuinely skipped.
+                        unrecorded(k::Int, @nospecialize a) =
+                            (isa(a, Core.SSAValue) || isa(a, Core.Argument)) &&
+                            needed !== nothing && !(k in needed)
+                        pvals = Tuple(unrecorded(k, a) ? UnrecordedOperand(k) : pb_presolve(a)
+                                      for (k, a) in enumerate(actual))
+                        # `opf` propagates an `UnrecordedOperand` rather than erroring: a contribution
+                        # that will be discarded is allowed to read one, and nested chains (like
+                        # `div_float`'s `db`) then propagate it for free.
                         ctx = (opf=(name, ty, args...) -> begin
                                    for a in args
-                                       isa(a, UnrecordedOperand) || continue
-                                       error("Differ internal error: the reverse rule for intrinsic " *
-                                             "`$(nameof(f))` reads operand $(a.position), but " *
-                                             "`intrinsic_rrule_operands(Val($(nameof(f))))` does not " *
-                                             "list it, so the forwards pass never recorded it. Fix " *
-                                             "that declaration in src/intrinsics_reverse.jl.")
+                                       isa(a, UnrecordedOperand) && return a
                                    end
                                    emit!(Expr(:call, GlobalRef(Core.Intrinsics, name), args...), ty)
                                end,
@@ -3394,6 +3435,16 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                             return nothing
                         end
                         for (a, c) in zip(actual, contribs)
+                            if isa(c, UnrecordedOperand)
+                                # No sink: this contribution was going to be discarded anyway.
+                                # Otherwise `intrinsic_rrule_deps` understates what its rule reads.
+                                ref_for(a) === nothing && continue
+                                error("Differ internal error: the reverse rule for intrinsic " *
+                                      "`$(nameof(f))` reads operand $(c.position), but " *
+                                      "`intrinsic_rrule_deps(Val($(nameof(f))))` does not list it " *
+                                      "there, so the forwards pass never recorded it. Fix that " *
+                                      "declaration in src/intrinsics_reverse.jl.")
+                            end
                             route!(a, c, zero_like_rdata_type(_widen(_optype(pir, a))))
                         end
                     end
