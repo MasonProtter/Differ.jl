@@ -17,6 +17,22 @@ const CC = Core.Compiler
 # so two egal-equal `owner`s must always be safe to share a CodeInstance cache partition.
 # `custom_state::S` is whatever mutable per-session bookkeeping the owner needs beyond that
 # (in-progress sets, bail-reason logs, …) — kept separate so it never leaks into `cache_owner`.
+"""
+    ContextualInterpreter{T,S} <: AbstractInterpreter
+
+A generic `AbstractInterpreter` that compiles a *contextually transformed* version of a primal
+method.
+
+This is a source-to-source pass on the primal's post-optimization `IRCode`, installed into the
+normal typeinf pipeline so it produces an ordinary `invoke`-able `CodeInstance`. The concrete
+transform is supplied by a plugin (Differ's forward/reverse-mode engines) via the
+[`build_contextual_ir`](@ref) hook.
+
+`owner::T` is the plugin's immutable "owner" type — it IS the `cache_owner` partition key
+directly, so two egal-equal `owner`s must always be safe to share a `CodeInstance` cache
+partition. `custom_state::S` is whatever mutable, per-session scratch state the plugin needs,
+deliberately kept out of `T`/`cache_owner`'s reach.
+"""
 struct ContextualInterpreter{T,S} <: AbstractInterpreter
     owner::T
     custom_state::S
@@ -88,6 +104,16 @@ Core.Compiler.codegen_cache(interp::ContextualInterpreter) = interp.codegen_cach
 # Call `f(args...)` with dispatch resolved at the interpreter's inference world instead of at the
 # generator's pin. Use for every call from transform code into a generic function another package
 # can extend.
+"""
+    at_world(world_or_interp, f, args...)
+
+Calls `f(args...)` with dispatch resolved at `world` (or at `interp`'s inference world) instead of
+at the pin `jl_call_staged` puts on a `@generated` generator's task world age. Use for every call
+from transform code into a generic function another package can extend — ordinary dispatch from
+inside a generator can't see methods added by any later-loaded package (a sibling package, or a
+package extension). Every lookup made this way must also record an [`mt_edge!`](@ref) so a later
+method definition invalidates the carrier being built.
+"""
 at_world(world::UInt, @nospecialize(f), @nospecialize(args...)) =
     Core._call_in_world_total(world, f, args...)
 at_world(interp::ContextualInterpreter, @nospecialize(f), @nospecialize(args...)) =
@@ -98,6 +124,16 @@ at_world(interp::ContextualInterpreter, @nospecialize(f), @nospecialize(args...)
 # vector that `compute_edges!`/`store_backedges` expects. A resolved-`MethodInstance` edge is not
 # a substitute: it covers "this method changed", not "a more specific method now exists".
 # Deduplicated since the same signature gets queried repeatedly per statement.
+"""
+    mt_edge!(edges::Vector{Any}, sig)
+
+Records a method-table backedge on `sig` in `edges`, so a method appearing later for that
+signature invalidates the carrier being built. Pushes `sig, Core.methodtable` — the pair inline in
+the edge vector `compute_edges!`/`store_backedges` expects — deduplicated, since the same signature
+gets queried repeatedly per statement. Pair with every [`at_world`](@ref) lookup; a resolved
+`MethodInstance` edge is not a substitute, since it covers "this method changed" rather than "a
+more specific method now exists".
+"""
 function mt_edge!(edges::Vector{Any}, @nospecialize(sig))
     for i in 1:(length(edges) - 1)
         edges[i] === sig && edges[i + 1] === Core.methodtable && return edges
@@ -108,6 +144,13 @@ end
 
 # Build a lowered `CodeInfo` from an expression. Used by a plugin's `@generated` fallback to
 # produce the trivial generated body that `invoke`s the compiled transformed `CodeInstance`.
+"""
+    expr_to_codeinfo(m::Module, argnames, spnames, sp, e::Expr, isva::Bool=false) -> CodeInfo
+
+Builds a lowered `CodeInfo` from expression `e`, whose body returns `e`, with argument names
+`argnames` and static parameter names `spnames`. Used by a plugin's `@generated` fallback to
+produce the trivial generated body that `invoke`s the compiled transformed `CodeInstance`.
+"""
 function expr_to_codeinfo(m::Module, argnames, spnames, sp, e::Expr, isva::Bool=false)
     lam = Expr(:lambda, argnames,
                Expr(Symbol("scope-block"),
@@ -135,6 +178,19 @@ end
 
 # Plugin hook: build the transformed `IRCode` for a carrier MethodInstance, or `nothing` to leave
 # `mi` to the ordinary pipeline. Overridden per plugin.
+"""
+    build_contextual_ir(interp::ContextualInterpreter, mi::MethodInstance) -> Union{IRCode,Nothing}
+
+Plugin hook: build the transformed `IRCode` for a carrier `MethodInstance`, or return `nothing` to
+leave `mi` to the ordinary compilation pipeline. Overridden per plugin (`DifferForwards` recognizes
+its `dualized_impl` carrier, `DifferReverse` its `reverse_fwds_impl`/`reverse_pullback_impl`
+carriers). Called from `finishinfer!`, at the point Julia's inference machinery is about to freeze
+a method's return type into its `CodeInstance`; when it returns a real `IRCode`, that return type
+and the plugin's discovered backedges get written in its place, and [`run_ipo_passes!`](@ref) later
+optimizes it in `optimize`. A plugin whose transform can't handle some construct returns `nothing`
+here: the carrier's throwing stub body then compiles normally and raises when invoked, a graceful
+failure rather than a miscompile.
+"""
 build_contextual_ir(::ContextualInterpreter, ::MethodInstance) = nothing
 
 # Builds the transformed IR and sets `me.bestguess` to its return type so the generic
@@ -186,6 +242,16 @@ end
 
 # The IRCode half of `run_passes_ipo_safe` (our transformed IR is already SSA IRCode, so
 # CONVERT/SLOT2REG are skipped).
+"""
+    run_ipo_passes!(ir::IRCode, opt::OptimizationState) -> IRCode
+
+Runs the IPO-safe half of Julia's ordinary optimization pipeline (`compact!` →
+`ssa_inlining_pass!` → `compact!` → `sroa_pass!` → `adce_pass!` → `compact!`) over an already-SSA
+`IRCode`, skipping the CONVERT/SLOT2REG steps a freshly-lowered `CodeInfo` would need. Called from
+`optimize` on the `IRCode` [`build_contextual_ir`](@ref) produced, so the synthetic
+construction/rule calls it emits get inlined and immutable results scalar-replaced just like
+ordinary code.
+"""
 function run_ipo_passes!(ir::IRCode, opt::CC.OptimizationState)
     ir = CC.compact!(ir)
     ir = CC.ssa_inlining_pass!(ir, opt.inlining, opt.src.propagate_inbounds)

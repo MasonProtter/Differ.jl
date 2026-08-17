@@ -7,6 +7,7 @@ makedocs(;
     modules = [Differ, Contextual, DifferCore, DifferForwards, DifferReverse],
     plugins = [CodeBlocks()],
     doctest = true,
+    checkdocs = :exports,
     pages = [
         "Home" => "index.md",
         "Writing rules" => "custom_rules.md",

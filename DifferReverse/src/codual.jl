@@ -1,6 +1,15 @@
 # Portions of this file are derived from Mooncake.jl (https://github.com/chalk-lab/Mooncake.jl),
 # Copyright (c) 2024 Will Tebbutt and Hong Ge, licensed under the MIT License.
 
+"""
+    CoDual(primal, shadow)
+
+Pairs a `primal` value with a `shadow` for reverse-mode AD. Unlike `DifferForwards.Dual`, `shadow`
+isn't fixed to `tangent_type(typeof(primal))`: during the forwards pass of [`rrule!!`](@ref) it is
+usually the fdata component ([`FData`](@ref)/[`NoFData`](@ref)) — the piece of the tangent that
+must be carried alongside the primal because the pullback reads it back later. [`zero_fcodual`](@ref)
+builds a `CoDual` in that fdata-carrying shape.
+"""
 struct CoDual{Tx,Tdx}
     x::Tx
     dx::Tdx
