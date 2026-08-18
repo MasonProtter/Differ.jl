@@ -33,6 +33,10 @@ central_diff(f, x, y, k::Int; h=1e-6) =
 # (reads the caller's stacks out of the ctx and resets them), so it needs its own check.
 function checkverify_prealloc(f, at; inactive=())
     ctx = build_ctx(f, at; inactive)
+    # If `build_ctx` ever fell back to the tape-allocating `Ctx{Nothing}`, `typeof(ctx)` below would
+    # make this verify the tape-allocating carrier instead of the pre-allocated one — fail loudly
+    # rather than check the wrong shape.
+    @test ctx isa Ctx{<:DifferReverse.Tape}
     interp = DifferReverse.build_reverse_interp()
     tt = Tuple{typeof(DifferReverse.reverse_fwds_impl),
                DifferReverse.fcodual_type(DifferReverse._typeof(f)), typeof(ctx),

@@ -3917,11 +3917,19 @@ refresh_pullback_entry()
 # ===========================================================================
 
 """
-    build_ctx(f, argtypes::Tuple; prealloc=true) -> Ctx
+    build_ctx(f, argtypes::Tuple; prealloc=true, inactive=()) -> Ctx
 
 Build a reusable differentiation context for `f` applied to arguments of types `argtypes` — a
 [`Ctx`](@ref) wrapping a tape sized for `f`'s derived rule (obtained by transforming `f`'s optimized
 IR). Pass it to [`rrule!!`](@ref) / [`value_and_gradient!`](@ref) / [`rev_gradient!`](@ref).
+
+`; inactive=(p, …)` marks argument positions (1-based, arguments only) the caller holds constant:
+the tape is sized for the `CoDual{P,Inactive}` carriers those slots must arrive as. `inactive` must
+be a **compile-time constant** tuple (a literal, or a locally-constructed constant the compiler can
+fold) — the positions ride into `_build_tape`'s generator as a `Val` type parameter, which only
+exists when the call site const-folds it. A value the compiler cannot fold (a loop or call result)
+still works at run time — the generator reads the positions off the `Val`'s runtime type — but
+`build_ctx`'s return type is no longer inferable, so the adjacent `rrule!!` dispatches dynamically.
 
 With `prealloc=true` (the default) the tape is allocated once, and its stacks are reset and reused on
 every call — the whole point of holding onto a context rather than differentiating afresh. That makes
@@ -3943,24 +3951,28 @@ function build_ctx(@nospecialize(f), @nospecialize(argtypes::Tuple); prealloc::B
     prealloc || return Ctx()
     # `Base.to_tuple_type` moves the argument types into a type parameter, which is the only way
     # `_build_tape`'s generator can see them: a runtime tuple of types has type `Tuple{DataType,…}`,
-    # which says nothing about which types they were. `inactive` rides in a `Val` for the same reason.
+    # which says nothing about which types they were. `inactive` rides in a `Val` for the same
+    # reason — but only if the call site const-folds it to a constant type parameter, which
+    # requires `_inactive_positions` to stay pure and allocation-free.
     return Ctx(_build_tape(f, Base.to_tuple_type(argtypes),
                            Val(_inactive_positions(inactive, length(argtypes)))))
 end
 
 """
-    _inactive_positions(inactive, nargs) -> NTuple{N,Int}
+    _inactive_positions(inactive, nargs) -> Tuple
 
-Normalise a user-supplied set of constant-argument positions (1-based, counting the arguments only,
-not `f`) into a sorted tuple suitable for a `Val` type parameter.
+Validate a user-supplied set of constant-argument positions (1-based, counting the arguments only,
+not `f`) and return it unchanged. Pure and allocation-free on purpose: that is what lets a
+compile-time-constant `inactive` const-fold through `build_ctx`'s `Val` into a constant type
+parameter, the only way `_build_tape`'s generator can read the positions. The result is only ever
+membership-tested (`j in inactive`), so no sorting or deduplication.
 """
 function _inactive_positions(inactive, nargs::Int)
-    ps = sort!(unique!(collect(Int, inactive)))
-    for p in ps
+    for p in inactive
         1 <= p <= nargs ||
             throw(ArgumentError("inactive argument position $p is out of range for $nargs arguments"))
     end
-    return Tuple(ps)
+    return inactive
 end
 
 """
@@ -3983,7 +3995,10 @@ end
 
 Allocate a fresh `Tape` of exactly the shape `f`'s derived rule will use — same block stack, same
 per-block comms stacks. Generated: the tape type is read off the tape-allocating carrier's return type
-at generation time, so at run time this is just the allocations.
+at generation time, so at run time this is just the allocations. At run time the `Val`'s parameter
+is the positions tuple value (a constant type parameter); if inference handed the generator a
+type-level parameter instead, it yields `nothing` and `build_ctx` returns the per-call allocating
+`Ctx{Nothing}` rather than a mistyped tape.
 """
 function _build_tape_body(world::UInt, source, self, ftype, argst, inactivet)
     argnames = Any[Symbol("#self#"), :f, :ArgsT, :Inactive]
@@ -3995,7 +4010,13 @@ function _build_tape_body(world::UInt, source, self, ftype, argst, inactivet)
         return bail("Differ.build_ctx: argtypes must be a tuple of types")
     (inactivet isa DataType && inactivet <: Val) ||
         return bail("Differ.build_ctx: inactive positions must be a `Val` of a tuple of Ints")
+    # Folded, the parameter is the positions tuple *value* (a constant type parameter, 1.13).
+    # A type-level parameter means inference couldn't fold `inactive`: no tape shape can be
+    # derived, so return `nothing` and let `build_ctx` degrade to the per-call allocating
+    # `Ctx{Nothing}`.
     inactive = inactivet.parameters[1]
+    (inactive isa Tuple) || return expr_to_codeinfo(@__MODULE__(), argnames, [], (),
+                                                    :(return nothing), false)
     interp = build_reverse_interp(; world)
     codualtys = Any[_fcdtype(world, ftype)]
     for T in ArgsT.parameters

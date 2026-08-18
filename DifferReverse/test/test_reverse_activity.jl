@@ -174,6 +174,45 @@ end
     @test_throws ArgumentError build_ctx((x, y) -> x * y, (Float64, Float64); inactive=(0,))
 end
 
+@testset "activity: build_ctx is inferable and steady-state zero-allocation" begin
+    # The point of preallocation is a concrete `Ctx{Tape{…}}` at the call site: an abstract `Ctx`
+    # makes the adjacent `rrule!!` dispatch dynamically, boxing its argument tuple and its return
+    # every call (ISSUES #124). `_inactive_positions` must stay allocation-free, or a literal
+    # `inactive` stops const-folding into the `Val` type parameter and this regresses.
+    f(x, y) = x * y + sin(x)
+    function plain_ctx()
+        build_ctx(f, (Float64, Float64))
+    end
+    function lit_ctx()
+        build_ctx(f, (Float64, Float64); inactive=(2,))
+    end
+    @test isconcretetype(only(Base.return_types(plain_ctx, ())))
+    @test isconcretetype(only(Base.return_types(lit_ctx, ())))
+
+    # Steady-state allocation, in the shape the benchmarks use: the `ctx` the setup block builds
+    # reaches the timed `rrule!!`/pullback call concretely typed (the closure's capture type is
+    # where the type travels), so a warmed round trip allocates nothing.
+    ctx = build_ctx(f, (Float64, Float64); inactive=(2,))
+    @test ctx isa Ctx{<:DifferReverse.Tape}
+    xcd = CoDual(2.0, NoFData())
+    ycd = const_codual(3.0)
+    measure = () -> (rrule!!(zero_fcodual(f), ctx, xcd, ycd)[2])(1.0)
+    measure(); measure()
+    @test @allocated(measure()) == 0
+end
+
+@testset "activity: a non-constant inactive still differentiates correctly at run time" begin
+    # Positions the compiler cannot fold (a generator result): the tape is still built correctly at
+    # run time — the generator reads the positions off the `Val`'s runtime type — so the context
+    # works; it is just not inferable, and the adjacent `rrule!!` dispatches dynamically.
+    f(x, y) = x * y + sin(x)
+    inact = Tuple(j for j in 1:2 if j == 2)
+    ctx = build_ctx(f, (Float64, Float64); inactive=inact)
+    @test ctx isa Ctx{<:DifferReverse.Tape}
+    _, pb = rrule!!(zero_fcodual(f), ctx, CoDual(2.0, NoFData()), const_codual(3.0))
+    @test pb(1.0) == (NoRData(), 3.0 + cos(2.0), NoRData())
+end
+
 @testset "activity: a constant vararg-tail element bails instead of miscompiling" begin
     # A vararg primal's trailing arguments all land in one packed tail slot, always typed as the
     # active fdata carrier. A constant trailing argument used to sneak an `Inactive()` value into that
