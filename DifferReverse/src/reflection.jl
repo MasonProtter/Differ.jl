@@ -20,7 +20,7 @@ function code_reverse_fwds_ircode(@nospecialize(f), @nospecialize(argtypes::Tupl
     codualtys = Any[fcodual_type(_typeof(f))]
     append!(codualtys,
             _arg_codual_types(world, argtypes, _inactive_positions(inactive, length(argtypes))))
-    # Inspect the tape-allocating shape (`Ctx{Nothing}`) — the one `build_ctx(...; prealloc=false)`
+    # Inspect the tape-allocating shape (`Ctx{Nothing}`) — the one a bare `Ctx()`
     # uses, and the shape a pre-allocated context differs from only in its prologue. Carrier layout is
     # `reverse_fwds_impl(fcd, ctx, argcds...)`: fcd first, then the ctx, then the argument coduals.
     impl_tt = Tuple{typeof(reverse_fwds_impl), codualtys[1], Ctx{Nothing}, codualtys[2:end]...}

@@ -201,6 +201,98 @@ end
     @test @allocated(measure()) == 0
 end
 
+@testset "activity: the carrier-type and carrier-value build_ctx forms" begin
+    # `Tuple{CoDual…}` states everything the tape shape depends on, activity included, as a type
+    # parameter, so the result type is a function of that tuple with no const-folding involved.
+    # The carrier-value form is the same thing spelled with the carriers themselves.
+    f(x, y) = x * y + sin(x)
+    fcd = zero_fcodual(f)
+    xcd = CoDual(2.0, NoFData())
+    ycd = const_codual(3.0)
+
+    ctx_ty = build_ctx(Tuple{typeof(fcd),typeof(xcd),typeof(ycd)})
+    ctx_val = build_ctx(fcd, xcd, ycd)
+    ctx_pos = build_ctx(f, (Float64, Float64); inactive=(2,))
+    # All three describe the same call, so they must land on the same tape.
+    @test typeof(ctx_ty) === typeof(ctx_val) === typeof(ctx_pos)
+    @test ctx_ty isa Ctx{<:DifferReverse.Tape}
+
+    for ctx in (ctx_ty, ctx_val)
+        _, pb = rrule!!(fcd, ctx, xcd, ycd)
+        @test pb(1.0) == (NoRData(), 3.0 + cos(2.0), NoRData())
+    end
+
+    # Inferable without const-folding: the carriers are locals, so `typeof` is exact.
+    function via_type()
+        g = (x, y) -> x * y
+        build_ctx(Tuple{typeof(zero_fcodual(g)),CoDual{Float64,NoFData},CoDual{Float64,Inactive}})
+    end
+    function via_values()
+        g = (x, y) -> x * y
+        build_ctx(zero_fcodual(g), CoDual(2.0, NoFData()), const_codual(3.0))
+    end
+    @test isconcretetype(only(Base.return_types(via_type, ())))
+    @test isconcretetype(only(Base.return_types(via_values, ())))
+end
+
+@testset "activity: returning an argument declared constant" begin
+    # The returned carrier's type is chosen from the shadow type, so its *value* has to be built to
+    # match. A `NoFData` primal used to take the `zero_fcodual` branch, which builds the
+    # primal-derived shadow (`NoFData()`) and blew up with a `TypeError` at the `%new`. `verify_ir`
+    # passes either way — it does not check declared-vs-actual statement types — so nothing in
+    # `checkverify_rev` catches this shape.
+    ret_const(x, c) = c
+    ctx = build_ctx(ret_const, (Float64, Float64); inactive=(2,))
+    ycd, pb = rrule!!(zero_fcodual(ret_const), ctx, zero_fcodual(1.0), const_codual(2.0))
+    @test primal(ycd) == 2.0
+    @test tangent(ycd) === Inactive()
+    @test pb(1.0) == (NoRData(), 0.0, NoRData())
+
+    # The fdata-carrying case routes differently and was already correct; pin it so the two stay
+    # in agreement.
+    ctx_v = build_ctx(ret_const, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    yv, pbv = rrule!!(zero_fcodual(ret_const), ctx_v,
+                      CoDual([1.0, 2.0], zeros(2)), const_codual([3.0, 4.0]))
+    @test primal(yv) == [3.0, 4.0]
+    @test tangent(yv) === Inactive()
+
+    # An active return alongside an inactive argument keeps the ordinary carrier.
+    ret_active(x, c) = x
+    ctx_a = build_ctx(ret_active, (Float64, Float64); inactive=(2,))
+    ya, pba = rrule!!(zero_fcodual(ret_active), ctx_a, zero_fcodual(5.0), const_codual(2.0))
+    @test tangent(ya) === NoFData()
+    @test pba(1.0) == (NoRData(), 1.0, NoRData())
+
+    checkverify_rev(ret_const, (Float64, Float64); inactive=(2,))
+end
+
+@testset "activity: inactive= accepts an Int or a tuple of them, and nothing else" begin
+    # The positions become a `Val` type parameter, so only what is constructible as one is allowed.
+    # A `Vector` used to surface as a `TypeError` from `Val` itself, and a range silently produced a
+    # tape-less `Ctx{Nothing}` — a pre-allocated context degrading to a per-call allocating one with
+    # no error. Both are now refused at the signature, naming the keyword.
+    f(x, y) = x * y + sin(x)
+    @test typeof(build_ctx(f, (Float64, Float64); inactive=2)) ===
+          typeof(build_ctx(f, (Float64, Float64); inactive=(2,)))
+    @test_throws TypeError build_ctx(f, (Float64, Float64); inactive=[2])
+    @test_throws TypeError build_ctx(f, (Float64, Float64); inactive=2:2)
+    # Still inferable in every accepted spelling.
+    c_none() = build_ctx(f, (Float64, Float64))
+    c_int() = build_ctx(f, (Float64, Float64); inactive=2)
+    c_tup() = build_ctx(f, (Float64, Float64); inactive=(2,))
+    for c in (c_none, c_int, c_tup)
+        @test isconcretetype(only(Base.return_types(c, ())))
+    end
+end
+
+@testset "activity: build_ctx rejects a malformed carrier tuple" begin
+    # A `UnionAll` element is not a usable carrier: it names no shadow, so no tape shape follows
+    # from it. Fail rather than guess one.
+    fcd = zero_fcodual((x, y) -> x * y)
+    @test_throws ErrorException build_ctx(Tuple{typeof(fcd),CoDual{Float64},CoDual{Float64,NoFData}})
+    @test_throws ErrorException build_ctx(Tuple{})
+end
+
 @testset "activity: a non-constant inactive still differentiates correctly at run time" begin
     # Positions the compiler cannot fold (a generator result): the tape is still built correctly at
     # run time — the generator reads the positions off the `Val`'s runtime type — so the context

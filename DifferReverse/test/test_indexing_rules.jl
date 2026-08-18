@@ -45,7 +45,7 @@ end
     # array-valued result carries its gradient via fdata (mutation of `dy`), not rdata. So seeding
     # is done the way any downstream consumer of `y` would: writing into `dy = tangent(ycd)` before
     # calling the pullback. Seeding `dy` with all-ones simulates a surrounding `sum(y)`.
-    ctx = build_ctx(Base.getindex, (Vector{Float64}, Vector{Bool}); prealloc=false)
+    ctx = Ctx()
     fcd, vcd, maskcd = zero_fcodual(Base.getindex), zero_fcodual(v), zero_fcodual(mask)
     ycd, pb = rrule!!(fcd, ctx, vcd, maskcd)
     @test primal(ycd) == [1.0, 3.0, 4.0]
@@ -60,7 +60,7 @@ end
     end
 
     idxvec = [1, 1, 2]
-    ctx2 = build_ctx(Base.getindex, (Vector{Float64}, Vector{Int}); prealloc=false)
+    ctx2 = Ctx()
     fcd2, vcd2, idxcd2 = zero_fcodual(Base.getindex), zero_fcodual(v), zero_fcodual(idxvec)
     ycd2, pb2 = rrule!!(fcd2, ctx2, vcd2, idxcd2)
     @test primal(ycd2) == [1.0, 1.0, 2.0]

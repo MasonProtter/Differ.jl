@@ -113,7 +113,7 @@ execution, and a `Stack` never deallocates, so after the first execution the slo
 in already holds a structurally identical tape — the emission site hands that one to the callee (via
 `Ctx{P}` with a concrete `P`, not `Ctx{Nothing}`) instead of allocating fresh (`_inner_ctx`,
 `src/stack.jl`). Any `P` other than `Nothing` is this shape: a tape whose stacks are reset and reused
-per call — either the caller's own top-level tape (`build_ctx(...; prealloc=true)`) or a callee's
+per call — either the caller's own top-level tape (`build_ctx`) or a callee's
 recycled one. Build a top-level one with [`build_ctx`](@ref).
 """
 struct Ctx{P} <: AbstractCtx
@@ -2440,7 +2440,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
         subtapes_ssa = icall!(Stack{TapeT}, Stack{TapeT}, ())
     else
         # Pre-allocated mode: read the caller's tape out of the `ctx` and reuse its stacks — the
-        # whole point of `build_ctx(...; prealloc=true)`, since a `Stack` is three heap objects.
+        # whole point of `build_ctx`, since a `Stack` is three heap objects.
         if PreTapeT !== TapeT
             reason[] = "the pre-allocated tape has type $(PreTapeT), but this primal's tape shape is " *
                        "$(TapeT) — rebuild the context with `build_ctx` for these exact argument types"
@@ -2660,7 +2660,13 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             FR = FRs === fdtype(iworld, R) ? _fcdtype(iworld, R) : CoDual{R,FRs}
             has_shadow = isa(s.val, Core.SSAValue) ? isassigned(shadow_map, s.val.id) :
                          isa(s.val, Core.Argument) ? isassigned(farg, s.val.n) : false
-            result_cd = if fdtype(iworld, R) === NoFData
+            result_cd = if FRs === Inactive
+                # Returning a value the caller declared constant: the carrier has to say so, since
+                # `FR` above was chosen from the shadow type. Not `zero_fcodual` — that builds the
+                # *primal-derived* shadow, which for a `NoFData` primal is `NoFData()`, a different
+                # type from `FR` and a `TypeError` at the `%new`.
+                emit!(Expr(:new, FR, ret_val, Inactive()), FR)
+            elseif fdtype(iworld, R) === NoFData
                 icall!(zerofcodual_g, FR, (R,), ret_val)
             elseif has_shadow
                 emit!(Expr(:new, FR, ret_val, sresolve(s.val)), FR)
@@ -3917,24 +3923,48 @@ refresh_pullback_entry()
 # ===========================================================================
 
 """
-    build_ctx(f, argtypes::Tuple; prealloc=true, inactive=()) -> Ctx
+    build_ctx(::Type{CDs}) -> Ctx
+    build_ctx(fcd::CoDual, argcds::CoDual...) -> Ctx
+    build_ctx(f, argtypes::Tuple; inactive=()) -> Ctx
 
-Build a reusable differentiation context for `f` applied to arguments of types `argtypes` — a
-[`Ctx`](@ref) wrapping a tape sized for `f`'s derived rule (obtained by transforming `f`'s optimized
-IR). Pass it to [`rrule!!`](@ref) / [`value_and_gradient!`](@ref) / [`rev_gradient!`](@ref).
+Build a reusable differentiation context — a [`Ctx`](@ref) wrapping a tape sized for the derived
+rule of the call it describes (obtained by transforming the primal's optimized IR). Pass it to
+[`rrule!!`](@ref) / [`value_and_gradient!`](@ref) / [`rev_gradient!`](@ref).
+
+`CDs` is the `Tuple` of `CoDual` types the call will be made with, the function's own carrier first
+— exactly `rrule!!`'s argument list minus the context. This is the primary form: everything the tape
+shape depends on, activity included, is already a type parameter, so the result type is a pure
+function of `CDs` with no const-folding involved.
+
+```julia
+ctx = build_ctx(Tuple{typeof(fcd),typeof(vcd),typeof(acd)})
+```
+
+The `CoDual` form is the same thing spelled with the carriers themselves, and is usually what you
+want when you have them to hand — it cannot disagree with the call, because it *is* the call's
+argument list:
+
+```julia
+acd = CoDual(a, Inactive())            # held constant, stated once
+ctx = build_ctx(fcd, vcd, acd)
+y, pb = rrule!!(fcd, ctx, vcd, acd)
+```
+
+The primal-types form is the convenience spelling for when no carriers exist yet; it derives each
+argument's carrier from its primal type.
 
 `; inactive=(p, …)` marks argument positions (1-based, arguments only) the caller holds constant:
-the tape is sized for the `CoDual{P,Inactive}` carriers those slots must arrive as. `inactive` must
-be a **compile-time constant** tuple (a literal, or a locally-constructed constant the compiler can
-fold) — the positions ride into `_build_tape`'s generator as a `Val` type parameter, which only
-exists when the call site const-folds it. A value the compiler cannot fold (a loop or call result)
-still works at run time — the generator reads the positions off the `Val`'s runtime type — but
-`build_ctx`'s return type is no longer inferable, so the adjacent `rrule!!` dispatches dynamically.
+the tape is sized for the `CoDual{P,Inactive}` carriers those slots must arrive as. It is an `Int`
+or a tuple of them — nothing else, since the positions ride into `_build_tape`'s generator as a
+`Val` type parameter and only those are constructible as one. It should also be a **compile-time
+constant** (a literal, or a locally-constructed constant the compiler can fold): one the compiler
+cannot fold still works at run time, but `build_ctx`'s return type is then not inferable, and the
+adjacent `rrule!!` dispatches dynamically. The two carrier forms above have neither restriction.
 
-With `prealloc=true` (the default) the tape is allocated once, and its stacks are reset and reused on
-every call — the whole point of holding onto a context rather than differentiating afresh. That makes
-the context **single-use at a time**: it is not reentrant and not thread-safe, so give each task its
-own. `prealloc=false` returns `Ctx()` — a context that allocates a fresh tape per call instead.
+The tape is allocated once, and its stacks are reset and reused on every call — the whole point of
+holding onto a context rather than differentiating afresh. That makes the context **single-use at a
+time**: it is not reentrant and not thread-safe, so give each task its own. For a context that
+allocates a fresh tape per call instead, construct `Ctx()` directly; there is no flag for it.
 
 A reused tape also holds onto the *previous* call's argument coduals (the pullback reaches primal
 argument values through them) — and so keeps their shadows alive — until the next call overwrites
@@ -3946,9 +3976,15 @@ y, pb = rrule!!(zero_fcodual(f), ctx, CoDual(x, dx))
 _, gx = pb(1.0)
 ```
 """
-function build_ctx(@nospecialize(f), @nospecialize(argtypes::Tuple); prealloc::Bool=true,
-                   inactive=())
-    prealloc || return Ctx()
+build_ctx(::Type{CDs}) where {CDs<:Tuple} = Ctx(_build_tape(CDs))
+
+# `typeof` of each carrier folds to a constant here — the method is already specialized on those
+# types — so the `Tuple{…}` this hands to the type form is a constant too.
+build_ctx(fcd::CoDual, argcds::Vararg{CoDual,N}) where {N} =
+    build_ctx(Tuple{typeof(fcd),map(typeof, argcds)...})
+
+function build_ctx(@nospecialize(f), @nospecialize(argtypes::Tuple);
+                   inactive::Union{Int,Tuple{Vararg{Int}}}=())
     # `Base.to_tuple_type` moves the argument types into a type parameter, which is the only way
     # `_build_tape`'s generator can see them: a runtime tuple of types has type `Tuple{DataType,…}`,
     # which says nothing about which types they were. `inactive` rides in a `Val` for the same
@@ -3959,15 +3995,21 @@ function build_ctx(@nospecialize(f), @nospecialize(argtypes::Tuple); prealloc::B
 end
 
 """
-    _inactive_positions(inactive, nargs) -> Tuple
+    _inactive_positions(inactive, nargs) -> Tuple{Vararg{Int}}
 
 Validate a user-supplied set of constant-argument positions (1-based, counting the arguments only,
-not `f`) and return it unchanged. Pure and allocation-free on purpose: that is what lets a
+not `f`), returning them as a tuple. Pure and allocation-free on purpose: that is what lets a
 compile-time-constant `inactive` const-fold through `build_ctx`'s `Val` into a constant type
 parameter, the only way `_build_tape`'s generator can read the positions. The result is only ever
 membership-tested (`j in inactive`), so no sorting or deduplication.
+
+`build_ctx` accepts only an `Int` or a tuple of them, so anything reaching here is already a
+constructible `Val` parameter — a `Vector` or a range is not, and is rejected at the signature
+with a `MethodError` naming the type rather than surfacing as a `TypeError` from `Val`, or (for a
+range) as a generator that can make no sense of the parameter.
 """
-function _inactive_positions(inactive, nargs::Int)
+_inactive_positions(inactive::Int, nargs::Int) = _inactive_positions((inactive,), nargs)
+function _inactive_positions(inactive::Tuple{Vararg{Int}}, nargs::Int)
     for p in inactive
         1 <= p <= nargs ||
             throw(ArgumentError("inactive argument position $p is out of range for $nargs arguments"))
@@ -4001,7 +4043,7 @@ type-level parameter instead, it yields `nothing` and `build_ctx` returns the pe
 `Ctx{Nothing}` rather than a mistyped tape.
 """
 function _build_tape_body(world::UInt, source, self, ftype, argst, inactivet)
-    argnames = Any[Symbol("#self#"), :f, :ArgsT, :Inactive]
+    argnames = Any[Symbol("#self#"), :f, :ArgsT, :Positions]
     bail(msg) = expr_to_codeinfo(@__MODULE__(), argnames, [], (), :(error($msg)), false)
     (argst isa DataType && argst <: Type) ||
         return bail("Differ.build_ctx: argtypes must be a tuple of types")
@@ -4010,22 +4052,62 @@ function _build_tape_body(world::UInt, source, self, ftype, argst, inactivet)
         return bail("Differ.build_ctx: argtypes must be a tuple of types")
     (inactivet isa DataType && inactivet <: Val) ||
         return bail("Differ.build_ctx: inactive positions must be a `Val` of a tuple of Ints")
-    # Folded, the parameter is the positions tuple *value* (a constant type parameter, 1.13).
-    # A type-level parameter means inference couldn't fold `inactive`: no tape shape can be
-    # derived, so return `nothing` and let `build_ctx` degrade to the per-call allocating
-    # `Ctx{Nothing}`.
+    # The parameter is the positions tuple *value*, folded or not — a generator only ever sees
+    # concrete argument types, so `Val`'s parameter is whatever was actually constructed.
+    # `build_ctx` admits only an `Int` or a tuple of them, so this is unreachable from there; it
+    # stays as a guard for a direct `_build_tape` call, and errors rather than quietly handing back
+    # a context that allocates a tape per call when a pre-allocated one was asked for.
     inactive = inactivet.parameters[1]
-    (inactive isa Tuple) || return expr_to_codeinfo(@__MODULE__(), argnames, [], (),
-                                                    :(return nothing), false)
-    interp = build_reverse_interp(; world)
-    codualtys = Any[_fcdtype(world, ftype)]
+    (inactive isa Tuple) ||
+        return bail("Differ.build_ctx: inactive positions must be a `Val` of a tuple of Ints, got " *
+                    "`Val{$(inactive)}`")
     for T in ArgsT.parameters
         (T isa Type) || return bail("Differ.build_ctx: argtypes must be a tuple of types")
     end
+    codualtys = Any[_fcdtype(world, ftype)]
     append!(codualtys, _arg_codual_types(world, ArgsT.parameters, inactive))
+    return _tape_codeinfo(world, argnames, codualtys, Tuple{ftype,ArgsT.parameters...})
+end
+
+"""
+    _build_tape(::Type{CDs}) -> Tape
+
+Carrier-type form: `CDs` is the `Tuple` of `CoDual` types the call will be made with, the function's
+own carrier first. Nothing is derived from primal types here, so there is no `Val` and no reliance
+on const-folding — the tape shape is a function of `CDs` alone, and `CDs` is a type parameter
+already.
+"""
+function _build_tape_cds_body(world::UInt, source, self, cdst)
+    argnames = Any[Symbol("#self#"), :CDs]
+    bail(msg) = expr_to_codeinfo(@__MODULE__(), argnames, [], (), :(error($msg)), false)
+    (cdst isa DataType && cdst <: Type) ||
+        return bail("Differ.build_ctx: expected a `Tuple` type of `CoDual` types")
+    CDs = cdst.parameters[1]
+    (CDs isa DataType && CDs <: Tuple) ||
+        return bail("Differ.build_ctx: expected a `Tuple` type of `CoDual` types, got `$(CDs)`")
+    isempty(CDs.parameters) &&
+        return bail("Differ.build_ctx: the tuple must start with the function's own `CoDual` type")
+    codualtys = Any[]
+    for C in CDs.parameters
+        # A `UnionAll` (`CoDual{Float64}`) or a union fails `isa DataType`, which is what keeps a
+        # partially-specified carrier from reaching `findsup`.
+        (C isa DataType && C <: CoDual) ||
+            return bail("Differ.build_ctx: every element must be a fully-specified `CoDual` type, " *
+                        "got `$(C)`")
+        push!(codualtys, C)
+    end
+    primal_tt = Tuple{(_codual_primal_type(C) for C in codualtys)...}
+    return _tape_codeinfo(world, argnames, codualtys, primal_tt)
+end
+
+# Shared tail of both `_build_tape` generators: given the carrier types (`fcd` first), read the tape
+# shape off the tape-allocating carrier's return type and return the `CodeInfo` that constructs one.
+# `primal_tt` is only ever used in error messages.
+function _tape_codeinfo(world::UInt, argnames, codualtys, @nospecialize(primal_tt))
+    bail(msg) = expr_to_codeinfo(@__MODULE__(), argnames, [], (), :(error($msg)), false)
+    interp = build_reverse_interp(; world)
     # Carrier layout is `reverse_fwds_impl(fcd, ctx, argcds...)`: fcd first, then `Ctx{Nothing}`
     # (tape-allocating mode — this only reads its return type), then the argument coduals.
-    primal_tt = Tuple{ftype,ArgsT.parameters...}
     impl_tt = Tuple{typeof(reverse_fwds_impl),codualtys[1],Ctx{Nothing},codualtys[2:end]...}
     match, _ = CC.findsup(impl_tt, CC.method_table(interp))
     match === nothing &&
@@ -4071,9 +4153,13 @@ end
 end
 
 function refresh_build_tape()
-    @eval function _build_tape(f, ArgsT, Inactive)
+    @eval function _build_tape(f, ArgsT, Positions)
         $(Expr(:meta, :generated_only))
         $(Expr(:meta, :generated, _build_tape_body))
+    end
+    @eval function _build_tape(CDs)
+        $(Expr(:meta, :generated_only))
+        $(Expr(:meta, :generated, _build_tape_cds_body))
     end
 end
 refresh_build_tape()
@@ -4097,7 +4183,7 @@ end
 # `rev_gradient` above calls `zero_fcodual` on `f` and every argument, allocating a fresh shadow per
 # call (for an `Array` argument: the shadow array itself). These variants instead take the caller's
 # own `CoDual`s, so the shadow buffers are owned and reused by the caller. Pair them with a
-# `build_ctx(...; prealloc=true)` context and a steady-state call allocates essentially nothing.
+# `build_ctx` context and a steady-state call allocates essentially nothing.
 #
 # The gradient w.r.t. an argument arrives one of two ways, decided by the argument's type, not by
 # this API:

@@ -101,6 +101,24 @@ mutable struct MPoint; x::Float64; y::Float64; end
         @test shadow_type(Vector{Float64}) === Union{Vector{Float64},Inactive}
         @test shadow_type(Float64) === Union{NoFData,Inactive}
 
+        # The mixed-activity tuple arm must not capture homogeneously-typed tuples: those keep the
+        # general entry point's aliasing/circular-reference cache. Uncached, a mutable tangent
+        # reachable through two slots is counted twice.
+        @test which(increment!!, Tuple{Tuple{Float64},Tuple{Float64}}).sig <: Tuple{Any,T,T} where {T<:Tuple}
+        let t = zero_tangent(MPoint(1.0, 2.0)), s = zero_tangent(MPoint(1.0, 2.0))
+            s.fields = (x = 1.0, y = 2.0)
+            @test increment!!((t, t), (s, s))[1].fields == (x = 1.0, y = 2.0)
+        end
+        let a = zero_tangent(MPoint(1.0, 2.0)), b = zero_tangent(MPoint(1.0, 2.0)),
+            s = zero_tangent(MPoint(1.0, 2.0))
+            s.fields = (x = 1.0, y = 2.0)
+            r = increment!!((a, b), (s, s))
+            @test r[1].fields == (x = 1.0, y = 2.0) && r[2].fields == (x = 1.0, y = 2.0)
+        end
+        # A genuinely mixed-activity tuple still goes structurally, slot by slot.
+        @test increment!!((1.0, Inactive()), (10.0, 5.0)) === (11.0, Inactive())
+        @test increment!!((Inactive(), 1.0), (5.0, 10.0)) === (Inactive(), 11.0)
+
         # Strong zero: absorbing in the accumulator slot, identity in the contribution slot.
         # Deliberately not commutative — slot 1 owns storage, slot 2 is a contribution.
         @test increment!!(Inactive(), 3.0) === Inactive()

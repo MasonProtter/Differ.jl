@@ -36,7 +36,7 @@ IR.
 - **Reverse**: `rrule!!(fcd::CoDual, ctx::AbstractCtx, argcds::CoDual...) -> (ycd, pullback)`, where
   **the pullback closure *is* the tape** — the derived path's `pullback` is literally a `Tape` value.
   `ctx` just holds that same `Tape` object *between calls* so it can be reused instead of reallocated
-  (`Ctx(nothing)` allocates fresh each call; `build_ctx(...; prealloc=true)` resets and hands back the
+  (`Ctx(nothing)` allocates fresh each call; `build_ctx` resets and hands back the
   cached one) — not a second tape. That's why `rrule!!` itself is stateless/reentrant while `Ctx` is
   single-use per task. `rrule!!` is a single generic function: hand-written primitives
   (`src/rrules.jl`) and a `@generated` derived fallback are both methods of it. A hand rule ignores
@@ -44,8 +44,10 @@ IR.
   hand-rule-vs-fallback dispatch unambiguous.
 - **Context**: `build_ctx(f, argtypes)` returns a `Ctx` wrapping a tape allocated once and reused
   (stacks reset) per call — the pre-allocated fast path (not reentrant/thread-safe, one per task).
-  `build_ctx(…; prealloc=false)` returns `Ctx()`, which allocates a fresh tape per call (also what
-  every recursive inner call and plain `gradient` use).
+  A bare `Ctx()` allocates a fresh tape per call instead (also what every recursive inner call and
+  plain `gradient` use). `build_ctx` also accepts the carriers directly — `build_ctx(fcd, argcds...)`
+  — or their types as one tuple, `build_ctx(Tuple{typeof(fcd),typeof.(argcds)...})`; both state
+  activity through the carriers' own shadow slots rather than an `inactive=` position list.
 - User-facing reverse entry points: `gradient(f, args...)` (allocates everything) and
   `gradient!`/`value_and_gradient!(ctx, fcd, argcds...)` (caller supplies both the context and each
   argument's shadow; a steady-state call allocates only the returned tuple).

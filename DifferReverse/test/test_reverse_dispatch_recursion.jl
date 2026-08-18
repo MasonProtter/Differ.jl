@@ -288,7 +288,6 @@ end
     @test err isa ErrorException
     @test occursin("is not a concrete DataType", err.msg)
     @test occursin("dyncallee", err.msg)
-    @test !occursin("prealloc=false", err.msg)
 end
 
 @testset "reverse mode: vararg primal" begin

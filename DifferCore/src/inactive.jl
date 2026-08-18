@@ -115,6 +115,13 @@ increment!!(::ZeroRData, ::Inactive) = ZeroRData()
                 (:(increment_internal!!(c, x[$n], y[$n])) for n in 1:fieldcount(x))...)
 end
 increment!!(x::Tuple, y::Tuple) = increment_internal!!(NoCache(), x, y)
+# Diagonal, so more specific than the arm above: a homogeneously-typed tuple is not a mixed-activity
+# one and keeps the general entry point's cache decision. Without this it would match `x::Tuple,
+# y::Tuple` instead of `increment!!(x::T, y::T)` — the sole place the aliasing/circular-reference
+# cache is chosen — and every tuple tangent would accumulate uncached, double-counting a mutable
+# tangent reachable through two slots.
+increment!!(x::T, y::T) where {T<:Tuple} =
+    increment_internal!!(_inc_cache(require_tangent_cache(T)), x, y)
 
 increment_rdata!!(::Inactive, @nospecialize(_)) = Inactive()
 increment_rdata!!(t, ::Inactive) = t

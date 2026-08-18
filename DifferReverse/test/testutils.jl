@@ -29,7 +29,7 @@ central_diff(f, x, y, k::Int; h=1e-6) =
     k == 1 ? (f(x+h, y) - f(x-h, y)) / 2h : (f(x, y+h) - f(x, y-h)) / 2h
 
 # `code_reverse_fwds_ircode`/`code_reverse_pullback_ircode` inspect the tape-*allocating* carrier
-# shape (`Ctx{Nothing}`). A `build_ctx(...; prealloc=true)` context compiles a different prologue
+# shape (`Ctx{Nothing}`). A `build_ctx` context compiles a different prologue
 # (reads the caller's stacks out of the ctx and resets them), so it needs its own check.
 function checkverify_prealloc(f, at; inactive=())
     ctx = build_ctx(f, at; inactive)
@@ -98,7 +98,7 @@ _assert_tuple_balanced(t::Tuple, seen) = foreach(v -> v isa DifferReverse.Tape &
 # full rule+pullback round trip. The pullback *is* the tape, so this just calls it and confirms
 # every `Stack`'s `position` is back to 0, recursively into any recycled inner tape.
 #
-# Doubly load-bearing since a `build_ctx(...; prealloc=true)` context *reuses* its tape across
+# Doubly load-bearing since a `build_ctx` context *reuses* its tape across
 # calls: balance is what makes reuse correct, so this also runs each case twice through one
 # pre-allocated context and checks the answers agree.
 #
@@ -106,7 +106,7 @@ _assert_tuple_balanced(t::Tuple, seen) = foreach(v -> v isa DifferReverse.Tape &
 # tuple-valued `f`). That also skips the pre-allocated half below, which reaches the pullback
 # through `rev_gradient!` and so seeds with `one(y)` itself.
 function check_stack_balance(f, args...; seed=nothing)
-    ctx = build_ctx(f, map(DifferReverse._typeof, args); prealloc=false)
+    ctx = Ctx()
     fcd, argcds = zero_fcodual(f), map(zero_fcodual, args)
     ycd, pb = rrule!!(fcd, ctx, argcds...)
     pb(seed === nothing ? one(DifferReverse.primal(ycd)) : seed)
@@ -130,7 +130,7 @@ end
 # traffic (a real data-dependent branch or loop) — a regression guard against the optimization
 # over-firing.
 function check_block_stack_traffic(f, args...; expect_zero::Bool)
-    ctx = build_ctx(f, map(DifferReverse._typeof, args); prealloc=false)
+    ctx = Ctx()
     fcd, argcds = zero_fcodual(f), map(zero_fcodual, args)
     ycd, pb = rrule!!(fcd, ctx, argcds...)
     pb(one(DifferReverse.primal(ycd)))

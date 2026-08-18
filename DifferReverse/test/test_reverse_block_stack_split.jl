@@ -230,7 +230,7 @@ end
         ocd = CoDual(o, d)
         fcd = zero_fcodual(memloop!)
         xcd = zero_fcodual(3.0)
-        ctx = build_ctx(memloop!, (Memory{Float64}, Float64, Int); prealloc=false)
+        ctx = Ctx()
         y, pb = rrule!!(fcd, ctx, ocd, xcd, zero_fcodual(N))
         pb(NoRData())
         @test pb.block_stack.position == 0
