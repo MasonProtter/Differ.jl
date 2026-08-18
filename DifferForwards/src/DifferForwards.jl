@@ -45,6 +45,8 @@ include("rules_linalg.jl")
 include("reflection.jl")
 include("adtypes.jl")
 
+export DifferCore
+
 export Dual, primal, tangent, NoTangent, frule!!
 export code_dual_ircode, @code_dual_ircode
 export tangent_type, fdata_type, rdata_type

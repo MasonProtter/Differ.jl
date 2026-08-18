@@ -8,11 +8,12 @@ A primal value paired with its shadow. `Tdx` is one of:
 
 - `fdata_type(tangent_type(Tx))` — the ordinary active carrier, built by [`fcodual_type`](@ref);
 - `tangent_type(Tx)` — the full-tangent flavour, built by [`codual_type`](@ref);
-- `Inactive` — the value is *held constant*: no derivative is propagated to or from it.
+- [`Inactive`](@ref) — the value is *held constant*: no derivative is propagated to or from it.
 
-The third case is what `isactive` tests, and it is decidable from `Tdx` alone. That is why it is
-`Inactive` rather than `NoTangent`: an active `Float64`'s shadow is `NoFData()`, so an empty fdata
-cannot mean "constant", and `NoTangent` is already the tangent of a type with no tangent space.
+The third case is what [`isactive`](@ref) tests, and it is decidable from `Tdx` alone. That is why
+it is `Inactive` rather than `NoTangent`: an active `Float64`'s shadow is `NoFData()`, so an empty
+fdata cannot mean "constant", and `NoTangent` is already the tangent of a type with no tangent
+space.
 
 Marking an argument constant is a promise about aliasing: an inactive value must not share memory
 with an active one, and an active value must not be stored into an inactive container. Neither is

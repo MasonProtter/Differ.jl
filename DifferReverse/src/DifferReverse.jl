@@ -80,6 +80,8 @@ Selects Differ's reverse mode for DifferentiationInterface.jl. Method implementa
 struct AutoDifferReverse <: ADTypes.AbstractADType end
 ADTypes.mode(::AutoDifferReverse) = ADTypes.ReverseMode()
 
+export DifferCore
+
 export CoDual, primal, tangent, NoTangent, Inactive, rrule!!
 export AbstractCtx, Ctx, build_ctx
 export value_and_gradient!, zero_fcodual
@@ -94,6 +96,6 @@ export as_tangent, unit_tangent
 export isactive, @ifactive
 export AutoDifferReverse
 
-public rev_gradient, rev_gradient!
+public rev_gradient, rev_gradient!, fcodual_type, codual_type
 
 end # module DifferReverse

@@ -24,6 +24,8 @@ using DifferReverse
 # declaration below has a real binding behind it.
 using DifferReverse: rev_gradient, rev_gradient!
 
+export DifferCore, DifferForwards, DifferReverse
+
 # Carriers and the forward-mode entry points.
 export Dual, CoDual, primal, tangent, NoTangent, Inactive, frule!!
 export code_dual_ircode, @code_dual_ircode
