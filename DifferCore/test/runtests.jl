@@ -7,6 +7,7 @@ using DifferCore
 using DifferCore: tangent_type, fdata_type, rdata_type, fdata, rdata, tangent, zero_tangent, increment!!
 using DifferCore: Tangent, MutableTangent, NoFData, NoRData, build_tangent
 using DifferCore: NoTangent, require_tangent_cache
+using DifferCore: Inactive, shadow_type, isactive, set_to_zero!!, increment_rdata!!, ZeroRData
 
 struct Point; x::Float64; y::Float64; end
 mutable struct MPoint; x::Float64; y::Float64; end
@@ -81,5 +82,64 @@ mutable struct MPoint; x::Float64; y::Float64; end
         v = [Point(1.0, 2.0), Point(3.0, 4.0)]
         zt = zero_tangent(v)
         @test zt == [zero_tangent(Point(1.0, 2.0)), zero_tangent(Point(3.0, 4.0))]
+    end
+
+    @testset "Inactive" begin
+        @test Base.issingletontype(Inactive) && sizeof(Inactive) == 0
+
+        @test !isactive(Inactive())
+        @test isactive(NoFData())        # an active scalar's shadow — not inactivity
+        @test isactive(NoTangent())      # "no tangent space" is a different claim
+
+        # `Inactive` survives the fdata/rdata split, which is what `NoTangent` cannot do.
+        @test fdata_type(Inactive) === Inactive
+        @test rdata_type(Inactive) === Inactive
+        @test fdata(Inactive()) === Inactive()
+        @test rdata(Inactive()) === Inactive()
+        @test tangent(Inactive(), Inactive()) === Inactive()
+
+        @test shadow_type(Vector{Float64}) === Union{Vector{Float64},Inactive}
+        @test shadow_type(Float64) === Union{NoFData,Inactive}
+
+        # Strong zero: absorbing in the accumulator slot, identity in the contribution slot.
+        # Deliberately not commutative — slot 1 owns storage, slot 2 is a contribution.
+        @test increment!!(Inactive(), 3.0) === Inactive()
+        @test increment!!(3.0, Inactive()) === 3.0
+        @test increment!!(Inactive(), Inactive()) === Inactive()
+        let a = [1.0, 2.0]
+            @test increment!!(a, Inactive()) === a && a == [1.0, 2.0]
+            @test increment!!(Inactive(), a) === Inactive() && a == [1.0, 2.0]
+        end
+
+        # `ZeroRData` is the additive identity, so it keeps its own accumulator's meaning.
+        @test increment!!(Inactive(), ZeroRData()) === Inactive()
+        @test increment!!(ZeroRData(), Inactive()) === ZeroRData()
+
+        @test increment_rdata!!(Inactive(), 3.0) === Inactive()
+        @test increment_rdata!!(3.0, Inactive()) === 3.0
+        @test set_to_zero!!(Inactive()) === Inactive()
+
+        # `NoTangent` stays strict: no absorbing arm, so an analysis bug surfaces as a
+        # `MethodError` rather than a silently dropped gradient.
+        @test_throws MethodError increment!!(NoTangent(), 3.0)
+        @test_throws MethodError increment!!(3.0, NoTangent())
+
+        # Aggregates compose: a mixed tuple is an ordinary concrete tangent, and the
+        # `tangent(fdata(t), rdata(t)) === t` round-trip still holds through it.
+        let t = (1.0, Inactive())
+            @test fdata_type(typeof(t)) === Tuple{NoFData,Inactive}
+            @test rdata_type(typeof(t)) === Tuple{Float64,Inactive}
+            @test fdata(t) === (NoFData(), Inactive())
+            @test rdata(t) === (1.0, Inactive())
+            @test tangent(fdata(t), rdata(t)) === t
+            @test increment!!(t, (2.0, Inactive())) === (3.0, Inactive())
+        end
+
+        # An inactive slot costs nothing in an aggregate.
+        @test sizeof(Tuple{Vector{Float64},Inactive}) == sizeof(Tuple{Vector{Float64}})
+
+        # Any shadow is valid fdata/rdata for any primal once it is declared inactive.
+        @test DifferCore.verify_fdata_type(Vector{Float64}, Inactive) === nothing
+        @test DifferCore.verify_rdata_type(Float64, Inactive) === nothing
     end
 end

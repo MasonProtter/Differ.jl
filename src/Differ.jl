@@ -25,7 +25,7 @@ using DifferReverse
 using DifferReverse: rev_gradient, rev_gradient!
 
 # Carriers and the forward-mode entry points.
-export Dual, CoDual, primal, tangent, NoTangent, frule!!
+export Dual, CoDual, primal, tangent, NoTangent, Inactive, frule!!
 export code_dual_ircode, @code_dual_ircode
 
 # Reverse-mode entry points.

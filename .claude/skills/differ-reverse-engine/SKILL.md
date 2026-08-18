@@ -343,7 +343,15 @@ several chains, returning a `BitVector` indexed by SSA id (arguments are checked
   `getfield(::MemoryRef, :ptr_or_offset)` would otherwise be marked tracked with no `_get_fdata_field`
   method to serve it (ISSUES #87).
 - **`Core.PhiNode`**: tracked iff `fdtype(iworld, Ti) !== NoFData` (the phi's own inferred type carries
-  fdata) and every edge value is assigned and itself tracked. A branch-merged or loop-carried array/
+  fdata) and every edge value is assigned and either itself tracked **or** an inactive bare
+  `Core.Argument` (`phi_inactive_edge`). A merge with one constant edge is active — any active edge
+  makes it so — and normalises to its own primal-derived shadow type, so the constant arm is served by
+  a zero the fwds builder hoists into the entry block, keyed `(phi, edge)`: per *edge*, since
+  `sresolve` still serves every other one, and hoisted because a phi must lead its block and a
+  loop-carried merge would otherwise rebuild the zero every iteration. The restriction to a bare
+  `Core.Argument` is what keeps this declaration and that emission in sync by construction. This is the
+  shape `Broadcast.unalias` produces for a constant array operand, so `sum(v .* w)` with either operand
+  held constant works (ISSUES #117). A branch-merged or loop-carried array/
   mutable-struct binding is exactly this shape — the construct that blocked `sum(v .+ v)` before ISSUES
   #86 (the broadcast loop reads its accumulator through a phi).
 - **`%new` of an immutable struct**: tracked (not a root by itself, unlike the mutable case below) iff
@@ -376,19 +384,30 @@ was added to handle, and this specific shape of it still isn't reachable.
 
 ## `_activity`: constant arguments
 
-`NoTangent` in a `CoDual`'s shadow slot means the caller declared that value **constant**:
-`CoDual(x, NoTangent())`. This is a third flavour of the carrier alongside `fcodual_type`'s fdata form
-and `codual_type`'s full-tangent form, and it needs no new type — for a differentiable `P`,
-`CoDual{P,NoTangent}` was simply an unused encoding, and `CoDual` has no inner constructor to relax
-(unlike `Dual`, which enforces `tangent_type(P) == T` and will have to be loosened before forward mode
-can carry one). `isactive(dx) = !isa(dx, NoTangent)` and `@ifactive(dx, expr)` (`DifferCore`) are the
-rule-author predicates. **`isactive` is not decidable from the fdata type**: an active `Float64`'s
-shadow is `NoFData()`, since a scalar's whole tangent is rdata.
+`Inactive` in a `CoDual`'s shadow slot means the caller declared that value **constant**:
+`CoDual(x, Inactive())`. This is a third flavour of the carrier alongside `fcodual_type`'s fdata form
+and `codual_type`'s full-tangent form. `CoDual` has no inner constructor to relax (unlike `Dual`,
+which enforces `tangent_type(P) == T` and will have to be loosened before forward mode can carry one).
+`isactive(dx) = !isa(dx, Inactive)` and `@ifactive(dx, expr)` (`DifferCore/src/inactive.jl`) are the
+rule-author predicates, and unlike the old `NoTangent` encoding **`isactive` is decidable from the
+shadow type in every position** — see `differ-tangent-system` for why `NoTangent` could not do this
+job (its fdata is `NoFData`, which is also an active `Float64`'s).
 
 Activity is **type-level at function boundaries, a dataflow analysis inside a function**. Because the
 `@generated` `rrule!!` fallback keys on the `CoDual` argument types, each activity signature gets its
 own carrier, `Tape` type and `CodeInstance` for free; `Tape{ArgsTT,CS}`'s `ArgsTT` is what lets the
 pullback carrier recover the same seed the fwds carrier used, so the two agree with no extra channel.
+Mixed-activity aggregates are expressible because `Inactive` composes: a `Core.tuple` built from one
+active and one constant operand has shadow type `Tuple{Vector{Float64},Inactive}` — concrete, one word
+narrower than the primal-derived type, and with no slot to allocate a zero into. `_shadow_types(pir,
+iworld, n, arg_active, codualparams)` (beside `_activity`) computes the type each SSA's shadow is
+*actually* declared at, and `_shadow_type_of` answers the same for an arbitrary operand node (an
+argument's is exactly its codual's fdata type). **Emission must use `ctx.sty`, never `ctx.fdtype`,
+wherever it types a shadow read off an operand** — today that is `Core.tuple`'s construction,
+`Core.getfield`'s two shadow reads, and the returned `CoDual`'s own type. A single forward pass, not a
+fixpoint: a non-phi operand dominates its use, and a `PhiNode` is pinned to its own primal-derived
+type, so no mixed type is ever carried around a loop.
+
 Inside a function there are no intermediate `CoDual`s, so `_activity(pir, iworld, n, codualparams)`
 returns a `BitVector` over SSA ids — a monotone least-fixpoint scan of exactly the same shape as
 `_fdata_tracked`, and for the same reason (loop-carried phis). Its conservatism runs the *other* way,
@@ -427,9 +446,10 @@ literal.
 
 **Aliasing is a user obligation**, as in Enzyme: an inactive value must not share memory with an active
 one, and that is not checkable here. The one statically detectable case — writing an active value into
-an inactive container — is a located bail, never a silent zero. Deliberately, there is **no** absorbing
-`increment_internal!!(::NoTangent, x)` arm: its absence is what turns an analysis bug into a
-`MethodError` instead of a dropped gradient. Do not add one as a convenience.
+an inactive container — is a located bail, never a silent zero. `Inactive` absorbs by definition
+(`increment!!(Inactive(), y) === Inactive()`), but **`NoTangent` keeps no absorbing arm**: its absence
+is what turns an analysis bug into a `MethodError` instead of a dropped gradient, and a mis-analysed
+active value still lands on `NoTangent`, not on `Inactive`. Do not add one as a convenience.
 
 Entry points take `inactive=(positions...)` (1-based, arguments only, not `f`): `build_ctx`,
 `tape_type`, `code_reverse_fwds_ircode`, `code_reverse_pullback_ircode`. See ISSUES #112, and

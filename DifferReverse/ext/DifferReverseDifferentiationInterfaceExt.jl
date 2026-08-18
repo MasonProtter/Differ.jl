@@ -2,7 +2,7 @@ module DifferReverseDifferentiationInterfaceExt
 
 import DifferentiationInterface as DI
 using DifferReverse: DifferReverse, AutoDifferReverse, CoDual, primal, tangent, rrule!!, Ctx, build_ctx,
-    zero_fcodual, set_to_zero!!, ZeroRData, zero_rdata, fdata, rdata, increment!!, NoTangent
+    zero_fcodual, set_to_zero!!, ZeroRData, zero_rdata, fdata, rdata, increment!!, Inactive
 
 DI.check_available(::AutoDifferReverse) = true
 
@@ -32,7 +32,7 @@ _di_out_copy(y) = y
 # Only `DI.Constant` maps to an inactive `CoDual` — not `Cache` (its own docstring example writes an
 # *active* argument into it), not `ConstantOrCache` (conservatively active), not `FunctionContext`
 # (may carry a function with differentiable captures). Never dispatch on `GeneralizedConstant`.
-_ctx_codual(c::DI.Constant) = CoDual(DI.unwrap(c), NoTangent())
+_ctx_codual(c::DI.Constant) = CoDual(DI.unwrap(c), Inactive())
 _ctx_codual(c::DI.Context) = zero_fcodual(DI.unwrap(c))
 
 # Context positions among `build_ctx`'s `inactive=` argument list: `offset` is 1 for the one-arg

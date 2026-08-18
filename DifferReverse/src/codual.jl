@@ -8,10 +8,11 @@ A primal value paired with its shadow. `Tdx` is one of:
 
 - `fdata_type(tangent_type(Tx))` — the ordinary active carrier, built by [`fcodual_type`](@ref);
 - `tangent_type(Tx)` — the full-tangent flavour, built by [`codual_type`](@ref);
-- `NoTangent` — the value is *held constant*: no derivative is propagated to or from it.
+- `Inactive` — the value is *held constant*: no derivative is propagated to or from it.
 
-The third case is what `isactive` tests. It is not the same as an empty fdata: an active `Float64`'s
-shadow is `NoFData()`, since a scalar's whole tangent is rdata.
+The third case is what `isactive` tests, and it is decidable from `Tdx` alone. That is why it is
+`Inactive` rather than `NoTangent`: an active `Float64`'s shadow is `NoFData()`, so an empty fdata
+cannot mean "constant", and `NoTangent` is already the tangent of a type with no tangent space.
 
 Marking an argument constant is a promise about aliasing: an inactive value must not share memory
 with an active one, and an active value must not be stored into an inactive container. Neither is
@@ -40,6 +41,10 @@ end
 
 function CoDual(x::Type{P}, dx::NoTangent) where {P}
     return CoDual{@isdefined(P) ? Type{P} : typeof(x),NoTangent}(P, dx)
+end
+
+function CoDual(x::Type{P}, dx::Inactive) where {P}
+    return CoDual{@isdefined(P) ? Type{P} : typeof(x),Inactive}(P, dx)
 end
 
 primal(x::CoDual) = x.x
@@ -134,7 +139,8 @@ to_fwds(x::CoDual{Type{P}}) where {P} = CoDual{Type{P},NoFData}(primal(x), NoFDa
 
 # No `NoTangent` arm: `zero_codual` yields `CoDual{P,NoTangent}` for every primal whose own
 # `tangent_type` is `NoTangent`, and converting those to `NoFData` is exactly this function's job. An
-# inactive carrier is built by the caller, already in fdata form, and never routed through here.
+# inactive carrier (`Inactive` shadow) is built by the caller, already in fdata form, and never
+# routed through here.
 
 """
     zero_fcodual(x)

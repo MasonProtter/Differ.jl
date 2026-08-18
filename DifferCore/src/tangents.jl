@@ -14,17 +14,6 @@ You might need to use this for `primitive type`s though.
 struct NoTangent end
 
 """
-    isactive(dx)
-
-Whether the shadow `dx` carries a derivative. `false` exactly for `NoTangent()`, which a carrier
-(`Dual`/`CoDual`) uses in its shadow slot to mean "this value is held constant".
-
-Not decidable from the shadow's type alone in general — an active `Float64` shadow is `NoFData()`,
-since a scalar's whole tangent is rdata. Only `NoTangent` marks inactivity.
-"""
-isactive(@nospecialize dx) = !isa(dx, NoTangent)
-
-"""
     PossiblyUninitTangent{T}
 
 Represents a `T` that may or may not be present. Does not distinguish between zero and

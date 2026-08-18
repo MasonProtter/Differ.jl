@@ -219,13 +219,13 @@ function apply_builtin_rrule_fwds!(::Val{Core.getfield}, actual, Ti, ctx)
         if (P isa DataType && P <: Array) || !_bi_literal_index(actual[2])
             # Array shadow, or a homogeneous fdata-tuple's own dynamic-index shadow (both a plain
             # `getfield` at `ctx.fdtype(Ti)` — homogeneity makes the result type static).
-            shadow = ctx.emit!(Expr(:call, _getfieldg, ctx.sresolve(obj), ctx.presolve(actual[2])), ctx.fdtype(Ti))
+            shadow = ctx.emit!(Expr(:call, _getfieldg, ctx.sresolve(obj), ctx.presolve(actual[2])), ctx.sty(ctx.ssa))
         else
             # General struct, literal index: pull the field's fdata out of the object's fdata
             # handle, covering an `FData`-wrapped immutable struct and a raw `MutableTangent`
             # uniformly.
             fname = _bi_fieldname(actual[2])
-            shadow = ctx.icall!(_rr_get_fdata_field, ctx.fdtype(Ti), (ctx.fdtype(P), typeof(fname)),
+            shadow = ctx.icall!(_rr_get_fdata_field, ctx.sty(ctx.ssa), (ctx.sty(obj), typeof(fname)),
                                 ctx.sresolve(obj), actual[2])
         end
     end
@@ -331,14 +331,19 @@ function apply_builtin_rrule_fwds!(::Val{Core.tuple}, actual, Ti, ctx)
     shadow = nothing
     if _bi_tracked(ctx.ssa, ctx)
         T = _widen(Ti)
-        FT = ctx.fdtype(T)
+        # `ctx.sty`, not `ctx.fdtype`: an inactive operand's slot is declared `Inactive`, so the
+        # shadow tuple's type is not the primal-derived one.
+        FT = ctx.sty(ctx.ssa)
         shadow = ctx.emit!(Expr(:call, _ctupleg,
                      (begin
                           FTj = ctx.fdtype(fieldtype(T, j))
                           if FTj === NoFData
                               NoFData()
                           elseif ctx.inactive(actual[j])
-                              ctx.icall!(_rr_zero_fdata, FTj, (fieldtype(T, j),), ctx.presolve(actual[j]))
+                              # Nothing to synthesise: `Inactive` is zero-size and absorbs whatever
+                              # is accumulated into it, so the slot costs neither an allocation nor
+                              # a word of storage.
+                              Inactive()
                           else
                               ctx.sresolve(actual[j])
                           end

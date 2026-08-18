@@ -7,7 +7,7 @@ using LinearAlgebra: dot
 import DifferentiationInterface as DI
 include("testutils.jl")
 
-# Declaring an argument constant: `NoTangent` in a `CoDual`'s shadow slot. Activity propagates from
+# Declaring an argument constant: `Inactive` in a `CoDual`'s shadow slot. Activity propagates from
 # there through the primal IR, so anything reached only through a constant is replayed primally
 # instead of differentiated.
 
@@ -42,7 +42,7 @@ end
     g(x, y) = x * y
     fcd = zero_fcodual(g)
     ycd = const_codual(3.0)
-    @test tangent(ycd) === NoTangent()
+    @test tangent(ycd) === Inactive()
     @test rrule!!(fcd, Ctx(), CoDual(2.0, NoFData()), ycd)[2](1.0) == (NoRData(), 3.0, NoRData())
 end
 
@@ -70,10 +70,11 @@ end
     y1, g1 = value_and_gradient!(ctx, fcd, vcd, wcd)
     y2, g2 = value_and_gradient!(ctx, fcd, vcd, wcd)
     @test y1 == y2 == floop(v, w)
-    @test g1 == g2 == (NoTangent(), w, NoTangent())
+    @test g1 == g2 == (NoTangent(), w, Inactive())
 
-    # The constant slot reconstructs to `NoTangent()`, not a zero array.
-    @test g1[3] === NoTangent()
+    # The constant slot reconstructs to `Inactive()` — distinct both from a zero array and from
+    # the `NoTangent()` a genuinely non-differentiable argument would give.
+    @test g1[3] === Inactive()
 end
 
 @testset "activity: matches the full gradient's corresponding slot" begin
@@ -175,7 +176,7 @@ end
 
 @testset "activity: a constant vararg-tail element bails instead of miscompiling" begin
     # A vararg primal's trailing arguments all land in one packed tail slot, always typed as the
-    # active fdata carrier. A constant trailing argument used to sneak a `NoTangent()` value into that
+    # active fdata carrier. A constant trailing argument used to sneak an `Inactive()` value into that
     # slot and produce a `TypeError`; it must now be a located bail.
     vasum(vs...) = sum(vs[1])
     v = [1.0, 2.0, 3.0]
@@ -229,9 +230,11 @@ end
     cut = comms_element_types(tape_type(f, (Vector{Float64}, Vector{Float64}); inactive=(2,)))
     @test sum(fieldcount, full) > sum(fieldcount, cut)
 
-    # Mode A (both-`NoTangent`) gains its first direct test: unaffected by the third mode.
+    # Mode A (both-`NoTangent`) gains its first direct test: unaffected by the third mode. Note
+    # the *ordinary active* carrier — `Vector{Int}` reaches mode A because its element type has no
+    # tangent space, which is a different claim from declaring the argument constant.
     fA(x) = sum(copy(x))
-    y2, pb2 = rrule!!(zero_fcodual(fA), Ctx(), CoDual([1, 2, 3], NoTangent()))
+    y2, pb2 = rrule!!(zero_fcodual(fA), Ctx(), zero_fcodual([1, 2, 3]))
     @test primal(y2) == 6
     @test pb2(1.0) == (NoRData(), NoRData())
     checkverify_rev(fA, (Vector{Int},))
@@ -265,7 +268,7 @@ end
     @test gc ≈ w
 end
 
-@testset "activity: Core.tuple synthesises a zero for an inactive operand" begin
+@testset "activity: Core.tuple builds no shadow for an inactive operand" begin
     # `(v, w)` survives optimization as a literal `Core.tuple` when returned directly (SROA otherwise
     # eliminates an immediately-destructured tuple, which would test nothing).
     tuple_pair(v, w) = (v, w)
@@ -273,15 +276,28 @@ end
     dv = zeros(3)
     y, pb = rrule!!(zero_fcodual(tuple_pair), Ctx(), CoDual(copy(v), dv), const_codual(w))
     @test primal(y) == (v, w)
-    # The inactive slot's shadow is a real (synthesised), unaliased zero array — not a crash, not the
-    # active slot's own shadow.
+    # The inactive slot holds `Inactive()`, not a synthesised zero: the shadow tuple's type is
+    # narrower than the primal-derived one, so there is no slot to allocate into.
     @test tangent(y)[1] === dv
-    @test tangent(y)[2] == zeros(3) && tangent(y)[2] !== dv
+    @test tangent(y)[2] === Inactive()
+    @test typeof(tangent(y)) === Tuple{Vector{Float64},Inactive}
 
+    # Seeding still works even though the caller builds its seed from the primal type and it is
+    # therefore wider than the shadow: accumulation is structural, and the inactive slot discards.
     increment!!(tangent(y), (ones(3), ones(3)))
     @test dv == ones(3)   # flows through the aliased slot
     @test pb(NoRData()) == (NoRData(), NoRData(), NoRData())
     @test dv == ones(3)   # the inactive slot's increment went nowhere — no leak, no crash
+
+    # Gone from the carrier, not merely unused.
+    ir = code_reverse_fwds_ircode(tuple_pair, (Vector{Float64}, Vector{Float64}); inactive=(2,))[1]
+    @test !occursin("_rr_zero_fdata", string(ir))
+
+    # Destructuring a mixed tuple reads the constant slot back out as `Inactive`, so a consumer
+    # downstream of the aggregate still types correctly.
+    destructure(a, b) = (t = (a, b); sum(t[1]) + sum(t[2]))
+    @test rev_gradient(destructure, [1.0, 2.0], [3.0, 4.0]) == (NoTangent(), ones(2), ones(2))
+    checkverify_rev(destructure, (Vector{Float64}, Vector{Float64}); inactive=(2,))
 
     checkverify_rev(tuple_pair, (Vector{Float64}, Vector{Float64}); inactive=(2,))
     check_stack_balance(tuple_pair, copy(v), copy(w); seed=NoRData())
@@ -329,29 +345,45 @@ end
     check_stack_balance(stale_field, copy(av), copy(cv))
 end
 
-@testset "activity: broadcast through a constant array still bails (phi gap, not yet fixed)" begin
-    # This is the real-world instance of verification point 3 (an active-but-untraceable operand must
-    # still bail, gated on activity not trackedness) — no synthetic construction needed. `.`-broadcast's
-    # `Broadcast.unalias` builds a `PhiNode` merging one inactive edge (the untouched constant argument)
-    # with one active, tracked edge (the memmove-copied buffer); the merged value is therefore ACTIVE
-    # (any tracked incoming edge makes a phi active) but `_fdata_tracked`'s `PhiNode` arm still requires
-    # *every* edge tracked, so it comes out untracked — exactly the shape this whole feature has to keep
-    # bailing on. Had the fix at any of the four sites relaxed on trackedness instead of activity, a
-    # case shaped like this one would have silently gone through with a wrong (too-small) gradient
-    # instead of raising this error.
-    #
-    # Regression pin, not a design choice: if this starts passing, `_fdata_tracked`'s `PhiNode` arm
-    # (and the fwds carrier's phi-shadow-merge codegen) has been taught about `ctx.inactive` — a
-    # deliberate future fix, not a regression. Revisit this test (and its framing above) when that
-    # lands; it is not meant to hold as a permanent invariant.
+@testset "activity: broadcast through a constant array" begin
+    # `.`-broadcast's `Broadcast.unalias` builds a `PhiNode` merging one inactive edge (the untouched
+    # constant argument) with one active, tracked edge (the memmove-copied buffer). The merge is
+    # active — any active edge makes it so — and normalises to its own primal-derived shadow type, so
+    # the inactive arm is served by a zero hoisted into the entry block rather than by a shadow that
+    # was never built.
     f(v, w) = sum(v .* w)
-    err = try
-        rrule!!(zero_fcodual(f), Ctx(), CoDual([1.0, 2.0, 3.0], zeros(3)), const_codual([4.0, 5.0, 6.0]))
-        nothing
-    catch e
-        e
+    v, w = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
+    full = rev_gradient(f, v, w)
+
+    for inact in (1, 2)
+        ctx = build_ctx(f, (Vector{Float64}, Vector{Float64}); inactive=(inact,))
+        d1 = inact == 1 ? Inactive() : zeros(3)
+        d2 = inact == 2 ? Inactive() : zeros(3)
+        y, g = value_and_gradient!(ctx, zero_fcodual(f), CoDual(v, d1), CoDual(w, d2))
+        @test y == f(v, w)
+        @test g[1] === NoTangent()
+        # Whatever is differentiated agrees with the all-active run; the constant slot is `Inactive`.
+        @test g[inact + 1] === Inactive()
+        other = inact == 1 ? 3 : 2
+        @test g[other] ≈ full[other]
+        checkverify_rev(f, (Vector{Float64}, Vector{Float64}); inactive=(inact,))
     end
-    @test err isa ErrorException
+
+    # A loop-carried merge, run well past 2 iterations: a per-edge change to the phi has to survive
+    # the block-stack replay, which N=0/1 would not exercise (see ISSUES #52).
+    function floop(v, w)
+        s = 0.0
+        for k in 1:4
+            s += sum(v .* w) * k
+        end
+        return s
+    end
+    ctx = build_ctx(floop, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    y, g = value_and_gradient!(ctx, zero_fcodual(floop), CoDual(v, zeros(3)), CoDual(w, Inactive()))
+    @test y == floop(v, w)
+    @test g[2] ≈ rev_gradient(floop, v, w)[2]
+    @test g[3] === Inactive()
+    checkverify_rev(floop, (Vector{Float64}, Vector{Float64}); inactive=(2,))
 end
 
 # Intrinsic operand *primal recording* is per-contribution: an operand whose rdata contribution has
@@ -475,7 +507,7 @@ end
 end
 
 # A nested call into a hand-ruled function with a constant argument keeps the closed-form rule: the
-# engine passes a `CoDual{P,NoTangent}` through instead of bailing on untraceable provenance.
+# engine passes a `CoDual{P,Inactive}` through instead of bailing on untraceable provenance.
 
 @testset "activity: nested hand rule with a constant argument" begin
     f(v, w) = dot(v, w)
@@ -484,7 +516,7 @@ end
     y, dvout = value_and_gradient!(build_ctx(f, (Vector{Float64}, Vector{Float64}); inactive=(2,)),
                                     zero_fcodual(f), CoDual(v, dv), const_codual(w))
     @test y == dot(v, w)
-    @test dvout == (NoTangent(), w, NoTangent())
+    @test dvout == (NoTangent(), w, Inactive())
     @test dv == w
     checkverify_rev(f, (Vector{Float64}, Vector{Float64}); inactive=(2,))
 

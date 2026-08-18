@@ -15,7 +15,7 @@ import Contextual: build_contextual_ir
 # Any name DifferReverse adds new methods to (not just calls) must come in via `import`, not bare
 # `using DifferCore`/`using DifferCore: name` — otherwise it either errors ("must be explicitly
 # imported to be extended") or silently creates a disconnected same-named local function.
-import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangent, MutableTangent,
+import DifferCore: DifferCore, NoTangent, Inactive, NoFData, NoRData, FData, RData, Tangent, MutableTangent,
     PossiblyUninitTangent, tangent_type, fdata_type, rdata_type,
     zero_tangent, zero_rdata, randn_tangent, increment!!, set_to_zero!!,
     build_tangent, get_tangent_field, set_tangent_field!,
@@ -80,7 +80,7 @@ Selects Differ's reverse mode for DifferentiationInterface.jl. Method implementa
 struct AutoDifferReverse <: ADTypes.AbstractADType end
 ADTypes.mode(::AutoDifferReverse) = ADTypes.ReverseMode()
 
-export CoDual, primal, tangent, NoTangent, rrule!!
+export CoDual, primal, tangent, NoTangent, Inactive, rrule!!
 export AbstractCtx, Ctx, build_ctx
 export value_and_gradient!, zero_fcodual
 export code_reverse_fwds_ircode, @code_reverse_fwds_ircode

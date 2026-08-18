@@ -18,13 +18,14 @@ in `differ-forward-dualization` and `differ-reverse-engine` (not yet written).
 ## File map (`DifferCore/src/`)
 
 Include order, from `DifferCore.jl`: `tangent_utils.jl` → `tangents.jl` → `fwds_rvs_data.jl` →
-`array_tangents.jl` → `shared_ir_helpers.jl`.
+`inactive.jl` → `array_tangents.jl` → `shared_ir_helpers.jl`.
 
 | File | Contents |
 |---|---|
 | `tangent_utils.jl` | Generic helpers the port needs: `@foldable`, `_typeof`, `tuple_map`, `tuple_fill`, `_findall`, `stable_all`, `_map`, `_map_if_assigned!`, `always_initialised`/`is_always_initialised`/`is_always_fully_initialised`, `_new_`, boxed-error printing, base `_copy` methods. |
 | `tangents.jl` | `NoTangent`, `PossiblyUninitTangent`, `Tangent`, `MutableTangent`, `tangent_type(P)`, `zero_tangent`/`randn_tangent`/`increment!!`/`set_to_zero!!`/`_scale`/`_dot`/`_add_to_primal`, `build_tangent`/`get_tangent_field`/`set_tangent_field!`, `as_tangent`/`unit_tangent`, `tangent_to_primal!!`/`primal_to_tangent!!`, `require_tangent_cache`. |
 | `fwds_rvs_data.jl` | The fdata/rdata split: `NoFData`/`FData`/`NoRData`/`RData`, `fdata_type`/`rdata_type`, `fdata`/`rdata`/`tangent(f,r)`, `zero_rdata`/`LazyZeroRData`/`ZeroRData`. |
+| `inactive.jl` | `Inactive` (a value held constant), `shadow_type`, `isactive`/`@ifactive`, and the `Inactive` arms of every operation above. Included after the two files it extends. |
 | `array_tangents.jl` | Element-wise `Array` tangent *value* ops (`zero_tangent_internal`, `increment_internal!!`, etc. specialised to `Array`). |
 | `shared_ir_helpers.jl` | Small, mode-agnostic IR-inspection helpers used by both `DifferForwards` and `DifferReverse`'s own dualization/pullback engines. No tangent-system logic of its own. |
 
@@ -38,7 +39,70 @@ Exports: `tangent_type`, `fdata_type`, `rdata_type`; `Tangent`, `MutableTangent`
 `PossiblyUninitTangent`, `NoTangent`; `NoFData`, `NoRData`, `FData`, `RData`; `fdata`, `rdata`,
 `tangent`, `primal`, `zero_tangent`, `zero_rdata`, `randn_tangent`; `increment!!`, `set_to_zero!!`;
 `build_tangent`, `get_tangent_field`, `set_tangent_field!`; `as_tangent`, `unit_tangent`;
-`LazyZeroRData`.
+`LazyZeroRData`; `Inactive`, `shadow_type`, `isactive`, `@ifactive`.
+
+## `Inactive`: a value held constant
+
+`tangent_type(P)` is one type per primal type, but *activity* is a property of a value, so a shadow
+slot has one more legal inhabitant:
+
+```julia
+shadow_type(P) = Union{fdata_type(tangent_type(P)), Inactive}
+```
+
+**A validity predicate, never a declaration.** Use it in `<:` checks and rule-signature constraints
+only. Every declared slot, field, comms item and SSA type stays concrete — the engine picks the
+concrete alternative from its own per-value activity (`_shadow_types`, `differ-reverse-engine`), so
+no union reaches a hot path.
+
+**Why not `NoTangent`.** `NoTangent` already means "this *type* has no tangent space", and it is
+closed under the split the wrong way: `fdata_type(NoTangent) === NoFData`, which is also an active
+`Float64`'s fdata. So `NoTangent` in a shadow slot cannot say "constant" once a value is nested, and
+`isactive` would not be decidable from the type. `Inactive` is preserved by both halves —
+`fdata(Inactive()) === rdata(Inactive()) === Inactive()` — so it survives into an aggregate's shadow.
+
+**Bare singleton, no type parameter**, matching every other marker here (`NoTangent`, `NoFData`,
+`NoRData`, `ZeroRData`). The one primal-keyed type, `LazyZeroRData{P,Tdata}`, is keyed because it
+must *reconstruct* `zero_rdata_from_type(P)` with no value in hand; `Inactive` never reconstructs
+anything, and anywhere you would materialise you have the primal from the carrier (which carries the
+size a type cannot).
+
+**Strong zero, asymmetrically.** Both arms follow the general rule that `increment!!` returns a value
+of the accumulator's (first argument's) type:
+
+```julia
+increment_internal!!(::IncCache, ::Inactive, _)          = Inactive()   # accumulate into a constant → discard
+increment_internal!!(::IncCache, x, ::Inactive)          = x            # a constant contributes nothing
+increment_internal!!(::IncCache, ::Inactive, ::Inactive) = Inactive()   # disambiguator, else ambiguous
+```
+
+So **`increment!!` is not commutative** in the presence of `Inactive`: slot 1 is the accumulator that
+owns storage, slot 2 is a contribution. Any site that swaps argument order would silently drop a live
+gradient (all current call sites are accumulator-first — audited).
+
+The strong-zero property is *structural, not numerical*: `Inactive` short-circuits before any
+arithmetic, so `dx += y * dz` never evaluates with an infinite `y`. A materialised zero buffer would
+give `NaN` there, which is a correctness argument for this representation and not only a performance
+one.
+
+`NoTangent` deliberately keeps **no** absorbing arm, so a mis-analysed active value still raises a
+`MethodError` rather than dropping a gradient. Do not add one.
+
+Two consequences worth knowing:
+
+- The `increment!!`/`increment_internal!!` entry points are homogeneously typed
+  (`increment!!(x::T, y::T)`), so the `Inactive` arms are *heterogeneous* methods — a deliberate
+  loosening of an invariant the rest of the system enforces.
+- `increment_internal!!(c, x::Tuple, y::Tuple)` accumulates two tuples of *different* types
+  elementwise. A caller builds its seed from the primal type, so the seed is wider than a
+  mixed-activity aggregate's shadow; accumulation across aggregates has to be structural rather than
+  type-equality-gated.
+
+`@ifactive(dx, expr)` returns `NoRData()` (not `Inactive()`) on the inactive arm: activity has to be
+visible in the *fdata* half, where a primal-derived declaration would otherwise be a type lie; an
+inactive argument's rdata slot carries nothing either way, and `NoRData()` is what the derived path
+emits, so hand rules and derived rules return the same shape. `tangent(Inactive(), r)` is `Inactive()`
+whatever `r` is.
 
 ## `tangent_type(P)`: the central function
 

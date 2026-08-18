@@ -150,8 +150,8 @@ end
 
 function rrule!!(
     ::CoDual{typeof(atan),NoFData}, ::AbstractCtx,
-    (; y, dy)::CoDual{Float64,<:Union{NoFData,NoTangent}},
-    (; x, dx)::CoDual{Float64,<:Union{NoFData,NoTangent}},
+    (; y, dy)::CoDual{Float64,<:Union{NoFData,Inactive}},
+    (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}},
 )
     r2 = x^2+y^2
     atan2_pullback(dz) = (NoRData(), @ifactive(dy, x*dz/r2), @ifactive(dx, -y*dz/r2))
@@ -174,8 +174,8 @@ end
 
 function rrule!!(
     ::CoDual{typeof(^),NoFData}, ::AbstractCtx,
-    (; x, dx)::CoDual{Float64,<:Union{NoFData,NoTangent}},
-    (; y, dy)::CoDual{Float64,<:Union{NoFData,NoTangent}},
+    (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}},
+    (; y, dy)::CoDual{Float64,<:Union{NoFData,Inactive}},
 )
     yp = Base.:^(x, y)
     pow_pullback(dz) = (NoRData(), @ifactive(dx, y*Base.:^(x, y-1)*dz), @ifactive(dy, yp*Base.log(x)*dz))
@@ -189,7 +189,7 @@ end
 
 function rrule!!(
     ::CoDual{typeof(^),NoFData}, ::AbstractCtx,
-    (; x, dx)::CoDual{P,<:Union{NoFData,NoTangent}}, (; y)::CoDual{N,NoFData},
+    (; x, dx)::CoDual{P,<:Union{NoFData,Inactive}}, (; y)::CoDual{N,NoFData},
 ) where {P<:Union{Float32,Float64},N<:Integer}
     n = Int(y)
     function intpow_pullback(dy)
@@ -206,8 +206,8 @@ end
 
 function rrule!!(
     ::CoDual{typeof(hypot),NoFData}, ::AbstractCtx,
-    (; x, dx)::CoDual{Float64,<:Union{NoFData,NoTangent}},
-    (; y, dy)::CoDual{Float64,<:Union{NoFData,NoTangent}},
+    (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}},
+    (; y, dy)::CoDual{Float64,<:Union{NoFData,Inactive}},
 )
     r = Base.hypot(x, y)
     hypot_pullback(dz) = (NoRData(), @ifactive(dx, x/r*dz), @ifactive(dy, y/r*dz))
@@ -246,8 +246,8 @@ end
 
 function rrule!!(
     ::CoDual{typeof(max),NoFData}, ::AbstractCtx,
-    (; x, dx)::CoDual{Float64,<:Union{NoFData,NoTangent}},
-    (; y, dy)::CoDual{Float64,<:Union{NoFData,NoTangent}},
+    (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}},
+    (; y, dy)::CoDual{Float64,<:Union{NoFData,Inactive}},
 )
     x_wins = x >= y
     max_pullback(dz) = (NoRData(), @ifactive(dx, x_wins ? dz : 0.0), @ifactive(dy, x_wins ? 0.0 : dz))
@@ -256,8 +256,8 @@ end
 
 function rrule!!(
     ::CoDual{typeof(min),NoFData}, ::AbstractCtx,
-    (; x, dx)::CoDual{Float64,<:Union{NoFData,NoTangent}},
-    (; y, dy)::CoDual{Float64,<:Union{NoFData,NoTangent}},
+    (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}},
+    (; y, dy)::CoDual{Float64,<:Union{NoFData,Inactive}},
 )
     x_wins = x <= y
     min_pullback(dz) = (NoRData(), @ifactive(dx, x_wins ? dz : 0.0), @ifactive(dy, x_wins ? 0.0 : dz))
@@ -271,8 +271,8 @@ end
 
 function rrule!!(
     ::CoDual{typeof(copysign),NoFData}, ::AbstractCtx,
-    (; x, dx)::CoDual{Float64,<:Union{NoFData,NoTangent}},
-    (; y, dy)::CoDual{Float64,<:Union{NoFData,NoTangent}},
+    (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}},
+    (; y, dy)::CoDual{Float64,<:Union{NoFData,Inactive}},
 )
     copysign_pullback(dz) = (NoRData(), @ifactive(dx, Base.sign(x)*Base.sign(y)*dz), @ifactive(dy, 0.0))
     CoDual(Base.copysign(x, y), NoFData()), copysign_pullback
@@ -280,9 +280,9 @@ end
 
 function rrule!!(
     ::CoDual{typeof(fma),NoFData}, ::AbstractCtx,
-    (; x, dx)::CoDual{Float64,<:Union{NoFData,NoTangent}},
-    (; y, dy)::CoDual{Float64,<:Union{NoFData,NoTangent}},
-    (; z, dz)::CoDual{Float64,<:Union{NoFData,NoTangent}},
+    (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}},
+    (; y, dy)::CoDual{Float64,<:Union{NoFData,Inactive}},
+    (; z, dz)::CoDual{Float64,<:Union{NoFData,Inactive}},
 )
     fma_pullback(dw) = (NoRData(), @ifactive(dx, y*dw), @ifactive(dy, x*dw), @ifactive(dz, dw))
     CoDual(Base.fma(x, y, z), NoFData()), fma_pullback
@@ -290,9 +290,9 @@ end
 
 function rrule!!(
     ::CoDual{typeof(muladd),NoFData}, ::AbstractCtx,
-    (; x, dx)::CoDual{Float64,<:Union{NoFData,NoTangent}},
-    (; y, dy)::CoDual{Float64,<:Union{NoFData,NoTangent}},
-    (; z, dz)::CoDual{Float64,<:Union{NoFData,NoTangent}},
+    (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}},
+    (; y, dy)::CoDual{Float64,<:Union{NoFData,Inactive}},
+    (; z, dz)::CoDual{Float64,<:Union{NoFData,Inactive}},
 )
     muladd_pullback(dw) = (NoRData(), @ifactive(dx, y*dw), @ifactive(dy, x*dw), @ifactive(dz, dw))
     CoDual(Base.muladd(x, y, z), NoFData()), muladd_pullback

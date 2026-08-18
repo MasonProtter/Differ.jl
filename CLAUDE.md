@@ -9,6 +9,19 @@ The tangent representation is a port of Mooncake.jl's tangent / fdata / rdata ty
 `Dual`/`CoDual` carriers). Forward mode is built on this `Dual`, reverse mode on this `CoDual`.
 `../Mooncake.jl` is the reference for anything tangent-system-related.
 
+One addition of Differ's own: `Inactive` (`DifferCore/src/inactive.jl`) marks a value the caller
+holds constant, and is a legal inhabitant of a shadow slot alongside the primal-derived fdata type.
+`NoTangent` cannot do that job — it already means "this *type* has no tangent space", and its fdata
+is `NoFData`, which is also an active `Float64`'s — so constancy needs its own inhabitant, one that
+`fdata`/`rdata` preserve and that composes inside aggregates. `shadow_type(P)` gives the legal set,
+`Union{fdata_type(tangent_type(P)), Inactive}`, and is a **validity predicate, never a declaration**:
+every declared slot, field, comms item and SSA type stays concrete, so no union reaches a hot path.
+`Inactive` is a strong zero — `increment!!(Inactive(), y) === Inactive()` (accumulating into a
+constant discards) and `increment!!(x, Inactive()) === x` (a constant contributes nothing), which
+makes `increment!!` deliberately non-commutative: slot 1 is the accumulator that owns storage, slot 2
+is a contribution. `NoTangent` keeps *no* absorbing arm, so a mis-analysed active value still raises a
+`MethodError` instead of dropping a gradient.
+
 When writing comments, be terse and too the point (though not opaque). Don't use weird metaphors and made
 up Claude-jargon like calling a function a "seam", or "belt-and-suspenders", "brace", etc.
 

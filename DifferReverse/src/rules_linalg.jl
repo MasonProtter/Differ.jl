@@ -20,8 +20,8 @@
 function rrule!!(
     ::CoDual{typeof(LinearAlgebra.dot),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Vector{Float64},<:Union{Vector{Float64},NoTangent}},
-    (; y, dy)::CoDual{Vector{Float64},<:Union{Vector{Float64},NoTangent}},
+    (; x, dx)::CoDual{Vector{Float64},<:Union{Vector{Float64},Inactive}},
+    (; y, dy)::CoDual{Vector{Float64},<:Union{Vector{Float64},Inactive}},
 )
     Base.length(x) == Base.length(y) ||
         throw(DimensionMismatch("dot: vectors have different lengths"))
@@ -91,8 +91,8 @@ end
 function rrule!!(
     ::CoDual{typeof(Base.:*),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
-    (; y, dy)::CoDual{Vector{Float64},<:Union{Vector{Float64},NoTangent}},
+    (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
+    (; y, dy)::CoDual{Vector{Float64},<:Union{Vector{Float64},Inactive}},
 )
     z = Base.:*(x, y)
     zcd = zero_fcodual(z)
@@ -124,8 +124,8 @@ end
 function rrule!!(
     ::CoDual{typeof(Base.:*),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
-    (; y, dy)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
+    (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
+    (; y, dy)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
 )
     z = Base.:*(x, y)
     zcd = zero_fcodual(z)
@@ -162,13 +162,13 @@ end
 function rrule!!(
     ::CoDual{typeof(LinearAlgebra.mul!),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Vector{Float64},<:Union{Vector{Float64},NoTangent}},
-    (; y, dy)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
-    (; z, dz)::CoDual{Vector{Float64},<:Union{Vector{Float64},NoTangent}},
+    (; x, dx)::CoDual{Vector{Float64},<:Union{Vector{Float64},Inactive}},
+    (; y, dy)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
+    (; z, dz)::CoDual{Vector{Float64},<:Union{Vector{Float64},Inactive}},
 )
     # `dx` carries both the backward seed and the result's shadow, so a constant destination would
-    # silently drop the sources' gradients. A write-only buffer needs a zeroed shadow, not `NoTangent`.
-    isactive(dx) || error("Differ: `mul!` into a destination declared constant (`NoTangent` shadow) " *
+    # silently drop the sources' gradients. A write-only buffer needs a zeroed shadow, not `Inactive`.
+    isactive(dx) || error("Differ: `mul!` into a destination declared constant (`Inactive` shadow) " *
                           "would discard the gradient flowing to the factors — pass a zeroed shadow " *
                           "buffer instead of declaring the destination constant")
     old_dx = Base.copy(dx)
@@ -202,13 +202,13 @@ end
 function rrule!!(
     ::CoDual{typeof(LinearAlgebra.mul!),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
-    (; y, dy)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
-    (; z, dz)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},NoTangent}},
+    (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
+    (; y, dy)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
+    (; z, dz)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
 )
     # See the matrix-vector rule above: a constant destination would silently drop the factors'
     # gradients.
-    isactive(dx) || error("Differ: `mul!` into a destination declared constant (`NoTangent` shadow) " *
+    isactive(dx) || error("Differ: `mul!` into a destination declared constant (`Inactive` shadow) " *
                           "would discard the gradient flowing to the factors — pass a zeroed shadow " *
                           "buffer instead of declaring the destination constant")
     old_dx = Base.copy(dx)

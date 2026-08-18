@@ -13,8 +13,8 @@ using DifferForwards: code_dual_ircode
 # Forward-mode dualized IR is legal (order-1).
 checkverify(f, at) = Core.Compiler.verify_ir(code_dual_ircode(f, at)[1])
 
-# The `CoDual` for an argument held constant: `NoTangent` in the shadow slot (see `CoDual`).
-const_codual(x) = DifferReverse.CoDual(x, NoTangent())
+# The `CoDual` for an argument held constant: `Inactive` in the shadow slot (see `CoDual`).
+const_codual(x) = DifferReverse.CoDual(x, Inactive())
 
 # The argument `CoDual` types a call with these constant positions will be built from.
 arg_codual_types(f, at; inactive=()) =

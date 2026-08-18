@@ -17,7 +17,7 @@
 
 # Per-element shadow for a hand-built inner `CoDual`, carrying the outer array argument's own
 # activity: an inactive outer array means every element is inactive too, not merely zero.
-_elt_shadow(::NoTangent) = NoTangent()
+_elt_shadow(::Inactive) = Inactive()
 _elt_shadow(_) = NoFData()
 
 # ===========================================================================
@@ -26,7 +26,7 @@ _elt_shadow(_) = NoFData()
 
 function rrule!!(
     ::CoDual{typeof(map),NoFData}, ::AbstractCtx, gcd::CoDual{G,FG},
-    (; x, dx)::CoDual{X,<:Union{X,NoTangent}}
+    (; x, dx)::CoDual{X,<:Union{X,Inactive}}
 ) where {G,FG,X<:Array{<:IEEEFloat}}
     isconcretetype(G) || error("Differ: map requires a concretely-typed function argument in " *
                                 "reverse mode (see ISSUES.md #43)")
@@ -66,7 +66,7 @@ end
 
 function rrule!!(
     ::CoDual{typeof(map),NoFData}, ::AbstractCtx,
-    gcd::CoDual{G,FG}, (; x, dx)::CoDual{X,<:Union{X,NoTangent}}, (; y, dy)::CoDual{Y,<:Union{Y,NoTangent}}
+    gcd::CoDual{G,FG}, (; x, dx)::CoDual{X,<:Union{X,Inactive}}, (; y, dy)::CoDual{Y,<:Union{Y,Inactive}}
 ) where {G,FG,X<:Array{<:IEEEFloat},Y<:Array{<:IEEEFloat}}
     isconcretetype(G) || error("Differ: map requires a concretely-typed function argument in " *
                                 "reverse mode (see ISSUES.md #43)")
@@ -105,7 +105,7 @@ end
 
 function rrule!!(
     ::CoDual{typeof(map!),NoFData}, ::AbstractCtx,
-    gcd::CoDual{G,FG}, (; x, dx)::CoDual{D,<:Union{D,NoTangent}}, (; y, dy)::CoDual{X,<:Union{X,NoTangent}}
+    gcd::CoDual{G,FG}, (; x, dx)::CoDual{D,<:Union{D,Inactive}}, (; y, dy)::CoDual{X,<:Union{X,Inactive}}
 ) where {G,FG,D<:Array{<:IEEEFloat},X<:Array{<:IEEEFloat}}
     isconcretetype(G) || error("Differ: map! requires a concretely-typed function argument in " *
                                 "reverse mode (see ISSUES.md #43)")
@@ -115,8 +115,8 @@ function rrule!!(
     n == 0 && error("Differ: map!(f, dest, x) over empty arrays is not supported by this rule")
     # `dx` carries both the per-element backward seed and the result's shadow, so a constant
     # destination would silently drop the source's gradient. A write-only buffer needs a zeroed
-    # shadow, not `NoTangent`.
-    isactive(dx) || error("Differ: `map!` into a destination declared constant (`NoTangent` shadow) " *
+    # shadow, not `Inactive`.
+    isactive(dx) || error("Differ: `map!` into a destination declared constant (`Inactive` shadow) " *
                           "would discard the gradient flowing to the source — pass a zeroed shadow " *
                           "buffer instead of declaring the destination constant")
     old_dx = copy(dx)
@@ -154,8 +154,8 @@ end
 
 function rrule!!(
     ::CoDual{typeof(map!),NoFData}, ::AbstractCtx,
-    gcd::CoDual{G,FG}, (; x, dx)::CoDual{D,<:Union{D,NoTangent}}, (; y, dy)::CoDual{X,<:Union{X,NoTangent}},
-    (; z, dz)::CoDual{Y,<:Union{Y,NoTangent}}
+    gcd::CoDual{G,FG}, (; x, dx)::CoDual{D,<:Union{D,Inactive}}, (; y, dy)::CoDual{X,<:Union{X,Inactive}},
+    (; z, dz)::CoDual{Y,<:Union{Y,Inactive}}
 ) where {G,FG,D<:Array{<:IEEEFloat},X<:Array{<:IEEEFloat},Y<:Array{<:IEEEFloat}}
     isconcretetype(G) || error("Differ: map! requires a concretely-typed function argument in " *
                                 "reverse mode (see ISSUES.md #43)")
@@ -164,7 +164,7 @@ function rrule!!(
     n = length(y)
     n == 0 && error("Differ: map!(f, dest, x, y) over empty arrays is not supported by this rule")
     # See the unary rule above: a constant destination would silently drop the sources' gradients.
-    isactive(dx) || error("Differ: `map!` into a destination declared constant (`NoTangent` shadow) " *
+    isactive(dx) || error("Differ: `map!` into a destination declared constant (`Inactive` shadow) " *
                           "would discard the gradient flowing to the sources — pass a zeroed shadow " *
                           "buffer instead of declaring the destination constant")
     old_dx = copy(dx)

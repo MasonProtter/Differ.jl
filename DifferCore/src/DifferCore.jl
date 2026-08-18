@@ -6,6 +6,10 @@ module DifferCore
 include("tangent_utils.jl")
 include("tangents.jl")
 include("fwds_rvs_data.jl")
+
+# `Inactive`: the shadow-lattice inhabitant for a value held constant. Included after the
+# tangent/fdata/rdata definitions it adds arms to.
+include("inactive.jl")
 include("array_tangents.jl")
 
 # Mode-agnostic IR-inspection helpers shared by DifferForwards' and DifferReverse's own
@@ -28,6 +32,6 @@ export increment!!, set_to_zero!!
 export build_tangent, get_tangent_field, set_tangent_field!
 export as_tangent, unit_tangent
 export LazyZeroRData
-export isactive, @ifactive
+export Inactive, shadow_type, isactive, @ifactive
 
 end # module DifferCore
