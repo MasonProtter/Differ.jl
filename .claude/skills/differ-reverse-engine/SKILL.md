@@ -581,6 +581,17 @@ compilation) then `reverse_fwds_recursive_ci`/`reverse_pullback_recursive_ci` (r
   self-call). The pre-allocated `Ctx{<:Tape}` carrier's self-edge always targets the `Ctx{Nothing}`
   sibling instead of itself — resolved via one bounded nested compile (that sibling's own self-edge
   *is* literal identity, so it terminates). ISSUES #65/#68.
+
+  Because the callee is the build itself, both carriers must state the recursive call's declared
+  result type in **closed form** — there is no `CodeInstance` to read a `rettype` off. Both therefore
+  have to derive it from the very expression the build's own `return` uses, activity substitution
+  included: the pullback's self-`:invoke` and its returned tuple share one `own_RdatasT`
+  (`ret_rt`, which maps an inactive argument to `NoRData`), and the fwds self-`:invoke`'s carrier
+  comes from a pre-pass over `exit_blocks` running the same `ret_carrier` the `ReturnNode` arm does.
+  Recomputing either independently is how ISSUES #127 arose — the pullback's half as a SIGILL, the
+  fwds' half as a silently reinterpreted shadow, and neither visible to `verify_ir`, which does not
+  check declared statement types. A self-recursive build whose exits disagree on their shadow type
+  needs a genuine fixpoint and bails (ISSUES #128).
 - **Mutual recursion** (A -> B -> A) — still unsupported; would need a tape-type pre-pass across the
   whole strongly-connected component. Bails cleanly via `interp.custom_state.in_progress`
   (`build_reverse_fwds_ir`/`build_reverse_pullback_ir`, keyed by *carrier* `MethodInstance` — not primal

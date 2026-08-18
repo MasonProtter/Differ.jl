@@ -1,6 +1,7 @@
 using Test
 using DifferReverse
-using DifferReverse: NoTangent, rev_gradient, get_tangent_field, MutableTangent
+using DifferReverse: NoTangent, rev_gradient, value_and_gradient!, get_tangent_field,
+                     MutableTangent
 # `Dual`/`frule!!` here are DifferForwards' forward-mode carrier, used purely as an independent
 # numerical oracle.
 using DifferForwards: Dual, frule!!
@@ -43,6 +44,44 @@ end
     else
         return evenodd(n - 1, x * 2.0) + 1.0
     end
+end
+
+# Self-recursion combined with a constant argument. Both carriers declare a self-`:invoke`'s result
+# type in closed form (the callee is the build itself, so there is no `CodeInstance` to read it off),
+# and both have to apply the same inactive substitution their own return does. Module-level per the
+# `rec_self` comment above.
+@noinline function rec_scale(x::Float64, c::Float64, n::Int)
+    n <= 0 && return x * c
+    return rec_scale(x + 1.0, c, n - 1)
+end
+
+# The constant argument's rdata type is a non-trivial `RData`, so its slot cannot pass by looking
+# like the neighbouring `Float64` one.
+@noinline function rec_tupc(x::Float64, c::Tuple{Float64,Float64}, n::Int)
+    n <= 0 && return x * c[1] + c[2]
+    return rec_tupc(x + 1.0, c, n - 1)
+end
+
+# The constant argument carries fdata (an array), threaded through the recursive call.
+@noinline function rec_arrc(v::Vector{Float64}, w::Vector{Float64}, i::Int)
+    i > length(v) && return 0.0
+    return v[i] * w[i] + rec_arrc(v, w, i + 1)
+end
+
+# Vararg self-recursion with a constant in the fixed part (`Inactive` in the packed tail is refused
+# outright), so the returned rdatas tuple mixes the substitution with the tail scatter.
+@noinline function rec_va(c::Float64, n::Int, xs::Float64...)
+    n <= 0 && return c * sum(xs)
+    return rec_va(c, n - 1, xs...)
+end
+
+# Exits disagreeing on their shadow type: the base case returns the constant itself
+# (`CoDual{Float64,Inactive}`), the recursive one returns the call's result (`NoFData`). Resolving
+# that needs a fixpoint over the return shadow type, so it must bail rather than declare one of the
+# two over a call that returns the other.
+@noinline function rec_ret_c(x::Float64, c::Float64, n::Int)
+    n <= 0 && return c
+    return rec_ret_c(x + 1.0, c, n - 1)
 end
 
 # A const global holding a function, passed as an operand of a surviving call: the operand is a
@@ -210,6 +249,68 @@ end
     end
     @test err_mut isa ErrorException
     @test occursin("self- or mutually-recursive primal", err_mut.msg)
+end
+
+@testset "reverse mode: direct self-recursion with a constant argument" begin
+    # A self-`:invoke`'s result type is closed-form on both carriers — its callee is the build
+    # itself — so both have to apply the same inactive substitution their own return does. Checked
+    # at run time by necessity: `verify_ir` does not look at declared statement types, and the
+    # pullback's half failed as a SIGILL rather than an exception.
+    at = (Float64, Float64, Int)
+    fcd, xcd, ncd = zero_fcodual(rec_scale), CoDual(2.0, NoFData()), zero_fcodual(2)
+    all_active = rrule!!(fcd, Ctx(), xcd, CoDual(3.0, NoFData()), ncd)[2](1.0)
+
+    ycd, pb = rrule!!(fcd, Ctx(), xcd, const_codual(3.0), ncd)
+    @test primal(ycd) == rec_scale(2.0, 3.0, 2)
+    rd = pb(1.0)
+    @test rd == (NoRData(), all_active[2], NoRData(), NoRData())
+    @test rd[2] ≈ central_diff(x -> rec_scale(x, 3.0, 2), 2.0) rtol = 1e-6
+    _assert_tape_balanced(pb)
+    checkverify_rev(rec_scale, at; inactive=(2,))
+
+    # Pre-allocated context: the self-edge resolves against an already-compiled sibling there rather
+    # than the mid-compile identity, and reusing the tape must not move the answer.
+    ctx = build_ctx(rec_scale, at; inactive=(2,))
+    y1, g1 = value_and_gradient!(ctx, fcd, xcd, const_codual(3.0), ncd)
+    y2, g2 = value_and_gradient!(ctx, fcd, xcd, const_codual(3.0), ncd)
+    @test y1 == y2 == rec_scale(2.0, 3.0, 2)
+    @test g1 == g2 == (NoTangent(), all_active[2], Inactive(), NoTangent())
+
+    # A constant whose rdata type isn't `Float64`, so its slot can't pass by resembling its
+    # neighbour's.
+    yt, pbt = rrule!!(zero_fcodual(rec_tupc), Ctx(), xcd, const_codual((3.0, 4.0)), ncd)
+    @test primal(yt) == rec_tupc(2.0, (3.0, 4.0), 2)
+    @test pbt(1.0) == (NoRData(), 3.0, NoRData(), NoRData())
+    checkverify_rev(rec_tupc, (Float64, Tuple{Float64,Float64}, Int); inactive=(2,))
+
+    # A constant carrying fdata, threaded through the recursive call: the active argument still
+    # accumulates into the caller's own buffer, and no shadow is allocated for the constant.
+    v, w, dv = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0], zeros(3)
+    ya, pba = rrule!!(zero_fcodual(rec_arrc), Ctx(), CoDual(v, dv), const_codual(w), zero_fcodual(1))
+    @test primal(ya) == rec_arrc(v, w, 1)
+    @test pba(1.0) == (NoRData(), NoRData(), NoRData(), NoRData())
+    @test dv == w
+    checkverify_rev(rec_arrc, (Vector{Float64}, Vector{Float64}, Int); inactive=(2,))
+
+    # Vararg, constant in the fixed part: the returned rdatas tuple mixes the substitution with the
+    # packed tail's scatter.
+    yv, pbv = rrule!!(zero_fcodual(rec_va), Ctx(), const_codual(2.0), zero_fcodual(1),
+                      CoDual(3.0, NoFData()), CoDual(4.0, NoFData()))
+    @test primal(yv) == rec_va(2.0, 1, 3.0, 4.0)
+    @test pbv(1.0) == (NoRData(), NoRData(), NoRData(), 2.0, 2.0)
+
+    # Exits disagreeing on their shadow type must bail — never crash, and never hand back the
+    # primal-derived shadow where the constant's belongs.
+    err = try
+        rrule!!(zero_fcodual(rec_ret_c), Ctx(), xcd, const_codual(3.0), ncd)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("disagree on their shadow type", err.msg)
+    # The same primal with no constant argument is unaffected.
+    @test rev_gradient(rec_ret_c, 2.0, 3.0, 2)[3] == 1.0
 end
 
 @testset "operand types come from the value a node names, not from the node" begin

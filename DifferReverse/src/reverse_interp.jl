@@ -1728,7 +1728,8 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
                                    @nospecialize(ftype), argtypes::Vector{Any}, @nospecialize(R),
                                    edges::Vector{Any}, reason::Ref{String};
                                    @nospecialize(own_TapeT=nothing),
-                                   mask::BitVector=falses(length(argtypes)))
+                                   mask::BitVector=falses(length(argtypes)),
+                                   @nospecialize(self_FCDT=CoDual{R,NoFData}))
     # `has_hand_reverse_rule` already rejects a surviving call with a `Dual` callee/argument during
     # inlining, so this shouldn't be reachable — kept as a `reason[]`-based fallback in case some path
     # reaches recursion without going through that check, rather than crashing in `fcodual_type` below.
@@ -1770,7 +1771,7 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
                 # so if that sibling's own scan eagerly tried to compile its apparent self-edge
                 # target too, it would recurse straight back into the still-mid-construction
                 # `Ctx{Nothing}` build, and `in_progress` would (correctly) flag that as a cycle.
-                own_TapeT === nothing && return nothing, reverse_fwds_impl, CoDual{R,NoFData}, Tape
+                own_TapeT === nothing && return nothing, reverse_fwds_impl, self_FCDT, Tape
                 tt_self = Tuple{typeof(reverse_fwds_impl),CoDual{ftype,NoFData},Ctx{own_TapeT},
                                 argcodualtys...}
                 push!(edges, tt_self, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
@@ -1786,11 +1787,11 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
                 callee_impl_mi = specialize_method(matches[1])::MethodInstance
                 if callee_impl_mi === impl_mi
                     CC.add_inlining_edge!(edges, callee_impl_mi)
-                    return callee_impl_mi, reverse_fwds_impl, CoDual{R,NoFData}, Tape
+                    return callee_impl_mi, reverse_fwds_impl, self_FCDT, Tape
                 else
                     ci = CC.typeinf_ext_toplevel(interp, callee_impl_mi, CC.SOURCE_MODE_ABI)::CodeInstance
                     CC.add_invoke_edge!(edges, tt_self, ci)
-                    return ci, reverse_fwds_impl, CoDual{R,NoFData}, Tape
+                    return ci, reverse_fwds_impl, self_FCDT, Tape
                 end
             end
         end
@@ -1863,8 +1864,11 @@ end
 # `reverse_fwds_recursive_ci` leaves in a cyclic block's comms type — never a concrete type there,
 # so it can't be resolved into a `tt` directly. The concrete type is `own_TapeT`, the current
 # pullback build's own tape type: a self-recursive callee's tape is by construction the same type as
-# the caller's own. The callee's rettype is likewise closed-form regardless of whether compiling
-# turns out to be needed below, computed straight from `own_codualparams`.
+# the caller's own. The callee's rettype is `own_RdatasT`, the caller's *own* returned-rdatas type,
+# passed in rather than recomputed: the callee is this same build, so the declared `:invoke` type and
+# the tuple the pullback actually builds must be one expression. Recomputing it from the codual
+# params instead is how it came to ignore the inactive -> `NoRData` substitution the return applies,
+# declaring a slot the callee never fills.
 #
 # Whether compiling is needed mirrors the fwds side's reasoning, but the source of the mismatch
 # differs: the pullback carrier has no ctx-type variance, but the recursive call's own seed type
@@ -1874,7 +1878,7 @@ end
 # (same tape, different seed type); that nested compile's own recursive edge targets its own seed
 # type, so it resolves via the literal-identity branch and terminates.
 function reverse_pullback_recursive_ci(interp, impl_mi::MethodInstance, @nospecialize(own_TapeT),
-                                       own_codualparams::Vector{Any}, @nospecialize(InnerTapeT),
+                                       @nospecialize(own_RdatasT), @nospecialize(InnerTapeT),
                                        @nospecialize(InnerSeedT), edges::Vector{Any}, reason::Ref{String},
                                        nargs::Int)
     if InnerTapeT === Tape
@@ -1887,14 +1891,21 @@ function reverse_pullback_recursive_ci(interp, impl_mi::MethodInstance, @nospeci
             return nothing
         end
         pb_mi = specialize_method(matches[1])::MethodInstance
-        InnerRdatasT = Tuple{(zero_like_rdata_type(_codual_primal_type(c)) for c in own_codualparams)...}
         if pb_mi === impl_mi
             CC.add_inlining_edge!(edges, pb_mi)
-            return pb_mi, true, InnerRdatasT
+            return pb_mi, true, own_RdatasT
         else
             ci = CC.typeinf_ext_toplevel(interp, pb_mi, CC.SOURCE_MODE_ABI)::CodeInstance
+            # A sibling (same tape, different seed type) is already compiled here, so its rettype is
+            # real — check it rather than trusting the closed form, which only the literal-identity
+            # arm above is forced to.
+            if ci.rettype !== own_RdatasT
+                reason[] = "the recursive (self-cyclic) pullback build for `$(tt)` returned " *
+                           "$(ci.rettype), which does not match this build's own $(own_RdatasT)"
+                return nothing
+            end
             CC.add_invoke_edge!(edges, tt, ci)
-            return ci, true, InnerRdatasT
+            return ci, true, own_RdatasT
         end
     end
     # Mirrors the fwds side's two shapes. A derived inner pullback is a `Tape`, so we target its
@@ -2336,6 +2347,41 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable_block,
                                                     block_of, npacked, nfixed)
 
+    # The carrier a `return` builds. A mixed-activity aggregate's shadow is narrower than the
+    # primal-derived carrier would declare, so the `CoDual` has to come from the shadow's own type;
+    # every other return keeps `_fcdtype`'s result byte-for-byte (it handles `Type` primals and
+    # non-concrete `R`, which this does not).
+    carrier_ty(@nospecialize(R), @nospecialize(FRs)) =
+        FRs === fdtype(iworld, R) ? _fcdtype(iworld, R) : CoDual{R,FRs}
+    ret_carrier(@nospecialize(node), @nospecialize(R)) = begin
+        FRs = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked,
+                              node)
+        (FRs, carrier_ty(R, FRs))
+    end
+
+    # A self-recursive `:invoke`'s declared result carrier is closed-form — its callee is this same
+    # build — so it has to equal what this build's own returns produce, activity included. Computed
+    # before emission because the recursive call is emitted before the exits are. Exits that disagree
+    # would need a fixpoint over the return shadow type (the recursive call's own shadow type feeds
+    # back into it), which this engine does not solve.
+    has_self_edge = !isempty(self_recursive_ssas)
+    self_FRs = NoFData
+    if has_self_edge
+        exit_FRs = Any[]
+        for b in exit_blocks
+            v = pstmts[pir.cfg.blocks[b].stmts.stop][:stmt].val
+            F = ret_carrier(v, _optype_w(pir, iworld, v))[1]
+            F in exit_FRs || push!(exit_FRs, F)
+        end
+        if length(exit_FRs) != 1
+            reason[] = "a self-recursive primal whose returns disagree on their shadow type " *
+                       "($(join(exit_FRs, ", "))) is not supported — the recursive call's own " *
+                       "result carrier then has no single closed-form type"
+            return nothing
+        end
+        self_FRs = exit_FRs[1]
+    end
+
     getf = GlobalRef(Core, :getfield)
     setf = GlobalRef(Core, :setfield!)
     ctuple = GlobalRef(Core, :tuple)
@@ -2651,13 +2697,17 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             # lattice-faithful and can return a `Core.PartialStruct` (e.g. a tuple return narrowed by
             # const-prop), but `fcodual_type` below needs a bare `Type`.
             R = isa(s.val, GlobalRef) ? Core.Typeof(ret_val) : _widen(_optype(pir, s.val))
-            # A mixed-activity aggregate's shadow is narrower than the primal-derived carrier
-            # would declare, so the returned `CoDual` has to be built from the shadow's own type.
-            # Every other return keeps `_fcdtype`'s result byte-for-byte (it handles `Type` primals
-            # and non-concrete `R`, which this does not).
-            FRs = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams,
-                                  npacked, s.val)
-            FR = FRs === fdtype(iworld, R) ? _fcdtype(iworld, R) : CoDual{R,FRs}
+            FRs, FR = ret_carrier(s.val, R)
+            # The pre-pass above declared every self-recursive `:invoke` in this build to return
+            # `self_FRs`. It reads `R` off the return node itself (`_optype_w`) where this arm reads
+            # it off `ret_val` for a `GlobalRef`, so catch a disagreement rather than emit an
+            # `:invoke` whose declared type this return contradicts.
+            if has_self_edge && FRs !== self_FRs
+                reason[] = "a self-recursive build's return shadow type ($(FRs)) disagrees with " *
+                           "the one its recursive calls were declared with ($(self_FRs)) at %$i: " *
+                           "`$(_stmt_str(s))`"
+                return nothing
+            end
             has_shadow = isa(s.val, Core.SSAValue) ? isassigned(shadow_map, s.val.id) :
                          isa(s.val, Core.Argument) ? isassigned(farg, s.val.n) : false
             result_cd = if FRs === Inactive
@@ -2869,7 +2919,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                 fval, ftype, argtypes, mask = info
                 R = _widen(Ti)
                 resolved = reverse_fwds_recursive_ci(interp, impl_mi, primal_mi, ftype, argtypes, R,
-                                                     edges, reason; own_TapeT=TapeT, mask)
+                                                     edges, reason; own_TapeT=TapeT, mask,
+                                                     self_FCDT=carrier_ty(R, self_FRs))
                 if resolved === nothing
                     reason[] *= " — at %$i: `$(_stmt_str(s))`"
                     return nothing
@@ -3122,6 +3173,19 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                                    arg_active, active)
     arg_tracked = _arg_fdata_tracked(iworld, length(packed_codualparams), packed_codualparams,
                                      arg_active)
+
+    # The rdatas tuple this pullback returns, one slot per primal argument (`#self#` first). Defined
+    # here, not at the return below, because a self-recursive `:invoke` has to declare exactly this
+    # type — its callee is this same build — and deriving it a second time there is what let the
+    # declared and actual types drift. `nfixed_eff` is `n` when non-vararg, so the vararg tail branch
+    # at the return never fires. An inactive argument has no accumulator to read: its slot is the
+    # `NoRData()` literal, and `ret_rt` types both that slot and the returned tuple.
+    is_vararg = nfixed >= 0
+    nfixed_eff = is_vararg ? nfixed : n
+    ret_inactive(k::Int) = k <= nfixed_eff && !arg_active[k]
+    ret_rt(k::Int) = ret_inactive(k) ? NoRData :
+                     zero_like_rdata_type(_codual_primal_type(codualparams[k]))
+    own_RdatasT = Tuple{(ret_rt(k) for k in 1:n)...}
 
     getf = GlobalRef(Core, :getfield)
     setf = GlobalRef(Core, :setfield!)
@@ -3655,7 +3719,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     # inner pullback must be resolved to accept exactly that (possibly wider) seed type —
                     # its own exit-route `increment!!` already tolerates `ZeroRData` generically.
                     SeedT = zero_like_rdata_type(_widen(Ti))
-                    pb_resolved = reverse_pullback_recursive_ci(interp, impl_mi, TapeT, codualparams,
+                    pb_resolved = reverse_pullback_recursive_ci(interp, impl_mi, TapeT, own_RdatasT,
                                                                  InnerTapeT, SeedT, edges, reason,
                                                                  length(argtypes))
                     if pb_resolved === nothing
@@ -3732,14 +3796,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                 end
             end
             # Read out every argument's accumulated rdata and return them as a tuple, flat arity.
-            # `nfixed_eff` is `n` when non-vararg, so the tail branch below never fires.
-            is_vararg = nfixed >= 0
-            nfixed_eff = is_vararg ? nfixed : n
-            # An inactive argument has no accumulator to read: its slot is the `NoRData()` literal.
-            # `ret_rt` types both that slot and the returned tuple, so the two cannot drift apart.
-            ret_inactive(k::Int) = k <= nfixed_eff && !arg_active[k]
-            ret_rt(k::Int) = ret_inactive(k) ? NoRData :
-                             zero_like_rdata_type(_codual_primal_type(codualparams[k]))
+            # `is_vararg`/`nfixed_eff`/`ret_inactive`/`ret_rt` are defined with `own_RdatasT` above.
             result_ids = Vector{Any}(undef, n)
             for k in 1:nfixed_eff
                 result_ids[k] = ret_inactive(k) ? NoRData() :
@@ -3757,7 +3814,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                                                 tail_acc, Val(j), Pk), RTk)
                 end
             end
-            res = emit!(Expr(:call, ctuple, result_ids...), Tuple{(ret_rt(k) for k in 1:n)...})
+            res = emit!(Expr(:call, ctuple, result_ids...), own_RdatasT)
             emit!(Core.ReturnNode(res), Any)
         elseif phi_end < lo
             # No PhiNodes at the top of this block: switch straight to each predecessor's own block.
