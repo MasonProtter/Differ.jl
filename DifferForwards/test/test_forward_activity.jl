@@ -29,6 +29,22 @@ vtail(x, ys...) = x * ys[1] + ys[2]
 loopdots(v, w, n) = (s = 0.0; for _ in 1:n; s += dot(v, w); end; s)
 mapsin(v, w) = sum(map((a, b) -> a * sin(b), v, w))
 
+# A function barrier allocating a fresh buffer from constant-only arguments, then written into with
+# an active value: the buffer must still be an activity root, since a store never propagates
+# activity backward into where the buffer was allocated.
+@noinline mkbuf(n) = fill(0.0, n)
+storebuf(x, n) = (v = mkbuf(n); v[1] = x; v[1] * 1.0)
+# The counter-case: a barrier returning a bits value from constant arguments stays inactive.
+@noinline mkbits(n) = n + 1
+usebits(x, n) = (m = mkbits(n); x * m)
+# A barrier returning an immutable struct that wraps a mutable `Vector` field: still an activity
+# root, since the fdata-carrying part of its tangent is the nested `Vector`, not the struct itself.
+struct VecWrap
+    v::Vector{Float64}
+end
+@noinline mkwrap(n) = VecWrap(fill(0.0, n))
+storewrap(x, n) = (w = mkwrap(n); w.v[1] = x; w.v[1] * 1.0)
+
 @testset "activity: an inactive argument is not merely zero-seeded" begin
     d = const_dual(3.0)
     @test tangent(d) === Inactive()
@@ -138,6 +154,32 @@ end
     @test r.dx ≈ 2.0                        # only `x * 2.0` contributes
     @test length(v) == 2                    # `push!` was genuinely replayed
     checkverify(tagged, (Float64, Vector{Float64}); inactive=(2,))
+end
+
+@testset "activity: a fresh container behind a function barrier is an activity root" begin
+    # `mkbuf`'s only argument (`n`) is inactive, so operand-based activity alone would classify the
+    # allocated buffer constant; the store of `x` into it would then have nowhere active to go.
+    r = frule!!(Dual(storebuf, NoTangent()), Dual(2.0, 1.0), Dual(3, NoTangent()))
+    @test r.x ≈ storebuf(2.0, 3)
+    @test r.dx ≈ 1.0
+    checkverify(storebuf, (Float64, Int))
+
+    # Counter-case: a barrier returning a bits value from constant arguments has nothing to write a
+    # derivative into, so it stays inactive — no shadow statement for the `mkbits` call.
+    ir, _ = code_dual_ircode(usebits, (Float64, Int))
+    stmts = [sprint(show, ir.stmts[i][:stmt]) for i in 1:length(ir.stmts)]
+    @test !any(s -> occursin("mkbits", s) && occursin("Dual", s), stmts)
+    r2 = frule!!(Dual(usebits, NoTangent()), Dual(2.0, 1.0), Dual(3, NoTangent()))
+    @test r2.x ≈ usebits(2.0, 3)
+    @test r2.dx ≈ 4.0                       # d/dx(x*(n+1)) = n+1
+    checkverify(usebits, (Float64, Int))
+
+    # An immutable wrapper around a mutable field, returned through a barrier from constant
+    # arguments: still a root, since fdata-non-triviality is checked on the tangent recursively.
+    r3 = frule!!(Dual(storewrap, NoTangent()), Dual(2.0, 1.0), Dual(3, NoTangent()))
+    @test r3.x ≈ storewrap(2.0, 3)
+    @test r3.dx ≈ 1.0
+    checkverify(storewrap, (Float64, Int))
 end
 
 @testset "activity: no shadow is emitted for an inactive subgraph" begin

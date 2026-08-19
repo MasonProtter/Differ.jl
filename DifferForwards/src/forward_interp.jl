@@ -580,10 +580,29 @@ function _arg_active(dualparams, nfixed::Int, nslots::Int, tt)
     return aa
 end
 
+# Whether a (widened) type can carry caller-visible mutable shadow state: the same test
+# `fdata_shadow_type`/`CoDual` use for "this needs real shadow storage, not just a value copied
+# through" — `fdata_type(tangent_type(T)) !== NoFData`. A plain differentiable scalar (`Float64`)
+# answers `false` (its fdata is `NoFData`, all information rides in the rdata half); a mutable
+# struct/`Array`/`Memory`, or an immutable type with such a thing nested inside it, answers `true`.
+# `T isa Type` excludes lattice elements that survived widening as something else (shouldn't
+# happen after `_widen`, but this is the type-safety boundary before `tangent_type`/`fdata_type`
+# dispatch); `T !== Union{}` excludes throw-typed statements, matching the `Ptr` check above.
+# `W <: Dual` excludes the higher-order self-tangent case (`tangent_type(::Type{<:Dual}) = itself`):
+# `fdata_type` has no method for a `Dual` carrier, and a statement typed `Dual` there is composed
+# machinery, not a fresh user-level container.
+function _act_container_result(@nospecialize(T), tt, ft)
+    T isa Type || return false
+    T === Union{} && return false
+    W = tt(T)
+    (W isa Type && !(W <: Dual)) || return false
+    return ft(W) !== NoFData
+end
+
 # Which SSA values may carry a derivative. Monotone least fixpoint — a loop-carried `PhiNode` reads
 # a back-edge value not yet computed — and the conservatism grows "may be active", so an
 # unrecognised value-producing statement must default to *active*.
-function _activity(pir, iworld::UInt, tt, nslots::Int, arg_active::BitVector)
+function _activity(pir, iworld::UInt, tt, ft, nslots::Int, arg_active::BitVector)
     stmts = pir.stmts
     N = length(stmts)
     active = falses(N)
@@ -634,6 +653,23 @@ function _activity(pir, iworld::UInt, tt, nslots::Int, arg_active::BitVector)
                 f = _calleeval(fpos, iworld)
                 if f === Core.memorynew
                     true                      # the array-allocation half of the same root case
+                elseif !(isa(f, Core.Builtin) || isa(f, Core.IntrinsicFunction)) &&
+                       _act_container_result(Tw, tt, ft)
+                    # A *composite* call/invoke whose result can carry a fresh mutable container is
+                    # an activity root regardless of operand activity — e.g. a `@noinline` allocation
+                    # helper behind a function barrier, called with only constant arguments. Stores
+                    # never propagate activity backward into a container (activity flows forward
+                    # only), so without this the container is misclassified constant and an active
+                    # value later written into it is lost. An abstract/dynamic result type (`Any`)
+                    # also lands here (`tangent_type(Any) = Any`, `fdata_type(Any) = Any`),
+                    # correctly: an unknown result type can't rule out a mutable container either.
+                    #
+                    # Excludes `Core.Builtin`/`Core.IntrinsicFunction` callees deliberately: a
+                    # builtin like `getfield`/`memoryrefnew` projects/derives from an *existing*
+                    # object rather than allocating a fresh one (e.g. `getfield(v, :ref)` pulls a
+                    # `MemoryRef` out of an already-classified `v`), so it must follow ordinary
+                    # operand activity like everything else here, not become an unconditional root.
+                    true
                 else
                     operand_active(fpos) || any(operand_active, actual)
                 end
@@ -833,6 +869,15 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         W = _widen(T)
         mt_edge!(edges, Tuple{typeof(tangent_type),Type{W}})
         return at_world(interp, tangent_type, W)
+    end
+
+    # `fdata_type` of a tangent type — used by the activity analysis to decide whether a call's
+    # result can carry caller-visible mutable shadow state (`_act_container_result`). Same
+    # world-age/extensibility reasoning as `tt`.
+    function ft(@nospecialize T)
+        W = _widen(T)
+        mt_edge!(edges, Tuple{typeof(fdata_type),Type{W}})
+        return at_world(interp, fdata_type, W)
     end
 
     # Same treatment for the other two entry points this transform calls on primal types: `dual_type`
@@ -1060,7 +1105,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         end
         nslots > nfixed && (argty[nslots] = Pva)
         arg_active = _arg_active(dualparams, nfixed, nslots, tt)
-        active = _activity(pir, iworld, tt, nslots, arg_active)
+        active = _activity(pir, iworld, tt, ft, nslots, arg_active)
         mat, arg_mat = _materialized(pir, active, nslots, arg_active, argty, iworld)
         pelts = Any[]; telts = Any[]
         for i in 1:n
@@ -1135,7 +1180,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # active argument list; the elision happened one order down.
         arg_active = _arg_active(Any[Dual{typeof(dualized_impl),NoTangent},
                                      Dual{Tuple{ptys...},Tuple{ttys...}}], 2, 2, tt)
-        active = _activity(pir, iworld, tt, 2, arg_active)
+        active = _activity(pir, iworld, tt, ft, 2, arg_active)
         mat, arg_mat = _materialized(pir, active, 2, arg_active, argty, iworld)
     end
 
