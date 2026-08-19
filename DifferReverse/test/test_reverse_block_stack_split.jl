@@ -10,9 +10,10 @@
 # single-predecessor balance-pop — the two changes are coupled, neither is correct alone. The
 # direct unit tests below cover the surgery itself; the `rev_gradient`-level testsets exercise the
 # live fix across the disambiguation boundary (N=0,1,2,3,5,50), and the `memloop!` traffic test
-# asserts the reduction to N+3 (the per-edge split took 3N+2 to 2N+3; counted-loop trip-count
-# compression — `_counted_loops`, tested in test_reverse_counted_loops.jl — then removed the
-# per-iteration header push, leaving only the iterate-end merge's genuinely data-dependent push).
+# asserts the reduction to a flat constant (the per-edge split took 3N+2 to 2N+3; counted-loop
+# trip-count compression — `_counted_loops`, tested in test_reverse_counted_loops.jl — removed
+# the per-iteration header push; the implied-merge scheme — `_implied_merges`, tested in
+# test_reverse_implied_merges.jl — removed the iterate-end merge's).
 #
 # A second, *fallthrough*-ambiguous shape (the mirror insertion case: the ambiguous arm is the
 # implicit fallthrough rather than the explicit `dest`) is exercised too, but not via a real Julia
@@ -220,7 +221,7 @@ end
     @test Set(phi.edges) == Set([relay.id, body_blk.id])   # `chk`'s edge renamed to the relay
 end
 
-@testset "memloop!: block-stack traffic scales N+3" begin
+@testset "memloop!: block-stack traffic is flat" begin
     # Same shape as `bench/workloads.jl`'s `memloop!` benchmark, redefined locally rather than
     # `include`d (the bench project pulls in `BenchmarkTools`, not a `test/Project.toml`
     # dependency). `Memory` has no `zero_tangent` method, so its `CoDual` is built by hand.
@@ -240,15 +241,14 @@ end
         return length(pb.block_stack.memory)
     end
 
-    # Two reductions layered here: the per-edge split removed the loop-exit-diamond per-block push
-    # (3N+2 -> 2N+3), then counted-loop compression replaced the header's per-arrival push with one
-    # recorded trip count (2N+3 -> N+3). The remaining 1/iteration is the iterate-end merge's two
-    # real predecessors — genuinely data-dependent, disambiguated at runtime. Measured: N=2->5,
-    # N=5->8, N=100->103, N=10_000->10_003.
-    @test run_memloop(2)  == 5
-    @test run_memloop(5)  == 8
-    large = run_memloop(10_000)
-    @test large ≤ 2 * 10_000 + 4    # comfortably below the old 2N+3 floor
-    @test large > 10_000            # and not better than the data-dependent N floor
-    @test large == 10_000 + 3       # exact: N+3
+    # Three reductions layered here: the per-edge split removed the loop-exit-diamond per-block
+    # push (3N+2 -> 2N+3), counted-loop compression replaced the header's per-arrival push with
+    # one recorded trip count (2N+3 -> N+3), and the implied-merge scheme removed the iterate-end
+    # merge's per-iteration push — its predecessor is recovered from the direction of the
+    # following branch (N+3 -> flat). What's left is one push for the `1:N` empty-range check
+    # diamond (its branch is genuinely data-dependent) and one for the loop-exit -> exit-merge
+    # edge.
+    @test run_memloop(2) == 2
+    @test run_memloop(5) == 2
+    @test run_memloop(10_000) == 2
 end

@@ -949,15 +949,17 @@ end
 # ===========================================================================
 function _unique_predecessor_info(pir, exit_blocks::Vector{Int}, unreachable::AbstractVector{Bool},
                                   regions::Dict{Int,Int}, quiet::Set{Int},
-                                  counted_edges::Set{NTuple{2,Int}}=Set{NTuple{2,Int}}())
+                                  served_edges::Set{NTuple{2,Int}}=Set{NTuple{2,Int}}())
     nblocks = length(pir.cfg.blocks)
     preds = [filter(!=(0), pir.cfg.blocks[b].preds) for b in 1:nblocks]
     succs = [pir.cfg.blocks[b].succs for b in 1:nblocks]
 
     # Per-edge push predicate: `b` pushes on `b -> s` iff `s`'s arrival is genuinely ambiguous and
-    # the edge isn't served by a counted loop's trip count instead (`_counted_loops` — both edges
-    # into a counted header are disambiguated by the countdown, not by pops).
-    needs_push(b, s) = length(preds[s]) > 1 && (b, s) ∉ counted_edges
+    # the edge isn't served by some other disambiguation mechanism (`served_edges`): a counted
+    # loop's trip count (`_counted_loops` — both edges into a counted header are resolved by the
+    # countdown) or an implied merge's branch direction (`_implied_merges` — both edges into the
+    # merge are resolved by which arm of the downstream branch the reverse walk arrives from).
+    needs_push(b, s) = length(preds[s]) > 1 && (b, s) ∉ served_edges
 
     is_unique_pred = falses(nblocks)
     for b in 1:nblocks
@@ -1220,6 +1222,202 @@ function _counted_loops(pir, unreachable::AbstractVector{Bool},
 end
 
 # ===========================================================================
+# Implied merges: recover a merge's predecessor from the reverse walk's own direction.
+#
+# The `iterate`-end diamond every `for` loop lowers to merges two arms at a block `m` whose
+# following branch is decided by a value like `not_int(φ(#a ⇒ true, #b ⇒ false))` — the branch
+# direction is a pure function of which predecessor fired. The pullback's reverse walk already
+# knows that direction: its arms into the branch block's reverse code are per-successor. So
+# neither edge into `m` needs a block-stack push; instead, each reverse arm into the branch
+# block's reverse code stores the predecessor it implies into a per-merge `Ref{Int32}` cell, and
+# `m`'s reverse block dispatches on the cell instead of popping. This is what takes a `for` loop's
+# residual per-iteration block-stack traffic (left after counted-loop compression) to zero.
+#
+# The merge and the branch may be different blocks: iterator-protocol lowering routinely puts the
+# `φ(… ⇒ false, … ⇒ true)` merge and the `GotoIfNot` one or two blocks apart, connected by a
+# single-predecessor/single-successor chain. The chain's shape is what keeps the scheme sound:
+# every visit of `m` reaches the branch exactly once, and the reverse routing from the branch back
+# to `m` is unconditional, so between the arm's store and `m`'s read only that visit's own reverse
+# code runs.
+#
+# Like the counted-loop scheme this is a two-sided change — the forwards suppression (via
+# `served_edges`) and the pullback's cell store/dispatch must always agree — but unlike it the
+# forwards carrier needs no new instrumentation at all: it just stops pushing on the two edges.
+# ===========================================================================
+
+struct ImpliedMerge
+    merge::Int      # m: the 2-predecessor merge whose push/pop pair is eliminated
+    branch::Int     # d: the GotoIfNot block whose direction implies m's predecessor (may be m)
+    dest_pred::Int  # m's pred when d takes its `dest` arm (condition evaluated false)
+    fall_pred::Int  # m's pred when d falls through (condition evaluated true)
+end
+
+# The edges whose block-stack pushes the implied-merge scheme replaces: both arrivals at each merge.
+function _implied_edges(implied::Vector{ImpliedMerge})
+    edges = Set{NTuple{2,Int}}()
+    for im in implied
+        push!(edges, (im.dest_pred, im.merge))
+        push!(edges, (im.fall_pred, im.merge))
+    end
+    return edges
+end
+
+# Abstract values for `_branch_cond_eval`: a known constant is represented by itself, an unknown
+# value by its widened type, and `_CondBail` poisons the whole evaluation (an unassigned phi edge,
+# a value cycle). `_CondUnknown`/`_CondBail` instances never appear as primal IR constants, so the
+# three cases can't be confused.
+struct _CondUnknown
+    typ::Type
+end
+struct _CondBail end
+
+# Evaluate `node` under the assumption that block `m` was entered from predecessor `P`, using only
+# statements inside `region` (the m -> branch chain); anything defined outside is unknown-by-type.
+# Deliberately narrow: `φ`-at-`m` leaves, chain-block phis, `PiNode`s, `not_int`, and `===` (via
+# egal's type-disjointness/singleton rules) are the whole language — a genuinely data-dependent
+# condition evaluates to unknown and disqualifies the merge, never guesses.
+function _branch_cond_eval(pir, iworld::UInt, block_of::Vector{Int}, region::Set{Int}, m::Int,
+                           P::Int, @nospecialize(node), seen::Set{Int})
+    if isa(node, Core.SSAValue)
+        i = node.id
+        # `seen` holds the SSA ids currently on the evaluation stack — a revisit is a genuine value
+        # cycle (a loop-carried phi), not mere sharing, and poisons the evaluation.
+        i in seen && return _CondBail()
+        push!(seen, i)
+        r = _branch_cond_eval_ssa(pir, iworld, block_of, region, m, P, i, seen)
+        delete!(seen, i)
+        return r
+    elseif isa(node, Core.Argument)
+        return _CondUnknown(_widen(pir.argtypes[node.n]))
+    elseif isa(node, GlobalRef)
+        # A non-`const` binding is only knowable at run time; even a `const` one is left unknown —
+        # nothing observed needs more than the `===` type rules.
+        return _CondUnknown(Any)
+    elseif isa(node, QuoteNode)
+        return node.value
+    end
+    return node
+end
+
+function _branch_cond_eval_ssa(pir, iworld::UInt, block_of::Vector{Int}, region::Set{Int}, m::Int,
+                               P::Int, i::Int, seen::Set{Int})
+    b = block_of[i]
+    b in region || return _CondUnknown(_stype(pir.stmts, i))
+    s = pir.stmts[i][:stmt]
+    recur(@nospecialize v) = _branch_cond_eval(pir, iworld, block_of, region, m, P, v, seen)
+    if isa(s, Core.PhiNode)
+        # At `m`, the edge for `P` is the whole point; at a chain block the single real edge is
+        # the only one that can fire. An unassigned edge would be an undef read — bail.
+        want = b == m ? P : begin
+            bpreds = filter(!=(0), pir.cfg.blocks[b].preds)
+            length(bpreds) == 1 || return _CondBail()
+            only(bpreds)
+        end
+        eidx = findfirst(==(Int32(want)), s.edges)
+        (eidx === nothing || !isassigned(s.values, eidx)) && return _CondBail()
+        return recur(s.values[eidx])
+    elseif isa(s, Core.PiNode)
+        r = recur(s.val)
+        return r isa _CondUnknown ? _CondUnknown(_stype(pir.stmts, i)) : r
+    elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
+        fpos, actual = _call_parts(s)
+        f = _calleeval(fpos, iworld)
+        if f === Core.Intrinsics.not_int && length(actual) == 1
+            r = recur(actual[1])
+            r isa _CondBail && return r
+            return r isa Bool ? !r : _CondUnknown(_stype(pir.stmts, i))
+        elseif f === Core.:(===) && length(actual) == 2
+            a = recur(actual[1])
+            a isa _CondBail && return a
+            c = recur(actual[2])
+            c isa _CondBail && return c
+            if !(a isa _CondUnknown) && !(c isa _CondUnknown)
+                return a === c
+            end
+            ta = a isa _CondUnknown ? a.typ : typeof(a)
+            tc = c isa _CondUnknown ? c.typ : typeof(c)
+            # Egal implies identical concrete type: disjoint types decide `false`, a shared
+            # singleton type decides `true`, anything else stays unknown.
+            typeintersect(ta, tc) === Union{} && return false
+            (ta === tc && Base.issingletontype(ta)) && return true
+            return _CondUnknown(Bool)
+        end
+        return _CondUnknown(_stype(pir.stmts, i))
+    end
+    return _CondUnknown(_stype(pir.stmts, i))
+end
+
+"""
+    _implied_merges(pir, iworld, unreachable, regions, quiet, counted)::Vector{ImpliedMerge}
+
+Merges of `pir` whose predecessor is statically implied by the direction of the following branch.
+A block `m` qualifies iff: it is reachable with exactly two distinct reachable predecessors; it
+is not a collapsible-region block (`regions`/`quiet` — a region entry's reverse code is entered
+from the region merge unconditionally, which erases the arm information this scheme reads) and
+not a counted loop's header (those edges are already served by the countdown, and the two
+dispatch kinds must stay mutually exclusive); a `GotoIfNot` block `d` is reachable from `m`
+through single-predecessor/single-successor blocks only (possibly `d == m`), with two distinct
+successors; and `d`'s branch condition evaluates to a known `Bool` under each predecessor
+assumption (`_branch_cond_eval`), with the two values differing. Anything that doesn't qualify
+keeps the ordinary per-edge push/pop scheme.
+"""
+function _implied_merges(pir, iworld::UInt, unreachable::AbstractVector{Bool},
+                         regions::Dict{Int,Int}, quiet::Set{Int},
+                         counted::Vector{CountedLoop})::Vector{ImpliedMerge}
+    cfg = pir.cfg
+    nb = length(cfg.blocks)
+    preds = [filter(!=(0), cfg.blocks[b].preds) for b in 1:nb]
+    succs = [cfg.blocks[b].succs for b in 1:nb]
+    counted_headers = Set{Int}(cl.header for cl in counted)
+    term(b) = pir.stmts[cfg.blocks[b].stmts.stop][:stmt]
+    block_of = _stmt_block_map(pir)
+
+    implied = ImpliedMerge[]
+    for m in 1:nb
+        unreachable[m] && continue
+        length(preds[m]) == 2 || continue
+        p, q = preds[m]
+        (p != q && !unreachable[p] && !unreachable[q]) || continue
+        (m in quiet || haskey(regions, m) || m in counted_headers) && continue
+
+        # Walk m -> d: the branch may sit a few blocks downstream (iterator-protocol lowering puts
+        # the constant-`φ` merge and its `GotoIfNot` in separate blocks). Every step must be a
+        # single-pred/single-succ block so each visit of `m` reaches `d` exactly once and the
+        # reverse routing back is unconditional.
+        d = m
+        region = Int[m]
+        ok = true
+        while !isa(term(d), Core.GotoIfNot)
+            length(succs[d]) == 1 || (ok = false; break)
+            s = only(succs[d])
+            (1 <= s <= nb && !unreachable[s] && length(preds[s]) == 1 && s ∉ quiet &&
+             !haskey(regions, s) && s ∉ region && length(region) <= nb) || (ok = false; break)
+            push!(region, s)
+            d = s
+        end
+        ok || continue
+        gin = term(d)::Core.GotoIfNot
+        dest, fall = Int(gin.dest), d + 1
+        dest == fall && continue
+        # An arm into block 1 has no reverse dispatch to decorate with the cell store (the
+        # pullback's block-1 code is its final block and never routes) — same exclusion as
+        # `_counted_loops`' `e == 1`.
+        (dest == 1 || fall == 1) && continue
+
+        rset = Set{Int}(region)
+        vp = _branch_cond_eval(pir, iworld, block_of, rset, m, p, gin.cond, Set{Int}())
+        vp isa Bool || continue
+        vq = _branch_cond_eval(pir, iworld, block_of, rset, m, q, gin.cond, Set{Int}())
+        vq isa Bool || continue
+        vp != vq || continue
+        # `GotoIfNot` takes `dest` when the condition is false.
+        dest_pred, fall_pred = vp ? (q, p) : (p, q)
+        push!(implied, ImpliedMerge(m, d, dest_pred, fall_pred))
+    end
+    return implied
+end
+
+# ===========================================================================
 # ISSUES #52: split a block's stack push per edge rather than per block.
 #
 # `is_unique_pred[b] == false` makes `emit_epilogue!` push block `b`'s number unconditionally, but a
@@ -1260,7 +1458,7 @@ end
 """
     _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool},
                                   counted=CountedLoop[], count_stack_ssa=0,
-                                  mk_count_push=nothing)::CC.IRCode
+                                  mk_count_push=nothing, implied_edges=Set{NTuple{2,Int}}())::CC.IRCode
 
 Post-processes the already-built forwards-carrier `ir` (still 1:1 in block topology with the primal
 `pir`) so a block with a `GotoIfNot` terminator where exactly one arm needs a block-stack push no
@@ -1279,13 +1477,14 @@ and lower back to a real `IRCode` (Stage 2). Returns `ir` unchanged when there i
 function _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool},
                                        counted::Vector{CountedLoop}=CountedLoop[],
                                        count_stack_ssa::Int=0,
-                                       mk_count_push=nothing)::CC.IRCode
+                                       mk_count_push=nothing,
+                                       implied_edges::Set{NTuple{2,Int}}=Set{NTuple{2,Int}}())::CC.IRCode
     nblocks = length(pir.cfg.blocks)
-    counted_edges = _counted_edges(counted)
+    served_edges = union!(_counted_edges(counted), implied_edges)
     npreds(s) = length(filter(!=(0), pir.cfg.blocks[s].preds))
     # Must match `_unique_predecessor_info`'s formula exactly — same per-edge predicate, same
-    # counted-edge exclusion — or push and pop desynchronize.
-    needs_push(b, s) = npreds(s) > 1 && (b, s) ∉ counted_edges
+    # counted-/implied-edge exclusion — or push and pop desynchronize.
+    needs_push(b, s) = npreds(s) > 1 && (b, s) ∉ served_edges
 
     # Stage 0: classify, in primal block-number space — no IR construction yet.
     candidates = Tuple{Int,Symbol,Int}[]   # (b, :dest|:fallthrough, push-needing target block number)
@@ -2618,8 +2817,10 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # builder), like `_unique_predecessor_info` — a pure function of identical arguments, so the
     # sides agree by construction.
     counted = _counted_loops(pir, unreachable_block, regions, quiet)
+    implied = _implied_merges(pir, iworld, unreachable_block, regions, quiet, counted)
     is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions,
-                                                    quiet, _counted_edges(counted))
+                                                    quiet, union!(_counted_edges(counted),
+                                                                  _implied_edges(implied)))
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
@@ -3410,7 +3611,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
         count_push_ci === nothing ? Expr(:call, push_g, cs_id, val_id) :
                                     Expr(:invoke, count_push_ci, push_g, cs_id, val_id), Any)
     ir = _split_ambiguous_block_pushes(ir, pir, is_unique_pred, counted, count_stack_ssa.id,
-                                       mk_count_push)
+                                       mk_count_push, _implied_edges(implied))
     CC.verify_ir(ir)
     return ir
 end
@@ -3473,12 +3674,25 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # Recomputed from the same threaded inputs as the forwards builder's copy — a pure function of
     # identical arguments, so the two sides agree by construction.
     counted = _counted_loops(pir, unreachable_block, regions, quiet)
+    implied = _implied_merges(pir, iworld, unreachable_block, regions, quiet, counted)
     _, pred_is_unique_pred, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions,
-                                                         quiet, _counted_edges(counted))
+                                                         quiet, union!(_counted_edges(counted),
+                                                                       _implied_edges(implied)))
     # Where the reverse walk enters each counted loop's region (pop the recorded trip count there)
     # and which reverse blocks dispatch on the countdown instead of popping the block stack.
     counted_exit = Dict((cl.exiting, cl.exit_target) => li for (li, cl) in enumerate(counted))
     counted_header = Dict(cl.header => li for (li, cl) in enumerate(counted))
+    # Implied merges (`_implied_merges`): which reverse blocks dispatch on the per-merge cell
+    # instead of popping, and — keyed like `counted_exit`, `(pred p, current block b)` — which
+    # reverse arms store the predecessor the arriving direction implies. The two arms into the
+    # branch block's reverse code come from its two successors, and each names a distinct pred.
+    implied_merge = Dict(im.merge => ii for (ii, im) in enumerate(implied))
+    implied_store = Dict{NTuple{2,Int},Tuple{Int,Int32}}()
+    for (ii, im) in enumerate(implied)
+        gin = pstmts[pir.cfg.blocks[im.branch].stmts.stop][:stmt]::Core.GotoIfNot
+        implied_store[(im.branch, Int(gin.dest))] = (ii, Int32(im.dest_pred))
+        implied_store[(im.branch, im.branch + 1)] = (ii, Int32(im.fall_pred))
+    end
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
@@ -3638,6 +3852,13 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # scalarization costs a load/store per reverse iteration, never correctness.
     cnt_ref_id = [eemit!(Expr(:new, Base.RefValue{Int64}, Int64(0)), Base.RefValue{Int64})
                   for _ in counted]
+
+    # One predecessor cell per implied merge, stored by the reverse arm entering the branch
+    # block's reverse code and read by the merge's reverse dispatch in place of a block-stack pop.
+    # A `Ref` for the same reason as the countdown cells above: SROA scalarizes it, and a missed
+    # scalarization costs a load/store, never correctness.
+    imp_ref_id = [eemit!(Expr(:new, Base.RefValue{Int32}, Int32(0)), Base.RefValue{Int32})
+                  for _ in implied]
 
     # An unassigned slot *in range* is an inactive statement/argument; `route!` discards a `nothing`
     # target, exactly as it already does for a literal operand. Out of range is an internal error, not
@@ -4123,7 +4344,17 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         # re-entry into the loop region re-pops first.
         emit_pred_dispatch!(preds_, targets_::Vector{ID}) = begin
             li = get(counted_header, b, nothing)
-            if li === nothing
+            ii = get(implied_merge, b, nothing)
+            if li === nothing && ii !== nothing
+                # Implied merge: the arriving arm already stored the predecessor it implies into
+                # this merge's cell — dispatch on that instead of popping.
+                im = implied[ii]
+                (length(preds_) == 2 && im.dest_pred in preds_ && im.fall_pred in preds_) ||
+                    error("Differ internal error: implied merge $b's predecessors $(preds_) do " *
+                          "not match its analysis ($(im.dest_pred), $(im.fall_pred))")
+                pv = emit!(Expr(:call, getf, imp_ref_id[ii], 1), Int32)
+                _emit_switch!(emit!, icall, block_stack_id, preds_, targets_; prev_id=pv)
+            elseif li === nothing
                 _emit_switch!(emit!, icall, block_stack_id, preds_, targets_;
                              skip_pop=pred_is_unique_pred[b])
             else
@@ -4150,6 +4381,18 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             remit!(Expr(:call, setf, cnt_ref_id[li], 1, c), Any)
             nothing
         end
+        # The arm routing to an implied merge's branch block records which predecessor this
+        # arrival direction implies. Between here and the merge's own dispatch only this visit's
+        # branch/chain reverse code runs, and only arms into the branch block store this cell, so
+        # the read always sees this visit's store.
+        store_pred!(remit!, p) = begin
+            e = get(implied_store, (p, b), nothing)
+            e === nothing && return nothing
+            ii, predid = e
+            remit!(Expr(:call, setf, imp_ref_id[ii], 1, predid), Any)
+            nothing
+        end
+        arm_decorated(p) = haskey(counted_exit, (p, b)) || haskey(implied_store, (p, b))
 
         if b == 1
             # No predecessors: this is the pullback's own final block — the last thing that runs.
@@ -4194,15 +4437,16 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         elseif phi_end < lo
             # No PhiNodes at the top of this block: switch straight to each predecessor's own
             # block, via a small routing block only where the arm must first recover a counted
-            # loop's trip count. A sole predecessor's pop can sit inline instead — the dispatch
-            # below is then a plain goto.
+            # loop's trip count or record an implied merge's predecessor. A sole predecessor's
+            # decorations can sit inline instead — the dispatch below is then a plain goto.
             target_ids = ID[]
             new_blocks = CFGBlock[]
             for p in preds
-                if !haskey(counted_exit, (p, b))
+                if !arm_decorated(p)
                     push!(target_ids, block_id[p])
                 elseif length(preds) == 1
                     count_pop!(emit!, p)
+                    store_pred!(emit!, p)
                     push!(target_ids, block_id[p])
                 else
                     rstmts = IDInstPair[]
@@ -4212,6 +4456,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                         id
                     end
                     count_pop!(remit!, p)
+                    store_pred!(remit!, p)
                     rid = ID()
                     remit!(IDGotoNode(block_id[p]), Any)
                     push!(new_blocks, CFGBlock(rid, rstmts))
@@ -4255,6 +4500,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     remit!(Expr(:call, setf, tgt, 1, new), Any)
                 end
                 count_pop!(remit!, p)
+                store_pred!(remit!, p)
                 rid = ID()
                 remit!(IDGotoNode(block_id[p]), Any)
                 push!(new_blocks, CFGBlock(rid, rstmts))
@@ -4287,20 +4533,23 @@ end
 
 # Emits a plain goto (`skip_pop`, the only path a single-predecessor block takes under the per-edge
 # formula) or `pop!(block_stack)` followed by a `Switch` comparing the popped id against each
-# candidate (`preds[1:end-1]`), falling through to `preds[end]`.
+# candidate (`preds[1:end-1]`), falling through to `preds[end]`. `prev_id` supplies an
+# already-emitted block id to dispatch on instead of popping — an implied merge's cell read.
 #
 # The `length(preds) == 1` branch below is dead code under the current `pred_is_unique_pred[b] =
 # length(preds[b]) <= 1` formula (every single-predecessor block returns early via `skip_pop`
 # above). Kept as a defensive no-op, not removed — the old per-block push/pop scheme needed a
 # balance-pop here (ISSUES #52); the two schemes must not be mixed.
 function _emit_switch!(emit!, icall, block_stack_id, preds::Vector{Int}, targets::Vector{ID};
-                       skip_pop::Bool=false)
+                       skip_pop::Bool=false, prev_id=nothing)
     if skip_pop
         @assert length(targets) == 1 "skip_pop requires an unambiguous (single) target"
         emit!(IDGotoNode(targets[1]), Any)
         return nothing
     end
-    prev_id = emit!(icall(__pop_blk_stack!, (Stack{Int32},), block_stack_id), Int32)
+    if prev_id === nothing
+        prev_id = emit!(icall(__pop_blk_stack!, (Stack{Int32},), block_stack_id), Int32)
+    end
     if length(preds) == 1
         # Dead under the per-edge formula (see above) — defensive balance-pop, kept for safety.
         emit!(IDGotoNode(targets[1]), Any)

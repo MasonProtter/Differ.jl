@@ -19,8 +19,8 @@ const CC = Core.Compiler
 # traffic — the only ambiguity was the header arrival).
 whilesum(x, N) = (s = 0.0; i = 1; while i <= N; s += x; i += 1; end; s)
 
-# `for`-shaped: exits from a mid-body block (the iterate-end check), whose merge keeps one
-# genuinely data-dependent push per iteration.
+# `for`-shaped: exits from a mid-body block (the iterate-end check), whose merge is compressed
+# separately, by the implied-merge scheme (`_implied_merges`).
 forsum(x, N) = (s = 0.0; for i in 1:N; s = s + x; end; s)
 
 # Body-first (do-while): the body runs before the exit check, so N=0 still runs once.
@@ -146,38 +146,29 @@ end
 end
 
 
-# Peak stack usage of one fresh round trip: (block-stack slots, count-stack slots).
-function _loop_traffic(f, args...)
-    ctx = Ctx()
-    fcd, argcds = zero_fcodual(f), map(zero_fcodual, args)
-    ycd, pb = rrule!!(fcd, ctx, argcds...)
-    pb(one(DifferReverse.primal(ycd)))
-    @test pb.block_stack.position == 0
-    @test pb.count_stack.position == 0
-    return length(pb.block_stack.memory), length(pb.count_stack.memory)
-end
-
 @testset "traffic: compressible shapes are flat, data-dependent pushes survive" begin
     # while-shape: the header arrival was the only ambiguity — zero block-stack traffic at any N,
     # one recorded count.
     for N in (0, 2, 5, 100, 10_000)
-        @test _loop_traffic(whilesum, 3.0, N) == (0, 1)
+        @test loop_traffic(whilesum, 3.0, N) == (0, 1)
     end
-    # for-shape: the iterate-end merge's push per iteration remains; the header's is gone.
-    b2, c2 = _loop_traffic(forsum, 3.0, 2)
-    b100, c100 = _loop_traffic(forsum, 3.0, 100)
+    # for-shape: the header's per-arrival push became the trip count, and the iterate-end merge's
+    # per-iteration push is now implied by the following branch (`_implied_merges`) — flat.
+    b2, c2 = loop_traffic(forsum, 3.0, 2)
+    b100, c100 = loop_traffic(forsum, 3.0, 100)
     @test c2 == c100 == 1
-    @test b100 - b2 == 100 - 2            # exactly one push per additional iteration
-    # data-dependent diamond: still one push per iteration for the merge, none for the header.
-    d2, _ = _loop_traffic(diamondloop, 3.0, 2)
-    d100, _ = _loop_traffic(diamondloop, 3.0, 100)
-    @test d100 - d2 >= 100 - 2
+    @test b100 == b2
+    # data-dependent diamond: still one push per iteration for its merge, none for the header or
+    # the iterate-end merge.
+    d2, _ = loop_traffic(diamondloop, 3.0, 2)
+    d100, _ = loop_traffic(diamondloop, 3.0, 100)
+    @test d100 - d2 == 100 - 2
     # nested: the inner loop records one count per outer iteration, plus the outer loop's own.
-    _, cn = _loop_traffic(nestedsum, 3.0, 7)
+    _, cn = loop_traffic(nestedsum, 3.0, 7)
     @test cn == 7 + 1
     # ineligible `break` loop: per-iteration block-stack traffic, no counts recorded. `s > 10`
     # first trips at N >= 5 for x = 3.0, so N=3 runs the loop to completion.
-    bb, cb = _loop_traffic(breaksum, 3.0, 3)
+    bb, cb = loop_traffic(breaksum, 3.0, 3)
     @test cb == 0
     @test bb > 0
 end
@@ -199,13 +190,13 @@ end
     checkverify_rev(mydot, (Vector{Float64}, Vector{Float64}))
     check_stack_balance(mydot, randn(4), randn(4))
     # The live carriers must actually compress these (the raw-IR analysis alone can't show that —
-    # the pipeline's own regions/quiet feed the eligibility check): for-shape keeps only the
-    # iterate-end merge push per iteration, while-shape drops to zero.
-    b2, c2 = _loop_traffic(mysum, randn(2))
-    b100, c100 = _loop_traffic(mysum, randn(100))
+    # the pipeline's own regions/quiet feed the eligibility check): for-shape is flat (trip count
+    # plus implied iterate-end merge), while-shape drops to zero.
+    b2, c2 = loop_traffic(mysum, randn(2))
+    b100, c100 = loop_traffic(mysum, randn(100))
     @test c2 == c100 == 1
-    @test b100 - b2 == 100 - 2
+    @test b100 == b2
     for N in (0, 5, 100)
-        @test _loop_traffic(mysum_w, randn(N)) == (0, 1)
+        @test loop_traffic(mysum_w, randn(N)) == (0, 1)
     end
 end

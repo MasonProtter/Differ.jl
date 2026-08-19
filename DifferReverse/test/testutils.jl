@@ -142,6 +142,19 @@ function check_block_stack_traffic(f, args...; expect_zero::Bool)
     return nothing
 end
 
+# Peak stack usage of one fresh round trip: (block-stack slots, count-stack slots). A `Stack`
+# never shrinks its backing memory, so the lengths after a balanced round trip are the high-water
+# marks.
+function loop_traffic(f, args...)
+    ctx = Ctx()
+    fcd, argcds = zero_fcodual(f), map(zero_fcodual, args)
+    ycd, pb = rrule!!(fcd, ctx, argcds...)
+    pb(one(DifferReverse.primal(ycd)))
+    @test pb.block_stack.position == 0
+    @test pb.count_stack.position == 0
+    return length(pb.block_stack.memory), length(pb.count_stack.memory)
+end
+
 # Tape size. Asserts on properties of the whole set of comms element types, never a particular
 # block's index: block numbering shifts with any unrelated change to Julia's optimizer.
 #

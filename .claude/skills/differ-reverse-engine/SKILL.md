@@ -268,16 +268,44 @@ builders:
   preheader arm at zero.
 
 Result: a `while`-shaped loop (`whilesum`, bounds-checked `mysum_w`) drops to **zero** block-stack
-traffic; a `for`-shaped loop (`loopsum`/`memloop!`/`mysum`/`mydot`) drops `2N+3 -> N+3` — the
-residual N/iteration is the iterate-end merge's two data-dependent predecessors, *not* header
-traffic (statically implied by which successor the check block takes; compressing that is a
-separate follow-up, ISSUES #130). `sum(v)` itself recurses into `mapreduce_impl`'s pairwise
+traffic; a `for`-shaped loop (`loopsum`/`memloop!`/`mysum`/`mydot`) drops `2N+3 -> N+3`, and the
+implied-merge scheme (next) then removes the residual N — its per-iteration pushes were the
+iterate-end merge's. `sum(v)` itself recurses into `mapreduce_impl`'s pairwise
 scheme, so its traffic lives on nested per-call-site tapes and the recursion machinery dominates
 regardless. Tests: `test_reverse_counted_loops.jl` (eligibility on real primal IR, gradients
 across N=0..50 for eligible and ineligible shapes, nested/`continue`/`break`/`@goto`/
 bounds-checked-read fixtures, exact traffic through the live pipeline — the raw-IR analysis alone
-can't see the regions/quiet interplay), plus the updated `memloop!` N+3 assertion in
+can't see the regions/quiet interplay), plus the flat `memloop!` assertion in
 `test_reverse_block_stack_split.jl`.
+
+**Implied merges** (`_implied_merges`/`ImpliedMerge`, ISSUES #130): a 2-predecessor merge `m`
+whose *following branch* is a pure function of which predecessor fired — the `iterate`-end diamond
+every `for` loop lowers to, whose `GotoIfNot` condition is `not_int(φ(#a ⇒ true, #b ⇒ false))` or
+`φ(tuple, nothing) === nothing` — keeps **no** block-stack traffic: which successor the branch
+block `d` takes already identifies `m`'s predecessor, and the pullback's reverse walk knows that
+direction for free (its arms into `d`'s reverse code are per-successor). `d` may be `m` itself
+(unit-range loops) or sit a few blocks downstream through a single-pred/single-succ chain
+(iterator-protocol lowering, `eachsum`/`zipsum`); a narrow evaluator (`_branch_cond_eval`:
+φ-at-`m` leaves, chain phis, `PiNode`, `not_int`, `===` by egal's type-disjointness/singleton
+rules) must produce a known, differing `Bool` under each predecessor assumption, so a genuinely
+data-dependent condition disqualifies naturally. Three coupled pieces, mirroring the counted
+scheme's structure but with **no forwards instrumentation at all** — the fwds carrier just stops
+pushing on the two edges (`_implied_edges` joins `_counted_edges` in the shared `served_edges`
+exclusion of `needs_push`, in `_unique_predecessor_info` and `_split_ambiguous_block_pushes`
+alike); the pullback allocates one `Ref{Int32}` cell per merge in its entry block (`imp_ref_id`,
+beside the countdown cells), each reverse arm into `d`'s reverse block stores the predecessor id
+that arrival direction implies (`store_pred!`, decorating the same routing blocks `count_pop!`
+does — the two compose when `d` is also a counted loop's exiting block), and `m`'s reverse
+dispatch reads the cell instead of popping (`_emit_switch!`'s `prev_id` override). Correctness
+window: between the arm's store and `m`'s read only that visit's own branch/chain reverse code
+runs, and only arms into `d`'s reverse code store that cell. Excluded: collapsible-region blocks
+(a region entry's reverse code is entered from the region merge unconditionally, erasing the arm
+information) and counted headers (the dispatch kinds must stay mutually exclusive). Result: `for`
+loops match `while` loops at O(1) block-stack traffic (`forsum`/`memloop!`/`mysum` flat at ~2
+per call, `eachsum` flat); `diamondloop`'s data-dependent ternary merge keeps exactly one push
+per iteration, and `zipsum` keeps one — zip's combined done-check merge is 3-predecessor with
+only a *partial* implication (the singleton class is the per-iteration pred), a tracked
+generalization (ISSUES #133). Tests: `test_reverse_implied_merges.jl`.
 
 **Collapsible regions** (`_collapsible_regions`) extend the unique-predecessor optimization from a
 single edge to a whole comms-free sub-region: the fixed diamond shape `@boundscheck` lowering produces
