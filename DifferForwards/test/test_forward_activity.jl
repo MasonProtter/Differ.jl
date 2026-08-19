@@ -188,6 +188,43 @@ end
     @test isnan(dot(dvinf, w) + dot(vinf, zero_tangent(w)))     # what a materialised zero gives
 end
 
+setidx1!(x, v) = (v[1] = x; v[1] * 1.0)
+mutable struct ActMS
+    a::Float64
+end
+setfld1!(x, m) = (m.a = x; m.a * 1.0)
+setidxmask!(x, v) = (setindex!(v, [x], [true, false]); v[1] * 1.0)
+
+@testset "activity: an inlined store refuses an Inactive destination fed an active value" begin
+    # `v[1] = x` has no hand rule for a scalar `Int` index — it always inlines to raw
+    # `memoryrefset!`. A constant `v` (`Inactive` shadow) materialises a fresh, disconnected zero
+    # `MemoryRef` wherever the ref is needed; writing an active `x` through it would silently drop
+    # the derivative instead of surfacing an error.
+    @test_throws ErrorException frule!!(Dual(setidx1!, NoTangent()), Dual(2.0, 1.0), const_dual([0.0]))
+    @test_throws ErrorException frule!!(Dual(setfld1!, NoTangent()), Dual(2.0, 1.0), const_dual(ActMS(0.0)))
+
+    # Dest active, value active: unchanged.
+    @test frule!!(Dual(setidx1!, NoTangent()), Dual(2.0, 1.0), Dual([0.0], [0.0])).dx ≈ 1.0
+    @test frule!!(Dual(setfld1!, NoTangent()), Dual(2.0, 1.0), Dual(ActMS(0.0), zero_tangent(ActMS(0.0)))).dx ≈ 1.0
+
+    # Dest active, value Inactive: the existing strong zero, unchanged.
+    @test frule!!(Dual(setidx1!, NoTangent()), const_dual(2.0), Dual([0.0], [0.0])).dx == 0.0
+    @test frule!!(Dual(setfld1!, NoTangent()), const_dual(2.0), Dual(ActMS(0.0), zero_tangent(ActMS(0.0)))).dx == 0.0
+
+    # Dest Inactive, value Inactive too: nothing active is lost, so no error.
+    @test frule!!(Dual(setidx1!, NoTangent()), const_dual(2.0), const_dual([0.0])).dx == 0.0
+    @test frule!!(Dual(setfld1!, NoTangent()), const_dual(2.0), const_dual(ActMS(0.0))).dx == 0.0
+
+    # The dualized IR itself is still legal in every case — the refusal is a runtime error inside
+    # otherwise-verifiable IR, not a compile-time bail.
+    checkverify(setidx1!, (Float64, Vector{Float64}); inactive=(2,))
+    checkverify(setfld1!, (Float64, ActMS); inactive=(2,))
+
+    # The non-inlined hand-rule path (`setindex!` with a mask, which does have a rule) agrees: an
+    # Inactive destination is refused there too.
+    @test_throws ErrorException frule!!(Dual(setidxmask!, NoTangent()), Dual(2.0, 1.0), const_dual([0.0, 0.0]))
+end
+
 @testset "activity: vararg tails and higher order degrade rather than bail" begin
     # A constant trailing element is materialised in the prologue, so the packed tangent tuple keeps
     # its primal-derived type and the rest of the transform needs no vararg awareness.

@@ -808,6 +808,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # though they never change identity.
     zerotang_g   = zero_tangent       # runtime zero-tangent fallback for non-diff results
     buildtang_g  = build_tangent      # construct a struct's `Tangent`/`MutableTangent` shadow
+    requiredestg = _require_active_dest  # refuse a store into a declared-constant destination
     fruleg = frule!!
     Dualg  = Dual                # the `Dual` constructor, for a runtime (dynamic) pack of a non-concrete result
     dynfrule_g = dynamic_frule   # runtime dispatcher for a surviving dynamic (`apply_generic`) call
@@ -1160,6 +1161,21 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     optype(@nospecialize x) = isa(x, Core.Argument) ? argty[x.n] :
                               isa(x, GlobalRef) ? gref_optype(x) : _widen(_optype(pir, x))
 
+    # Whether an operand's *origin* was found active by `_activity` — `arg_active`'s length stands
+    # in for `nslots`, which only one of the two branches above binds. A literal answers `false`.
+    op_active(@nospecialize x) =
+        isa(x, Core.SSAValue) ? active[x.id] :
+        isa(x, Core.Argument) ? (x.n <= length(arg_active) && arg_active[x.n]) : false
+    # A store's destination traces to a declared-constant (`Inactive`) origin while the value being
+    # stored is genuinely active: the destination's own shadow was materialised into a zero
+    # disconnected from the real array/struct (`_materialized`, since a builtin is a demanding
+    # consumer), so writing the active value there would silently drop its derivative. Used by the
+    # inlined `memoryrefset!`/`setfield!` store paths (`builtins.jl`) to refuse at run time, mirroring
+    # `_require_active_dest`'s hand-rule check. Only judged when `dest` is a genuine SSA/Argument node
+    # — a literal destination never arises for a `MemoryRef`/mutable struct in practice.
+    refuse_inactive_dest(@nospecialize(dest), @nospecialize(val)) =
+        (isa(dest, Core.SSAValue) || isa(dest, Core.Argument)) && !op_active(dest) && op_active(val)
+
     function frule_split!(fpos, actual, R)
         # Dual(callee, NoTangent()) and each Dual(arg_primal, arg_tangent), constructed via %new.
         # Embed the resolved callee value rather than the raw AST node when it's statically known: a
@@ -1310,7 +1326,8 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     builtin_ctx = (emit! =emit!, presolve=presolve, tresolve=tresolve, vpresolve=vpresolve,
                    zero_shadow=zero_shadow, optype=optype, tt=tt, emit_invoke! =emit_invoke!,
                    opf=opf, reason=reason, fsel_shadow_type=fsel_shadow_type,
-                   fsel_shadow_field=fsel_shadow_field, fsel_mirror_field=fsel_mirror_field)
+                   fsel_shadow_field=fsel_shadow_field, fsel_mirror_field=fsel_mirror_field,
+                   refuse_inactive_dest=refuse_inactive_dest, requiredestg=requiredestg)
     # And for `apply_foreigncall_frule!` (`src/foreigncalls.jl`). Two extra members for the
     # pointer-provenance walk: `pstmt` reads a primal statement back out of `pir` (old numbering), and
     # `calleeval` resolves a callee node so the walk can recognise `bitcast`/`getfield` in the chain.

@@ -280,6 +280,11 @@ function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
 
     TT = ctx.tt(Ti)
     TT === NoTangent && return p, NoTangent()
+    # Same refusal as `memoryrefset!` above, for a `setfield!` whose object shadow was materialised
+    # from a declared-constant origin while the value being stored is active.
+    if ctx.refuse_inactive_dest(actual[1], actual[3])
+        ctx.emit!(Expr(:call, ctx.requiredestg, Inactive(), "setfield!"), Union{})
+    end
     newtan = ctx.tresolve(actual[3])
     slot = _bi_literal_index(actual[2]) ? _tangent_field_slot(ctx.tt, Pobj, actual[2]) : nothing
     if slot === nothing
@@ -356,10 +361,20 @@ end
 
 # Writes one array element, returns the written value. `val` (actual[2]) is the only differentiable
 # operand; ref/ordering/boundscheck mirror the primal call unchanged.
+#
+# If the ref's own shadow traces to a declared-constant (`Inactive`) array while `val` is genuinely
+# active, writing `val`'s tangent through the ref would land in a zero disconnected from the real
+# array (`_materialized` stands the ref's shadow in with a fresh `zero_tangent`, since a builtin is a
+# demanding consumer) — refuse instead, mirroring `_require_active_dest`'s hand-rule check on
+# `setindex!`/`mul!`/`map!`. `Union{}`-typed, so the ordinary emission below is dead code once this
+# fires; left in place rather than special-cased so `primal[i]`/`shadow[i]` stay normally typed.
 function apply_builtin_frule!(::Val{Core.memoryrefset!}, actual, Ti, ctx)
+    TT = ctx.tt(Ti)
+    if TT !== NoTangent && ctx.refuse_inactive_dest(actual[1], actual[2])
+        ctx.emit!(Expr(:call, ctx.requiredestg, Inactive(), "memoryrefset!"), Union{})
+    end
     p = ctx.emit!(Expr(:call, _memrefsetg, ctx.presolve(actual[1]), ctx.presolve(actual[2]),
                        (ctx.presolve(a) for a in actual[3:end])...), Ti)
-    TT = ctx.tt(Ti)
     t = TT === NoTangent ? NoTangent() :
         ctx.emit!(Expr(:call, _memrefsetg, ctx.tresolve(actual[1]), ctx.tresolve(actual[2]),
                        (ctx.presolve(a) for a in actual[3:end])...), TT)
