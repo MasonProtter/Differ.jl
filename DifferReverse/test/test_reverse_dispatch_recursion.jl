@@ -682,17 +682,30 @@ end
     @test g1 == rev_gradient(evenodd, 9, 1.0)
 end
 
-@testset "reverse mode: nested-tape recycling — hand rule callee still gets a fresh Ctx()" begin
-    # A callee with a hand-written rrule!! (its pullback is whatever's cheapest to remember, not a
-    # Tape, so there is no tape to pre-allocate) must still receive a fresh Ctx() at its call site,
-    # never a recycled one from _inner_ctx.
-    plus1_hr(x) = sin(x) + 1
-    ir = code_reverse_fwds_ircode(plus1_hr, (Float64,))[1]
-    invokes_to_rrule = [stmt for stmt in ir.stmts.stmt
+invokes_to_rrule(ir) = [stmt for stmt in ir.stmts.stmt
                         if isa(stmt, Expr) && stmt.head === :invoke &&
                            length(stmt.args) >= 4 && stmt.args[2] === rrule!!]
-    @test length(invokes_to_rrule) == 1
-    ctx_arg = only(invokes_to_rrule).args[4]
+
+@testset "reverse mode: hand rule callee inlines ordinarily, stays an :invoke under nested_forward" begin
+    # A callee with a hand-written rrule!! is small enough that ordinary inlining absorbs it — no
+    # surviving `invoke rrule!!`. Only forward-over-reverse (`nested_forward`) keeps it a real call
+    # with a fresh Ctx(), never a recycled one from _inner_ctx: that composition has never been
+    # exercised against an inlined rule body.
+    plus1_hr(x) = sin(x) + 1
+
+    ir = code_reverse_fwds_ircode(plus1_hr, (Float64,))[1]
+    @test isempty(invokes_to_rrule(ir))
+
+    interp = DifferReverse.build_reverse_interp(; nested_forward=true)
+    codualtys = Any[DifferReverse.fcodual_type(DifferReverse._typeof(plus1_hr)),
+                    DifferReverse.fcodual_type(Float64)]
+    impl_tt = Tuple{typeof(DifferReverse.reverse_fwds_impl), codualtys[1], Ctx{Nothing}, codualtys[2]}
+    match, _ = Core.Compiler.findsup(impl_tt, Core.Compiler.method_table(interp))
+    impl_mi = Base.specialize_method(match.method, match.spec_types, match.sparams)
+    nested_ir = DifferReverse.optimized_reverse_fwds_ir(interp, impl_mi, Ref("no specific reason recorded"))
+    calls = invokes_to_rrule(nested_ir)
+    @test length(calls) == 1
+    ctx_arg = only(calls).args[4]
     @test ctx_arg isa DifferReverse.Ctx{Nothing}
 end
 

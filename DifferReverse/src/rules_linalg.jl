@@ -9,9 +9,6 @@
 # `transpose`/`adjoint` deliberately have no rule here: both already differentiate correctly via
 # the generic struct-tangent machinery, so a rule would be redundant and risk dispatch ambiguity
 # with the generic fallback. See `test/test_linalg_rules.jl` for the regression test.
-#
-# `Base`/`LinearAlgebra` names are qualified throughout (`Base.:*`, `LinearAlgebra.dot`, ...) for
-# the same GlobalRef-inlining reason as `rrules.jl`.
 
 # ---------------------------------------------------------------------------
 # dot(x, y)
@@ -23,12 +20,12 @@ function rrule!!(
     (; x, dx)::CoDual{Vector{Float64},<:Union{Vector{Float64},Inactive}},
     (; y, dy)::CoDual{Vector{Float64},<:Union{Vector{Float64},Inactive}},
 )
-    Base.length(x) == Base.length(y) ||
+    length(x) == length(y) ||
         throw(DimensionMismatch("dot: vectors have different lengths"))
-    s = LinearAlgebra.dot(x, y)
+    s = dot(x, y)
     xactive, yactive = isactive(dx), isactive(dy)
     function dot_pullback(dz)
-        for i in Base.eachindex(x, y)
+        for i in eachindex(x, y)
             xactive && (dx[i] = increment!!(dx[i], dz * y[i]))
             yactive && (dy[i] = increment!!(dy[i], dz * x[i]))
         end
@@ -46,10 +43,10 @@ function rrule!!(
     ::AbstractCtx,
     (; x, dx)::CoDual{Vector{Float64},Vector{Float64}},
 )
-    nrm = LinearAlgebra.norm(x)
+    nrm = norm(x)
     function norm_pullback(dy)
         c = dy / nrm
-        for i in Base.eachindex(x, dx)
+        for i in eachindex(x, dx)
             dx[i] = increment!!(dx[i], c * x[i])
         end
         return (NoRData(), NoRData())
@@ -66,7 +63,7 @@ function rrule!!(
     ::AbstractCtx,
     (; x, dx)::CoDual{Matrix{Float64},Matrix{Float64}},
 )
-    n = Base.size(x, 1)
+    n = size(x, 1)
     s = 0.0
     for i in 1:n
         s += x[i, i]
@@ -94,10 +91,10 @@ function rrule!!(
     (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
     (; y, dy)::CoDual{Vector{Float64},<:Union{Vector{Float64},Inactive}},
 )
-    z = Base.:*(x, y)
+    z = x * y
     zcd = zero_fcodual(z)
     dz = tangent(zcd)
-    m, n = Base.size(x)
+    m, n = size(x)
     xactive, yactive = isactive(dx), isactive(dy)
     function matvecmul_pullback(::NoRData)
         if xactive
@@ -127,21 +124,21 @@ function rrule!!(
     (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
     (; y, dy)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
 )
-    z = Base.:*(x, y)
+    z = x * y
     zcd = zero_fcodual(z)
     dz = tangent(zcd)
     xactive, yactive = isactive(dx), isactive(dy)
     function matmul_pullback(::NoRData)
         # dx += dz*y',  dy += x'*dz
         if xactive
-            gx = Base.:*(dz, Base.adjoint(y))
-            for i in Base.eachindex(dx, gx)
+            gx = dz * adjoint(y)
+            for i in eachindex(dx, gx)
                 dx[i] = increment!!(dx[i], gx[i])
             end
         end
         if yactive
-            gy = Base.:*(Base.adjoint(x), dz)
-            for i in Base.eachindex(dy, gy)
+            gy = adjoint(x) * dz
+            for i in eachindex(dy, gy)
                 dy[i] = increment!!(dy[i], gy[i])
             end
         end
@@ -171,10 +168,10 @@ function rrule!!(
     isactive(dx) || error("Differ: `mul!` into a destination declared constant (`Inactive` shadow) " *
                           "would discard the gradient flowing to the factors — pass a zeroed shadow " *
                           "buffer instead of declaring the destination constant")
-    old_dx = Base.copy(dx)
-    LinearAlgebra.mul!(x, y, z)
-    Base.fill!(dx, 0.0)
-    m, n = Base.size(y)
+    old_dx = copy(dx)
+    mul!(x, y, z)
+    fill!(dx, 0.0)
+    m, n = size(y)
     yactive, zactive = isactive(dy), isactive(dz)
     function mulmatvec_pullback(::NoRData)
         if yactive
@@ -211,21 +208,21 @@ function rrule!!(
     isactive(dx) || error("Differ: `mul!` into a destination declared constant (`Inactive` shadow) " *
                           "would discard the gradient flowing to the factors — pass a zeroed shadow " *
                           "buffer instead of declaring the destination constant")
-    old_dx = Base.copy(dx)
-    LinearAlgebra.mul!(x, y, z)
-    Base.fill!(dx, 0.0)
+    old_dx = copy(dx)
+    mul!(x, y, z)
+    fill!(dx, 0.0)
     yactive, zactive = isactive(dy), isactive(dz)
     function mulmatmat_pullback(::NoRData)
         # dy += dx*z',  dz += y'*dx
         if yactive
-            gy = Base.:*(dx, Base.adjoint(z))
-            for i in Base.eachindex(dy, gy)
+            gy = dx * adjoint(z)
+            for i in eachindex(dy, gy)
                 dy[i] = increment!!(dy[i], gy[i])
             end
         end
         if zactive
-            gz = Base.:*(Base.adjoint(y), dx)
-            for i in Base.eachindex(dz, gz)
+            gz = adjoint(y) * dx
+            for i in eachindex(dz, gz)
                 dz[i] = increment!!(dz[i], gz[i])
             end
         end

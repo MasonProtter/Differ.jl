@@ -388,29 +388,35 @@ function has_hand_reverse_rule(interp::ContextualInterpreter, callee_mi::MethodI
     return hand_reverse_rule_match(interp, ftype, argcodualtys) !== nothing
 end
 
-# Is `mi` itself a `reverse_fwds_impl`/`reverse_pullback_impl` specialization — the target of one of
-# Part 1's recursive `:invoke`s (`reverse_fwds_recursive_ci`/`reverse_pullback_recursive_ci`), hand-
-# written rule or generated fallback alike? A hand rule's body is typically small (e.g. one `sin(x)`
-# call) — small enough that Julia's ordinary cost heuristic would happily inline it, unlike the
-# generated fallback (always sizable) or forward mode's `frule!!` hand rules for the same functions
-# (which call two transcendentals — `Dual(sin(x), cos(x)*dx)` — comfortably over the inlining
-# threshold, so this hazard never arose there). Inlining one back into its recursive caller is never
-# correct here: the inlined statements carry GlobalRefs resolved relative to the callee's own defining
-# module (confirmed empirically — a `sin(x)` call inside a hand rule in `src/rrules.jl` inlines as
-# `GlobalRef(Differ, :sin)`, not `GlobalRef(Base, :sin)`), which `Core.Compiler.verify_ir` rejects as
-# an "unbound or partitioned GlobalRef... in value position" once re-embedded in the caller's own
-# compiled unit. So every recursive carrier invoke must stay a genuine `:invoke`, never inlined,
-# regardless of apparent cost.
+# Is `mi` itself a `reverse_fwds_impl`/`reverse_pullback_impl`/`rrule!!` invoke — the target of one of
+# Part 1's recursive `:invoke`s, or a call to `rrule!!` (hand-written or the derived fallback)? All
+# three stay genuine `:invoke`s by default. The first two: recursion — inlining would unfold the
+# transform's own call graph at compile time. `rrule!!`: `has_hand_reverse_rule` below reads
+# `mi.specTypes.parameters[1]` as the *differentiated primal's* ftype, so a surviving `rrule!!` invoke
+# is the only evidence that a primal called `rrule!!` itself (reverse-over-reverse) — inlining it away
+# before that scan runs would hide the evidence, and the derived fallback's body is too large for
+# ordinary cost-based inlining to matter anyway.
 #
-# Covers the two carriers and the hand-written `rrule!!` primitives. A hand-written pullback has no
-# common supertype to test (it's a method on the closure's own compiler-generated type), so those
-# are blocked at the call site instead: the emitted pullback-recursion `:invoke` carries
-# `CC.IR_FLAG_NOINLINE`, which `resolve_todo` honours regardless of the callee's type.
+# The one opt-out: `reverse_fwds_to_ircode`'s own hand-rule recursive-call emission sets
+# `CC.IR_FLAG_INLINE` on that specific `:invoke` (never under `nested_forward`), and
+# `CC.src_inlining_policy` honours that flag before falling through to this blanket block. A
+# `rrule!!` call embedded in ordinary primal source never carries the flag, so it stays protected.
+#
+# A hand-written pullback has no common supertype to test (it's a method on the closure's own
+# compiler-generated type), so its own recursive calls are blocked at the call site instead: the
+# emitted pullback-recursion `:invoke` carries `CC.IR_FLAG_NOINLINE` there when needed (see the
+# `pb_derived`/`nested_forward` logic further down).
 _is_reverse_carrier_mi(mi::MethodInstance) = isa(mi.def, Method) && isa(mi.specTypes, DataType) &&
     !isempty(mi.specTypes.parameters) &&
     (mi.specTypes.parameters[1] === typeof(reverse_fwds_impl) ||
      mi.specTypes.parameters[1] === typeof(reverse_pullback_impl) ||
      mi.specTypes.parameters[1] === typeof(rrule!!))
+
+# Is `mi` a hand-written `rrule!!` method (not the `@generated` derived fallback)? Used at the
+# `reverse_fwds_to_ircode` emission site to decide whether to opt a call in via `CC.IR_FLAG_INLINE`.
+_is_hand_rrule_mi(mi::MethodInstance) = isa(mi.def, Method) && isa(mi.specTypes, DataType) &&
+    !isempty(mi.specTypes.parameters) && mi.specTypes.parameters[1] === typeof(rrule!!) &&
+    !is_generated_reverse_fwds_fallback(mi.def)
 
 # ---------------------------------------------------------------------------
 # Coupling-point hooks: reverse-over-forward rejection and nested-forward frule protection
@@ -443,7 +449,9 @@ _foreign_has_hand_frule(interp, @nospecialize(mi)) = false
 
 # Never inline a call whose callee has a hand-written reverse-mode rule (so it survives into the
 # primal IR for `_static_recursible_call`'s recursion dispatch), and never inline a recursive
-# reverse-mode carrier invoke once emitted (`_is_reverse_carrier_mi` above).
+# reverse-mode carrier invoke once emitted (`_is_reverse_carrier_mi` above) — except a specific
+# `:invoke` this transform opted in itself via `CC.IR_FLAG_INLINE` (`_is_hand_rrule_mi`'s emission
+# site in `reverse_fwds_to_ircode`), checked first so it bypasses the blanket block below.
 #
 # `_nested_forward_protects_frule` (above) adds a third condition, active only when this interp was
 # built to compile a reverse-mode carrier on behalf of an outer forward-over-reverse dualization:
@@ -452,8 +460,15 @@ _foreign_has_hand_frule(interp, @nospecialize(mi)) = false
 # surviving call. Always `false` for the ordinary (non-nested) reverse path.
 function CC.src_inlining_policy(interp::ContextualInterpreter{Reverse}, mi::MethodInstance,
                                 @nospecialize(src), @nospecialize(info::CC.CallInfo), stmt_flag::UInt32)
-    (_is_reverse_carrier_mi(mi) || has_hand_reverse_rule(interp, mi)) && return false
-    _nested_forward_protects_frule(interp, mi) && return false
+    # Opted in: skip our own blocks and defer entirely to the ordinary policy, which itself checks
+    # `is_stmt_inline(stmt_flag)` — this also gets `src`'s own validity check for free (`nothing`,
+    # i.e. no cached inferred source, must still refuse rather than crash `retrieve_ir_for_inlining`).
+    opted_in = _is_hand_rrule_mi(mi) && CC.is_stmt_inline(stmt_flag)
+    if !opted_in
+        _is_reverse_carrier_mi(mi) && return false
+        has_hand_reverse_rule(interp, mi) && return false
+        _nested_forward_protects_frule(interp, mi) && return false
+    end
     return @invoke CC.src_inlining_policy(interp::CC.AbstractInterpreter, mi::MethodInstance,
                                           src::Any, info::CC.CallInfo, stmt_flag::UInt32)
 end
@@ -461,14 +476,14 @@ end
 # Build a minimal IRCode whose only effect is to `error(msg)` when invoked, installed via the same
 # `finishinfer!`/`optimize` path as a real reverse-mode body. Works for either carrier's argument
 # shape (`_impl_argtypes` below).
-function reverse_error_ircode(impl_mi::MethodInstance, msg::String)
+function reverse_error_ircode(interp, impl_mi::MethodInstance, msg::String)
     stream = CC.InstructionStream(2)
     stream.stmt[1] = Expr(:call, error, msg); stream.type[1] = Union{}; stream.flag[1] = CC.IR_FLAG_NULL
     stream.stmt[2] = Core.ReturnNode();       stream.type[2] = Union{}; stream.flag[2] = CC.IR_FLAG_NULL
     cfg = CC.CFG(CC.BasicBlock[CC.BasicBlock(CC.StmtRange(1, 2), Int[], Int[])], Int[3])
     di = CC.DebugInfoStream(stream.line)
     di.def = impl_mi
-    ir = CC.IRCode(stream, cfg, di, _impl_argtypes(impl_mi), Expr[], CC.VarState[])
+    ir = CC.IRCode(stream, cfg, di, _impl_argtypes(impl_mi), Expr[], CC.VarState[], carrier_world_range(interp))
     CC.verify_ir(ir)
     return ir
 end
@@ -495,7 +510,7 @@ function build_contextual_ir(interp::ContextualInterpreter{Reverse}, mi::MethodI
         interp.transformed_edges[mi] = edges
         if ir === nothing
             interp.custom_state.bail_reasons[mi] = reason[]   # so a recursing caller can report *this* reason
-            return reverse_error_ircode(mi, reason[])
+            return reverse_error_ircode(interp, mi, reason[])
         end
         return ir
     elseif is_reverse_pullback_impl(mi)
@@ -505,7 +520,7 @@ function build_contextual_ir(interp::ContextualInterpreter{Reverse}, mi::MethodI
         interp.transformed_edges[mi] = edges
         if ir === nothing
             interp.custom_state.bail_reasons[mi] = reason[]
-            return reverse_error_ircode(mi, reason[])
+            return reverse_error_ircode(interp, mi, reason[])
         end
         return ir
     end
@@ -2388,8 +2403,9 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     push_g = Base.push!
     zerofcodual_g = zero_fcodual
 
-    code = Any[]; types = Any[]
-    emit!(ex, @nospecialize(ty)) = (push!(code, ex); push!(types, ty); Core.SSAValue(length(code)))
+    code = Any[]; types = Any[]; flags = UInt32[]
+    emit!(ex, @nospecialize(ty), flag=CC.IR_FLAG_NULL) =
+        (push!(code, ex); push!(types, ty); push!(flags, flag); Core.SSAValue(length(code)))
     opf(name, ty, args...) = emit!(Expr(:call, GlobalRef(Core.Intrinsics, name), args...), ty)
 
     # Emit a call to a runtime helper as a static `:invoke` (see `helper_ci` for why a plain `:call`
@@ -2984,8 +3000,13 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                     icall!(_inner_ctx, Ctx{InnerTapeT}, (ST, Val{k}, Type{InnerTapeT}),
                            comms_stack_ssa[host_b], Val(k), InnerTapeT)
                 end
+                # Hand-rule callee, ordinary (non-nested-forward) build: opt this specific `:invoke`
+                # into inlining (see `_is_reverse_carrier_mi`'s comment) — never under `nested_forward`,
+                # symmetric with the pullback-recursion site's `IR_FLAG_NOINLINE` below.
+                pair_flag = callee_val !== reverse_fwds_impl && !interp.owner.nested_forward ?
+                    CC.IR_FLAG_INLINE : CC.IR_FLAG_NULL
                 pair = emit!(Expr(:invoke, ci, callee_val, fcodual, ctx_val, argcoduals...),
-                            Tuple{InnerFCoDualT,InnerTapeT})
+                            Tuple{InnerFCoDualT,InnerTapeT}, pair_flag)
                 result_cd = emit!(Expr(:call, getf, pair, 1), InnerFCoDualT)
                 primal_map[i] = emit!(Expr(:call, getf, result_cd, 1), Ti)
                 if fdtype(iworld, Ti) !== NoFData
@@ -3078,7 +3099,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     for i in 1:len
         stream.stmt[i] = code[i]
         stream.type[i] = types[i]
-        stream.flag[i] = CC.IR_FLAG_NULL
+        stream.flag[i] = flags[i]
     end
     new_blocks = Vector{CC.BasicBlock}(undef, nblocks)
     for b in 1:nblocks
@@ -3094,9 +3115,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # `_impl_argtypes(impl_mi)`, which is what the bail path (`reverse_error_ircode`) uses.
     argtypes = Any[impl_mi.specTypes.parameters[1], impl_mi.specTypes.parameters[2],
                    impl_mi.specTypes.parameters[3], vararg_tt]
-    # `pir.valid_worlds`, not the constructor's unbounded default — see the matching comment in
-    # `forward_interp.jl`'s `dualize_to_ircode` and `cfg_ir.jl`'s `lower_cfg_blocks_to_ir`.
-    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[], pir.valid_worlds)
+    # See `carrier_world_range` (Contextual.jl) for why this world range.
+    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[], carrier_world_range(interp, pir))
     # `_split_ambiguous_block_pushes` (fixes ISSUES #52): relocate the per-block block-stack push
     # onto only the ambiguous arm of a mixed `GotoIfNot`, making the forwards push per-edge — the
     # companion to the per-edge `pred_is_unique_pred` formula above (`length(preds[b]) <= 1`). The
@@ -3113,17 +3133,14 @@ end
 # a `Switch` into a `GotoIfNot` chain), using the `ID`/`CFGBlock` layer from `cfg_ir.jl`. rdata
 # accumulators are real mutable `Ref`s, one per primal SSA + one per argument.
 
-# `Base.pop!`, not a bare `pop!`: inlined into synthetic carrier IR, where a bare call would
-# resolve as `GlobalRef(Differ, :pop!)` and trip `verify_ir`.
-@inline __pop_blk_stack!(block_stack) = Base.pop!(block_stack)::Int32
-# Fully qualified for the same reason as `__pop_blk_stack!` above.
-@inline __switch_case(id::Int32, prev::Int32) = Base.:!(Core.:(===)(id, prev))
+@inline __pop_blk_stack!(block_stack) = pop!(block_stack)::Int32
+@inline __switch_case(id::Int32, prev::Int32) = !(id === prev)
 
 # Materializes a real zero rdata from `acc` when it's the `ZeroRData` placeholder. Needed wherever a
 # `deref_and_zero!`-derived accumulator must be treated as an actual `RDataT` value (e.g. decomposed
-# field-by-field for an immutable `%new`) rather than merely `increment!!`-ed into. `@noinline`: gets
-# threaded through `icall` into hand-built carrier IR; without it, inlining the tiny body would
-# re-embed a bare call as `GlobalRef(Differ, ...)`, which `verify_ir` rejects.
+# field-by-field for an immutable `%new`) rather than merely `increment!!`-ed into. `@noinline`: gets threaded
+# through `icall` into hand-built carrier IR, where keeping it a real call avoids re-inferring the
+# tiny body at every emission site.
 @noinline _rr_realize_rdata(acc, ::Type{RDataT}) where {RDataT} =
     (acc isa ZeroRData ? zero_rdata_from_type(RDataT) : acc)::RDataT
 
@@ -3728,15 +3745,16 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     end
                     pb_ci, pb_derived, InnerRdatasT = pb_resolved
                     # A derived inner pullback goes through its carrier (`reverse_pullback_impl` the
-                    # callee, tape an argument); a hand-written one is the callee. The hand-written
-                    # case is flagged `IR_FLAG_NOINLINE`: inlining a rule author's body back in here
-                    # would re-embed its `GlobalRef`s relative to its defining module (a bare `cos`
-                    # becomes `GlobalRef(Differ, :cos)`), which `verify_ir` rejects. `_is_reverse_carrier_mi`
-                    # can't cover this case by type — a hand pullback has no common supertype.
+                    # callee, tape an argument); a hand-written one is the callee directly. Only under
+                    # forward-over-reverse (`nested_forward`) does the hand-written case stay
+                    # `IR_FLAG_NOINLINE` — that composition has never been exercised against an inlined
+                    # pullback body. `_is_reverse_carrier_mi` can't cover this case by type — a hand
+                    # pullback has no common supertype.
                     pb_stmt = pb_derived ? Expr(:invoke, pb_ci, reverse_pullback_impl, inner_tape, acc) :
                                            Expr(:invoke, pb_ci, inner_tape, acc)
                     inner_rdatas = emit!(pb_stmt, InnerRdatasT,
-                                         pb_derived ? CC.IR_FLAG_REFINED : CC.IR_FLAG_NOINLINE)
+                                         pb_derived ? CC.IR_FLAG_REFINED :
+                                         (interp.owner.nested_forward ? CC.IR_FLAG_NOINLINE : CC.IR_FLAG_NULL))
                     # Slot 1 is the callee's own rdata — guaranteed `NoRData` by
                     # `_static_recursible_call`'s callee guard, discarded exactly like `ref_for` already
                     # discards any literal operand's contribution — so routing starts at 2.
@@ -3878,7 +3896,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # `_remove_unreachable_cfg_blocks!` drops the throw-only-primal-block stubs: nothing in the
     # pullback ever pushes/routes to them, so they're genuinely unreachable here.
     blocks = _remove_unreachable_cfg_blocks!(_sort_cfg_blocks!(blocks))
-    ir2 = lower_cfg_blocks_to_ir(blocks, pir; argtypes=Any[impl_mi.specTypes.parameters...], def=impl_mi)
+    ir2 = lower_cfg_blocks_to_ir(blocks, pir; argtypes=Any[impl_mi.specTypes.parameters...], def=impl_mi,
+                                 valid_worlds=carrier_world_range(interp, pir))
     CC.verify_ir(ir2)
     return ir2
 end

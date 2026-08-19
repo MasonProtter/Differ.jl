@@ -652,8 +652,16 @@ end
     checkverify_rev(f, (Vector{Float64}, Vector{Float64}); inactive=(2,))
 
     # Without the assertion below, the test above passes for the wrong reason — silently via the
-    # derived path instead of the hand rule.
-    ir = code_reverse_fwds_ircode(f, (Vector{Float64}, Vector{Float64}); inactive=(2,))[1]
+    # derived path instead of the hand rule. Checked on the pre-inlining IR (`build_reverse_fwds_ir`,
+    # not `code_reverse_fwds_ircode`): a hand rule's own body is small enough that ordinary inlining
+    # now absorbs it, so its `:invoke rrule!!` only survives before `run_ipo_passes!` runs.
+    interp = DifferReverse.build_reverse_interp()
+    codualtys = Any[DifferReverse.fcodual_type(DifferReverse._typeof(f)),
+                    arg_codual_types(f, (Vector{Float64}, Vector{Float64}); inactive=(2,))...]
+    impl_tt = Tuple{typeof(DifferReverse.reverse_fwds_impl), codualtys[1], Ctx{Nothing}, codualtys[2:end]...}
+    match, _ = Core.Compiler.findsup(impl_tt, Core.Compiler.method_table(interp))
+    impl_mi = Base.specialize_method(match.method, match.spec_types, match.sparams)
+    ir = DifferReverse.build_reverse_fwds_ir(interp, impl_mi)
     invokes_to_rrule = [stmt for stmt in ir.stmts.stmt
                         if isa(stmt, Expr) && stmt.head === :invoke &&
                            length(stmt.args) >= 2 && stmt.args[2] === rrule!!]

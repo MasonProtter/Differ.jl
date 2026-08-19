@@ -12,6 +12,7 @@ using SafeTestsets
 @safetestset "reverse: activity (constant arguments)" begin include("test_reverse_activity.jl") end
 @safetestset "reverse: closures & globals" begin include("test_reverse_closures_globals.jl") end
 @safetestset "cfg / IR" begin include("test_cfg_ir.jl") end
+@safetestset "carrier world ranges" begin include("test_world_ranges.jl") end
 @safetestset "rules: math" begin include("test_math_rules.jl") end
 @safetestset "rules: reductions" begin include("test_reduction_rules.jl") end
 @safetestset "rules: broadcast" begin include("test_broadcast_rules.jl") end

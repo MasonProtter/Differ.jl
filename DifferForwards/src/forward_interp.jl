@@ -85,7 +85,7 @@ function build_contextual_ir(interp::ContextualInterpreter{Forward}, mi::MethodI
     # not-yet-written `frule!!`) later appears, the mt-backedges recorded below invalidate this
     # carrier so it gets a real chance to dualize instead of staying pinned to the error stub.
     interp.transformed_edges[mi] = edges
-    ir === nothing && return error_ircode(mi, reason[])
+    ir === nothing && return error_ircode(interp, mi, reason[])
     return ir
 end
 
@@ -101,7 +101,7 @@ is_dualized_impl(mi) = isa(mi.def, Method) && isa(mi.specTypes, DataType) &&
 # Minimal IRCode that just `error(msg)`s when invoked, installed via the same path as a real
 # dualized body. Used when `build_dual_ir` bails, so calling the carrier reports why instead of
 # `dualized_impl`'s generic stub message.
-function error_ircode(impl_mi::MethodInstance, msg::String)
+function error_ircode(interp, impl_mi::MethodInstance, msg::String)
     stream = CC.InstructionStream(2)
     stream.stmt[1] = Expr(:call, error, msg); stream.type[1] = Union{}; stream.flag[1] = CC.IR_FLAG_NULL
     stream.stmt[2] = Core.ReturnNode();       stream.type[2] = Union{}; stream.flag[2] = CC.IR_FLAG_NULL
@@ -110,7 +110,7 @@ function error_ircode(impl_mi::MethodInstance, msg::String)
     di.def = impl_mi
     dualparams = impl_mi.specTypes.parameters[2:end]
     argtypes = Any[impl_mi.specTypes.parameters[1], Tuple{dualparams...}]
-    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[])
+    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[], carrier_world_range(interp))
     CC.verify_ir(ir)
     return ir
 end
@@ -1416,11 +1416,8 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     di  = CC.DebugInfoStream(stream.line)
     di.def = impl_mi                                # required: Core.DebugInfo(di, n) does something(di.def)
     argtypes = Any[impl_mi.specTypes.parameters[1], vararg_tt]
-    # `pir.valid_worlds` (not the constructor's unbounded default): this IR mirrors `pir` statement
-    # for statement, so it's valid for exactly as long as `pir` is. Leaving the default sentinel makes
-    # `Base`-namespaced GlobalRefs (from inlined primal library code) print as "dynamic" even though
-    # they're ordinary static calls.
-    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[], pir.valid_worlds)
+    # See `carrier_world_range` (Contextual.jl) for why this world range.
+    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[], carrier_world_range(interp, pir))
     CC.verify_ir(ir)                                # a failure here is a bug in this transform, not
                                                      # unsupported input IR — let it throw plainly
     return ir

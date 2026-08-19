@@ -32,7 +32,6 @@ jobs:
           - { name: Differ,         project: . }
         os:
           - ubuntu-latest
-          - macos-latest
         version:
           - '1.13'
         # `yes` is what `Pkg.test()` does by default. It can hide a bug where an
@@ -42,10 +41,6 @@ jobs:
         check_bounds:
           - 'yes'
           - 'auto'
-        exclude:
-          # The `auto` lane only needs one OS.
-          - os: macos-latest
-            check_bounds: 'auto'
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2

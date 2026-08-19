@@ -9,7 +9,7 @@ const CC = Core.Compiler
 using Base: specialize_method
 
 using Contextual: Contextual, ContextualInterpreter, expr_to_codeinfo, run_ipo_passes!,
-    at_world, mt_edge!
+    carrier_world_range, at_world, mt_edge!
 import Contextual: build_contextual_ir
 
 # Any name DifferReverse adds new methods to (not just calls) must come in via `import`, not bare

@@ -59,10 +59,8 @@ _bi_tracked(@nospecialize(node), ctx) =
     false
 
 # `@noinline` wrappers around the small `Tangent`-system accessors threaded through `icall`/`icall!`
-# into hand-built carrier IR. Without this, inlining the real (tiny, `@inline`) bodies would re-embed
-# their bare `getfield`/`setfield!` calls as `GlobalRef(Differ, :getfield)` — an unbound GlobalRef
-# `verify_ir` rejects (same hazard as `reverse_interp.jl`'s control-flow helpers). `@noinline` keeps
-# each a genuine `:invoke`, so its internals are never re-embedded.
+# into hand-built carrier IR. `@noinline` keeps each a genuine `:invoke` rather than expanding the
+# tiny body at every emission site.
 @noinline _rr_get_tangent_field(t, i) = get_tangent_field(t, i)
 @noinline _rr_set_tangent_field!(t, i, x) = set_tangent_field!(t, i, x)
 @noinline _rr_get_fdata_field(f, name) = _get_fdata_field(f, name)
