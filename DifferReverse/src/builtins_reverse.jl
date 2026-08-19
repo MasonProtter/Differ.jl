@@ -154,6 +154,20 @@ function builtin_rrule_comms(::Val{Core.getfield}, actual, Ti, ctx)
     obj = actual[1]
     P = ctx.optype(obj)
     dyn = !_bi_literal_index(actual[2])
+    if dyn
+        # A dynamic index into a mixed-activity tuple (a packed vararg tail with some trailing
+        # arguments held constant) cannot be resolved: which slot is read — and so whether it is
+        # constant — is not statically decidable. All-constant never reaches here (the read itself
+        # is inactive and replayed primally), so this is a genuine mix.
+        Fobj = ctx.sty(obj)
+        if Fobj isa DataType && Fobj <: Tuple && any(T -> T === Inactive, Fobj.parameters)
+            ctx.reason[] = "reverse mode `getfield` with a dynamic (non-literal) index into a " *
+                           "tuple of mixed activity (shadow type $(Fobj)) is not supported: hold " *
+                           "the trailing arguments uniformly active, or all constant, at " *
+                           "%$(ctx.ssa.id)"
+            return false
+        end
+    end
     if dyn && ctx.tt(_widen(Ti)) !== NoTangent
         # Dynamic (non-literal) field index into a differentiable field: two accepted shapes, both
         # requiring a homogeneous Tuple/NamedTuple (or mutable struct, pure-rdata case only) —

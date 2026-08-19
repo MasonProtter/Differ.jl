@@ -440,9 +440,18 @@ literal.
 - **`:foreigncall` is unconditionally active.** Native code can write through any pointer it is handed,
   and keeping it active is what lets the comms scan, fwds pass and pullback stay uniformly
   activity-gated without an exemption that would desynchronise a push/pop pair.
-- **The packed vararg tail always keeps its rdata accumulator** — the scatter at the pullback's return
-  reads it unconditionally, and an all-`NoTangent` tail (`Tuple{}`, an `Int` vararg) is inactive by
-  type.
+- **The packed vararg tail always keeps its rdata accumulator** (`_has_rdata_sink`'s `nfixed+1`
+  exemption), even when some trailing arguments are constant — the scatter at the pullback's return
+  now gates *per flat position* (`ret_inactive`, a `NoRData()` literal for a constant one) but still
+  reads the one accumulator for the rest, and an all-`NoTangent` tail (`Tuple{}`, an `Int` vararg) is
+  inactive by type. Per-element tail activity itself is ISSUES #116: a constant trailing argument
+  gives the packed slot a mixed per-element shadow type (`Inactive` in the constant slots, via
+  `_packed_tail_shadow_type`), and a literal-index read of a constant slot is inactive
+  (`_inactive_arg_root`'s mixed-tuple-argument arm, consulted by `_activity`). A *dynamic* index into
+  a genuinely mixed tail bails (not statically decidable which slot — the `getfield` comms rule, via
+  the scan ctx's `sty`); an all-constant tail's dynamic read is fine. Passing the whole mixed-shadow
+  tail to a resolved nested call bails too (`_static_recursible_call`'s `mixed_shadow` guard): the
+  recursion glue declares unmasked argument coduals at the uniformly-active fdata type.
 
 **Aliasing is a user obligation**, as in Enzyme: an inactive value must not share memory with an active
 one, and that is not checkable here. The one statically detectable case — writing an active value into
@@ -453,7 +462,7 @@ active value still lands on `NoTangent`, not on `Inactive`. Do not add one as a 
 
 Entry points take `inactive=(positions...)` (1-based, arguments only, not `f`): `build_ctx`,
 `tape_type`, `code_reverse_fwds_ircode`, `code_reverse_pullback_ircode`. See ISSUES #112, and
-#114-#116 for the open follow-ups.
+#113-#118 for the follow-ups (all fixed).
 
 **`ctx.inactive`/`_inactive_arg_root`** (all five ctx bundles: the three `:foreigncall` ones and two
 builtin ones) ask a different question than `_bi_tracked`: not "can a shadow be resolved back to an
@@ -653,7 +662,7 @@ generated fallback matches the loose probe, the strict check would find nothing 
 `has_hand_reverse_rule` checks this first and returns `false` immediately on failure, before it builds
 `argcodualtys` (its own per-argument `tangent_type` calls) and calls `hand_reverse_rule_match`.
 `reverse_fwds_recursive_ci` builds its own `argcodualtys` the same way, except a masked (inactive)
-position gets `CoDual{P,NoTangent}` in place of `_fcdtype(P)` — see ISSUES #115 below.
+position gets `CoDual{P,Inactive}` in place of `_fcdtype(P)` — see ISSUES #115 below.
 
 **Hazard for any future change here**: `tangent_type` is `@assume_effects :foldable` — no mutable
 state, no depth counters, nothing that would falsify `:consistent`/`:effect_free`. A global recursion-
@@ -792,38 +801,44 @@ index (block numbering shifts with unrelated optimizer changes).
   in "Mutation: the shadow-chain comms scheme" above.
 
 - **Activity follow-ups**: ISSUES #113 fixed the `memmove`/`Core.tuple`/`Core.setfield!`/
-  `Base.memoryrefset!` third modes (`ctx.inactive`/`_inactive_arg_root`, above), but `sum(v .* w)` as
-  literally written still bails — ISSUES #117, a `PhiNode` merging an inactive edge with an active,
-  tracked one comes out active-but-untracked, the shape `Broadcast.unalias` produces for a constant
-  array operand; adjacent to #91, same `_fdata_tracked` `PhiNode` arm. ISSUES #118: `Core.tuple`'s
-  inactive-slot zero allocates every call; intended fix is one allocation per argument shape hung off
-  the `Tape`, not a shared sink (rejected — undermines the no-`increment_internal!!(::NoTangent,x)`
-  invariant). ISSUES #114 (fixed): intrinsic operand primal recording is now per-contribution
+  `Base.memoryrefset!` third modes (`ctx.inactive`/`_inactive_arg_root`, above). ISSUES #117 (fixed):
+  a `PhiNode` merging an inactive bare-`Argument` edge with an active, tracked one is tracked
+  (`phi_inactive_edge` + the entry-block zero hoisted per `(phi, edge)` — the `PhiNode` arm in
+  "`_fdata_tracked`: provenance gating" above), so `sum(v .* w)` works with either operand held
+  constant. ISSUES #118 (fixed): `Core.tuple`'s inactive-operand slot no longer synthesises a zero at
+  all — `Inactive` is a legal shadow-slot inhabitant, so a mixed aggregate's shadow carries
+  `Inactive()` in the constant slots (`_shadow_types`/`ctx.sty`, above); the earlier "one allocation
+  per argument shape hung off the `Tape`" idea was dropped as treating the symptom, and a shared
+  absorbing sink stays rejected (`NoTangent` keeps no absorbing arm — a mis-analysed active value is a
+  `MethodError`, not a dropped gradient). ISSUES #114 (fixed): intrinsic operand primal recording is now per-contribution
   (`intrinsic_rrule_deps`/`_intrinsic_needed_operands`/`_has_rdata_sink`) rather than a flat
   "positions read" set, so `mul_float`/`div_float`/`fma_float`'s crossed dependencies drop the
   correct operand (not necessarily the inactive/literal one itself) instead of always keeping both.
   ISSUES #115 (fixed): hand-written *multi-argument* rules now match an inactive argument, both at
   the top level and through a nested recursive call. Rules-side, the affected slots widen to
-  `CoDual{P,<:Union{NoFData,NoTangent}}` (scalar) or `CoDual{X,<:Union{X,NoTangent}}` (fdata-carrying)
-  plus `@ifactive`/an `isactive(dx)` loop guard; unary rules need nothing, since an inactive sole
-  argument makes the whole callsite inactive and primal replay fires before dispatch. Engine-side,
-  `_static_recursible_call` computes a per-operand `mask` (`_has_rdata_sink` on the operand, restricted
-  to `SSAValue`/`Argument` so a literal/`GlobalRef` operand stays active) and threads it through
-  `reverse_fwds_recursive_ci`/`hand_reverse_rule_match` (which now takes prebuilt codual types, not
-  argtypes) and both emission loops, so a masked operand is passed as `CoDual{P,NoTangent}` instead of
-  tripping the fdata-provenance guard that used to bail the nested case outright. The same change added
-  a pullback recursion arity/slot-type check (`reverse_pullback_recursive_ci`): a wrong-arity or
-  wrong-slot-type hand pullback is now a located bail instead of a `getfield` error in generated IR.
-  An **overwriting** rule (`mul!`/`map!`) with an inactive *destination* returns a `NoTangent`-shadowed
-  codual whose primal type still carries fdata; a **nested** recursive call into such a rule trips a
-  separate, pre-existing check in `reverse_fwds_recursive_ci` ("recursive call's resolved result fdata
-  type does not match this call's own inferred fdata type") that compares the callsite's static primal
-  type against the resolved callee's return type without accounting for activity. Top-level dispatch
-  (calling the rule's `rrule!!` directly, what `rev_gradient`/DI actually use) is unaffected — this is
-  open only for the *nested* shape, found while testing #115, not itself fixed. ISSUES #116: an
-  inactive element in a vararg primal's packed tail only bails (`_packed_codualparams`), never
-  miscompiles — real support would need per-element activity threaded through five sites across both
-  carriers.
+  `CoDual{P,<:Union{NoFData,Inactive}}` (scalar) or `CoDual{X,<:Union{X,Inactive}}` (fdata-carrying)
+  — originally spelled with `NoTangent` as the constancy marker; #118 migrated the whole encoding to
+  `Inactive` — plus `@ifactive`/an `isactive(dx)` loop guard; unary rules need nothing, since an
+  inactive sole argument makes the whole callsite inactive and primal replay fires before dispatch.
+  Engine-side, `_static_recursible_call` computes a per-operand `mask` (`_has_rdata_sink` on the
+  operand, restricted to `SSAValue`/`Argument` so a literal/`GlobalRef` operand stays active) and
+  threads it through `reverse_fwds_recursive_ci`/`hand_reverse_rule_match` (which now takes prebuilt
+  codual types, not argtypes) and both emission loops, so a masked operand is passed as
+  `CoDual{P,Inactive}` instead of tripping the fdata-provenance guard that used to bail the nested
+  case outright. The same change added a pullback recursion arity/slot-type check
+  (`reverse_pullback_recursive_ci`): a wrong-arity or wrong-slot-type hand pullback is now a located
+  bail instead of a `getfield` error in generated IR.
+  An **overwriting** rule (`mul!`/`map!`) with an inactive *destination* is a located `error` in the
+  rule itself, by design (ISSUES #123): the destination's shadow is both the backward seed and the
+  result's shadow, so a no-op fast path would silently zero the sources' gradients — pass a zeroed
+  shadow buffer (what `DI.Cache` produces) instead of declaring the destination constant. A *nested*
+  recursive call into that shape hits `reverse_fwds_recursive_ci`'s own-result-fdata check first and
+  bails with a worse message than the rule's own located refusal — cosmetic, not tracked separately. ISSUES #116 (fixed):
+  an inactive element in a vararg primal's packed tail is supported — per-element tail activity via
+  `_packed_tail_shadow_type` + `_inactive_arg_root`'s mixed-tuple-argument arm + `ret_inactive`'s
+  per-flat-position scatter gating (see "the packed vararg tail always keeps its rdata accumulator"
+  above); a dynamic index into a genuinely *mixed* tail and passing the whole mixed-shadow tail to a
+  nested call are the two remaining located bails.
 
 Growable-array mutation (`push!`/`resize!`), non-bits array elements, and any `Core.Builtin` with no
 registered rule remain out of scope for both modes (`differ-extending-ir-support`).
@@ -850,5 +865,8 @@ registered rule remain out of scope for both modes (`differ-extending-ir-support
   `:subtape` inner-tape recycling (#107), and the immutable-`%new` pullback's bare-`Tuple`/`NamedTuple`
   rdata crash (#108). Search `## 🟢 Reverse-mode activity analysis` and `#112`-`#120` for constant
   arguments (#112), the `memmove`/`Core.tuple`/`Core.setfield!`/`Base.memoryrefset!` third modes and
-  `ctx.inactive`/`_inactive_arg_root` (#113), and the open follow-ups (#114-#120, including the
-  `PhiNode`-merge gap #117 and the `_rr_zero_fdata` allocation #118).
+  `ctx.inactive`/`_inactive_arg_root` (#113), and the follow-ups #114-#118 (all fixed:
+  per-contribution intrinsic recording, hand-rule inactive matching, per-element vararg-tail
+  activity, the `PhiNode` inactive edge, and `Inactive` as a shadow-slot inhabitant); #119/#120 (a
+  stale-doc note and an unexplained once-per-test-run print) are the section's only open entries.
+  Search `#123` for why an inactive *destination* is refused by design.

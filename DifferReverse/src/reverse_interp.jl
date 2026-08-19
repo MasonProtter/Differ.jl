@@ -575,23 +575,25 @@ end
 # `nfixed < 0` (see `resolve_reverse_primal`) means non-vararg: identity. Not `nfixed == n`: a
 # *vararg* primal called with zero trailing arguments also has `nfixed == n`, but the primal IR
 # still has a real (empty-tuple) packed tail slot in that case, so it must still pack.
-function _packed_codualparams(iworld::UInt, codualparams::Vector{Any}, nfixed::Int,
-                              reason::Ref{String})
+function _packed_codualparams(iworld::UInt, codualparams::Vector{Any}, nfixed::Int)
     nfixed < 0 && return codualparams
-    # A constant trailing argument is *typeable* as one packed slot now that a mixed aggregate's
-    # shadow can say `Inactive` per position — but activity and provenance are still decided per
-    # argument, so a read off that slot would come out active and reach for a shadow that isn't
-    # there. Real support needs per-element activity threaded through `_activity`,
-    # `_fdata_tracked`, `_inactive_arg_root` and the pullback's tail scatter; until then this stays
-    # a located bail rather than a `FieldError` inside generated IR.
-    if any(_codual_fdata_type(codualparams[k]) === Inactive for k in (nfixed + 1):length(codualparams))
-        reason[] = "reverse mode cannot hold a vararg primal's trailing argument constant: " *
-            "positions $(nfixed + 1)..$(length(codualparams)) are bound to one packed tuple slot, " *
-            "whose shadow must be uniformly active"
-        return nothing
-    end
     tailP = Tuple{(_codual_primal_type(P) for P in codualparams[(nfixed + 1):end])...}
-    return Any[codualparams[1:nfixed]..., _fcdtype(iworld, tailP)]
+    TailF = _packed_tail_shadow_type(iworld, codualparams, nfixed)
+    packed = TailF === fdtype(iworld, tailP) ? _fcdtype(iworld, tailP) : CoDual{tailP,TailF}
+    return Any[codualparams[1:nfixed]..., packed]
+end
+
+# The type the packed tail's shadow is declared at: the primal-derived fdata type when every
+# trailing argument is active (keeping the `NoFData` collapse), else the per-element tuple with
+# `Inactive` in the constant slots — concrete either way, narrower than the primal-derived type in
+# the mixed case. Shared between `_packed_codualparams` and `_pack_vararg_args!` so the declared
+# slot type and the emitted tuple's type cannot disagree.
+function _packed_tail_shadow_type(iworld::UInt, codualparams::Vector{Any}, nfixed::Int)
+    tail = (nfixed + 1):length(codualparams)
+    if any(k -> _codual_fdata_type(codualparams[k]) === Inactive, tail)
+        return Tuple{(_codual_fdata_type(codualparams[k]) for k in tail)...}
+    end
+    return fdtype(iworld, Tuple{(_codual_primal_type(codualparams[k]) for k in tail)...})
 end
 
 
@@ -605,15 +607,18 @@ function _pack_vararg_args!(emit!::F, ctuple, parg::Vector{Any}, farg::Vector{An
     # Read the flat tail before resizing: with zero trailing arguments, `nfixed+1` is one past
     # `parg`/`farg`'s current length, so the slot doesn't exist to assign into until after `resize!`.
     packed_primal = emit!(Expr(:call, ctuple, (parg[k] for k in (nfixed + 1):n)...), tailP)
-    tailFT = fdtype(iworld, tailP)
+    tailFT = _packed_tail_shadow_type(iworld, codualparams, nfixed)
     packed_fdata = if tailFT === NoFData
         # `tangent_type` collapses an all-`NoTangent`/`Tuple{}` tail to `NoTangent`, so this needs
         # the literal `NoFData()` — an emitted `Core.tuple(NoFData(), ...)` has type
         # `Tuple{NoFData,...}`, not `NoFData`.
         NoFData()
     else
+        # A constant trailing argument's slot gets an `Inactive()` literal, matching the `Inactive`
+        # slot `_packed_tail_shadow_type` declared for it.
         emit!(Expr(:call, ctuple,
-            ((isassigned(farg, k) ? farg[k] : NoFData()) for k in (nfixed + 1):n)...), tailFT)
+            ((_codual_fdata_type(codualparams[k]) === Inactive ? Inactive() :
+              isassigned(farg, k) ? farg[k] : NoFData()) for k in (nfixed + 1):n)...), tailFT)
     end
     resize!(parg, nfixed + 1)
     resize!(farg, nfixed + 1)
@@ -1272,6 +1277,11 @@ function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
                 if f === Core.memorynew
                     # The array-allocation half of the same root case.
                     true
+                elseif f === Core.getfield &&
+                       _inactive_arg_root(Core.SSAValue(i), pir, iworld, arg_active, codualparams)
+                    # A read of a constant slot in a mixed-activity tuple argument (the packed
+                    # vararg tail): held constant even though the tuple as a whole is active.
+                    false
                 elseif notan && (isa(f, Core.Builtin) || isa(f, Core.IntrinsicFunction))
                     false
                 else
@@ -1298,31 +1308,53 @@ function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
     return arg_active, active
 end
 
-# Whether `node` is a transparent view onto an argument the caller declared constant, walking the
+# Whether `node` is a transparent view onto a value the caller declared constant, walking the
 # same steps `_fc_ptr_origin` recognizes (in the opposite direction, so the two must stay in step).
 # Never through a `PhiNode`: a phi merging an inactive edge with an active one is active, and must
 # keep bailing rather than be zeroed. A global read or call result stops the walk — only an argument
-# carries the caller's no-aliasing promise.
-function _inactive_arg_root(@nospecialize(node), pir, iworld::UInt, arg_active::BitVector, n::Int,
-                            depth::Int = 0)
+# carries the caller's no-aliasing promise. Two root shapes: a bare `Core.Argument` whose whole
+# shadow is `Inactive`, and a `getfield` slot read off an argument whose declared shadow is a
+# mixed-activity tuple with `Inactive` at that slot — the packed vararg tail, or a caller-built
+# mixed carrier. `codualparams` is the *packed* codual type list (the space the primal IR's
+# `Core.Argument` numbering lives in).
+function _inactive_arg_root(@nospecialize(node), pir, iworld::UInt, arg_active::BitVector,
+                            codualparams::Vector{Any}, depth::Int = 0)
+    n = length(codualparams)
     isa(node, Core.Argument) && return node.n <= n && !arg_active[node.n]
     (depth > 8 || !isa(node, Core.SSAValue)) && return false
     s = pir.stmts[node.id][:stmt]
     if isa(s, Core.PiNode)
-        return _inactive_arg_root(s.val, pir, iworld, arg_active, n, depth + 1)
+        return _inactive_arg_root(s.val, pir, iworld, arg_active, codualparams, depth + 1)
     elseif isa(s, Expr) && s.head === :call && length(s.args) >= 2
         f = _calleeval(s.args[1], iworld)
         if f === Core.Intrinsics.bitcast && length(s.args) == 3
             Pin = _optype(pir, s.args[3])
             (Pin isa DataType && Pin <: Ptr) || return false
-            return _inactive_arg_root(s.args[3], pir, iworld, arg_active, n, depth + 1)
+            return _inactive_arg_root(s.args[3], pir, iworld, arg_active, codualparams, depth + 1)
         elseif f === Core.getfield && length(s.args) >= 3
             nm = s.args[3]
             isa(nm, QuoteNode) && (nm = nm.value)
-            nm === :ref || return false
-            return _inactive_arg_root(s.args[2], pir, iworld, arg_active, n, depth + 1)
+            nm === :ref &&
+                return _inactive_arg_root(s.args[2], pir, iworld, arg_active, codualparams, depth + 1)
+            # Slot read off a mixed-activity tuple argument. The object must be a bare
+            # `Core.Argument` (through `PiNode`s): only an argument's declared shadow type carries
+            # the constancy promise — an SSA aggregate's slots go by `_shadow_types` instead.
+            obj = s.args[2]
+            d = depth
+            while isa(obj, Core.SSAValue) && (d += 1) <= 8
+                so = pir.stmts[obj.id][:stmt]
+                isa(so, Core.PiNode) || break
+                obj = so.val
+            end
+            (isa(obj, Core.Argument) && obj.n <= n) || return false
+            F = _codual_fdata_type(codualparams[obj.n])
+            (F isa DataType && F <: Tuple && isconcretetype(F)) || return false
+            nm isa Int && return 1 <= nm <= fieldcount(F) && fieldtype(F, nm) === Inactive
+            # Dynamic index: constant only when every slot is — then it doesn't matter which.
+            return isa(nm, Union{Core.SSAValue,Core.Argument}) && fieldcount(F) > 0 &&
+                   all(T -> T === Inactive, F.parameters)
         elseif f === Base.memoryrefnew && length(s.args) >= 2
-            return _inactive_arg_root(s.args[2], pir, iworld, arg_active, n, depth + 1)
+            return _inactive_arg_root(s.args[2], pir, iworld, arg_active, codualparams, depth + 1)
         end
     end
     return false
@@ -1382,7 +1414,7 @@ function _shadow_types(pir, iworld::UInt, n::Int, arg_active::BitVector,
                        codualparams::Vector{Any})
     N = length(pir.stmts)
     sty = Vector{Any}(undef, N)
-    inact(@nospecialize node) = _inactive_arg_root(node, pir, iworld, arg_active, n)
+    inact(@nospecialize node) = _inactive_arg_root(node, pir, iworld, arg_active, codualparams)
     opsty(@nospecialize a) =
         isa(a, Core.SSAValue) ? (isassigned(sty, a.id) ? sty[a.id] : fdtype(iworld, _widen(_optype(pir, a)))) :
         isa(a, Core.Argument) && a.n <= n ? _codual_fdata_type(codualparams[a.n]) :
@@ -1421,7 +1453,7 @@ _shadow_type_of(sty::Vector{Any}, pir, iworld::UInt, arg_active::BitVector,
                 codualparams::Vector{Any}, n::Int, @nospecialize(a)) =
     isa(a, Core.SSAValue) ? sty[a.id] :
     isa(a, Core.Argument) && a.n <= n ? _codual_fdata_type(codualparams[a.n]) :
-    _inactive_arg_root(a, pir, iworld, arg_active, n) ? Inactive :
+    _inactive_arg_root(a, pir, iworld, arg_active, codualparams) ? Inactive :
     fdtype(iworld, _widen(_optype(pir, a)))
 
 # Which top-level (fwds-carrier) arguments carry non-trivial fdata. Factored out of `_fdata_tracked`
@@ -1452,7 +1484,7 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any},
         isa(node, Core.Argument) ? (node.n <= n && arg_tracked[node.n]) : false
     # `Core.tuple` synthesises a fresh zero for an inactive operand rather than aliasing a shadow, so
     # such an operand must not fail the tuple's trackedness the way an untraceable-but-active one does.
-    operand_inactive(@nospecialize node) = _inactive_arg_root(node, pir, iworld, arg_active, n)
+    operand_inactive(@nospecialize node) = _inactive_arg_root(node, pir, iworld, arg_active, codualparams)
     # An inactive edge into an otherwise-tracked `PhiNode` supplies a synthesised zero rather than a
     # traced shadow — the merge is active (any active edge makes it so) and normalises to its own
     # primal-derived shadow type, so something real has to arrive on the constant arm. Restricted to
@@ -1600,7 +1632,8 @@ _call_parts(s::Expr) = s.head === :invoke ? (s.args[2], @view s.args[3:end]) : (
 # The call's own result may carry fdata (an array/mutable-struct return) — the emission side routes
 # its shadow into `shadow_map` for the caller to accumulate into.
 function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{String},
-                                 arg_tracked::BitVector, fdata_tracked::BitVector, has_sink)
+                                 arg_tracked::BitVector, fdata_tracked::BitVector, has_sink,
+                                 mixed_shadow)
     fpos, actual = _call_parts(s)
     fval = _calleeval(fpos, iworld)
     # `_calleeval` returns `nothing` for a callee in argument position (an `Argument`/`SSAValue`,
@@ -1665,6 +1698,14 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
         a = actual[j]
         mask[j] = isa(a, Union{Core.SSAValue,Core.Argument}) && _tt(iworld, P) !== NoTangent &&
                   !has_sink(a)
+        if !mask[j] && mixed_shadow(a)
+            # The recursion glue declares each unmasked argument codual at the primal-derived fdata
+            # type; a value whose shadow is a mixed-activity tuple (a packed vararg tail with some
+            # trailing arguments held constant) cannot be stated at that type.
+            reason[] = "recursive call with an argument whose shadow is a mixed-activity tuple " *
+                       "(some slots held constant) is not supported at %$i: `$(_stmt_str(s))`"
+            return nothing
+        end
         if fdtype(iworld, P) !== NoFData && !mask[j]
             # Any fdata shape is allowed through: fdata is the identity-carrying half of a tangent,
             # so an immutable aggregate's is a value wrapper whose leaves are the caller's own shared
@@ -2059,6 +2100,10 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
     block_of = _stmt_block_map(pir)
     has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable,
                                                     block_of, n, nfixed)
+    mixed_shadow(@nospecialize node) = begin
+        F = _shadow_type_of(shadow_types, pir, iworld, arg_active, codualparams, n, node)
+        F isa DataType && F <: Tuple && any(T -> T === Inactive, F.parameters)
+    end
     for i in 1:length(pir.stmts)
         b = block_of[i]
         unreachable[b] && continue
@@ -2088,7 +2133,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                   optype=(@nospecialize x) -> _widen(_optype(pir, x)), reason=reason,
                   tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                   tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i),
-                  inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, n))
+                  inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, codualparams))
             if fc === nothing
                 reason[] = "reverse mode does not support a `:foreigncall` with a runtime function " *
                            "pointer target at %$i: `$(_stmt_str(s))`"
@@ -2151,7 +2196,12 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                   # A `MemoryRef` statically re-derivable from an argument + literal index need not
                   # be pushed (see `_static_ref_derivation`). Consulted by `builtins_reverse.jl`.
                   static_ref=(@nospecialize x) -> _static_ref_derivation(pir, iworld, x),
-                  inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, n))
+                  # The shadow type a node's shadow is actually declared at — differs from `fdtype`
+                  # for a mixed-activity aggregate. Lets the `getfield` rule refuse a dynamic index
+                  # into one at scan time, before either builder runs.
+                  sty=(@nospecialize a) -> _shadow_type_of(shadow_types, pir, iworld, arg_active,
+                                                           codualparams, n, a),
+                  inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, codualparams))
             result = builtin_rrule_comms(Val(f), actual, _stype(pir.stmts, i), ctx)
             result === false && return nothing
             if result !== nothing
@@ -2166,7 +2216,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             # A surviving high-level call: attempt static recursion. Not qualifying is not an error
             # at scan time (mirrors how an unregistered intrinsic isn't flagged here either); only a
             # genuine attempted-and-failed resolution propagates as a real bail here.
-            info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, fdata_tracked, has_sink)
+            info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, fdata_tracked, has_sink, mixed_shadow)
             info === nothing && continue
             _, ftype, argtypes, mask = info
             R = _stype_invoke(pir.stmts, i)
@@ -2332,8 +2382,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     codualparams = Any[impl_mi.specTypes.parameters[2], impl_mi.specTypes.parameters[4:end]...]
     vararg_tt = Tuple{impl_mi.specTypes.parameters[4:end]...}
     ArgsTT = Tuple{codualparams...}
-    packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed, reason)
-    packed_codualparams === nothing && return nothing
+    packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed)
 
     scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges, nfixed)
     scan === nothing && return nothing
@@ -2361,6 +2410,10 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     npacked = length(packed_codualparams)
     has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable_block,
                                                     block_of, npacked, nfixed)
+    mixed_shadow(@nospecialize node) = begin
+        F = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked, node)
+        F isa DataType && F <: Tuple && any(T -> T === Inactive, F.parameters)
+    end
 
     # The carrier a `return` builds. A mixed-activity aggregate's shadow is narrower than the
     # primal-derived carrier would declare, so the `CoDual` has to come from the shadow's own type;
@@ -2455,7 +2508,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             isassigned(s.values, j) || continue
             v = s.values[j]
             (isa(v, Core.Argument) && v.n <= npacked) || continue
-            _inactive_arg_root(v, pir, iworld, arg_active, npacked) || continue
+            _inactive_arg_root(v, pir, iworld, arg_active, packed_codualparams) || continue
             Pv = _codual_primal_type(packed_codualparams[v.n])
             fdtype(iworld, Pv) <: FTi || continue
             phi_edge_zero[(i, j)] = icall!(_rr_zero_fdata, FTi, (Pv,), parg[v.n])
@@ -2872,7 +2925,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                     tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                     fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
                     tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i),
-                    inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, n))
+                    inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, codualparams))
             result = fc === nothing ? nothing : apply_foreigncall_rrule_fwds!(Val(fc.name), fc, Ti, fcctx)
             if result === nothing
                 reason[] = "reverse mode does not support foreigncall target " *
@@ -2901,7 +2954,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                        # `fdtype`, wherever it types a shadow read off an operand.
                        sty=(@nospecialize a) -> _shadow_type_of(shadow_types, pir, iworld, arg_active,
                                                                 packed_codualparams, npacked, a),
-                       inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, n))
+                       inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, codualparams))
                 # `_scan_block_comms` skips an inactive statement, so a rule firing here would push
                 # comms items that were never declared.
                 result = active[i] ? apply_builtin_rrule_fwds!(Val(f), actual, Ti, bctx) : nothing
@@ -2930,7 +2983,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                 primal_map[i] = emit!(Expr(:call, fv, (presolve(a) for a in actual)...), Ti)
             else
                 Ti = _stype_invoke(pstmts, i)
-                info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked, has_sink)
+                info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked, has_sink, mixed_shadow)
                 info === nothing && return nothing
                 fval, ftype, argtypes, mask = info
                 R = _widen(Ti)
@@ -3167,8 +3220,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     codualparams = Any[ArgsTT.parameters...]
     CS = TapeT.parameters[2]
     comms_stack_ty = Any[CS.parameters...]
-    packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed, reason)
-    packed_codualparams === nothing && return nothing
+    packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed)
 
     scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges, nfixed)
     scan === nothing && return nothing
@@ -3196,10 +3248,12 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # type — its callee is this same build — and deriving it a second time there is what let the
     # declared and actual types drift. `nfixed_eff` is `n` when non-vararg, so the vararg tail branch
     # at the return never fires. An inactive argument has no accumulator to read: its slot is the
-    # `NoRData()` literal, and `ret_rt` types both that slot and the returned tuple.
+    # `NoRData()` literal, and `ret_rt` types both that slot and the returned tuple. A vararg tail
+    # position goes by its own flat carrier — the packed slot's activity is per-element.
     is_vararg = nfixed >= 0
     nfixed_eff = is_vararg ? nfixed : n
-    ret_inactive(k::Int) = k <= nfixed_eff && !arg_active[k]
+    ret_inactive(k::Int) = k <= nfixed_eff ? !arg_active[k] :
+                           _codual_fdata_type(codualparams[k]) === Inactive
     ret_rt(k::Int) = ret_inactive(k) ? NoRData :
                      zero_like_rdata_type(_codual_primal_type(codualparams[k]))
     own_RdatasT = Tuple{(ret_rt(k) for k in 1:n)...}
@@ -3232,6 +3286,10 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                                    stmt_block, npacked, nfixed)
     has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable_block,
                                                     stmt_block, npacked, nfixed)
+    mixed_shadow(@nospecialize node) = begin
+        F = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked, node)
+        F isa DataType && F <: Tuple && any(T -> T === Inactive, F.parameters)
+    end
 
     entry_id = ID()
     block_id = [ID() for _ in 1:nblocks]
@@ -3295,7 +3353,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     for k in 1:npacked
         # An inactive argument accumulates nothing and returns `NoRData()`, so it gets no `Ref`. The
         # packed vararg tail is exempt: the scatter at the pullback's return reads its accumulator
-        # unconditionally, and an all-`NoTangent` tail is inactive by type anyway.
+        # for every non-constant flat position (`ret_inactive` gates per position, not per slot), and
+        # an all-`NoTangent` tail is inactive by type anyway.
         _has_rdata_sink(Core.Argument(k), pir, active, arg_active, unreachable_block, stmt_block,
                         npacked, nfixed) || continue
         Pk = _codual_primal_type(packed_codualparams[k])
@@ -3559,7 +3618,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                         tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                         rdtype=(@nospecialize(T) -> rdtype(iworld, T)),
                         fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
-                        inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, n))
+                        inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, codualparams))
                 contribs = fc === nothing ? nothing : apply_foreigncall_rrule!(Val(fc.name), fc, Ti, fcctx)
                 if contribs === nothing
                     reason[] = "reverse mode does not support foreigncall target " *
@@ -3718,7 +3777,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     end
                 else
                     Ti = _stype_invoke(pstmts, i)
-                    info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked, has_sink)
+                    info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked, has_sink, mixed_shadow)
                     info === nothing && return nothing
                     _, ftype, argtypes, mask = info
                     acc = deref_and_zero!(ssa_ref_id[i], Ti)   # this call's own seed for the inner pullback
@@ -3825,6 +3884,12 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                 tailRT = zero_like_rdata_type(tailPk)
                 tail_acc = emit!(Expr(:call, getf, arg_ref_id[nfixed_eff + 1], 1), tailRT)
                 for k in (nfixed_eff + 1):n
+                    # A trailing argument held constant accumulates nothing; its accumulator slot
+                    # stays at zero and is never read.
+                    if ret_inactive(k)
+                        result_ids[k] = NoRData()
+                        continue
+                    end
                     Pk = _codual_primal_type(codualparams[k])
                     RTk = zero_like_rdata_type(Pk)
                     j = k - nfixed_eff

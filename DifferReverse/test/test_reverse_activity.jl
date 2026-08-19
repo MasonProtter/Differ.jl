@@ -305,36 +305,140 @@ end
     @test pb(1.0) == (NoRData(), 3.0 + cos(2.0), NoRData())
 end
 
-@testset "activity: a constant vararg-tail element bails instead of miscompiling" begin
-    # A vararg primal's trailing arguments all land in one packed tail slot, always typed as the
-    # active fdata carrier. A constant trailing argument used to sneak an `Inactive()` value into that
-    # slot and produce a `TypeError`; it must now be a located bail.
-    vasum(vs...) = sum(vs[1])
-    v = [1.0, 2.0, 3.0]
+# A vararg primal's trailing arguments all land in one packed tail slot. A constant trailing
+# argument gives that slot a mixed per-element shadow (`Inactive` in the constant positions), a
+# literal-index read of a constant position is replayed primally, and the pullback's scatter
+# returns `NoRData()` for it. A dynamic index into a genuinely mixed tail stays a located bail —
+# which slot is read is not statically decidable — as does passing the whole mixed tail to a
+# nested call, whose recursion glue declares argument coduals at the uniformly-active type.
 
+@testset "activity: constant vararg-tail elements, scalar tail" begin
+    vscale(x, ys...) = x * ys[1] + 2.0 * ys[2]
+    x, y1, y2 = 3.0, 5.0, 7.0
+    fcd = zero_fcodual(vscale)
+
+    active = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(y1, NoFData()), CoDual(y2, NoFData()))
+    @test primal(active[1]) == vscale(x, y1, y2)
+    @test active[2](1.0) == (NoRData(), y1, x, 2.0)
+
+    # Each constant slot comes back `NoRData()`; the others match the all-active run exactly.
+    mixed = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(y1, NoFData()), const_codual(y2))
+    @test primal(mixed[1]) == vscale(x, y1, y2)
+    @test mixed[2](1.0) == (NoRData(), y1, x, NoRData())
+
+    allcon = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), const_codual(y1), const_codual(y2))
+    @test primal(allcon[1]) == vscale(x, y1, y2)
+    @test allcon[2](1.0) == (NoRData(), y1, NoRData(), NoRData())
+
+    for inactive in ((), (3,), (2, 3))
+        checkverify_rev(vscale, (Float64, Float64, Float64); inactive)
+    end
+
+    # The pre-allocated entry points work and reconstruct the constant slot to `Inactive()`.
+    a1, a2, a3 = CoDual(x, NoFData()), CoDual(y1, NoFData()), const_codual(y2)
+    ctx = build_ctx(fcd, a1, a2, a3)
+    yv, g = value_and_gradient!(ctx, fcd, a1, a2, a3)
+    @test yv == vscale(x, y1, y2)
+    @test g == (NoTangent(), y1, x, Inactive())
+    @test g[4] === Inactive()
+end
+
+@testset "activity: constant vararg-tail elements, fdata-carrying tail" begin
+    vsum2(x, vs...) = sum(vs[1]) + x * sum(vs[2])
+    x = 3.0
+    v1, v2 = [1.0, 2.0], [3.0, 4.0]
+    fcd = zero_fcodual(vsum2)
+
+    dv1a, dv2a = zeros(2), zeros(2)
+    ra = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(v1, dv1a), CoDual(v2, dv2a))
+    @test primal(ra[1]) == vsum2(x, v1, v2)
+    @test ra[2](1.0) == (NoRData(), sum(v2), NoRData(), NoRData())
+    @test dv1a == ones(2)
+    @test dv2a == fill(x, 2)
+
+    # `vs[2]` constant: `vs[1]`'s and `x`'s gradients match the all-active run slot for slot, and
+    # the constant array's (absent) shadow is never touched.
+    dv1 = zeros(2)
+    rm = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(v1, dv1), const_codual(v2))
+    @test primal(rm[1]) == vsum2(x, v1, v2)
+    @test rm[2](1.0) == (NoRData(), sum(v2), NoRData(), NoRData())
+    @test dv1 == ones(2)
+    _assert_tape_balanced(rm[2])
+
+    for inactive in ((2,), (3,), (2, 3))
+        checkverify_rev(vsum2, (Float64, Vector{Float64}, Vector{Float64}); inactive)
+    end
+
+    # A constant trailing array's `:fshadow`/save traffic disappears from the comms tuple.
+    at = (Float64, Vector{Float64}, Vector{Float64})
+    active_bytes = sum(sizeof, comms_element_types(tape_type(vsum2, at)); init=0)
+    mixed_bytes = sum(sizeof, comms_element_types(tape_type(vsum2, at; inactive=(3,))); init=0)
+    @test mixed_bytes <= active_bytes
+end
+
+@testset "activity: constant vararg-tail element read in a loop" begin
+    # Loop-carried, run over >= 2 iterations: per the ISSUES #52 lesson, `verify_ir` plus a
+    # single-pass test cannot validate an activity/comms change on its own.
+    vloop(x, ys...) = begin
+        s = 0.0
+        for i in 1:3
+            s += x * ys[1] + ys[2]
+        end
+        s
+    end
+    x, y1, y2 = 2.0, 5.0, 7.0
+    fcd = zero_fcodual(vloop)
+    active = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(y1, NoFData()), CoDual(y2, NoFData()))
+    @test primal(active[1]) == vloop(x, y1, y2)
+    @test active[2](1.0) == (NoRData(), 3y1, 3x, 3.0)
+    mixed = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(y1, NoFData()), const_codual(y2))
+    @test primal(mixed[1]) == vloop(x, y1, y2)
+    @test mixed[2](1.0) == (NoRData(), 3y1, 3x, NoRData())
+    _assert_tape_balanced(mixed[2])
+end
+
+@testset "activity: dynamic index into a vararg tail" begin
+    vdyn(vs...) = begin
+        s = 0.0
+        for j in 1:length(vs)
+            s += vs[j]
+        end
+        s
+    end
+    # All-active: unchanged.
+    ra = rrule!!(zero_fcodual(vdyn), Ctx(), CoDual(1.0, NoFData()), CoDual(2.0, NoFData()))
+    @test ra[2](1.0) == (NoRData(), 1.0, 1.0)
+    # Genuinely mixed: which slot is read is not statically decidable, so neither is its activity.
     err = try
-        rrule!!(zero_fcodual(vasum), Ctx(), const_codual(v))
+        rrule!!(zero_fcodual(vdyn), Ctx(), CoDual(1.0, NoFData()), const_codual(2.0))
         nothing
     catch e
         e
     end
     @test err isa ErrorException
-    @test occursin("cannot hold a vararg primal's trailing argument constant", err.msg)
+    @test occursin("dynamic (non-literal) index into a tuple of mixed activity", err.msg)
+    # All slots constant: it doesn't matter which slot is read — the whole loop replays primally.
+    rc = rrule!!(zero_fcodual(vdyn), Ctx(), const_codual(1.0), const_codual(2.0))
+    @test primal(rc[1]) == 3.0
+    @test rc[2](1.0) == (NoRData(), NoRData(), NoRData())
+end
 
-    err2 = try
-        build_ctx(vasum, (Vector{Float64},); inactive=(1,))
+@testset "activity: passing a whole mixed-shadow tail to a nested call bails" begin
+    tsum(t) = t[1] * t[2]
+    vpass(ys...) = @noinline tsum(ys)
+    # All-active control.
+    ra = rrule!!(zero_fcodual(vpass), Ctx(), CoDual(3.0, NoFData()), CoDual(5.0, NoFData()))
+    @test ra[2](1.0) == (NoRData(), 5.0, 3.0)
+    # Mixed: the recursion glue would declare the tail codual at the uniformly-active fdata type —
+    # a type lie against its mixed shadow — so it is a located bail, not a miscompile.
+    err = try
+        rrule!!(zero_fcodual(vpass), Ctx(), CoDual(3.0, NoFData()), const_codual(5.0))
         nothing
     catch e
         e
     end
-    @test err2 isa ErrorException
-    @test occursin("cannot hold a vararg primal's trailing argument constant", err2.msg)
-
-    # The active vararg case must still work: not an over-broad bail.
-    dv = zeros(3)
-    _, pb = rrule!!(zero_fcodual(vasum), Ctx(), CoDual(v, dv))
-    @test pb(1.0) == (NoRData(), NoRData())
-    @test dv == ones(3)
+    @test err isa ErrorException
+    @test occursin("shadow is a mixed-activity tuple", err.msg)
 end
 
 # An inactive source is handled by `memmove`/`memcpy` and by `Core.tuple`/`Core.setfield!`/

@@ -22,8 +22,8 @@ makes `increment!!` deliberately non-commutative: slot 1 is the accumulator that
 is a contribution. `NoTangent` keeps *no* absorbing arm, so a mis-analysed active value still raises a
 `MethodError` instead of dropping a gradient.
 
-When writing comments, be terse and too the point (though not opaque). Don't use weird metaphors and made
-up Claude-jargon like calling a function a "seam", or "belt-and-suspenders", "brace", etc.
+When writing comments, be terse and too the point (though not opaque). Don't use Claude-jargon/metaphors like calling a function a "seam", or "belt-and-suspenders", "brace", etc.
+
 
 ## Rule interfaces
 
