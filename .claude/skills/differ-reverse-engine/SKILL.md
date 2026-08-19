@@ -99,7 +99,8 @@ mutable struct Tape{ArgsTT<:Tuple,CS<:Tuple}
     const comms::CS
     const bufs::Vector{Any}
     const subtapes::Stack{Tape{ArgsTT,CS}}
-    args::ArgsTT   # left undef by the 3-arg constructor; assigned once per call
+    const count_stack::Stack{Int64}   # counted-loop trip counts, one push per loop-exit event
+    args::ArgsTT   # left undef by the shorter constructor; assigned once per call
 end
 ```
 
@@ -119,6 +120,13 @@ optimization).
   pushed in fwds program order and popped in the pullback's exact reverse order — the same
   global forward/reverse ordering the rest of the engine already relies on. Always constructed (even
   for a primal with no self-recursion) — a fresh-`Tape`-construction cost, not a steady-state one.
+- `count_stack::Stack{Int64}` — counted-loop trip counts (see "Counted loops" under "Control-flow
+  replay" below): one `Int64` pushed per loop-*exit* event, replacing that loop's per-iteration
+  block-stack pushes. A dedicated stack, not the block stack, so counts never contend with block-id
+  pushes for one stack's LIFO order, and `Int64` because compression is exactly what makes >2^31
+  iterations affordable. Sits before `args` so the shorter constructor can leave only `args` undef
+  — which is why `args` is **field 6** (the generated carriers address tape fields by index:
+  block_stack=1, comms=2, bufs=3, subtapes=4, count_stack=5, args=6).
 
 **Why `Tape` needs a hand-written `tangent_type`.** `subtapes`'s element type is
 `Tape{ArgsTT,CS}` itself, so the generic per-field tangent derivation (re-deriving `Tape`'s tangent by
@@ -187,8 +195,10 @@ computes, per primal block number:
   predecessor never pushes on the edge into it, and it must not pop either.
 
 **Per-edge, not per-block (ISSUES #52, fixed, two-sided).** The push/pop granularity is decided per
-*edge*, not per source block: for edge `b -> s`, `b` pushes iff `length(preds[s]) > 1`, and `s` pops
-iff `length(preds[s]) > 1` — one push per ambiguous arrival is matched by exactly one pop. This matters
+*edge*, not per source block: for edge `b -> s`, `b` pushes iff `needs_push(b, s)` — i.e.
+`length(preds[s]) > 1` and `(b, s)` is not a counted loop's header edge (`counted_edges`, below) —
+and `s` pops under the same predicate — one push per ambiguous arrival is matched by exactly one
+pop. This matters
 because a `GotoIfNot` with one unambiguous arm and one ambiguous arm previously pushed unconditionally
 on *both* arms (a block-granularity push always fires unless *every* successor is unambiguous),
 wasting a push on the arm that's never disambiguated by it. Two coupled pieces, and a first, forwards-
@@ -220,6 +230,42 @@ plain `goto` (`skip_pop=true`, always true today for a single predecessor under 
 `pop!(block_stack)` followed by a `Switch` pseudo-node comparing the popped id against each candidate
 predecessor. Its `length(preds) == 1` non-`skip_pop` branch is now dead code under the current formula,
 kept as a defensive no-op rather than removed.
+
+**Counted loops** (`_counted_loops`/`CountedLoop`, beside `_collapsible_regions`): a reducible
+single-latch natural loop's remaining per-iteration block-stack traffic at the *header* is fully
+determined by the trip count — in reverse, the latch fired `C` times, then the preheader once — so
+it compresses to one integer. Eligibility: exactly one back edge; header preds exactly
+`{preheader, latch}`; exactly one exiting edge `(x, e)`, from a 2-successor `GotoIfNot` block (any
+body block — a real `for` loop exits mid-body from the iterate-end check, only a `while` loop exits
+from its header); all six characteristic blocks reachable, `e != 1`; no boundary overlap with a
+collapsible region. Three coupled pieces, all recomputed from identical inputs at both builders:
+
+- `_unique_predecessor_info` takes the loop's two header edges (`_counted_edges`) out of
+  `needs_push`, so nothing pushes block ids on them any more.
+- Forwards (`_split_ambiguous_block_pushes`, extended): a synthetic `Int64` counter
+  `c = φ(preheader ⇒ 0, latch ⇒ c+1)` + increment spliced into the header (after its leading
+  phis), and `push!(count_stack, c)` — the *phi* value, i.e. the back-edge count at exit — on a
+  relay along the `x -> e` arm (sharing the relay with `x`'s relocated disc push when both exist;
+  order between them is immaterial, separate stacks). Its phi-fixup pass runs over the *current*
+  block versions, so one loop's exit relay landing on another loop's header edge re-edges that
+  header's counter phi too (nested/adjacent counted loops compose; no exclusion needed).
+- Pullback (`reverse_pullback_to_ircode`): one `Ref{Int64}` countdown cell per loop in the entry
+  block (a `Ref`, not a phi — all pullback state routes through `Ref`s SROA scalarizes, and a
+  missed scalarization costs a load/store, never correctness); the reverse arm routing into `x`
+  (`counted_exit`) pops the count into the cell — that arm is where the reverse walk enters the
+  loop region, re-run once per entry, which is what makes nesting work (inner loops push one count
+  per outer iteration, popped LIFO); and the header's reverse block (`counted_header`) replaces its
+  `_emit_switch!` pop with `emit_pred_dispatch!`'s countdown test — take the latch arm while
+  `c != 0`, decrementing unconditionally (a stale final store is harmless; re-entry re-pops), the
+  preheader arm at zero.
+
+Result: a `while`-shaped loop (`whilesum`) drops to **zero** block-stack traffic; a `for`-shaped
+loop (`loopsum`/`memloop!`) drops `2N+3 -> N+3` — the residual N/iteration is the iterate-end
+merge's two data-dependent predecessors, *not* header traffic (statically implied by which
+successor the check block takes; compressing that is a separate follow-up). Tests:
+`test_reverse_counted_loops.jl` (eligibility on real primal IR, gradients across N=0..50 for
+eligible and ineligible shapes, nested/`continue`/`break`/`@goto` fixtures, exact traffic), plus
+the updated `memloop!` N+3 assertion in `test_reverse_block_stack_split.jl`.
 
 **Collapsible regions** (`_collapsible_regions`) extend the unique-predecessor optimization from a
 single edge to a whole comms-free sub-region: the fixed diamond shape `@boundscheck` lowering produces

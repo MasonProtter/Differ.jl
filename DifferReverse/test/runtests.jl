@@ -3,6 +3,7 @@ using SafeTestsets
 @safetestset "reverse: scalar & struct" begin include("test_reverse_scalar_struct.jl") end
 @safetestset "reverse: control flow" begin include("test_reverse_control_flow.jl") end
 @safetestset "reverse: block-stack push/edge split (ISSUES #52)" begin include("test_reverse_block_stack_split.jl") end
+@safetestset "reverse: counted-loop trip-count compression" begin include("test_reverse_counted_loops.jl") end
 @safetestset "reverse: dispatch & recursion" begin include("test_reverse_dispatch_recursion.jl") end
 @safetestset "reverse: arrays" begin include("test_reverse_arrays.jl") end
 @safetestset "reverse: `.`-broadcast" begin include("test_reverse_broadcast.jl") end

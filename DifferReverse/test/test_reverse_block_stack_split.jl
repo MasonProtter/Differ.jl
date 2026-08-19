@@ -10,7 +10,9 @@
 # single-predecessor balance-pop — the two changes are coupled, neither is correct alone. The
 # direct unit tests below cover the surgery itself; the `rev_gradient`-level testsets exercise the
 # live fix across the disambiguation boundary (N=0,1,2,3,5,50), and the `memloop!` traffic test
-# asserts the 3N+2 -> 2N+3 reduction (the remaining 2/iter are irreducible).
+# asserts the reduction to N+3 (the per-edge split took 3N+2 to 2N+3; counted-loop trip-count
+# compression — `_counted_loops`, tested in test_reverse_counted_loops.jl — then removed the
+# per-iteration header push, leaving only the iterate-end merge's genuinely data-dependent push).
 #
 # A second, *fallthrough*-ambiguous shape (the mirror insertion case: the ambiguous arm is the
 # implicit fallthrough rather than the explicit `dest`) is exercised too, but not via a real Julia
@@ -218,7 +220,7 @@ end
     @test Set(phi.edges) == Set([relay.id, body_blk.id])   # `chk`'s edge renamed to the relay
 end
 
-@testset "memloop!: block-stack traffic scales 2N+3, not 3N+2" begin
+@testset "memloop!: block-stack traffic scales N+3" begin
     # Same shape as `bench/workloads.jl`'s `memloop!` benchmark, redefined locally rather than
     # `include`d (the bench project pulls in `BenchmarkTools`, not a `test/Project.toml`
     # dependency). `Memory` has no `zero_tangent` method, so its `CoDual` is built by hand.
@@ -238,14 +240,15 @@ end
         return length(pb.block_stack.memory)
     end
 
-    # The fix removes the wasteful loop-exit-diamond per-block push: traffic drops from 3N+2 to
-    # 2N+3. The remaining 2/iteration are irreducible (the loop header's two real predecessors, and
-    # the loop-body->merge edge's two real predecessors, both need runtime disambiguation), so this
-    # asserts the reduction, not flatness. Measured: N=2->7, N=3->9, N=5->13, N=100->203, N=10_000->20_003.
-    @test run_memloop(2)  == 7
-    @test run_memloop(5)  == 13
+    # Two reductions layered here: the per-edge split removed the loop-exit-diamond per-block push
+    # (3N+2 -> 2N+3), then counted-loop compression replaced the header's per-arrival push with one
+    # recorded trip count (2N+3 -> N+3). The remaining 1/iteration is the iterate-end merge's two
+    # real predecessors — genuinely data-dependent, disambiguated at runtime. Measured: N=2->5,
+    # N=5->8, N=100->103, N=10_000->10_003.
+    @test run_memloop(2)  == 5
+    @test run_memloop(5)  == 8
     large = run_memloop(10_000)
-    @test large ≤ 3 * 10_000 + 4    # comfortably below the old 3N+2 floor
-    @test large > 2 * 10_000        # and not better than the irreducible 2N floor
-    @test large == 2 * 10_000 + 3   # exact: 2N+3
+    @test large ≤ 2 * 10_000 + 4    # comfortably below the old 2N+3 floor
+    @test large > 10_000            # and not better than the data-dependent N floor
+    @test large == 10_000 + 3       # exact: N+3
 end

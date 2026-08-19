@@ -159,12 +159,19 @@ mutable struct Tape{ArgsTT<:Tuple,CS<:Tuple}
     # constructed, even with no self-recursive call (a fresh-tape-construction cost, not a
     # steady-state one).
     const subtapes::Stack{Tape{ArgsTT,CS}}
+    # Trip counts for counted loops: one `Int64` per loop-exit event instead of one block-stack
+    # `Int32` per iteration. A dedicated stack (not the block stack) so the count's width is
+    # independent of the block stack's, and so count pushes never interleave with block-id pushes
+    # on one stack's LIFO order. Sits before `args` so the shorter constructor can leave only
+    # `args` undef (only trailing fields can be).
+    const count_stack::Stack{Int64}
     args::ArgsTT
     Tape{ArgsTT,CS}(block_stack, comms, bufs=_NO_BULK_BUFS,
-                    subtapes=Stack{Tape{ArgsTT,CS}}()) where {ArgsTT<:Tuple,CS<:Tuple} =
-        new{ArgsTT,CS}(block_stack, comms, bufs, subtapes)    # `args` deliberately left undef
-    Tape{ArgsTT,CS}(block_stack, comms, bufs, subtapes, args) where {ArgsTT<:Tuple,CS<:Tuple} =
-        new{ArgsTT,CS}(block_stack, comms, bufs, subtapes, args)
+                    subtapes=Stack{Tape{ArgsTT,CS}}(),
+                    count_stack=Stack{Int64}()) where {ArgsTT<:Tuple,CS<:Tuple} =
+        new{ArgsTT,CS}(block_stack, comms, bufs, subtapes, count_stack)  # `args` left undef
+    Tape{ArgsTT,CS}(block_stack, comms, bufs, subtapes, count_stack, args) where {ArgsTT<:Tuple,CS<:Tuple} =
+        new{ArgsTT,CS}(block_stack, comms, bufs, subtapes, count_stack, args)
 end
 
 # `Tape` needs a hand-written `tangent_type` under forward-over-reverse: it's where the forward
@@ -209,6 +216,7 @@ function set_to_zero_internal!!(c::SetToZeroCache, x::Tape)
     x.block_stack.position = 0
     tuple_map(s -> set_to_zero_internal!!(c, s), x.comms)
     x.subtapes.position = 0
+    x.count_stack.position = 0
     return x
 end
 
@@ -940,15 +948,21 @@ end
 # — governs whether `b` needs to pop the block stack.
 # ===========================================================================
 function _unique_predecessor_info(pir, exit_blocks::Vector{Int}, unreachable::AbstractVector{Bool},
-                                  regions::Dict{Int,Int}, quiet::Set{Int})
+                                  regions::Dict{Int,Int}, quiet::Set{Int},
+                                  counted_edges::Set{NTuple{2,Int}}=Set{NTuple{2,Int}}())
     nblocks = length(pir.cfg.blocks)
     preds = [filter(!=(0), pir.cfg.blocks[b].preds) for b in 1:nblocks]
     succs = [pir.cfg.blocks[b].succs for b in 1:nblocks]
 
+    # Per-edge push predicate: `b` pushes on `b -> s` iff `s`'s arrival is genuinely ambiguous and
+    # the edge isn't served by a counted loop's trip count instead (`_counted_loops` — both edges
+    # into a counted header are disambiguated by the countdown, not by pops).
+    needs_push(b, s) = length(preds[s]) > 1 && (b, s) ∉ counted_edges
+
     is_unique_pred = falses(nblocks)
     for b in 1:nblocks
         ss = succs[b]
-        is_unique_pred[b] = !isempty(ss) && all(s -> length(preds[s]) == 1, ss)
+        is_unique_pred[b] = !isempty(ss) && all(s -> !needs_push(b, s), ss)
     end
     # A lone reachable exit is the only way control can leave the function, so it's a de facto
     # unique predecessor of "the pullback's entry routing" even though `succs[b]` is empty for it.
@@ -1066,6 +1080,115 @@ function _collapsible_regions(pir, unreachable::AbstractVector{Bool},
 end
 
 # ===========================================================================
+# Counted loops: compress a single-latch loop's block-stack traffic to one trip count.
+#
+# For a reducible single-latch natural loop, the header's only arrival ambiguity is "preheader or
+# latch", and the pop sequence the pullback would see is fully determined by the number of back-edge
+# traversals `C`: the latch, `C` times, then the preheader once. So instead of pushing a block id on
+# every edge into the header (one `Int32` per iteration), the forwards carrier maintains a synthetic
+# `Int64` counter phi at the header — `c = φ(preheader ⇒ 0, latch ⇒ c+1)` — and pushes the phi's
+# value once, on the loop-exit edge, onto the tape's dedicated `count_stack`. The pullback pops that
+# count where its reverse walk enters the loop region and runs a countdown instead of popping per
+# arrival: the header's reverse block takes the latch arm while the countdown is positive and the
+# preheader arm at zero.
+#
+# The count rides its own `Stack{Int64}`, not the block stack: the exiting block's own
+# disambiguation push (when its in-loop arm is also ambiguous) would otherwise contend with the
+# count for one stack's LIFO order, and `Int64` makes overflow unreachable — compression is exactly
+# what makes >2^31 iterations affordable, since an eligible comms-free loop's tape becomes O(1).
+#
+# Like the per-edge push split below, this is a two-sided change: the forwards suppression
+# (`_unique_predecessor_info`'s `counted_edges` + the counter/relay stages of
+# `_split_ambiguous_block_pushes`) and the pullback's counted dispatch
+# (`reverse_pullback_to_ircode`) must always agree, or replay desynchronizes into silently wrong
+# gradients for any loop iterating >= 2 times.
+# ===========================================================================
+
+struct CountedLoop
+    header::Int       # loop header `h`: the back edge's target, dominating the whole body
+    latch::Int        # the single back-edge source `l`
+    preheader::Int    # `h`'s unique predecessor outside the body
+    exiting::Int      # the single body block `x` with an edge leaving the body
+    exit_target::Int  # that edge's target `e` (outside the body)
+    inloop_succ::Int  # `x`'s other successor (inside the body)
+end
+
+# The edges whose block-stack pushes the counted scheme replaces: both arrivals at each header.
+function _counted_edges(counted::Vector{CountedLoop})
+    edges = Set{NTuple{2,Int}}()
+    for cl in counted
+        push!(edges, (cl.preheader, cl.header))
+        push!(edges, (cl.latch, cl.header))
+    end
+    return edges
+end
+
+"""
+    _counted_loops(pir, unreachable, regions, quiet)::Vector{CountedLoop}
+
+Natural loops of `pir` eligible for trip-count compression. A loop qualifies iff: it has exactly
+one back edge (single latch); the header has exactly two predecessors (the outside preheader and
+the latch); exactly one edge leaves the body, from a `GotoIfNot`-terminated block; all six
+characteristic blocks are reachable and the exit target isn't the entry block; and none of the
+boundary blocks participate in a collapsible region (`regions`/`quiet`), whose pullback routing
+overrides would silently reroute around the counted dispatch. Anything that doesn't qualify keeps
+the ordinary per-edge push/pop scheme — this analysis only ever removes traffic from loops it can
+prove simple, never guesses.
+"""
+function _counted_loops(pir, unreachable::AbstractVector{Bool},
+                        regions::Dict{Int,Int}, quiet::Set{Int})::Vector{CountedLoop}
+    cfg = pir.cfg
+    nb = length(cfg.blocks)
+    preds = [filter(!=(0), cfg.blocks[b].preds) for b in 1:nb]
+    succs = [cfg.blocks[b].succs for b in 1:nb]
+    dt = CC.construct_domtree(cfg.blocks)
+
+    latches = Dict{Int,Vector{Int}}()   # header -> back-edge sources
+    for b in 1:nb, s in succs[b]
+        (1 <= s <= nb) || continue
+        CC.dominates(dt, s, b) && push!(get!(Vector{Int}, latches, s), b)
+    end
+
+    loops = CountedLoop[]
+    for h in sort!(collect(keys(latches)))
+        length(latches[h]) == 1 || continue
+        l = only(latches[h])
+        # Natural loop body: `h` plus everything reaching `l` without passing through `h`.
+        body = falses(nb)
+        body[h] = true
+        worklist = Int[l]
+        while !isempty(worklist)
+            x = pop!(worklist)
+            (1 <= x <= nb) || continue
+            body[x] && continue
+            body[x] = true
+            append!(worklist, preds[x])
+        end
+        length(preds[h]) == 2 || continue
+        p = preds[h][1] == l ? preds[h][2] : preds[h][1]
+        (p != l && !body[p]) || continue
+        exits = NTuple{2,Int}[]
+        for b in 1:nb
+            body[b] || continue
+            for s in succs[b]
+                (1 <= s <= nb && !body[s]) && push!(exits, (b, s))
+            end
+        end
+        length(exits) == 1 || continue
+        x, e = only(exits)
+        length(succs[x]) == 2 || continue
+        s_in = succs[x][1] == e ? succs[x][2] : succs[x][1]
+        (s_in != e && body[s_in]) || continue
+        e == 1 && continue
+        any(b -> unreachable[b], (h, l, p, x, s_in, e)) && continue
+        any(in(quiet), (h, x, s_in, e)) && continue
+        any(b -> haskey(regions, b), (h, s_in, e)) && continue
+        push!(loops, CountedLoop(h, l, p, x, e, s_in))
+    end
+    return loops
+end
+
+# ===========================================================================
 # ISSUES #52: split a block's stack push per edge rather than per block.
 #
 # `is_unique_pred[b] == false` makes `emit_epilogue!` push block `b`'s number unconditionally, but a
@@ -1104,45 +1227,69 @@ function _is_expected_block_push(inst::CC.NewInstruction, b::Int)::Bool
 end
 
 """
-    _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool})::CC.IRCode
+    _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool},
+                                  counted=CountedLoop[], count_stack_ssa=0,
+                                  mk_count_push=nothing)::CC.IRCode
 
 Post-processes the already-built forwards-carrier `ir` (still 1:1 in block topology with the primal
-`pir`) so a block with a `GotoIfNot` terminator where exactly one arm is ambiguous no longer pushes
-its block number on the unambiguous arm. Three stages: classify candidates in primal block-number
-space (Stage 0), splice a relay block per candidate plus fix up any `PhiNode` edge the redirect
-disturbs (Stage 1), reassemble and lower back to a real `IRCode` (Stage 2). Returns `ir` unchanged
-(no round trip through the `cfg_ir.jl` layer) when there is nothing to split.
+`pir`) so a block with a `GotoIfNot` terminator where exactly one arm needs a block-stack push no
+longer pushes on the other arm, and so each counted loop (`_counted_loops`) gets its trip counter:
+a synthetic `Int64` phi/increment pair in the header and a single count push spliced onto the
+loop-exit arm. `count_stack_ssa` is the prologue statement index of the tape's `count_stack`;
+`mk_count_push(stack_id, val_id)` builds the push instruction (both supplied by
+`reverse_fwds_to_ircode`, unused when `counted` is empty).
+
+Stages: classify push relocations in primal block-number space (Stage 0), build one relay per
+rewritten arm — a relocated push, a count push, or both sharing one relay (Stage 1), insert each
+counted header's counter phi + increment (Stage 1c), fix up every `PhiNode` edge the redirects
+disturbed — including counter phis another loop's relay may have re-edged (Stage 1p), reassemble
+and lower back to a real `IRCode` (Stage 2). Returns `ir` unchanged when there is nothing to do.
 """
-function _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool})::CC.IRCode
+function _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool},
+                                       counted::Vector{CountedLoop}=CountedLoop[],
+                                       count_stack_ssa::Int=0,
+                                       mk_count_push=nothing)::CC.IRCode
     nblocks = length(pir.cfg.blocks)
+    counted_edges = _counted_edges(counted)
+    npreds(s) = length(filter(!=(0), pir.cfg.blocks[s].preds))
+    # Must match `_unique_predecessor_info`'s formula exactly — same per-edge predicate, same
+    # counted-edge exclusion — or push and pop desynchronize.
+    needs_push(b, s) = npreds(s) > 1 && (b, s) ∉ counted_edges
 
     # Stage 0: classify, in primal block-number space — no IR construction yet.
-    candidates = Tuple{Int,Symbol,Int}[]   # (b, :dest|:fallthrough, ambiguous target block number)
+    candidates = Tuple{Int,Symbol,Int}[]   # (b, :dest|:fallthrough, push-needing target block number)
     for b in 1:(nblocks - 1)
         is_unique_pred[b] && continue
         term = pir.stmts[pir.cfg.blocks[b].stmts.stop][:stmt]
         isa(term, Core.GotoIfNot) || continue    # the only 2-successor terminator kind in primal IR
         dest, fall = Int(term.dest), b + 1
-        npd = length(filter(!=(0), pir.cfg.blocks[dest].preds))
-        npf = length(filter(!=(0), pir.cfg.blocks[fall].preds))
-        if npd > 1 && npf > 1
-            continue                              # both already ambiguous — nothing to split off
-        elseif npd > 1
+        nd, nf = needs_push(b, dest), needs_push(b, fall)
+        if nd && nf
+            continue                              # both arms need it — the per-block push stays
+        elseif nd
             push!(candidates, (b, :dest, dest))
-        elseif npf > 1
+        elseif nf
             push!(candidates, (b, :fallthrough, fall))
         end
-        # else: neither ambiguous — contradicts `!is_unique_pred[b]`; skip defensively.
+        # else: neither arm needs a push — contradicts `!is_unique_pred[b]`; skip defensively.
     end
-    isempty(candidates) && return ir
+    isempty(candidates) && isempty(counted) && return ir
 
-    # Stage 1: surgery + PhiNode fixup.
     blks = _ircode_to_cfg_blocks(ir)          # blks[b] is primal block b — order-preserving
+    if !isempty(counted)
+        (mk_count_push !== nothing && 1 <= count_stack_ssa <= length(blks[1])) ||
+            error("Differ internal error: counted loops need the count-stack prologue statement " *
+                  "and a push builder")
+    end
+    count_stack_id = isempty(counted) ? nothing : blks[1].inst_ids[count_stack_ssa]
+    cnt_phi_ids = [ID() for _ in counted]     # minted first — the exit relays reference them
 
-    rewritten = Dict{Int,CFGBlock}()          # b -> its push-stripped (maybe re-terminated) block
-    append_relays = CFGBlock[]                # `:dest` relays — appended at the very end
-    insert_after = Dict{Int,CFGBlock}()       # b -> its `:fallthrough` relay, inserted right after b
-    phi_fixups = Tuple{Int,ID,ID}[]           # (target block#, old pred ID, relay ID) — pre-mutation
+    # Stage 1: one relay per rewritten arm. A relay body starts with its pushes (a relocated
+    # block-id push, a trip-count push, or both — they target different stacks, so their relative
+    # order is immaterial) and ends with a goto to the arm's original target.
+    relay_body = Dict{NTuple{2,Any},Vector{IDInstPair}}()  # (b, side) -> push instructions
+    relay_target = Dict{NTuple{2,Any},Int}()               # (b, side) -> target block number
+    strip_push = Set{Int}()                                # blocks whose own push was relocated
 
     for (b, side, target) in candidates
         blk = blks[b]
@@ -1153,30 +1300,70 @@ function _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::Abstr
         _is_expected_block_push(push_inst, b) ||
             error("Differ internal error: expected a block-stack push as the second-to-last " *
                   "instruction of block $b, found `$(push_inst.stmt)`")
+        relay_body[(b, side)] = IDInstPair[(push_id, push_inst)]
+        relay_target[(b, side)] = target
+        push!(strip_push, b)
+    end
+    for (li, cl) in enumerate(counted)
+        x, e = cl.exiting, cl.exit_target
+        term = pir.stmts[pir.cfg.blocks[x].stmts.stop][:stmt]
+        isa(term, Core.GotoIfNot) ||
+            error("Differ internal error: counted loop's exiting block $x is not GotoIfNot-terminated")
+        side = Int(term.dest) == e ? :dest : :fallthrough
+        side === :fallthrough && x + 1 != e &&
+            error("Differ internal error: counted loop's exit edge $x -> $e matches neither arm")
+        body = get!(Vector{IDInstPair}, relay_body, (x, side))
+        pushfirst!(body, (ID(), mk_count_push(count_stack_id, cnt_phi_ids[li])))
+        relay_target[(x, side)] = e
+    end
 
+    rewritten = Dict{Int,CFGBlock}()          # b -> its current rewritten version
+    curblk(b) = get(rewritten, b, blks[b])
+    append_relays = CFGBlock[]                # `:dest` relays — appended at the very end
+    insert_after = Dict{Int,CFGBlock}()       # b -> its `:fallthrough` relay, inserted right after b
+    phi_fixups = Tuple{Int,ID,ID}[]           # (target block#, old pred ID, relay ID) — pre-mutation
+
+    for ((b, side), body) in relay_body
+        target = relay_target[(b, side)]
         relay_id = ID()
-        relay = CFGBlock(relay_id, [push_id, ID()],
-                         CC.NewInstruction[push_inst, new_inst(IDGotoNode(blks[target].id), Any)])
-
+        push!(body, (ID(), new_inst(IDGotoNode(blks[target].id), Any)))
+        relay = CFGBlock(relay_id, body)
+        blk = curblk(b)
+        keep = b in strip_push && !haskey(rewritten, b) ? (1:(length(blk) - 2)) : (1:(length(blk) - 1))
         term_id, term_inst = blk.inst_ids[end], blk.insts[end]
         if side === :dest
             old_term = term_inst.stmt::IDGotoIfNot
-            new_term = CC.NewInstruction(term_inst; stmt=IDGotoIfNot(old_term.cond, relay_id))
+            term_inst = CC.NewInstruction(term_inst; stmt=IDGotoIfNot(old_term.cond, relay_id))
             push!(append_relays, relay)
-        else
-            new_term = term_inst              # dest untouched — only the implicit fallthrough moves
+        else                                  # dest untouched — only the implicit fallthrough moves
             insert_after[b] = relay
         end
-        rewritten[b] = CFGBlock(blk.id, vcat(blk.inst_ids[1:(end - 2)], term_id),
-                                vcat(blk.insts[1:(end - 2)], new_term))
+        rewritten[b] = CFGBlock(blk.id, vcat(blk.inst_ids[keep], term_id),
+                                vcat(blk.insts[keep], term_inst))
         push!(phi_fixups, (target, blk.id, relay_id))
     end
 
-    # Applied in one dedicated pass, over the pre-mutation candidate list, so a target block number
-    # being before or after `b` (a loop back-edge target has a *lower* number) can't cause ordering
-    # or aliasing bugs.
+    # Stage 1c: each counted header gets `c = φ(preheader ⇒ 0, latch ⇒ c+1)` right after its
+    # existing leading phis, then the increment. The exit relay above pushes the *phi* value — the
+    # number of back-edge traversals at the moment the exit edge is taken.
+    for (li, cl) in enumerate(counted)
+        hb = curblk(cl.header)
+        nphi = something(findlast(x -> x.stmt isa IDPhiNode, hb.insts), 0)
+        inc_id = ID()
+        phi = IDPhiNode(ID[blks[cl.preheader].id, blks[cl.latch].id], Any[Int64(0), inc_id])
+        inc = Expr(:call, GlobalRef(Core.Intrinsics, :add_int), cnt_phi_ids[li], Int64(1))
+        rewritten[cl.header] = CFGBlock(hb.id,
+            vcat(hb.inst_ids[1:nphi], cnt_phi_ids[li], inc_id, hb.inst_ids[(nphi + 1):end]),
+            vcat(hb.insts[1:nphi], new_inst(phi, Int64), new_inst(inc, Int64),
+                 hb.insts[(nphi + 1):end]))
+    end
+
+    # Stage 1p: applied in one dedicated pass over the *current* block versions, so a target block
+    # number being before or after `b` (a loop back-edge target has a *lower* number) can't cause
+    # ordering or aliasing bugs, and a counter phi inserted above is re-edged too when another
+    # loop's exit relay lands on one of its header's incoming edges.
     for (target, old_id, relay_id) in phi_fixups
-        _, phis = phi_nodes(blks[target])
+        _, phis = phi_nodes(curblk(target))
         for phi_inst in phis
             phi = phi_inst.stmt::IDPhiNode
             for j in eachindex(phi.edges)
@@ -1188,7 +1375,7 @@ function _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::Abstr
     # Stage 2: reassemble in primal block order, then lower back to a real IRCode.
     final = CFGBlock[]
     for b in 1:nblocks
-        push!(final, get(rewritten, b, blks[b]))
+        push!(final, curblk(b))
         haskey(insert_after, b) && push!(final, insert_after[b])
     end
     append!(final, append_relays)
@@ -2396,7 +2583,12 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, _, _, block_fused_refs,
         regions, quiet = scan
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
-    is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions, quiet)
+    # Recomputed from the same threaded inputs at every site that needs it (here, the pullback
+    # builder), like `_unique_predecessor_info` — a pure function of identical arguments, so the
+    # sides agree by construction.
+    counted = _counted_loops(pir, unreachable_block, regions, quiet)
+    is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions,
+                                                    quiet, _counted_edges(counted))
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
@@ -2553,6 +2745,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             comms_stack_ssa[b] = ST <: SingletonStack ? emit!(Expr(:new, ST), ST) : icall!(ST, ST, ())
         end
         subtapes_ssa = icall!(Stack{TapeT}, Stack{TapeT}, ())
+        count_stack_ssa = icall!(Stack{Int64}, Stack{Int64}, ())
     else
         # Pre-allocated mode: read the caller's tape out of the `ctx` and reuse its stacks — the
         # whole point of `build_ctx`, since a `Stack` is three heap objects.
@@ -2568,6 +2761,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             comms_stack_ssa[b] = emit!(Expr(:call, getf, comms_tuple_in, b), comms_stack_ty[b])
         end
         subtapes_ssa = emit!(Expr(:call, getf, tape_ssa, 4), Stack{TapeT})
+        count_stack_ssa = emit!(Expr(:call, getf, tape_ssa, 5), Stack{Int64})
         # Reset every reusable stack to empty. Balanced push/pop already leaves them at 0 after a
         # completed round trip, but resetting here makes reuse correct unconditionally — a caller
         # can run the forwards pass and never call the pullback, or bail out partway through.
@@ -2580,11 +2774,12 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             emit!(Expr(:call, setf, comms_stack_ssa[b], 2, 0), Any)
         end
         emit!(Expr(:call, setf, subtapes_ssa, 2, 0), Any)
+        emit!(Expr(:call, setf, count_stack_ssa, 2, 0), Any)
         # This call's coduals replace the previous call's. A re-used context therefore keeps the
         # previous call's arguments (and their shadows) alive until the next call overwrites them —
         # noted in `build_ctx`'s docstring; the field is concretely typed, so there's nothing to null
-        # it to in between. `args` is field 5 now that `subtapes` (field 4) sits before it.
-        emit!(Expr(:call, setf, tape_ssa, 5, args_tup_ssa), Any)
+        # it to in between. `args` is field 6, after `subtapes` (4) and `count_stack` (5).
+        emit!(Expr(:call, setf, tape_ssa, 6, args_tup_ssa), Any)
     end
 
     # --- Bulk primal save. Still in the prologue, before any primal statement has run, so it captures
@@ -2800,7 +2995,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             if tape === nothing
                 comms_tuple = emit!(Expr(:call, ctuple, comms_stack_ssa...), Tuple{comms_stack_ty...})
                 tape = emit!(Expr(:new, TapeT, block_stack_ssa, comms_tuple, bufs_ssa, subtapes_ssa,
-                                  args_tup_ssa), TapeT)
+                                  count_stack_ssa, args_tup_ssa), TapeT)
             end
             final = emit!(Expr(:call, ctuple, result_cd, tape), Tuple{FR,TapeT})
             emit!(Core.ReturnNode(final), Any)
@@ -3175,8 +3370,16 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # companion to the per-edge `pred_is_unique_pred` formula above (`length(preds[b]) <= 1`). The
     # two changes are coupled; neither is correct alone (a first fwds-only attempt at this shipped
     # verify_ir-clean IR and passed its own tests but silently corrupted gradients for any loop
-    # iterating >= 2 times — see `_emit_switch!` below for the root cause).
-    ir = _split_ambiguous_block_pushes(ir, pir, is_unique_pred)
+    # iterating >= 2 times — see `_emit_switch!` below for the root cause). The same pass also
+    # installs each counted loop's trip counter (see `_counted_loops`), whose pullback companion is
+    # `reverse_pullback_to_ircode`'s counted dispatch — the same both-sides-or-neither coupling.
+    count_push_ci = isempty(counted) ? nothing :
+        helper_ci(interp, Tuple{typeof(Base.push!),Stack{Int64},Int64}, edges, hcache)
+    mk_count_push(cs_id, val_id) = new_inst(
+        count_push_ci === nothing ? Expr(:call, push_g, cs_id, val_id) :
+                                    Expr(:invoke, count_push_ci, push_g, cs_id, val_id), Any)
+    ir = _split_ambiguous_block_pushes(ir, pir, is_unique_pred, counted, count_stack_ssa.id,
+                                       mk_count_push)
     CC.verify_ir(ir)
     return ir
 end
@@ -3188,6 +3391,11 @@ end
 
 @inline __pop_blk_stack!(block_stack) = pop!(block_stack)::Int32
 @inline __switch_case(id::Int32, prev::Int32) = !(id === prev)
+# Counted-loop countdown pieces (see `_counted_loops`): pop one recorded trip count, decrement it,
+# and test it for the `Switch` polarity `_emit_switch!` also uses (`false` selects the dest arm).
+@inline __pop_count_stack!(count_stack) = pop!(count_stack)::Int64
+@inline __count_dec(c::Int64) = c - Int64(1)
+@inline __count_case(c::Int64) = !(c === Int64(0))
 
 # Materializes a real zero rdata from `acc` when it's the `ZeroRData` placeholder. Needed wherever a
 # `deref_and_zero!`-derived accumulator must be treated as an actual `RDataT` value (e.g. decomposed
@@ -3231,7 +3439,15 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # `(item, host, slot)` shape, but read out of the tuple the *host* block's reverse code popped.
     block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, _,
         block_hoisted_refs, block_fused_refs, regions, quiet = scan
-    _, pred_is_unique_pred, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions, quiet)
+    # Recomputed from the same threaded inputs as the forwards builder's copy — a pure function of
+    # identical arguments, so the two sides agree by construction.
+    counted = _counted_loops(pir, unreachable_block, regions, quiet)
+    _, pred_is_unique_pred, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions,
+                                                         quiet, _counted_edges(counted))
+    # Where the reverse walk enters each counted loop's region (pop the recorded trip count there)
+    # and which reverse blocks dispatch on the countdown instead of popping the block stack.
+    counted_exit = Dict((cl.exiting, cl.exit_target) => li for (li, cl) in enumerate(counted))
+    counted_header = Dict(cl.header => li for (li, cl) in enumerate(counted))
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
@@ -3322,6 +3538,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # Direct self-recursion's dedicated storage (`Tape.subtapes`, field 4). Unconditionally unpacked
     # (unused/DCE'd by `run_ipo_passes!` when this primal has no self-recursive call).
     subtapes_id = eemit!(Expr(:call, getf, tape_id, 4), Stack{TapeT})
+    count_stack_id = eemit!(Expr(:call, getf, tape_id, 5), Stack{Int64})
 
     comms_obj_id = Vector{Any}(undef, nblocks)
     for b in 1:nblocks
@@ -3336,7 +3553,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # same `entry_stmts` vector, and anything appended after that would land past a terminator. ---
     parg_pb = Vector{Any}(undef, n)
     farg_pb = Vector{Any}(undef, n)
-    let args_tup_id = eemit!(Expr(:call, getf, tape_id, 5), ArgsTT)
+    let args_tup_id = eemit!(Expr(:call, getf, tape_id, 6), ArgsTT)
         for k in 1:n
             Ck = codualparams[k]
             Pk = _codual_primal_type(Ck)
@@ -3382,6 +3599,14 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         RT = zero_like_rdata_type(Ti)
         ssa_ref_id[i] = eemit!(Expr(:new, Base.RefValue{RT}, zero_like_rdata_from_type(Ti)), Base.RefValue{RT})
     end
+
+    # One countdown cell per counted loop, initialized from the popped trip count at the loop
+    # region's reverse entry and decremented at each reverse header visit. A `Ref` rather than a
+    # phi threaded through the reverse CFG: every other piece of pullback state already routes
+    # through `Ref`s SROA scalarizes, it dominates everything from here, and a missed
+    # scalarization costs a load/store per reverse iteration, never correctness.
+    cnt_ref_id = [eemit!(Expr(:new, Base.RefValue{Int64}, Int64(0)), Base.RefValue{Int64})
+                  for _ in counted]
 
     # An unassigned slot *in range* is an inactive statement/argument; `route!` discards a `nothing`
     # target, exactly as it already does for a literal operand. Out of range is an internal error, not
@@ -3859,6 +4084,42 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             push!(phi_acc, active[i] ? deref_and_zero!(ssa_ref_id[i], _stype(pstmts, i)) : nothing)
         end
 
+        # Dispatch to the chosen predecessor's target: the block-stack pop/switch for an ordinary
+        # block, or — for a counted loop's header — the countdown test, with no pop at all: the
+        # popped trip count (stored at the loop region's reverse entry, see `counted_exit` below)
+        # replaces every per-arrival push this block used to consume. The decrement is
+        # unconditional; the stale store on the final (preheader) arm is harmless because any
+        # re-entry into the loop region re-pops first.
+        emit_pred_dispatch!(preds_, targets_::Vector{ID}) = begin
+            li = get(counted_header, b, nothing)
+            if li === nothing
+                _emit_switch!(emit!, icall, block_stack_id, preds_, targets_;
+                             skip_pop=pred_is_unique_pred[b])
+            else
+                cl = counted[li]
+                (length(preds_) == 2 && cl.preheader in preds_ && cl.latch in preds_) ||
+                    error("Differ internal error: counted header $b's predecessors $(preds_) " *
+                          "do not match its loop (preheader $(cl.preheader), latch $(cl.latch))")
+                ip = findfirst(==(cl.preheader), preds_)
+                cref = cnt_ref_id[li]
+                cd = emit!(Expr(:call, getf, cref, 1), Int64)
+                dec = emit!(icall(__count_dec, (Int64,), cd), Int64)
+                emit!(Expr(:call, setf, cref, 1, dec), Any)
+                cond = emit!(icall(__count_case, (Int64,), cd), Bool)
+                emit!(Switch(Any[cond], ID[targets_[ip]], targets_[ip == 1 ? 2 : 1]), Any)
+            end
+            nothing
+        end
+        # The arm routing to a counted loop's exiting block is where the reverse walk enters that
+        # loop's region: recover this entry's trip count before anything inside the region runs.
+        count_pop!(remit!, p) = begin
+            li = get(counted_exit, (p, b), nothing)
+            li === nothing && return nothing
+            c = remit!(icall(__pop_count_stack!, (Stack{Int64},), count_stack_id), Int64)
+            remit!(Expr(:call, setf, cnt_ref_id[li], 1, c), Any)
+            nothing
+        end
+
         if b == 1
             # No predecessors: this is the pullback's own final block — the last thing that runs.
             # Restore every bulk-saved argument's primal contents here, which is what makes the whole
@@ -3900,9 +4161,34 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             res = emit!(Expr(:call, ctuple, result_ids...), own_RdatasT)
             emit!(Core.ReturnNode(res), Any)
         elseif phi_end < lo
-            # No PhiNodes at the top of this block: switch straight to each predecessor's own block.
-            _emit_switch!(emit!, icall, block_stack_id, preds, ID[block_id[p] for p in preds];
-                         skip_pop=pred_is_unique_pred[b])
+            # No PhiNodes at the top of this block: switch straight to each predecessor's own
+            # block, via a small routing block only where the arm must first recover a counted
+            # loop's trip count. A sole predecessor's pop can sit inline instead — the dispatch
+            # below is then a plain goto.
+            target_ids = ID[]
+            new_blocks = CFGBlock[]
+            for p in preds
+                if !haskey(counted_exit, (p, b))
+                    push!(target_ids, block_id[p])
+                elseif length(preds) == 1
+                    count_pop!(emit!, p)
+                    push!(target_ids, block_id[p])
+                else
+                    rstmts = IDInstPair[]
+                    remit!(ex, @nospecialize(ty)) = begin
+                        id = ID()
+                        push!(rstmts, (id, new_inst(ex, ty)))
+                        id
+                    end
+                    count_pop!(remit!, p)
+                    rid = ID()
+                    remit!(IDGotoNode(block_id[p]), Any)
+                    push!(new_blocks, CFGBlock(rid, rstmts))
+                    push!(target_ids, rid)
+                end
+            end
+            emit_pred_dispatch!(preds, target_ids)
+            append!(blocks, new_blocks)
         else
             # PhiNodes: route each predecessor's own edge value, in a small dedicated block per pred.
             phi_ids = lo:phi_end
@@ -3937,12 +4223,13 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     new = remit!(icall(increment_g, (RTcur, RTacc), cur, phi_acc[j]), RTcur)
                     remit!(Expr(:call, setf, tgt, 1, new), Any)
                 end
+                count_pop!(remit!, p)
                 rid = ID()
                 remit!(IDGotoNode(block_id[p]), Any)
                 push!(new_blocks, CFGBlock(rid, rstmts))
                 push!(target_ids, rid)
             end
-            _emit_switch!(emit!, icall, block_stack_id, preds, target_ids; skip_pop=pred_is_unique_pred[b])
+            emit_pred_dispatch!(preds, target_ids)
             append!(blocks, new_blocks)
         end
 
@@ -4280,7 +4567,8 @@ function _fresh_tape_expr(@nospecialize(TapeT))
     slots = Any[S <: SingletonStack ? :($S()) :
                 S <: CommsCell ? :($S()) :
                 :($S(1)) for S in CS.parameters]
-    return :($TapeT($(Stack{Int32})(1), ($(slots...),), $(Vector{Any})(), $(Stack{TapeT})()))
+    return :($TapeT($(Stack{Int32})(1), ($(slots...),), $(Vector{Any})(), $(Stack{TapeT})(),
+                    $(Stack{Int64})(1)))
 end
 
 # Nested-tape recycling (`_inner_ctx`, `stack.jl`): allocate a fresh tape of exactly the shape

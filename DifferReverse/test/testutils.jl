@@ -82,6 +82,9 @@ function _assert_tape_balanced(tape::DifferReverse.Tape, seen::Base.IdSet{Any}=B
     for i in eachindex(tape.subtapes.memory)
         isassigned(tape.subtapes.memory, i) && _assert_tape_balanced(tape.subtapes.memory[i], seen)
     end
+    # Counted-loop trip counts: every count pushed on a loop exit must have been popped at the
+    # matching reverse region entry.
+    @test tape.count_stack.position == 0
     return nothing
 end
 function _assert_comms_balanced(s::DifferReverse.Stack, seen)
