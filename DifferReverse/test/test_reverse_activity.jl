@@ -490,6 +490,38 @@ end
     # structural) phi-merge gap: see "broadcast through a constant array still bails" below.
 end
 
+@testset "activity: memmove source read out of a vararg tail" begin
+    # `_inactive_arg_root`'s mixed-activity-tuple arm must read the *packed* codual list (what the
+    # comms scan uses) at every call site, not the flat per-argument list the fwds/pullback carriers
+    # are built from — otherwise the scan and the emitted code disagree about which packed slot
+    # `srcs[1]` names, and the fwds pass tries to resolve an `:fshadow` comms item the scan never
+    # declared.
+    vcopy!(dst, srcs...) = begin
+        copyto!(dst, srcs[1])
+        sum(dst)
+    end
+    dst = zeros(3)
+    src1, src2 = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
+    at = (Vector{Float64}, Vector{Float64}, Vector{Float64})
+
+    ddst = zeros(3)
+    y, pb = rrule!!(zero_fcodual(vcopy!), Ctx(), CoDual(copy(dst), ddst),
+                    const_codual(src1), CoDual(copy(src2), zeros(3)))
+    @test primal(y) == sum(src1)
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData(), NoRData())
+    @test ddst == zeros(3)   # dst's initial content is fully overwritten by the copy
+    _assert_tape_balanced(pb)
+
+    checkverify_rev(vcopy!, at; inactive=(2,))
+
+    ctx = build_ctx(vcopy!, at; inactive=(2,))
+    fcd = zero_fcodual(vcopy!)
+    dstcd, src1cd, src2cd = CoDual(copy(dst), zeros(3)), const_codual(src1), CoDual(copy(src2), zeros(3))
+    yv, g = value_and_gradient!(ctx, fcd, dstcd, src1cd, src2cd)
+    @test yv == sum(src1)
+    @test g == (NoTangent(), zeros(3), Inactive(), zeros(3))
+end
+
 @testset "activity: DI.Constant round trip through memmove's third mode" begin
     f(x, w) = sum(x) + sum(copy(w))
     x, w = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]

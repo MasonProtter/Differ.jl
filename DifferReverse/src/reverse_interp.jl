@@ -3352,7 +3352,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                     tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                     fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
                     tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i),
-                    inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, codualparams))
+                    inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, packed_codualparams))
             result = fc === nothing ? nothing : apply_foreigncall_rrule_fwds!(Val(fc.name), fc, Ti, fcctx)
             if result === nothing
                 reason[] = "reverse mode does not support foreigncall target " *
@@ -3381,7 +3381,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                        # `fdtype`, wherever it types a shadow read off an operand.
                        sty=(@nospecialize a) -> _shadow_type_of(shadow_types, pir, iworld, arg_active,
                                                                 packed_codualparams, npacked, a),
-                       inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, codualparams))
+                       inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, packed_codualparams))
                 # `_scan_block_comms` skips an inactive statement, so a rule firing here would push
                 # comms items that were never declared.
                 result = active[i] ? apply_builtin_rrule_fwds!(Val(f), actual, Ti, bctx) : nothing
@@ -4095,7 +4095,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                         tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                         rdtype=(@nospecialize(T) -> rdtype(iworld, T)),
                         fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
-                        inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, codualparams))
+                        inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, packed_codualparams))
                 contribs = fc === nothing ? nothing : apply_foreigncall_rrule!(Val(fc.name), fc, Ti, fcctx)
                 if contribs === nothing
                     reason[] = "reverse mode does not support foreigncall target " *
