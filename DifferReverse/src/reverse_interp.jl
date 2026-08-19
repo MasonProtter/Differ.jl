@@ -635,6 +635,40 @@ function _pack_vararg_args!(emit!::F, ctuple, parg::Vector{Any}, farg::Vector{An
     return nothing
 end
 
+# Widens an already-resolved shadow value `sval` (primal `pval`, primal type `P`) from its own,
+# possibly-mixed-activity type `SF` up to the full primal-derived fdata type `FT`, materializing a
+# real zero (`_rr_zero_fdata`) for each constant slot — recursively, so a *nested* mixed tuple
+# (`t2 = (t1, y)` where `t1 = (x, c)` is itself mixed) widens all the way down rather than emitting
+# a `getfield` typed at `FT`'s slot while the value it reads still carries `SF`'s narrower one, one
+# level down (the same declared-vs-actual lie this whole mechanism exists to close). `SF`/`FT` are
+# always the same shape wherever they differ (`_shadow_types` only ever narrows a slot to
+# `Inactive`, never restructures the tuple), so any other mismatch is an internal error, not a
+# normal bail — it means the two disagree about which value this even is.
+function _widen_shadow_val!(emit!::E, icall!::I, getf, ctuple, @nospecialize(pval), @nospecialize(sval),
+                            @nospecialize(P), @nospecialize(SF), @nospecialize(FT)) where {E,I}
+    SF === FT && return sval
+    SF === Inactive && return icall!(_rr_zero_fdata, FT, (P,), pval)
+    if !(SF isa DataType && SF <: Tuple && FT isa DataType && FT <: Tuple &&
+         P isa DataType && P <: Tuple && fieldcount(SF) == fieldcount(FT) == fieldcount(P))
+        error("Differ internal error: cannot widen a mixed shadow of type $(SF) to $(FT) " *
+              "(primal type $(P)) — shapes disagree")
+    end
+    vals = Vector{Any}(undef, fieldcount(FT))
+    for j in 1:fieldcount(FT)
+        FTj = fieldtype(FT, j)
+        SFj = fieldtype(SF, j)
+        if SFj === FTj
+            vals[j] = emit!(Expr(:call, getf, sval, j), FTj)
+        else
+            Pj = fieldtype(P, j)
+            pfield = emit!(Expr(:call, getf, pval, j), Pj)
+            sfield = SFj === Inactive ? nothing : emit!(Expr(:call, getf, sval, j), SFj)
+            vals[j] = _widen_shadow_val!(emit!, icall!, getf, ctuple, pfield, sfield, Pj, SFj, FTj)
+        end
+    end
+    return emit!(Expr(:call, ctuple, vals...), FT)
+end
+
 # Splits the packed tail's one rdata accumulator (`arg_ref_id[nfixed+1]`) back across a flat
 # position `j` at the pullback's return, since the return arity is flat. `acc` is a real per-field
 # tuple, or a collapsed `NoRData`/`ZeroRData` when the tail carries no real rdata.
@@ -1865,6 +1899,16 @@ function _shadow_types(pir, iworld::UInt, n::Int, arg_active::BitVector,
         sty[i] = fdtype(iworld, Ti)
         sty[i] === NoFData && continue
         s = pir.stmts[i][:stmt]
+        if isa(s, Core.PiNode)
+            # Pure passthrough (a type refinement, not a new value) — the emission side literally
+            # aliases the operand's own shadow (`sresolve(s.val)`, never a fresh `emit!`), so the
+            # declared type has to inherit the operand's own `sty`, mixed or not, rather than default
+            # to the primal-derived one like every other statement kind does.
+            F = opsty(s.val)
+            F isa DataType && F <: Tuple && Ti isa DataType && Ti <: Tuple && isconcretetype(Ti) &&
+                fieldcount(F) == fieldcount(Ti) && (sty[i] = F)
+            continue
+        end
         (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || continue
         fpos, actual = _call_parts(s)
         f = _calleeval(fpos, iworld)
@@ -2958,6 +3002,38 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             phi_edge_zero[(i, j)] = icall!(_rr_zero_fdata, FTi, (Pv,), parg[v.n])
         end
     end
+    # An `SSAValue` edge whose own shadow is a mixed-activity tuple (a `Core.tuple` of mixed
+    # operands, say), narrower than the phi's own primal-derived type, needs the same widening —
+    # but unlike a bare `Core.Argument` (which dominates everywhere, so its zero can be hoisted to
+    # the entry block) an arbitrary SSA value's widening has to be emitted right where the value
+    # itself is built, in its own defining block, not at the phi (which must lead its own block).
+    # `phi_norm_target[v.id]` records the one target type an SSA id must be widened to; the main
+    # walk below fills `phi_norm_map[v.id]` with the widened result immediately after `v`'s own
+    # shadow is built, and the phi consults it in place of a bare `sresolve`.
+    phi_norm_target = Dict{Int,Any}()
+    for i in 1:length(pir.stmts)
+        fdata_tracked[i] || continue
+        s = pir.stmts[i][:stmt]
+        isa(s, Core.PhiNode) || continue
+        FTi = fdtype(iworld, _stype(pir.stmts, i))
+        FTi === NoFData && continue
+        for j in 1:length(s.values)
+            isassigned(s.values, j) || continue
+            v = s.values[j]
+            isa(v, Core.SSAValue) || continue
+            haskey(phi_edge_zero, (i, j)) && continue
+            SF = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked, v)
+            SF === FTi && continue
+            prev = get(phi_norm_target, v.id, nothing)
+            if prev !== nothing && prev !== FTi
+                reason[] = "SSA value %$(v.id) would need widening to two different shadow types " *
+                           "($(prev) vs $(FTi)) for two different `PhiNode`s — not supported"
+                return nothing
+            end
+            phi_norm_target[v.id] = FTi
+        end
+    end
+    phi_norm_map = Dict{Int,Any}()
     # Packed once here rather than at each use: both tape shapes below need it, and the
     # pre-allocated shape stores it in the prologue (not at the return) so an early bail can't sink
     # the store past a point where the tape is already visible to the caller.
@@ -3066,6 +3142,22 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
         isa(x, GlobalRef) ? _calleeval(x, iworld) : x
     sresolve(@nospecialize x) =
         isa(x, Core.SSAValue) ? shadow_map[x.id] : isa(x, Core.Argument) ? farg[x.n] : x
+
+    # `sresolve`, but widens a mixed-activity shadow (an `Inactive` slot in some sub-position, at
+    # any nesting depth, or the whole thing `Inactive`) up to the full primal-derived fdata type
+    # `FT` first — needed wherever a value flows into a slot declared at `FT` rather than its own
+    # (possibly narrower) `sty`: a `PhiNode` edge, or the value operand of a mutating store. A
+    # constant slot gets a real zero (`_rr_zero_fdata`, the same materializer `phi_edge_zero`
+    # already uses for a bare `Core.Argument` edge) rather than the `Inactive` sentinel — later
+    # contributions into it are discarded, which is exactly `Inactive`'s strong-zero meaning
+    # carried across the boundary. Pass-through when `node`'s own shadow type already is `FT`. Thin
+    # wrapper: `_widen_shadow_val!` is the actual (recursive) work, operating on resolved values.
+    normalize_shadow!(@nospecialize(node), @nospecialize(FT)) = begin
+        SF = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked, node)
+        SF === FT && return sresolve(node)
+        P = _widen(_optype(pir, node))
+        _widen_shadow_val!(emit!, icall!, getf, ctuple, presolve(node), sresolve(node), P, SF, FT)
+    end
 
     # Part 1: which block's own recursive-call `:subtape` comms item already has its inner `Tape`
     # SSA value computed, so `emit_epilogue!` can find it (sparse, parallel to `primal_map`).
@@ -3401,6 +3493,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                        # `fdtype`, wherever it types a shadow read off an operand.
                        sty=(@nospecialize a) -> _shadow_type_of(shadow_types, pir, iworld, arg_active,
                                                                 packed_codualparams, npacked, a),
+                       normalize_shadow!,
                        inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, packed_codualparams))
                 # `_scan_block_comms` skips an inactive statement, so a rule firing here would push
                 # comms items that were never declared.
@@ -3543,6 +3636,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             k = length(s.values)
             pvals = Vector{Any}(undef, k)
             want_shadow = fdata_tracked[i]
+            FTi = want_shadow ? fdtype(iworld, Ti) : NoFData
             svals = want_shadow ? Vector{Any}(undef, k) : nothing
             for j in 1:k
                 isassigned(s.values, j) || continue
@@ -3557,7 +3651,13 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                     want_shadow && push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (svals, j, false))
                 else
                     pvals[j] = presolve(v)
-                    want_shadow && (svals[j] = sresolve(v))
+                    # `phi_norm_map[v.id]`, not a bare `sresolve`, when present: an SSA edge's own
+                    # shadow can be a mixed-activity tuple (a `Core.tuple` of mixed operands),
+                    # narrower than this phi's own primal-derived `FTi` — the widened value was
+                    # already built right after `v`'s own shadow (see the main walk below), since a
+                    # phi must lead its own block and can't emit the widening beside itself.
+                    want_shadow && (svals[j] = isa(v, Core.SSAValue) && haskey(phi_norm_map, v.id) ?
+                                               phi_norm_map[v.id] : sresolve(v))
                 end
             end
             primal_map[i] = emit!(Core.PhiNode(s.edges, pvals), Ti)
@@ -3565,7 +3665,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             # (`verify_ir`). `rdata_type` of an fdata-carrying value is always `NoRData`, so no
             # pullback comms needed; `getfield`/`memoryrefget` off this phi resolves via `sresolve`
             # like any tracked node.
-            want_shadow && (shadow_map[i] = emit!(Core.PhiNode(s.edges, svals), fdtype(iworld, Ti)))
+            want_shadow && (shadow_map[i] = emit!(Core.PhiNode(s.edges, svals), FTi))
         elseif isa(s, GlobalRef)
             primal_map[i] = emit!(s, Ti)
         elseif !isa(s, Expr)
@@ -3574,9 +3674,15 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             reason[] = "unsupported statement kind $(typeof(s)) at %$i: `$(_stmt_str(s))`"
             return nothing
         end
+        # `i`'s own shadow may need widening for a phi elsewhere (`phi_norm_target`, built ahead of
+        # time) — emitted right here, immediately after `i`'s own shadow, so it lands in `i`'s own
+        # (dominating) block rather than at the consuming phi. Must run before the `pending`
+        # backpatch below, which prefers this widened value over the raw one when present.
+        haskey(phi_norm_target, i) && (phi_norm_map[i] = normalize_shadow!(Core.SSAValue(i), phi_norm_target[i]))
         if haskey(pending, i)
             for (arr, slot, wantp) in pending[i]
-                arr[slot] = wantp ? primal_map[i] : shadow_map[i]
+                arr[slot] = wantp ? primal_map[i] :
+                            haskey(phi_norm_map, i) ? phi_norm_map[i] : shadow_map[i]
             end
             delete!(pending, i)
         end

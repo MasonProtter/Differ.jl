@@ -651,6 +651,63 @@ end
     check_stack_balance(stale_field, copy(av), copy(cv))
 end
 
+@testset "activity: memoryrefset! of a mixed-activity tuple normalizes the constant slot" begin
+    # A `Core.tuple` of mixed operands has a shadow narrower than the primal-derived fdata type
+    # (`Tuple{Vector{Float64},Inactive}`); storing it through `memoryrefset!` used to embed that
+    # narrower value straight into an `:invoke` declared at the full
+    # `Tuple{Vector{Float64},Vector{Float64}}` — a type lie that crashed with an illegal
+    # instruction. The fix widens the constant slot to a real zero before the store.
+    f(dest, x, c) = (t = (x, c); dest[1] = t; sum(x) + sum(c))
+    at = (Vector{Tuple{Vector{Float64},Vector{Float64}}}, Vector{Float64}, Vector{Float64})
+
+    x, c = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    dest = Vector{Tuple{Vector{Float64},Vector{Float64}}}(undef, 1)
+    dx = zeros(3)
+    y, pb = rrule!!(zero_fcodual(f), Ctx(), zero_fcodual(dest), CoDual(x, dx), const_codual(c))
+    @test primal(y) == sum(x) + sum(c)
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData(), NoRData())
+    @test dx == ones(3)   # `x`'s own gradient is unaffected by the mixed store
+    @test dest[1] == (x, c)
+    _assert_tape_balanced(pb)
+
+    checkverify_rev(f, at; inactive=(3,))
+
+    # The stored tuple's active slot still contributes when read back — the store's field-aliasing
+    # scheme threads a mixed-activity element the same way it does a plain one.
+    f2(dest, x, c) = (dest[1] = (x, c); sum(dest[1][1]) + 2sum(dest[1][2]))
+    dest2 = Vector{Tuple{Vector{Float64},Vector{Float64}}}(undef, 1)
+    dx2 = zeros(3)
+    y2, pb2 = rrule!!(zero_fcodual(f2), Ctx(), zero_fcodual(dest2), CoDual(x, dx2), const_codual(c))
+    @test primal(y2) == sum(x) + 2sum(c)
+    @test pb2(1.0) == (NoRData(), NoRData(), NoRData(), NoRData())
+    @test dx2 == ones(3)
+    checkverify_rev(f2, at; inactive=(3,))
+end
+
+@testset "activity: memoryrefset! of a nested mixed-activity tuple normalizes every level" begin
+    # `t2 = (t1, y)` where `t1 = (x, c)` is itself mixed nests one mixed-activity tuple inside
+    # another. Widening `t2` for the store has to recurse into slot 1 rather than declaring it
+    # `Tuple{Vector,Vector}` while it still carries `t1`'s own narrower `Tuple{Vector,Inactive}` —
+    # the same declared-vs-actual lie the flat case fixes, one level down.
+    f(dest, x, y, c) = (t1 = (x, c); t2 = (t1, y); dest[1] = t2; sum(x) + sum(y) + sum(c))
+    TupInner = Tuple{Vector{Float64},Vector{Float64}}
+    at = (Vector{Tuple{TupInner,Vector{Float64}}}, Vector{Float64}, Vector{Float64}, Vector{Float64})
+
+    x, y, c = [1.0, 2.0, 3.0], [7.0, 8.0, 9.0], [10.0, 20.0, 30.0]
+    dest = Vector{Tuple{TupInner,Vector{Float64}}}(undef, 1)
+    dx, dy = zeros(3), zeros(3)
+    yv, pb = rrule!!(zero_fcodual(f), Ctx(), zero_fcodual(dest), CoDual(x, dx), CoDual(y, dy),
+                     const_codual(c))
+    @test primal(yv) == sum(x) + sum(y) + sum(c)
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData(), NoRData(), NoRData())
+    @test dx == ones(3)
+    @test dy == ones(3)
+    @test dest[1] == ((x, c), y)
+    _assert_tape_balanced(pb)
+
+    checkverify_rev(f, at; inactive=(4,))
+end
+
 @testset "activity: broadcast through a constant array" begin
     # `.`-broadcast's `Broadcast.unalias` builds a `PhiNode` merging one inactive edge (the untouched
     # constant argument) with one active, tracked edge (the memmove-copied buffer). The merge is
@@ -690,6 +747,63 @@ end
     @test g[2] ≈ rev_gradient(floop, v, w)[2]
     @test g[3] === Inactive()
     checkverify_rev(floop, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+end
+
+@testset "activity: a `PhiNode` merging a mixed-activity tuple edge normalizes it" begin
+    # `t = b ? (x, c) : (x, y)` merges two `Core.tuple` results, one mixed (`c` constant) and one
+    # fully active, into a phi declared at the primal-derived `Tuple{Vector,Vector}`. A dynamic
+    # index (`t[i]`) keeps the tuple alive past SROA, so the mixed edge reaches the phi as a real
+    # SSA value rather than being destructured away — this used to embed the narrower shadow
+    # straight into the merge and segfault inside the tape's comms push.
+    phi_dyn(x, y, c, b, i) = (t = b ? (x, c) : (x, y); sum(t[i]))
+    at = (Vector{Float64}, Vector{Float64}, Vector{Float64}, Bool, Int)
+
+    x, y, c = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [10.0, 20.0, 30.0]
+
+    for (b, i, dxexp, dyexp) in ((true, 1, ones(3), zeros(3)), (true, 2, zeros(3), zeros(3)),
+                                 (false, 1, ones(3), zeros(3)), (false, 2, zeros(3), ones(3)))
+        dx, dy = zeros(3), zeros(3)
+        y_, pb = rrule!!(zero_fcodual(phi_dyn), Ctx(), CoDual(x, dx), CoDual(y, dy), const_codual(c),
+                         CoDual(b, NoFData()), CoDual(i, NoFData()))
+        @test primal(y_) == phi_dyn(x, y, c, b, i)
+        @test pb(1.0) == ntuple(_ -> NoRData(), 6)
+        @test dx == dxexp
+        @test dy == dyexp
+        _assert_tape_balanced(pb)
+    end
+
+    checkverify_rev(phi_dyn, at; inactive=(3,))
+end
+
+@testset "activity: a `PhiNode` merging a nested mixed-activity tuple edge normalizes every level" begin
+    # Each branch builds a 2-tuple of 2-tuples — homogeneous at the outer level (both slots
+    # `Tuple{Vector,Vector}` primal-wise), so `t[i]`'s dynamic index survives SROA and reaches the
+    # `getfield` dynamic-index rule's `homog_fdata_tuple` shape. The `true` branch's inner tuples are
+    # themselves mixed (`c` constant); the `false` branch's are fully active (`z`). Widening the
+    # `true` edge up to the phi's own primal-derived type has to recurse into each inner slot rather
+    # than declaring it `Tuple{Vector,Vector}` while it still carries the mixed shadow underneath.
+    function phi_nested(x, z, c, b, i)
+        t = b ? ((x, c), (x, c)) : ((x, z), (x, z))
+        inner = t[i]
+        return sum(inner[1]) + sum(inner[2])
+    end
+    at = (Vector{Float64}, Vector{Float64}, Vector{Float64}, Bool, Int)
+
+    x, z, c = [1.0, 2.0, 3.0], [7.0, 8.0, 9.0], [10.0, 20.0, 30.0]
+
+    for (b, i, dxexp, dzexp) in ((true, 1, ones(3), zeros(3)), (true, 2, ones(3), zeros(3)),
+                                 (false, 1, ones(3), ones(3)), (false, 2, ones(3), ones(3)))
+        dx, dz = zeros(3), zeros(3)
+        y_, pb = rrule!!(zero_fcodual(phi_nested), Ctx(), CoDual(x, dx), CoDual(z, dz),
+                         const_codual(c), CoDual(b, NoFData()), CoDual(i, NoFData()))
+        @test primal(y_) == phi_nested(x, z, c, b, i)
+        @test pb(1.0) == ntuple(_ -> NoRData(), 6)
+        @test dx == dxexp
+        @test dz == dzexp
+        _assert_tape_balanced(pb)
+    end
+
+    checkverify_rev(phi_nested, at; inactive=(3,))
 end
 
 # Intrinsic operand *primal recording* is per-contribution: an operand whose rdata contribution has

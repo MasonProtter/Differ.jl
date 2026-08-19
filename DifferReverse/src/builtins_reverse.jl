@@ -618,9 +618,11 @@ function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
             zt = ctx.emit!(zero(TF), TF)
         else
             # Inactive forces the fresh-zero branch; `FTarg` must then be `NoFData`, not `FTi` —
-            # it declares `fdata_val`'s actual runtime type.
+            # it declares `fdata_val`'s actual runtime type. `normalize_shadow!`, not a bare
+            # `sresolve`: the assigned value's own shadow can be a mixed-activity tuple (narrower
+            # than `FTi`), which must be widened to `FTi` before it reaches this `:invoke`.
             inact = ctx.inactive(val_node)
-            fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.sresolve(val_node)
+            fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.normalize_shadow!(val_node, FTi)
             FTarg = (FTi === NoFData || inact) ? NoFData : FTi
             zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTarg), ctx.presolve(val_node), fdata_val)
         end
@@ -632,8 +634,9 @@ function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
         # makes later in-place accumulation into this field flow into the assigned value's own
         # shadow. `f = NoFData()` for a pure-rdata field collapses to the original fresh-zero
         # behavior — also what an inactive `val_node` forces, since it has no real shadow to embed.
+        # `normalize_shadow!`, not a bare `sresolve` — see the same note above.
         inact = ctx.inactive(val_node)
-        fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.sresolve(val_node)
+        fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.normalize_shadow!(val_node, FTi)
         FTarg = (FTi === NoFData || inact) ? NoFData : FTi
         zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTarg), ctx.presolve(val_node), fdata_val)
         ctx.icall!(_rr_set_tangent_field!, TF, (ctx.fdtype(P), Int, TF), mt, fieldidx, zt)
@@ -772,10 +775,12 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     # fabricating a fresh zero when the element carries fdata — the alias that makes later in-place
     # accumulation into this element flow into the assigned value's own shadow. `f = NoFData()` for
     # a pure-rdata element collapses to the original fresh-zero behavior — also what an inactive
-    # `val_node` forces, since it has no real shadow to embed.
+    # `val_node` forces, since it has no real shadow to embed. `normalize_shadow!`, not a bare
+    # `sresolve`: the assigned value's own shadow can be a mixed-activity tuple (narrower than
+    # `FTi`), which must be widened to `FTi` before it reaches this `:invoke`.
     FTi = ctx.fdtype(Ti)
     inact = ctx.inactive(val_node)
-    fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.sresolve(val_node)
+    fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.normalize_shadow!(val_node, FTi)
     FTarg = (FTi === NoFData || inact) ? NoFData : FTi
     zt = ctx.icall!(_rr_zero_tangent2, TT, (Ti, FTarg), ctx.presolve(val_node), fdata_val)
     ctx.emit!(Expr(:call, Base.memoryrefset!, sref, zt, (ctx.presolve(a) for a in rest)...), TT)
