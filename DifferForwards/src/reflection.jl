@@ -23,23 +23,6 @@ _nest_dual_inactive(@nospecialize(T), order::Int) =
     order <= 1 ? Dual{T,Inactive} : Dual{_nest_dual(T, order - 1),Inactive}
 
 """
-    _inactive_positions(inactive, nargs) -> Tuple{Vararg{Int}}
-
-Validate a user-supplied set of constant-argument positions (1-based, counting the arguments only,
-not `f`), returning them as a tuple. Mirrors `DifferReverse`'s function of the same name, including
-its `Int`-or-tuple-of-`Int` signature: a `Vector` or a range is rejected with a `MethodError` naming
-the type rather than surfacing further downstream.
-"""
-_inactive_positions(inactive::Int, nargs::Int) = _inactive_positions((inactive,), nargs)
-function _inactive_positions(inactive::Tuple{Vararg{Int}}, nargs::Int)
-    for p in inactive
-        1 <= p <= nargs ||
-            throw(ArgumentError("inactive argument position $p is out of range for $nargs arguments"))
-    end
-    return inactive
-end
-
-"""
     code_dual_ircode(f, argtypes::Tuple; order=1, world=Base.get_world_counter(), inactive=()) -> Pair{IRCode,Any}
 
 Return `ir => rettype`, the optimized dualized `IRCode` for differentiating `f` at arguments of

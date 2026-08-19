@@ -497,8 +497,6 @@ end
 # undef-checked element access, `Core._apply_iterate` over an unknown-length splat).
 # ===========================================================================
 
-const _Intr = Core.Intrinsics
-
 # ===========================================================================
 # Activity analysis: which values may carry a derivative.
 #
@@ -567,6 +565,12 @@ _act_replayable(@nospecialize s) =
 # A vararg primal binds every trailing argument to one packed slot, so that slot is active if *any*
 # trailing element is. Per-element constancy isn't modelled: the prologue materialises a zero for
 # each constant element, keeping the packed tangent tuple at its primal-derived type.
+#
+# Not shared with `DifferReverse`'s function of the same name despite the shared purpose: this one
+# does the vararg-tail packing itself, from the raw (unpacked) `dualparams`; reverse's caller packs
+# the vararg tail *before* calling it (`_packed_codualparams`), so reverse's version is a plain
+# per-slot loop with no reduction of its own. Reconciling the two conventions would mean
+# restructuring one side's established vararg handling, not just factoring out shared logic.
 function _arg_active(dualparams, nfixed::Int, nslots::Int, tt)
     aa = falses(nslots)
     live(D) = _dual_tangent_type(D) !== Inactive && tt(_dual_primal_type(D)) !== NoTangent
@@ -580,28 +584,18 @@ function _arg_active(dualparams, nfixed::Int, nslots::Int, tt)
     return aa
 end
 
-# Whether a (widened) type can carry caller-visible mutable shadow state: the same test
-# `fdata_shadow_type`/`CoDual` use for "this needs real shadow storage, not just a value copied
-# through" — `fdata_type(tangent_type(T)) !== NoFData`. A plain differentiable scalar (`Float64`)
-# answers `false` (its fdata is `NoFData`, all information rides in the rdata half); a mutable
-# struct/`Array`/`Memory`, or an immutable type with such a thing nested inside it, answers `true`.
-# `T isa Type` excludes lattice elements that survived widening as something else (shouldn't
-# happen after `_widen`, but this is the type-safety boundary before `tangent_type`/`fdata_type`
-# dispatch); `T !== Union{}` excludes throw-typed statements, matching the `Ptr` check above.
-# `W <: Dual` excludes the higher-order self-tangent case (`tangent_type(::Type{<:Dual}) = itself`):
-# `fdata_type` has no method for a `Dual` carrier, and a statement typed `Dual` there is composed
-# machinery, not a fresh user-level container.
-function _act_container_result(@nospecialize(T), tt, ft)
-    T isa Type || return false
-    T === Union{} && return false
-    W = tt(T)
-    (W isa Type && !(W <: Dual)) || return false
-    return ft(W) !== NoFData
-end
-
 # Which SSA values may carry a derivative. Monotone least fixpoint — a loop-carried `PhiNode` reads
 # a back-edge value not yet computed — and the conservatism grows "may be active", so an
 # unrecognised value-producing statement must default to *active*.
+#
+# Same shape as `DifferReverse`'s `_activity` (`reverse_interp.jl`), arm for arm, but not merged
+# into one walker: enough arms differ by real, mode-specific behavior — `tt`/`ft` (tangent-type)
+# queries here vs `fdtype` there, this file's `_act_container_result` root with no reverse
+# counterpart, reverse's mixed-activity-tuple-tail and rule-less-builtin exemptions with no forward
+# counterpart — that a single merged walker would need about as many hooks as arms. The genuinely
+# shared leaf pieces (`_call_parts`, `_act_ptr_deref`, `_act_container_result`) live in
+# `DifferCore/src/shared_ir_helpers.jl`; keep the two walkers' arm order and comments in step by
+# hand when either changes.
 function _activity(pir, iworld::UInt, tt, ft, nslots::Int, arg_active::BitVector)
     stmts = pir.stmts
     N = length(stmts)
@@ -648,13 +642,12 @@ function _activity(pir, iworld::UInt, tt, ft, nslots::Int, arg_active::BitVector
                     !notan && any(operand_active, @view s.args[2:end])
                 end
             elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
-                fpos = s.head === :invoke ? s.args[2] : s.args[1]
-                actual = s.head === :invoke ? (@view s.args[3:end]) : (@view s.args[2:end])
+                fpos, actual = _call_parts(s)
                 f = _calleeval(fpos, iworld)
                 if f === Core.memorynew
                     true                      # the array-allocation half of the same root case
                 elseif !(isa(f, Core.Builtin) || isa(f, Core.IntrinsicFunction)) &&
-                       _act_container_result(Tw, tt, ft)
+                       _act_container_result(Tw, tt, ft, W -> W <: Dual)
                     # A *composite* call/invoke whose result can carry a fresh mutable container is
                     # an activity root regardless of operand activity — e.g. a `@noinline` allocation
                     # helper behind a function barrier, called with only constant arguments. Stores
@@ -669,6 +662,10 @@ function _activity(pir, iworld::UInt, tt, ft, nslots::Int, arg_active::BitVector
                     # object rather than allocating a fresh one (e.g. `getfield(v, :ref)` pulls a
                     # `MemoryRef` out of an already-classified `v`), so it must follow ordinary
                     # operand activity like everything else here, not become an unconditional root.
+                    #
+                    # Reverse mode's `_activity` (`DifferReverse/src/reverse_interp.jl`) has no
+                    # matching arm — see the comment at its `:call`/`:invoke` arm for why the gap is
+                    # harmless there (`_fdata_tracked`'s own, narrower root set already gates this).
                     true
                 else
                     operand_active(fpos) || any(operand_active, actual)
@@ -697,19 +694,6 @@ end
 # `isconcretetype(Type{P})` is always `false` (documented Julia quirk), so a `Type{P}`-typed operand
 # takes `frule_split!`'s dynamic path instead of a static `:invoke` — correct, just slower.
 _conc(@nospecialize T) = T isa DataType && isconcretetype(T)
-
-# Unconditionally active, for the same reason `:foreigncall` is: what a pointer addresses is outside
-# this analysis, so how the *address* was computed does not bound what reading through it depends on.
-# Without this `unsafe_load(Ptr{Float64}(u))` for a `u::UInt` comes out inactive and is silently
-# zeroed, where forward mode deliberately bails.
-function _act_ptr_deref(@nospecialize(s), iworld::UInt)
-    (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || return false
-    f = _calleeval(s.head === :invoke ? s.args[2] : s.args[1], iworld)
-    return f === _Intr.pointerref || f === _Intr.pointerset ||
-           f === _Intr.atomic_pointerref || f === _Intr.atomic_pointerset ||
-           f === _Intr.atomic_pointerswap || f === _Intr.atomic_pointermodify ||
-           f === _Intr.atomic_pointerreplace
-end
 
 # `resolve_new_type` (inside `dualize_to_ircode`) without the closure — `%new`'s type argument is a
 # `GlobalRef` whenever the struct is named by a module-level binding.

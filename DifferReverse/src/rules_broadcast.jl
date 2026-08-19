@@ -116,9 +116,7 @@ function rrule!!(
     # `dx` carries both the per-element backward seed and the result's shadow, so a constant
     # destination would silently drop the source's gradient. A write-only buffer needs a zeroed
     # shadow, not `Inactive`.
-    isactive(dx) || error("Differ: `map!` into a destination declared constant (`Inactive` shadow) " *
-                          "would discard the gradient flowing to the source — pass a zeroed shadow " *
-                          "buffer instead of declaring the destination constant")
+    _require_active_dest(dx, "map!", "gradient flowing to the source")
     old_dx = copy(dx)
     r1, pb1 = rrule!!(gcd, Ctx(), CoDual(y[1], _elt_shadow(dy)))
     x[1] = primal(r1)
@@ -164,9 +162,7 @@ function rrule!!(
     n = length(y)
     n == 0 && error("Differ: map!(f, dest, x, y) over empty arrays is not supported by this rule")
     # See the unary rule above: a constant destination would silently drop the sources' gradients.
-    isactive(dx) || error("Differ: `map!` into a destination declared constant (`Inactive` shadow) " *
-                          "would discard the gradient flowing to the sources — pass a zeroed shadow " *
-                          "buffer instead of declaring the destination constant")
+    _require_active_dest(dx, "map!", "gradient flowing to the sources")
     old_dx = copy(dx)
     r1, pb1 = rrule!!(gcd, Ctx(), CoDual(y[1], _elt_shadow(dy)), CoDual(z[1], _elt_shadow(dz)))
     x[1] = primal(r1)

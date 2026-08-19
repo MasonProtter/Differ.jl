@@ -143,15 +143,8 @@ end
 # (the caller declared this particular value constant). `isactive` knows only the second.
 _inert(@nospecialize dx) = isa(dx, NoTangent) || isa(dx, Inactive)
 
-# A mutating rule overwrites its destination, so the destination's shadow *is* the result's shadow.
-# Skipping the shadow writes for a destination declared constant would silently drop the derivative
-# flowing from the sources, so refuse instead. Reverse mode refuses the same call for its own reason
-# (there the destination shadow is additionally the backward seed).
-_require_active_dest(::Inactive, what) =
-    error("Differ: `", what, "` into a destination declared constant (`Inactive` shadow) would ",
-          "discard the derivative flowing from the sources — pass a zeroed shadow buffer instead ",
-          "of declaring the destination constant")
-_require_active_dest(@nospecialize(_), @nospecialize(_)) = nothing
+# `_require_active_dest` (destination-activity refusal for a mutating rule) is defined in
+# `DifferCore/src/inactive.jl` and shared with `DifferReverse`.
 
 # Always sharpen the first thing if it's a type so static dispatch remains possible.
 function Dual(x::Type{P}, dx::NoTangent) where {P}

@@ -1666,6 +1666,13 @@ end
 # Which arguments carry a derivative. `NoTangent` in a `CoDual`'s shadow slot is the caller declaring
 # that argument constant; a primal type with no tangent space says the same from the type alone. A
 # non-concrete `codualparams[k]` yields `Any` here, which reads as active — sound.
+#
+# Not shared with `DifferForwards`' function of the same name despite the shared purpose: `n`/
+# `codualparams` here are already the *packed* list (`_activity_layers` always calls this with
+# `packed_codualparams`), so a vararg tail's combined activity falls out of the ordinary per-slot
+# check with no reduction of its own — forward mode instead packs inside its own `_arg_active`, from
+# the raw argument list. Reconciling the two would mean restructuring one side's established vararg
+# handling, not just factoring out shared logic.
 function _arg_active(iworld::UInt, n::Int, codualparams::Vector{Any})
     arg_active = falses(n)
     for k in 1:n
@@ -1675,20 +1682,9 @@ function _arg_active(iworld::UInt, n::Int, codualparams::Vector{Any})
     return arg_active
 end
 
-# Unconditionally active, for the same reason `:foreigncall` is: what a pointer addresses is outside
-# this analysis, so how the *address* was computed does not bound what reading through it depends on.
-# Without this `unsafe_load(Ptr{Float64}(u))` for a `u::UInt` comes out inactive and is silently
-# replayed with a zero shadow instead of reaching the "no reverse rule" bail. Ported from forward
-# mode's `_act_ptr_deref`.
-function _act_ptr_deref(@nospecialize(s), iworld)
-    (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || return false
-    fpos, _ = _call_parts(s)
-    f = _calleeval(fpos, iworld)
-    return f === Core.Intrinsics.pointerref || f === Core.Intrinsics.pointerset ||
-           f === Core.Intrinsics.atomic_pointerref || f === Core.Intrinsics.atomic_pointerset ||
-           f === Core.Intrinsics.atomic_pointerswap || f === Core.Intrinsics.atomic_pointermodify ||
-           f === Core.Intrinsics.atomic_pointerreplace
-end
+# `_act_ptr_deref` (pointer-typed statement / load-store-through-a-pointer is unconditionally
+# active) and `_call_parts` (fpos/actual out of a `:call`/`:invoke`) are shared with `DifferForwards`
+# in `DifferCore/src/shared_ir_helpers.jl`.
 
 # Which SSA values may carry a derivative. Anything reached only through inactive values is replayed
 # primally instead — no shadow, no rdata accumulator, no rule.
@@ -1696,6 +1692,12 @@ end
 # Monotone least fixpoint, same shape and same reason as `_fdata_tracked` (a loop-carried `PhiNode`
 # reads a back-edge value not yet computed), but the conservatism runs the other way: this grows
 # "may be active", so an unrecognised value-producing statement must default to *active*.
+#
+# Same shape as `DifferForwards`' `_activity` (`forward_interp.jl`), arm for arm, but not merged into
+# one walker — see the comment at the top of that function for why. The genuinely shared leaf pieces
+# (`_call_parts`, `_act_ptr_deref`, `_act_container_result`) live in
+# `DifferCore/src/shared_ir_helpers.jl`; keep the two walkers' arm order and comments in step by hand
+# when either changes.
 function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
     N = length(pir.stmts)
     arg_active = _arg_active(iworld, n, codualparams)
@@ -1709,7 +1711,8 @@ function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
         for i in 1:N
             active[i] && continue
             s = pir.stmts[i][:stmt]
-            (isa(s, Core.GotoNode) || isa(s, Core.GotoIfNot) || isa(s, Core.ReturnNode)) && continue
+            (isa(s, Core.GotoNode) || isa(s, Core.GotoIfNot) || isa(s, Core.ReturnNode) ||
+             isa(s, Core.EnterNode)) && continue
             isa(s, Expr) && s.head in
                 (:boundscheck, :loopinfo, :gc_preserve_begin, :gc_preserve_end) && continue
             # "Result has no tangent space ⇒ inactive" holds only for a *pure value producer*. A
@@ -1725,12 +1728,9 @@ function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
                 true                      # raw pointer, or a load/store through one — see below
             elseif isa(s, Core.PiNode)
                 !notan && operand_active(s.val)
-            elseif isa(s, Core.PhiNode)
-                !notan && any(j -> isassigned(s.values, j) && operand_active(s.values[j]),
-                              1:length(s.values))
-            elseif isa(s, Core.PhiCNode)
-                !notan && any(j -> isassigned(s.values, j) && operand_active(s.values[j]),
-                              1:length(s.values))
+            elseif isa(s, Core.PhiNode) || isa(s, Core.PhiCNode)
+                vals = s.values
+                !notan && any(j -> isassigned(vals, j) && operand_active(vals[j]), 1:length(vals))
             elseif isa(s, Core.UpsilonNode)
                 !notan && isdefined(s, :val) && operand_active(s.val)
             elseif isa(s, Expr) && s.head === :new
@@ -1748,6 +1748,19 @@ function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
                 if f === Core.memorynew
                     # The array-allocation half of the same root case.
                     true
+                # Forward mode's `_activity` has an extra arm here, `_act_container_result`
+                # (`DifferCore/src/shared_ir_helpers.jl`): a composite call whose result could carry
+                # a fresh mutable container is a root regardless of operand activity, so a `@noinline`
+                # allocation helper called with only constant arguments still gets an active result.
+                # Reverse mode doesn't need the analogous arm: `_fdata_tracked`'s own root set
+                # (`%new`/`memorynew` appearing directly in the primal IR, not behind an opaque call)
+                # is strictly narrower than what this arm would mark active, so a composite call's
+                # result is never provenance-tracked here regardless of how `_activity` classifies
+                # it — a later active store into it still bails cleanly via the array/struct-write
+                # provenance guard, not a dropped gradient. Confirmed empirically: inlined, the
+                # allocation is a direct `memorynew`/`:new` and already an unconditional root above;
+                # not inlined, the write bails with "no differentiable provenance traceable to a
+                # function argument" either way.
                 elseif f === Core.getfield &&
                        _inactive_arg_root(Core.SSAValue(i), pir, iworld, arg_active, codualparams)
                     # A read of a constant slot in a mixed-activity tuple argument (the packed
@@ -2134,11 +2147,6 @@ _rdtype_impl(@nospecialize W) = rdata_type(tangent_type(W))
 _fdtype_impl(@nospecialize W) = fdata_type(tangent_type(W))
 rdtype(world::UInt, @nospecialize P) = at_world(world, _rdtype_impl, _widen(P))
 fdtype(world::UInt, @nospecialize P) = at_world(world, _fdtype_impl, _widen(P))
-
-# Extract the callee-position node and actual-argument nodes from a `:call`/`:invoke` statement —
-# the same split used at every call-statement site in this file, factored out since the recursion
-# path needs it independently from the main dispatch loops.
-_call_parts(s::Expr) = s.head === :invoke ? (s.args[2], @view s.args[3:end]) : (s.args[1], @view s.args[2:end])
 
 # Is call statement `i` (`s`, already known to be a surviving, non-intrinsic, non-`getfield`,
 # non-array-builtin `:call`/`:invoke`) a candidate for Part 1's recursive `rrule` support? Purely
@@ -2584,6 +2592,20 @@ end
 # independently), so only intrinsic operands (`:primal`), recursive-call inner tapes (`:subtape`),
 # and tracked array reads (`:shadow_ref`) ever need comms.
 #
+# The activity/shadow-type/provenance layer for one carrier build: a pure function of
+# `(pir, iworld, packed_codualparams)`, computed once here and threaded through the comms scan and
+# both emission builders rather than recomputed at each — they used to each recompute it from the
+# same inputs, which is exactly what let the scan and an emission builder disagree about a packed
+# vararg tail's activity (fixed by "pass the packed codual list to emission-side inactivity checks").
+function _activity_layers(pir, iworld::UInt, packed_codualparams::Vector{Any})
+    n = length(packed_codualparams)
+    arg_active, active = _activity(pir, iworld, n, packed_codualparams)
+    shadow_types = _shadow_types(pir, iworld, n, arg_active, packed_codualparams)
+    fdata_tracked = _fdata_tracked(pir, iworld, n, packed_codualparams, arg_active, active)
+    arg_tracked = _arg_fdata_tracked(iworld, n, packed_codualparams, arg_active)
+    return arg_active, active, shadow_types, fdata_tracked, arg_tracked
+end
+
 # NOT side-effect-free once recursion is present: resolving a `:subtape` candidate compiles that
 # callee's own `reverse_fwds_impl` (via `reverse_fwds_recursive_ci`) — a deliberate departure from
 # "pure static scan". Both builders still derive it identically because `cache_owner` is a
@@ -2605,10 +2627,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
     self_recursive_ssas = BitSet()
     block_has_subtape = falses(nblocks)
     n = length(codualparams)
-    arg_active, active = _activity(pir, iworld, n, codualparams)
-    shadow_types = _shadow_types(pir, iworld, n, arg_active, codualparams)
-    fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams, arg_active, active)
-    arg_tracked = _arg_fdata_tracked(iworld, n, codualparams, arg_active)
+    arg_active, active, shadow_types, fdata_tracked, arg_tracked = _activity_layers(pir, iworld, codualparams)
     # A `Core.Argument`'s primal value never needs a comms slot: `Tape.args` already holds every
     # argument codual, and the pullback's own `pb_presolve` already falls back to `parg_pb[a.n]`
     # whenever no comms item was declared for it. Guarded on type: a declared item's type can be
@@ -2873,7 +2892,8 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
     end
 
     return nodes, types, bulk_args, self_recursive_ssas, block_has_subtape, block_hoisted_refs,
-           block_fused_refs, regions, quiet
+           block_fused_refs, regions, quiet, block_of, inloop, arg_active, active, shadow_types,
+           fdata_tracked, arg_tracked
 end
 
 # ===========================================================================
@@ -2920,7 +2940,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # the `:subtape` inner-tape recycling lookup below reads a block's comms stack directly rather
     # than through `presolve`, so it needs to know where a fused item actually landed.
     block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, _, _, block_fused_refs,
-        regions, quiet = scan
+        regions, quiet, block_of, inloop, arg_active, active, shadow_types, fdata_tracked,
+        arg_tracked = scan
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     # Recomputed from the same threaded inputs at every site that needs it (here, the pullback
     # builder), like `_unique_predecessor_info` — a pure function of identical arguments, so the
@@ -2933,13 +2954,6 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
-    arg_active, active = _activity(pir, iworld, length(packed_codualparams), packed_codualparams)
-    shadow_types = _shadow_types(pir, iworld, length(packed_codualparams), arg_active, packed_codualparams)
-    fdata_tracked = _fdata_tracked(pir, iworld, length(packed_codualparams), packed_codualparams,
-                                   arg_active, active)
-    arg_tracked = _arg_fdata_tracked(iworld, length(packed_codualparams), packed_codualparams,
-                                     arg_active)
-    block_of = _stmt_block_map(pir)
     npacked = length(packed_codualparams)
     has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable_block,
                                                     block_of, npacked, nfixed)
@@ -3118,7 +3132,6 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # `push!`/`pop!`/`position`/boundscheck. A loop block or non-`isbits` tuple keeps `Stack{T}`; an
     # empty tuple uses `SingletonStack`.
     comms_stack_ty = Vector{Any}(undef, nblocks)
-    inloop = _loop_blocks(pir)
     for b in 1:nblocks
         CommsT = Tuple{block_comms_types[b]...}
         if Base.issingletontype(CommsT)
@@ -3878,7 +3891,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # out of block `d`'s own comms slot instead of popping it locally. `block_fused_refs[b]`: same
     # `(item, host, slot)` shape, but read out of the tuple the *host* block's reverse code popped.
     block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, _,
-        block_hoisted_refs, block_fused_refs, regions, quiet = scan
+        block_hoisted_refs, block_fused_refs, regions, quiet, block_of, _, arg_active, active,
+        shadow_types, fdata_tracked, arg_tracked = scan
     # Recomputed from the same threaded inputs as the forwards builder's copy — a pure function of
     # identical arguments, so the two sides agree by construction.
     counted = _counted_loops(pir, unreachable_block, regions, quiet)
@@ -3905,12 +3919,6 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
-    arg_active, active = _activity(pir, iworld, length(packed_codualparams), packed_codualparams)
-    shadow_types = _shadow_types(pir, iworld, length(packed_codualparams), arg_active, packed_codualparams)
-    fdata_tracked = _fdata_tracked(pir, iworld, length(packed_codualparams), packed_codualparams,
-                                   arg_active, active)
-    arg_tracked = _arg_fdata_tracked(iworld, length(packed_codualparams), packed_codualparams,
-                                     arg_active)
 
     # The rdatas tuple this pullback returns, one slot per primal argument (`#self#` first). Defined
     # here, not at the return below, because a self-recursive `:invoke` has to declare exactly this
@@ -3945,16 +3953,13 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         ci === nothing ? Expr(:call, f, args...) : Expr(:invoke, ci, f, args...)
     end
 
-    # Which block each statement belongs to (reused throughout).
-    stmt_block = _stmt_block_map(pir)
-
     # Every statement except a pure control marker (or one living in a throw-only block) gets a `Ref`
     # to accumulate rdata into; literal/GlobalRef/`:boundscheck`/`:loopinfo` operands never do (both
     # always have `NoRData`, so skipping them here just avoids a useless allocation — not load-bearing).
     needs_ref(i) = _has_rdata_sink(Core.SSAValue(i), pir, active, arg_active, unreachable_block,
-                                   stmt_block, npacked, nfixed)
+                                   block_of, npacked, nfixed)
     has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable_block,
-                                                    stmt_block, npacked, nfixed)
+                                                    block_of, npacked, nfixed)
     mixed_shadow(@nospecialize node) = begin
         F = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked, node)
         F isa DataType && F <: Tuple && any(T -> T === Inactive, F.parameters)
@@ -4025,7 +4030,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         # packed vararg tail is exempt: the scatter at the pullback's return reads its accumulator
         # for every non-constant flat position (`ret_inactive` gates per position, not per slot), and
         # an all-`NoTangent` tail is inactive by type anyway.
-        _has_rdata_sink(Core.Argument(k), pir, active, arg_active, unreachable_block, stmt_block,
+        _has_rdata_sink(Core.Argument(k), pir, active, arg_active, unreachable_block, block_of,
                         npacked, nfixed) || continue
         Pk = _codual_primal_type(packed_codualparams[k])
         # `zero_like_rdata_type`/`zero_like_rdata_from_type`, not `rdtype`/`zero_rdata_from_type`: when
@@ -4908,29 +4913,6 @@ function build_ctx(@nospecialize(f), @nospecialize(argtypes::Tuple);
     # requires `_inactive_positions` to stay pure and allocation-free.
     return Ctx(_build_tape(f, Base.to_tuple_type(argtypes),
                            Val(_inactive_positions(inactive, length(argtypes)))))
-end
-
-"""
-    _inactive_positions(inactive, nargs) -> Tuple{Vararg{Int}}
-
-Validate a user-supplied set of constant-argument positions (1-based, counting the arguments only,
-not `f`), returning them as a tuple. Pure and allocation-free on purpose: that is what lets a
-compile-time-constant `inactive` const-fold through `build_ctx`'s `Val` into a constant type
-parameter, the only way `_build_tape`'s generator can read the positions. The result is only ever
-membership-tested (`j in inactive`), so no sorting or deduplication.
-
-`build_ctx` accepts only an `Int` or a tuple of them, so anything reaching here is already a
-constructible `Val` parameter — a `Vector` or a range is not, and is rejected at the signature
-with a `MethodError` naming the type rather than surfacing as a `TypeError` from `Val`, or (for a
-range) as a generator that can make no sense of the parameter.
-"""
-_inactive_positions(inactive::Int, nargs::Int) = _inactive_positions((inactive,), nargs)
-function _inactive_positions(inactive::Tuple{Vararg{Int}}, nargs::Int)
-    for p in inactive
-        1 <= p <= nargs ||
-            throw(ArgumentError("inactive argument position $p is out of range for $nargs arguments"))
-    end
-    return inactive
 end
 
 """

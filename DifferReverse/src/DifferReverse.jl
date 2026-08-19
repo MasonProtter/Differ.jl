@@ -31,7 +31,8 @@ import DifferCore: DifferCore, NoTangent, Inactive, NoFData, NoRData, FData, RDa
     _bi_literal_index, _bi_homog_tangent_type, _tangent_field_slot, _widen,
     _getfieldg, _setfieldg, _ctupleg, _ifelseg,
     _fc_parse, _fc_stmt, _fc_ptr_origin, _fc_same_stride, _fc_check_extent,
-    _fc_copy_sig_ok, _FC_COPY_ATS, isactive, @ifactive
+    _fc_copy_sig_ok, _FC_COPY_ATS, isactive, @ifactive, _require_active_dest, _inactive_positions,
+    _call_parts, _act_ptr_deref, _act_container_result
 
 # `Reverse` is the plugin owner type identifying DifferReverse to `Contextual`'s
 # `ContextualInterpreter{T,S}`. `owner` doubles as the `cache_owner` partition key, so

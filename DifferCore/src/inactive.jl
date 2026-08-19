@@ -60,6 +60,46 @@ macro ifactive(dx, expr)
 end
 
 """
+    _require_active_dest(dx, what::AbstractString, flowing::AbstractString="derivative flowing from the sources")
+
+A mutating rule overwrites its destination, so the destination's shadow *is* the result's shadow.
+Skipping the shadow writes for a destination declared constant would silently drop the derivative
+flowing from the sources, so refuse instead. `what` names the function (`"setindex!"`, `"mul!"`,
+…); `flowing` lets a caller phrase what's lost in its own terms — reverse mode's rules pass a
+"gradient flowing to …" phrase, since there the destination shadow is additionally the backward
+seed.
+"""
+_require_active_dest(::Inactive, what::AbstractString,
+                      flowing::AbstractString="derivative flowing from the sources") =
+    error("Differ: `", what, "` into a destination declared constant (`Inactive` shadow) would ",
+          "discard the ", flowing, " — pass a zeroed shadow buffer instead of declaring the ",
+          "destination constant")
+_require_active_dest(@nospecialize(dx), @nospecialize(what),
+                      @nospecialize(flowing)="derivative flowing from the sources") = nothing
+
+"""
+    _inactive_positions(inactive, nargs) -> Tuple{Vararg{Int}}
+
+Validate a user-supplied set of constant-argument positions (1-based, counting the arguments only,
+not `f`), returning them as a tuple. Shared by both engines' `inactive=` entry points
+(`code_dual_ircode`, `build_ctx`, …). Pure and allocation-free: `DifferReverse`'s `build_ctx` relies
+on that to let a compile-time-constant `inactive` const-fold through a `Val` into a constant type
+parameter. The result is only ever membership-tested (`j in inactive`), so no sorting or
+deduplication.
+
+A `Vector` or a range is rejected with a `MethodError` naming the type (only an `Int` or a tuple of
+them constructs), rather than surfacing further downstream.
+"""
+_inactive_positions(inactive::Int, nargs::Int) = _inactive_positions((inactive,), nargs)
+function _inactive_positions(inactive::Tuple{Vararg{Int}}, nargs::Int)
+    for p in inactive
+        1 <= p <= nargs ||
+            throw(ArgumentError("inactive argument position $p is out of range for $nargs arguments"))
+    end
+    return inactive
+end
+
+"""
     fdata_shadow_type(P::Type)
 
 The types a *reverse-mode* shadow for a primal of type `P` may legally have: its ordinary fdata

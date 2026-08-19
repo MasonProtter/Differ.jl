@@ -165,9 +165,7 @@ function rrule!!(
 )
     # `dx` carries both the backward seed and the result's shadow, so a constant destination would
     # silently drop the sources' gradients. A write-only buffer needs a zeroed shadow, not `Inactive`.
-    isactive(dx) || error("Differ: `mul!` into a destination declared constant (`Inactive` shadow) " *
-                          "would discard the gradient flowing to the factors — pass a zeroed shadow " *
-                          "buffer instead of declaring the destination constant")
+    _require_active_dest(dx, "mul!", "gradient flowing to the factors")
     old_dx = copy(dx)
     mul!(x, y, z)
     fill!(dx, 0.0)
@@ -205,9 +203,7 @@ function rrule!!(
 )
     # See the matrix-vector rule above: a constant destination would silently drop the factors'
     # gradients.
-    isactive(dx) || error("Differ: `mul!` into a destination declared constant (`Inactive` shadow) " *
-                          "would discard the gradient flowing to the factors — pass a zeroed shadow " *
-                          "buffer instead of declaring the destination constant")
+    _require_active_dest(dx, "mul!", "gradient flowing to the factors")
     old_dx = copy(dx)
     mul!(x, y, z)
     fill!(dx, 0.0)
