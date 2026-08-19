@@ -133,6 +133,18 @@ mutable struct MPoint; x::Float64; y::Float64; end
         @test increment!!((1.0, Inactive()), (10.0, 5.0)) === (11.0, Inactive())
         @test increment!!((Inactive(), 1.0), (5.0, 10.0)) === (Inactive(), 11.0)
 
+        # The mixed-activity arm needs the same aliasing cache as the homogeneous one: a
+        # `MutableTangent` reachable through two slots of a mixed-activity tuple must not be
+        # incremented twice just because some other slot's type differs between accumulator and
+        # contribution.
+        let t = zero_tangent(MPoint(1.0, 2.0)), s = zero_tangent(MPoint(1.0, 2.0))
+            s.fields = (x = 1.0, y = 2.0)
+            r = increment!!((t, t, 3.0), (s, s, Inactive()))
+            @test r[1].fields == (x = 1.0, y = 2.0)
+            @test r[1] === r[2]
+            @test r[3] === 3.0
+        end
+
         # Strong zero: absorbing in the accumulator slot, identity in the contribution slot.
         # Deliberately not commutative — slot 1 owns storage, slot 2 is a contribution.
         @test increment!!(Inactive(), 3.0) === Inactive()
