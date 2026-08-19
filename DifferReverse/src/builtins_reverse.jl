@@ -72,6 +72,30 @@ _bi_tracked(@nospecialize(node), ctx) =
 @noinline _rr_zero_tangent2(p, f) = zero_tangent(p, f)
 # An inactive value's shadow slot: a fresh zero, since there is no real shadow to alias.
 @noinline _rr_zero_fdata(p) = fdata(zero_tangent(p))
+# The same zero, but cached in the tape's `bufs` at a slot the transform assigns statically, so a
+# pre-allocated context materializes it once instead of once per call. Re-zeroed on reuse: the
+# fwds pass can write through it and the pullback can accumulate into it, and a constant's shadow
+# must start every call at zero. Rebuilt whenever the cached value can't serve this call's primal —
+# same reuse discipline as `_bulk_save!`.
+@noinline function _rr_cached_zero_fdata!(bufs::Vector{Any}, slot::Int, p, ::Type{F}) where {F}
+    length(bufs) < slot && resize!(bufs, slot)
+    if isassigned(bufs, slot)
+        b = bufs[slot]
+        if b isa F && _rr_zero_reusable(b, p)
+            return set_to_zero!!(b)::F
+        end
+    end
+    z = fdata(zero_tangent(p))::F
+    bufs[slot] = z
+    return z
+end
+
+# Is re-zeroing `b` in place enough to make it a fresh zero fdata for `p`? Only for an array of a
+# bits tangent element, whose whole structure is fixed by its size. Anything else (a nested array,
+# a mutable tangent) is rebuilt per call.
+_rr_zero_reusable(@nospecialize(b), @nospecialize(p)) = false
+_rr_zero_reusable(b::Array, p::Array) = isbitstype(eltype(b)) && size(b) == size(p)
+
 @noinline _rr_build_tangent(::Type{P}, fields...) where {P} = build_tangent(P, fields...)
 
 # Runtime aliasing guard (`_collect_alias_guard_globals` in `reverse_interp.jl`): an active argument

@@ -749,6 +749,58 @@ end
     checkverify_rev(floop, (Vector{Float64}, Vector{Float64}); inactive=(2,))
 end
 
+@testset "activity: an inactive phi edge's zero is reused across calls" begin
+    # The zero serving an inactive `Core.Argument` phi edge lives in the tape's `bufs`, so a
+    # pre-allocated context materializes it once instead of once per call — it used to be rebuilt in
+    # the carrier prologue every call, making steady-state allocation scale with the constant
+    # argument's length. It is re-zeroed on reuse (the pullback can accumulate into it), and rebuilt
+    # when this call's argument no longer fits it.
+    fb(out, v, w) = (out .= v .* w; sum(out))
+    fcd = zero_fcodual(fb)
+
+    # Repeated calls through one context, changing values: every call must match a fresh run.
+    n = 5
+    out, v, w = zeros(n), zeros(n), zeros(n)
+    dout, dv = zeros(n), zeros(n)
+    ocd, vcd, wcd = CoDual(out, dout), CoDual(v, dv), const_codual(w)
+    ctx = build_ctx(fcd, ocd, vcd, wcd)
+    for k in 1:4
+        v .= k .* [1.0, 2.0, 3.0, 4.0, 5.0]
+        w .= [4.0, 5.0, 6.0, 7.0, 8.0] ./ k
+        y, g = value_and_gradient!(ctx, fcd, ocd, vcd, wcd)
+        @test y == fb(out, v, w)
+        @test g[3] ≈ w
+        @test g[4] === Inactive()
+    end
+
+    # Same context, a different-length constant argument: `build_ctx` keys on argument types, not
+    # sizes, so this is a legal call and the cached zero has to be rebuilt for the new shape.
+    m = 9
+    out2, v2, w2 = zeros(m), collect(1.0:m), collect(2.0:(m + 1))
+    ocd2, vcd2 = CoDual(out2, zeros(m)), CoDual(v2, zeros(m))
+    y2, g2 = value_and_gradient!(ctx, fcd, ocd2, vcd2, const_codual(w2))
+    @test y2 == fb(out2, v2, w2)
+    @test g2[3] ≈ w2
+    # Back to the original length: the rebuilt zero must not have stuck.
+    y3, g3 = value_and_gradient!(ctx, fcd, ocd, vcd, wcd)
+    @test y3 == fb(out, v, w)
+    @test g3[3] ≈ w
+
+    # Steady-state allocation no longer scales with the constant argument's length. Measured at two
+    # sizes rather than against a byte count, so unrelated per-call overhead doesn't pin the test.
+    function steady(N)
+        o, a, b = zeros(N), randn(N), randn(N)
+        cds = (CoDual(o, zeros(N)), CoDual(a, zeros(N)), const_codual(b))
+        c = build_ctx(fcd, cds...)
+        run = () -> value_and_gradient!(c, fcd, cds...)
+        run(); run(); run()
+        return @allocated run()
+    end
+    @test steady(1024) == steady(64)
+
+    checkverify_rev(fb, (Vector{Float64}, Vector{Float64}, Vector{Float64}); inactive=(3,))
+end
+
 @testset "activity: a `PhiNode` merging a mixed-activity tuple edge normalizes it" begin
     # `t = b ? (x, c) : (x, y)` merges two `Core.tuple` results, one mixed (`c` constant) and one
     # fully active, into a phi declared at the primal-derived `Tuple{Vector,Vector}`. A dynamic

@@ -3049,11 +3049,15 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # `carg`/`args_tup_ssa`/`ArgsTT` stay flat: the tape and the pullback's return arity are keyed
     # by the caller's actual argument list.
     _pack_vararg_args!(emit!, ctuple, parg, farg, codualparams, iworld, nfixed)
-    # One zero per inactive `PhiNode` edge, built here rather than at the phi: a phi must lead its
-    # block, so the zero cannot be emitted beside it, and hoisting to the entry block also makes it
-    # once per call instead of once per iteration for a loop-carried merge. Keyed by (phi, edge) —
-    # per edge, not per phi, since `sresolve` still serves every other edge.
-    phi_edge_zero = Dict{Tuple{Int,Int},Any}()
+    # One zero per inactive `PhiNode` edge. Collected here but emitted below, after the tape
+    # prologue: the zero lives in the tape's `bufs`, so a pre-allocated context reuses it instead of
+    # rebuilding it every call. Still entry-block emission — a phi must lead its block, so the zero
+    # cannot be emitted beside it, and a loop-carried merge would otherwise rebuild it every
+    # iteration. Keyed by (phi, edge) — per edge, not per phi, since `sresolve` still serves every
+    # other edge.
+    phi_zero_edges = Tuple{Tuple{Int,Int},Int,Any,Any}[]   # ((phi, edge), argument, primal, fdata type)
+    phi_zero_keys = Set{Tuple{Int,Int}}()
+    phi_edge_zero = Dict{Tuple{Int,Int},Any}()             # filled by the emission after the prologue
     for i in 1:length(pir.stmts)
         fdata_tracked[i] || continue
         s = pir.stmts[i][:stmt]
@@ -3067,7 +3071,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             _inactive_arg_root(v, pir, iworld, arg_active, packed_codualparams) || continue
             Pv = _codual_primal_type(packed_codualparams[v.n])
             fdtype(iworld, Pv) <: FTi || continue
-            phi_edge_zero[(i, j)] = icall!(_rr_zero_fdata, FTi, (Pv,), parg[v.n])
+            push!(phi_zero_edges, ((i, j), v.n, Pv, FTi))
+            push!(phi_zero_keys, (i, j))
         end
     end
     # An `SSAValue` edge whose own shadow is a mixed-activity tuple (a `Core.tuple` of mixed
@@ -3089,7 +3094,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             isassigned(s.values, j) || continue
             v = s.values[j]
             isa(v, Core.SSAValue) || continue
-            haskey(phi_edge_zero, (i, j)) && continue
+            (i, j) in phi_zero_keys && continue
             SF = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked, v)
             SF === FTi && continue
             prev = get(phi_norm_target, v.id, nothing)
@@ -3181,8 +3186,9 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # --- Bulk primal save. Still in the prologue, before any primal statement has run, so it captures
     # the arguments exactly as the call found them. The buffers live on the tape, so a pre-allocated
     # context reuses them across calls and a steady-state call allocates nothing; a `Ctx()` call
-    # allocates each buffer once, on its tape's first (and only) use. ---
-    bufs_ssa = if isempty(bulk_args)
+    # allocates each buffer once, on its tape's first (and only) use. The inactive-phi-edge zeros
+    # below share these buffers, one slot each after the bulk-saved ones. ---
+    bufs_ssa = if isempty(bulk_args) && isempty(phi_zero_edges)
         # Shared empty sentinel: nothing will ever index it, and this way a primal that bulk-saves
         # nothing pays no allocation for the field.
         emit!(GlobalRef(@__MODULE__(), :_NO_BULK_BUFS), Vector{Any})
@@ -3196,6 +3202,14 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
         # `Array`/`Memory`, never a `Tuple`).
         Pk = _widen(_codual_primal_type(packed_codualparams[k]))
         icall!(_bulk_save!, Nothing, (Vector{Any}, Int, Pk), bufs_ssa, bulk_slot[k], parg[k])
+    end
+    # Inactive-phi-edge zeros, in `bufs` slots after the bulk-saved ones. `_rr_cached_zero_fdata!`
+    # re-zeroes a cached one and rebuilds it if this call's argument no longer fits it, so a reused
+    # context repeats allocation-free while a changed argument shape still gets a correct zero.
+    for (z, (key, an, Pv, FTi)) in enumerate(phi_zero_edges)
+        phi_edge_zero[key] =
+            icall!(_rr_cached_zero_fdata!, FTi, (Vector{Any}, Int, Pv, Type{FTi}),
+                   bufs_ssa, length(bulk_args) + z, parg[an], FTi)
     end
 
     primal_map = Vector{Any}(undef, N)
