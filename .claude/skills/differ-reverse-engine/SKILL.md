@@ -235,10 +235,18 @@ kept as a defensive no-op rather than removed.
 single-latch natural loop's remaining per-iteration block-stack traffic at the *header* is fully
 determined by the trip count — in reverse, the latch fired `C` times, then the preheader once — so
 it compresses to one integer. Eligibility: exactly one back edge; header preds exactly
-`{preheader, latch}`; exactly one exiting edge `(x, e)`, from a 2-successor `GotoIfNot` block (any
-body block — a real `for` loop exits mid-body from the iterate-end check, only a `while` loop exits
-from its header); all six characteristic blocks reachable, `e != 1`; no boundary overlap with a
-collapsible region. Three coupled pieces, all recomputed from identical inputs at both builders:
+`{preheader, latch}`; exactly one exiting edge `(x, e)` toward code that can still return, from a
+2-successor `GotoIfNot` block (any body block — a real `for` loop exits mid-body from the
+iterate-end check, only a `while` loop exits from its header); all six characteristic blocks
+reachable, `e != 1`; `x`/`e` outside any collapsible region. Two deliberate widenings, both needed
+for any bounds-checked array-reading loop (`mysum`-shaped) to qualify at all: an edge into
+throw-only code (`can_return` — backwards reachability from every valued return, transitive so
+multi-block throw paths count whole) is **not** an exit, since a call that takes it never runs the
+pullback; and `h`/`s_in` **may** sit in a collapsible region's quiet set (the optimizer routinely
+puts the bounds compare right in the header, making it the diamond's entry) — the region forcing
+only concerns that block's outgoing pushes, the counted scheme only `h`'s incoming edges, and
+`s_in` is shape-sanity only. Three coupled pieces, all recomputed from identical inputs at both
+builders:
 
 - `_unique_predecessor_info` takes the loop's two header edges (`_counted_edges`) out of
   `needs_push`, so nothing pushes block ids on them any more.
@@ -259,13 +267,17 @@ collapsible region. Three coupled pieces, all recomputed from identical inputs a
   `c != 0`, decrementing unconditionally (a stale final store is harmless; re-entry re-pops), the
   preheader arm at zero.
 
-Result: a `while`-shaped loop (`whilesum`) drops to **zero** block-stack traffic; a `for`-shaped
-loop (`loopsum`/`memloop!`) drops `2N+3 -> N+3` — the residual N/iteration is the iterate-end
-merge's two data-dependent predecessors, *not* header traffic (statically implied by which
-successor the check block takes; compressing that is a separate follow-up). Tests:
-`test_reverse_counted_loops.jl` (eligibility on real primal IR, gradients across N=0..50 for
-eligible and ineligible shapes, nested/`continue`/`break`/`@goto` fixtures, exact traffic), plus
-the updated `memloop!` N+3 assertion in `test_reverse_block_stack_split.jl`.
+Result: a `while`-shaped loop (`whilesum`, bounds-checked `mysum_w`) drops to **zero** block-stack
+traffic; a `for`-shaped loop (`loopsum`/`memloop!`/`mysum`/`mydot`) drops `2N+3 -> N+3` — the
+residual N/iteration is the iterate-end merge's two data-dependent predecessors, *not* header
+traffic (statically implied by which successor the check block takes; compressing that is a
+separate follow-up, ISSUES #130). `sum(v)` itself recurses into `mapreduce_impl`'s pairwise
+scheme, so its traffic lives on nested per-call-site tapes and the recursion machinery dominates
+regardless. Tests: `test_reverse_counted_loops.jl` (eligibility on real primal IR, gradients
+across N=0..50 for eligible and ineligible shapes, nested/`continue`/`break`/`@goto`/
+bounds-checked-read fixtures, exact traffic through the live pipeline — the raw-IR analysis alone
+can't see the regions/quiet interplay), plus the updated `memloop!` N+3 assertion in
+`test_reverse_block_stack_split.jl`.
 
 **Collapsible regions** (`_collapsible_regions`) extend the unique-predecessor optimization from a
 single edge to a whole comms-free sub-region: the fixed diamond shape `@boundscheck` lowering produces

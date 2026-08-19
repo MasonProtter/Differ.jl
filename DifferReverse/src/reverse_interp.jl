@@ -1128,11 +1128,15 @@ end
 
 Natural loops of `pir` eligible for trip-count compression. A loop qualifies iff: it has exactly
 one back edge (single latch); the header has exactly two predecessors (the outside preheader and
-the latch); exactly one edge leaves the body, from a `GotoIfNot`-terminated block; all six
-characteristic blocks are reachable and the exit target isn't the entry block; and none of the
-boundary blocks participate in a collapsible region (`regions`/`quiet`), whose pullback routing
-overrides would silently reroute around the counted dispatch. Anything that doesn't qualify keeps
-the ordinary per-edge push/pop scheme — this analysis only ever removes traffic from loops it can
+the latch); exactly one edge leaves the body toward code that can still return, from a
+`GotoIfNot`-terminated block; all six characteristic blocks are reachable and the exit target
+isn't the entry block; and none of the boundary blocks participate in a collapsible region
+(`regions`/`quiet`), whose pullback routing overrides would silently reroute around the counted
+dispatch. An edge into throw-only code (a target that cannot reach a valued return — every
+bounds-checked array access in the body has one) is not an exit the scheme has to serve: a call
+that takes it never runs the pullback, so no count is ever popped, and the prologue reset keeps an
+aborted forwards pass from corrupting a reused tape. Anything that doesn't qualify keeps the
+ordinary per-edge push/pop scheme — this analysis only ever removes traffic from loops it can
 prove simple, never guesses.
 """
 function _counted_loops(pir, unreachable::AbstractVector{Bool},
@@ -1142,6 +1146,27 @@ function _counted_loops(pir, unreachable::AbstractVector{Bool},
     preds = [filter(!=(0), cfg.blocks[b].preds) for b in 1:nb]
     succs = [cfg.blocks[b].succs for b in 1:nb]
     dt = CC.construct_domtree(cfg.blocks)
+
+    # Backwards reachability from every valued return: `can_return[b]` iff some path from `b` ends
+    # in a real `return` rather than a throw. Transitive, so a multi-block throw path (error
+    # construction spread over several blocks) is recognized whole, not just its final
+    # `unreachable`-terminated block.
+    can_return = falses(nb)
+    worklist = Int[]
+    for b in 1:nb
+        if !unreachable[b] && isa(pir.stmts[cfg.blocks[b].stmts.stop][:stmt], Core.ReturnNode)
+            can_return[b] = true
+            push!(worklist, b)
+        end
+    end
+    while !isempty(worklist)
+        b = pop!(worklist)
+        for p in preds[b]
+            (1 <= p <= nb && !can_return[p]) || continue
+            can_return[p] = true
+            push!(worklist, p)
+        end
+    end
 
     latches = Dict{Int,Vector{Int}}()   # header -> back-edge sources
     for b in 1:nb, s in succs[b]
@@ -1171,7 +1196,7 @@ function _counted_loops(pir, unreachable::AbstractVector{Bool},
         for b in 1:nb
             body[b] || continue
             for s in succs[b]
-                (1 <= s <= nb && !body[s]) && push!(exits, (b, s))
+                (1 <= s <= nb && !body[s] && can_return[s]) && push!(exits, (b, s))
             end
         end
         length(exits) == 1 || continue
@@ -1181,7 +1206,13 @@ function _counted_loops(pir, unreachable::AbstractVector{Bool},
         (s_in != e && body[s_in]) || continue
         e == 1 && continue
         any(b -> unreachable[b], (h, l, p, x, s_in, e)) && continue
-        any(in(quiet), (h, x, s_in, e)) && continue
+        # `h` or `s_in` may be a collapsible region's *entry* (the bounds compare often lands right
+        # in the header, or in the first body block): the region forcing only concerns that block's
+        # outgoing diamond pushes, while the counted scheme only touches `h`'s incoming edges and
+        # never references `s_in` at all — and neither can be a region interior (`h` has two
+        # predecessors; `s_in` is only shape sanity). `x` and `e` stay excluded: `x` hosts the count
+        # push and `e`'s reverse arm hosts the pop, so their routing must be the ordinary kind.
+        any(in(quiet), (x, e)) && continue
         any(b -> haskey(regions, b), (h, s_in, e)) && continue
         push!(loops, CountedLoop(h, l, p, x, e, s_in))
     end

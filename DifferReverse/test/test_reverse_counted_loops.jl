@@ -55,6 +55,22 @@ function nestedsum(x, N)
     return s
 end
 
+# Bounds-checked array reads: every access adds an edge into a `BoundsError` throw block, which
+# sits outside the natural loop body (it can't reach the latch) — such edges must not count as
+# loop exits (a call that throws never runs the pullback), and the bounds-check diamond putting
+# the region entry in the loop header must not disqualify it either.
+mysum(v) = (s = 0.0; for i in 1:length(v); s += v[i]; end; s)
+mydot(v, w) = (s = 0.0; for i in 1:length(v); s += v[i] * w[i]; end; s)
+function mysum_w(v)
+    s = 0.0
+    i = 1
+    while i <= length(v)
+        s += v[i]
+        i += 1
+    end
+    return s
+end
+
 # `break` gives the loop a second exit edge — ineligible, must keep the ordinary per-edge scheme.
 function breaksum(x, N)
     s = 0.0
@@ -105,6 +121,9 @@ end
     @test length(_counted_of(nestedsum, (Float64, Int))) == 2
     # `break` adds a second exit edge: the whole loop must fall back to the per-edge scheme.
     @test isempty(_counted_of(breaksum, (Float64, Int)))
+    # A bounds-checked read's edge into the `BoundsError` throw block is not a loop exit.
+    @test length(_counted_of(mysum, (Vector{Float64},))) == 1
+    @test length(_counted_of(mysum_w, (Vector{Float64},))) == 1
 end
 
 @testset "gradient correctness across the compression boundary (N=0,1,2,3,5,50)" begin
@@ -125,6 +144,7 @@ end
         end
     end
 end
+
 
 # Peak stack usage of one fresh round trip: (block-stack slots, count-stack slots).
 function _loop_traffic(f, args...)
@@ -160,4 +180,32 @@ end
     bb, cb = _loop_traffic(breaksum, 3.0, 3)
     @test cb == 0
     @test bb > 0
+end
+
+@testset "array-reading loops: gradients, balance, and compression through the real pipeline" begin
+    for N in (0, 1, 2, 3, 5, 50)
+        v, w = randn(N), randn(N)
+        @test rev_gradient(mysum, v)[2] ≈ ones(N)
+        @test rev_gradient(mysum_w, v)[2] ≈ ones(N)
+        dv, dw = rev_gradient(mydot, v, w)[2:3]
+        @test dv ≈ w && dw ≈ v
+    end
+    for f in (mysum, mysum_w)
+        checkverify_rev(f, (Vector{Float64},))
+        for N in (0, 1, 3, 5)
+            check_stack_balance(f, randn(N))
+        end
+    end
+    checkverify_rev(mydot, (Vector{Float64}, Vector{Float64}))
+    check_stack_balance(mydot, randn(4), randn(4))
+    # The live carriers must actually compress these (the raw-IR analysis alone can't show that —
+    # the pipeline's own regions/quiet feed the eligibility check): for-shape keeps only the
+    # iterate-end merge push per iteration, while-shape drops to zero.
+    b2, c2 = _loop_traffic(mysum, randn(2))
+    b100, c100 = _loop_traffic(mysum, randn(100))
+    @test c2 == c100 == 1
+    @test b100 - b2 == 100 - 2
+    for N in (0, 5, 100)
+        @test _loop_traffic(mysum_w, randn(N)) == (0, 1)
+    end
 end
