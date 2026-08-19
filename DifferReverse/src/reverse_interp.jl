@@ -1641,6 +1641,21 @@ function _arg_active(iworld::UInt, n::Int, codualparams::Vector{Any})
     return arg_active
 end
 
+# Unconditionally active, for the same reason `:foreigncall` is: what a pointer addresses is outside
+# this analysis, so how the *address* was computed does not bound what reading through it depends on.
+# Without this `unsafe_load(Ptr{Float64}(u))` for a `u::UInt` comes out inactive and is silently
+# replayed with a zero shadow instead of reaching the "no reverse rule" bail. Ported from forward
+# mode's `_act_ptr_deref`.
+function _act_ptr_deref(@nospecialize(s), iworld)
+    (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || return false
+    fpos, _ = _call_parts(s)
+    f = _calleeval(fpos, iworld)
+    return f === Core.Intrinsics.pointerref || f === Core.Intrinsics.pointerset ||
+           f === Core.Intrinsics.atomic_pointerref || f === Core.Intrinsics.atomic_pointerset ||
+           f === Core.Intrinsics.atomic_pointerswap || f === Core.Intrinsics.atomic_pointermodify ||
+           f === Core.Intrinsics.atomic_pointerreplace
+end
+
 # Which SSA values may carry a derivative. Anything reached only through inactive values is replayed
 # primally instead — no shadow, no rdata accumulator, no rule.
 #
@@ -1669,7 +1684,12 @@ function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
             # alone. A rule-less `Core.Builtin`/intrinsic keeps the shortcut: without it `x === y` on
             # active operands would have no rule and bail.
             notan = _tt(iworld, _stype(pir.stmts, i)) === NoTangent
-            act = if isa(s, Core.PiNode)
+            # `Union{} <: Ptr` is true, so excluding it keeps `throw`-typed statements from becoming
+            # activity roots and dragging their operands into materialisation.
+            Tw = _stype(pir.stmts, i)
+            act = if (Tw isa Type && Tw !== Union{} && Tw <: Ptr) || _act_ptr_deref(s, iworld)
+                true                      # raw pointer, or a load/store through one — see below
+            elseif isa(s, Core.PiNode)
                 !notan && operand_active(s.val)
             elseif isa(s, Core.PhiNode)
                 !notan && any(j -> isassigned(s.values, j) && operand_active(s.values[j]),

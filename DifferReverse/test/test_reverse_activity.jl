@@ -169,6 +169,45 @@ end
     @test err isa ErrorException
 end
 
+@testset "activity: a pointer traced only through untangented values stays active" begin
+    # `u::UInt` has no tangent space, so without a pointer activity root the `Ptr{Float64}(u)`/
+    # `unsafe_load` chain would be classified inactive and replayed primally with a zero shadow —
+    # silently dropping the gradient instead of hitting the "no reverse rule" bail intrinsics
+    # without a rule reach. What a pointer addresses is outside the analysis, so it must stay active
+    # regardless of what the address was computed from.
+    f(u::UInt, x) = unsafe_load(Ptr{Float64}(u)) * x
+    v = [7.0]
+    u = UInt(pointer(v))
+    err = try
+        rev_gradient(f, u, 2.0)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("pointerref", sprint(showerror, err))
+
+    # Same profile for the atomic pointer intrinsics with no rule (`atomic_pointerswap` here; also
+    # `atomic_pointermodify`/`atomic_pointerreplace`): a declared-constant pointer argument has no
+    # other active operand to inherit activity from, so it must be listed explicitly rather than
+    # relying on the `Ptr`-typed-result root (its own result is the loaded value, not a `Ptr`). The
+    # bail only fires once the pullback itself runs — the fwds carrier replays every intrinsic
+    # primally regardless of activity, and reverse mode's per-intrinsic rule dispatch lives in the
+    # pullback statement loop.
+    swap(p::Ptr{Float64}) = Core.Intrinsics.atomic_pointerswap(p, 3.0, :monotonic)
+    v2 = [9.0]
+    p2 = Ptr{Float64}(pointer(v2))
+    _, pb = rrule!!(zero_fcodual(swap), Ctx(), CoDual(p2, Inactive()))
+    err2 = try
+        pb(1.0)
+        nothing
+    catch e
+        e
+    end
+    @test err2 isa ErrorException
+    @test occursin("atomic_pointerswap", sprint(showerror, err2))
+end
+
 @testset "activity: build_ctx rejects an out-of-range position" begin
     @test_throws ArgumentError build_ctx((x, y) -> x * y, (Float64, Float64); inactive=(3,))
     @test_throws ArgumentError build_ctx((x, y) -> x * y, (Float64, Float64); inactive=(0,))

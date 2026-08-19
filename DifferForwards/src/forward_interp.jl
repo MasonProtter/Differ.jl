@@ -670,7 +670,9 @@ function _act_ptr_deref(@nospecialize(s), iworld::UInt)
     (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || return false
     f = _calleeval(s.head === :invoke ? s.args[2] : s.args[1], iworld)
     return f === _Intr.pointerref || f === _Intr.pointerset ||
-           f === _Intr.atomic_pointerref || f === _Intr.atomic_pointerset
+           f === _Intr.atomic_pointerref || f === _Intr.atomic_pointerset ||
+           f === _Intr.atomic_pointerswap || f === _Intr.atomic_pointermodify ||
+           f === _Intr.atomic_pointerreplace
 end
 
 # `resolve_new_type` (inside `dualize_to_ircode`) without the closure — `%new`'s type argument is a
