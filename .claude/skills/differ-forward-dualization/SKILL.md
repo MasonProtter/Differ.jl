@@ -185,19 +185,45 @@ primal half, so a loop-carried constant costs no shadow phi at all. `_act_replay
 decide which arms these are; control-flow nodes and the marker `Expr` heads stay on their existing
 arms.
 
-**Materialisation is what keeps every rule file untouched.** Reverse mode lets `Inactive` flow *into*
-rules, which is why all its multi-argument `rrule!!`s had to be widened and guarded. Here, the moment
-an inactive value is read by an active one, `zero_shadow(Ti, primal[i])` supplies an ordinary zero at
-the value's *definition* — which dominates every use, including a phi edge. So `Inactive()` never
-reaches `frule_split!`, `ctx.tresolve`, or any hand/intrinsic/builtin rule, and none of them needed a
-line changed. (Reverse's #117 needed a per-`(phi, edge)` zero hoisted into the entry block precisely
-because a phi must lead its block; defining-point materialisation dissolves that case.) The fixpoint
-in `_materialized` exists because a phi-like statement builds its shadow from its *operands* rather
-than from `zero_shadow` — materialising one materialises those too.
+**Where an inactive value read by an active one goes** is `_materialized`'s decision, and it has two
+answers. A call the main loop routes through `frule_split!`'s *static* path takes the operand as
+`Inactive()` — wrapped `Dual{P,Inactive}`, keying its own carrier specialisation — because both a
+hand `frule!!` and the `@generated` fallback accept one. Every other consumer gets a real zero from
+`zero_shadow(Ti, primal[i])`, emitted at the value's *definition*, which dominates every use
+including a phi edge: intrinsic, builtin and `:foreigncall` rules, phi-likes, `%new`, and the
+`ReturnNode`. `_act_tolerates_inactive` draws that line, repeating every condition the dispatch arm
+and `frule_split!` test; anything it cannot resolve answers "materialise", because a missed
+tolerance costs a zero while a wrong one is a `MethodError` inside generated IR.
 
-**The payoff is coverage, not speed.** An inactive `:call` never reaches `frule_split!`, so a callee
-the transform could not have dualized at all (a `Dict` lookup, logging, string handling) no longer
-bails the whole build. Elided shadow arithmetic is the secondary win.
+Routing to the rule rather than zeroing is what recovers `Inactive`'s structural strong zero: a
+widened `dot` skips its `dot(x, dy)` term outright, where multiplying by a materialised zero turns a
+constant holding `Inf` into a `NaN`. (Reverse's #117 needed a per-`(phi, edge)` zero hoisted into the
+entry block precisely because a phi must lead its block; defining-point materialisation dissolves
+that case.) The fixpoint in `_materialized` exists because a phi-like statement builds its shadow
+from its *operands* rather than from `zero_shadow` — materialising one materialises those too.
+
+**`inactive_shadow` decides `Inactive()` vs. a zero for the value itself.** Two kinds never carry
+`Inactive`: a type with no tangent space (nothing to decline, and `NoTangent()` is a free literal),
+and a primal that is itself a `Dual`, i.e. the self-tangent nesting used at order ≥ 2, where a shadow
+must be a `Dual` of that same type. Handing `Inactive` to the latter breaks the higher-order
+composition lookup in `_build_dual_ir` with "could not find an inner carrier method to compose".
+
+**The payoff is mostly coverage.** An inactive `:call` never reaches `frule_split!`, so a callee the
+transform could not have dualized at all (a `Dict` lookup, logging, string handling) no longer bails
+the whole build. Elided shadow arithmetic, the skipped `zero_tangent` allocation for a constant
+array argument, and the strong zero above are the secondary wins.
+
+**Hand rules accept `Inactive` and must never return it.** All 41 `frule!!` methods destructure their
+shadows and guard on `isactive` (`_inert` where a `NoTangent` slot needs the same treatment); a
+mutating rule refuses an inactive *destination* via `_require_active_dest`, since the destination's
+shadow is also the result's. A rule always returns a real zero tangent, because `frule_split!`
+declares every nested call's result slot at `tangent_type(R)` before the callee is compiled — the
+same entanglement #138 describes. Forward signatures leave the tangent parameter free, so a rule
+that has *not* been widened still matches and fails inside its body; `test_forward_rule_activity.jl`
+audits every method under every activity mask, including that no rule has been added without a
+fixture. `ext/rules_ad_runtime.jl`'s reverse-runtime rules are in the same table: their value slots
+materialise a zero rather than skipping, because a push must pair with a pop whatever the pushed
+value's activity.
 
 **Four rules that are load-bearing:**
 

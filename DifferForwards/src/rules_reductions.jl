@@ -10,7 +10,9 @@
 # Forward is linear, so `cumsum` on the tangent array works directly.
 
 function frule!!(::Dual{typeof(cumsum)}, xd::Dual{X}) where {X<:Array{<:IEEEFloat}}
-    return Dual(cumsum(primal(xd)), cumsum(tangent(xd)))
+    y = cumsum(primal(xd))
+    dx = tangent(xd)
+    return Dual(y, isactive(dx) ? cumsum(dx) : zero_tangent(y))
 end
 
 # ---- extrema ----
@@ -35,5 +37,6 @@ function frule!!(::Dual{typeof(extrema)}, xd::Dual{X}) where {X<:Array{<:IEEEFlo
             imx = i
         end
     end
-    return Dual((mn, mx), (dx[imn], dx[imx]))
+    return isactive(dx) ? Dual((mn, mx), (dx[imn], dx[imx])) :
+                          Dual((mn, mx), (zero(mn), zero(mx)))
 end

@@ -64,9 +64,12 @@ Both modes carry it. In reverse mode a `CoDual`'s shadow can be `Inactive`, and 
 accepts it both via its `inactive=` positional-index form and by reading it straight off `CoDual`
 carriers. In forward mode a `Dual`'s tangent slot can be `Inactive` — `frule!!(…, Dual(w,
 Inactive()))` — and [`code_dual_ircode`](@ref) takes the same `inactive=` position list. Everything
-reachable only through constants is replayed primally with no tangent computed at all; a constant
-read by an active computation gets a zero materialised at its definition, so hand-written rules see
-an ordinary tangent. Widening the forward hand rules to take `Inactive` directly is future work.
+reachable only through constants is replayed primally with no tangent computed at all. A constant
+read by an *active* computation is handed to the rule as `Inactive()` where the rule can take one, so
+the term is skipped rather than multiplied by a zero; elsewhere a zero is materialised at the
+constant's definition. Hand-written rules in both modes accept `Inactive` in any differentiable slot.
+A mutating rule (`mul!`, `map!`, `setindex!`) refuses an inactive *destination* rather than silently
+dropping the derivative flowing from its sources.
 
 ```@docs
 Inactive

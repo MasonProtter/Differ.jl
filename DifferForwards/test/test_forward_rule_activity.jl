@@ -1,0 +1,183 @@
+using Test
+using Random: Xoshiro
+using DifferForwards
+using DifferForwards: Dual, Inactive, NoTangent, frule!!, primal, tangent, isactive,
+    tangent_type, zero_tangent
+using DifferForwards: is_generated_frule_fallback, randn_tangent
+using LinearAlgebra: dot, norm, tr, mul!
+# Loaded so `DifferForwardsOverReverseExt`'s own `frule!!` methods are present and audited too;
+# without it they would silently escape the completeness check below.
+using DifferReverse
+using DifferReverse: Stack, SingletonStack, _bulk_save!, _bulk_restore!
+
+# Every hand-written `frule!!` must accept an `Inactive()` in any differentiable slot, because
+# `dualize_to_ircode` routes a constant operand straight to the rule rather than materialising a
+# zero for it. Forward-mode rule signatures leave the tangent parameter free, so a rule that has
+# *not* been widened still matches `Dual{P,Inactive}` and fails inside its body — the widening is
+# invisible in the source, and this file is what makes it visible instead.
+#
+# The other half is the return type. `frule_split!` declares every nested call's result tangent slot
+# at `tangent_type(R)` before the callee is compiled, so a rule must never hand back an `Inactive()`
+# however inactive its inputs were. That is what the `isactive(tangent(r))` assertion below pins.
+#
+# The forward half of `TODO.org`'s "automated audit" item; reverse's equivalent is still open.
+
+# A fixture is a thunk (mutating rules need fresh buffers per mask), the callee, and which argument
+# slot — if any — is a destination the rule is expected to *refuse* when declared constant.
+struct Fixture
+    name::String
+    f::Any
+    args::Function
+    dest::Union{Int,Nothing}
+end
+Fixture(name, f, args) = Fixture(name, f, args, nothing)
+
+const V = [1.0, 2.0, 3.0]
+const W = [0.5, 1.5, 2.5]
+const M = [1.0 2.0; 3.0 4.0]
+const MASK = [true, false, true]
+const IDX = [1, 3]
+
+unary(f, x) = Fixture(string(f), f, () -> (x,))
+
+const FIXTURES = Fixture[
+    # frules.jl
+    unary(sin, 0.7), unary(cos, 0.7),
+    # rules_math.jl — arguments kept inside each function's real domain
+    unary(exp, 0.7), unary(log, 0.7), unary(log1p, 0.7), unary(expm1, 0.7),
+    unary(log2, 0.7), unary(log10, 0.7), unary(exp2, 0.7), unary(exp10, 0.7),
+    unary(sinh, 0.7), unary(cosh, 0.7), unary(tanh, 0.7),
+    unary(asinh, 0.7), unary(acosh, 2.0), unary(atanh, 0.7),
+    unary(asin, 0.7), unary(acos, 0.7), unary(atan, 0.7), unary(cbrt, 0.7),
+    Fixture("atan(y,x)", atan, () -> (1.0, 2.0)),
+    Fixture("^(x,y)", ^, () -> (2.0, 3.0)),
+    Fixture("^(x,n::Int)", ^, () -> (2.0, 3)),
+    Fixture("hypot", hypot, () -> (3.0, 4.0)),
+    Fixture("sqrt(::Complex)", sqrt, () -> (1.0 + 2.0im,)),
+    # rules_linalg.jl
+    Fixture("dot", dot, () -> (copy(V), copy(W))),
+    Fixture("norm", norm, () -> (copy(V),)),
+    Fixture("tr", tr, () -> (copy(M),)),
+    Fixture("*(M,v)", *, () -> (copy(M), [1.0, 2.0])),
+    Fixture("*(M,M)", *, () -> (copy(M), copy(M))),
+    Fixture("mul!(v,M,v)", mul!, () -> (zeros(2), copy(M), [1.0, 2.0]), 1),
+    Fixture("mul!(M,M,M)", mul!, () -> (zeros(2, 2), copy(M), copy(M)), 1),
+    # rules_reductions.jl
+    Fixture("cumsum", cumsum, () -> (copy(V),)),
+    Fixture("extrema", extrema, () -> (copy(V),)),
+    # rules_broadcast.jl
+    Fixture("map(f,x)", map, () -> (sin, copy(V))),
+    Fixture("map(f,x,y)", map, () -> (atan, copy(V), copy(W))),
+    Fixture("map!(f,d,x)", map!, () -> (sin, zeros(3), copy(V)), 2),
+    Fixture("map!(f,d,x,y)", map!, () -> (atan, zeros(3), copy(V), copy(W)), 2),
+    # rules_indexing.jl
+    Fixture("getindex(A,mask)", getindex, () -> (copy(V), copy(MASK))),
+    Fixture("getindex(A,idx)", getindex, () -> (copy(V), copy(IDX))),
+    Fixture("setindex!(A,v,mask)", setindex!, () -> (copy(V), [9.0, 9.0], copy(MASK)), 1),
+    Fixture("setindex!(A,v,idx)", setindex!, () -> (copy(V), [9.0, 9.0], copy(IDX)), 1),
+]
+
+# Slots with a tangent space are the ones an activity mask ranges over; the rest can only ever carry
+# `NoTangent()`, which every rule already handled.
+diff_slots(args) = [i for i in eachindex(args) if tangent_type(typeof(args[i])) !== NoTangent]
+
+seed(x) = randn_tangent(Xoshiro(1), x)
+
+# The `frule!!` method a fixture dispatches to under a given mask.
+rule_method(fx, duals) =
+    which(frule!!, Tuple{Dual{typeof(fx.f),NoTangent},map(typeof, duals)...})
+
+covered = Set{Method}()
+
+@testset "rule activity: $(fx.name)" for fx in FIXTURES
+    slots = diff_slots(fx.args())
+    for bits in 0:(2^length(slots) - 1)
+        inactive = Set(slots[i] for i in eachindex(slots) if (bits >> (i - 1)) & 1 == 1)
+        args = fx.args()
+        duals = Any[i in inactive ? Dual(args[i], Inactive()) : Dual(args[i], seed(args[i]))
+                    for i in eachindex(args)]
+        fd = Dual(fx.f, NoTangent())
+
+        # A hand rule must keep matching under every mask — never quietly fall through to the
+        # generated fallback, which would re-derive a body (a BLAS `ccall`, say) it cannot see.
+        m = rule_method(fx, duals)
+        @test !is_generated_frule_fallback(m)
+        push!(covered, m)
+
+        if fx.dest !== nothing && fx.dest in inactive
+            # A mutating rule overwrites its destination, so the destination's shadow is the
+            # result's; treating a constant one as a no-op would silently drop the sources'
+            # derivatives. Refused, not supported — same call reverse mode makes.
+            @test_throws ErrorException frule!!(fd, duals...)
+            continue
+        end
+
+        r = frule!!(fd, duals...)
+        @test r isa Dual
+        # Never `Inactive()`: `frule_split!` declares a nested call's tangent slot at
+        # `tangent_type(R)` before the callee is compiled.
+        @test isactive(tangent(r))
+        @test typeof(tangent(r)) === tangent_type(typeof(primal(r)))
+    end
+end
+
+# ---------------------------------------------------------------------------
+# `DifferForwardsOverReverseExt`'s rules for the reverse runtime's own primitives. These are tape
+# plumbing rather than derivative arithmetic, so they take fixtures of their own: the exposed slot
+# is the *recorded value*, and an inactive one must still push/save a real zero so pushes stay
+# paired with pops. Every other slot is a stack, buffer or tape type — an activity root, so it never
+# arrives inactive; those methods are listed as structural below rather than fixtured.
+# ---------------------------------------------------------------------------
+
+@testset "rule activity: reverse-runtime plumbing takes a constant value slot" begin
+    for shadow in (1.0, Inactive())
+        st = Stack{Float64}()
+        dst = Stack{Float64}()
+        r = frule!!(Dual(push!, NoTangent()), Dual(st, dst), Dual(2.0, shadow))
+        push!(covered, rule_method((f = push!,), (Dual(st, dst), Dual(2.0, shadow))))
+        # Paired regardless of activity: one primal push, one shadow push.
+        @test st.position == 1 && dst.position == 1
+        @test isactive(tangent(r))
+        p = frule!!(Dual(pop!, NoTangent()), Dual(st, dst))
+        push!(covered, rule_method((f = pop!,), (Dual(st, dst),)))
+        @test primal(p) == 2.0
+        @test tangent(p) == (shadow === Inactive() ? 0.0 : 1.0)
+
+        ss, dss = SingletonStack{Float64}(), SingletonStack{Float64}()
+        frule!!(Dual(push!, NoTangent()), Dual(ss, dss), Dual(2.0, shadow))
+        push!(covered, rule_method((f = push!,), (Dual(ss, dss), Dual(2.0, shadow))))
+
+        bufs, dbufs = Any[nothing], Any[nothing]
+        src, dsrc = [1.0, 2.0], (shadow === Inactive() ? Inactive() : [1.0, 1.0])
+        frule!!(Dual(_bulk_save!, NoTangent()), Dual(bufs, dbufs),
+                Dual(1, NoTangent()), Dual(src, dsrc))
+        push!(covered, rule_method((f = _bulk_save!,),
+                                   (Dual(bufs, dbufs), Dual(1, NoTangent()), Dual(src, dsrc))))
+        frule!!(Dual(_bulk_restore!, NoTangent()), Dual(bufs, dbufs),
+                Dual(1, NoTangent()), Dual(src, dsrc))
+        push!(covered, rule_method((f = _bulk_restore!,),
+                                   (Dual(bufs, dbufs), Dual(1, NoTangent()), Dual(src, dsrc))))
+        @test src == [1.0, 2.0]
+    end
+end
+
+@testset "rule activity: every hand rule has a fixture" begin
+    # The completeness half: a newly added `frule!!` with no fixture here fails this test rather
+    # than silently going un-audited.
+    #
+    # The exemptions are the extension rules whose every operand is a stack, tape or `Type` — all
+    # activity roots or `NoTangent`, so no activity mask over them exists to audit. Listed by name
+    # rather than by a predicate so adding a rule to the extension still fails this test.
+    structural = Set([DifferReverse.__pop_blk_stack!, DifferReverse._inner_ctx,
+                      DifferReverse._inner_self_ctx, DifferReverse._alloc_tape])
+    is_structural(m) = any(f -> m.sig <: Tuple{Any,Dual{typeof(f)},Vararg{Any}}, structural) ||
+                       m.sig <: Tuple{Any,Dual{typeof(pop!)},Dual{<:SingletonStack},Vararg{Any}}
+    # Package-owned rules only. Under the full `runtests.jl` every file shares one process, and
+    # several define test-local `frule!!` methods of their own (the world-age and dispatch tests);
+    # those are not part of the rule table this audits.
+    extmod = Base.get_extension(DifferForwards, :DifferForwardsOverReverseExt)
+    owned(m) = m.module === DifferForwards || m.module === extmod
+    declared = Set(m for m in methods(frule!!)
+                   if owned(m) && !is_generated_frule_fallback(m) && !is_structural(m))
+    @test setdiff(declared, covered) == Set{Method}()
+end

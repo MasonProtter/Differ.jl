@@ -9,9 +9,10 @@ using DifferForwards: AutoDifferForwards
 include(joinpath(@__DIR__, "testutils.jl"))
 
 # `Inactive()` in a `Dual`'s tangent slot declares the value constant. Inside the dualized body,
-# everything reachable only through constants is replayed primally with no shadow at all; a constant
-# read by something active gets a materialised zero at its definition, so no hand rule, intrinsic
-# rule or builtin rule ever sees an `Inactive`.
+# everything reachable only through constants is replayed primally with no shadow at all. A constant
+# read by something *active* travels on as `Inactive()` to a call routed through `frule!!`, and is
+# materialised as a real zero at its definition for every other consumer — intrinsic and builtin
+# rules, phi-likes, `%new`, the return. `test_forward_rule_activity.jl` audits the rule side.
 #
 # Fixtures are top level where `@noinline` matters (the call must survive into the primal IR rather
 # than be inlined away).
@@ -25,6 +26,8 @@ nested_dot(v, w) = dot(v, w)
 # bail would surface at run time from the callee's own carrier instead of at `code_dual_ircode`.
 tagged(x, v) = x * 2.0 + (push!(v, 1.0); v[1])
 vtail(x, ys...) = x * ys[1] + ys[2]
+loopdots(v, w, n) = (s = 0.0; for _ in 1:n; s += dot(v, w); end; s)
+mapsin(v, w) = sum(map((a, b) -> a * sin(b), v, w))
 
 @testset "activity: an inactive argument is not merely zero-seeded" begin
     d = const_dual(3.0)
@@ -96,6 +99,28 @@ end
         end
         @test frule!!(Dual(loopdot, NoTangent()), const_dual(v), const_dual(w)).x ≈ loopdot(v, w)
     end
+
+    # Same range, but with a *hand rule* in the loop body: the constant operand is handed to `dot`
+    # as `Inactive()` once per iteration rather than zeroed once at its definition.
+    v, w = [1.0, 2.0, 3.0], [0.5, 1.5, 2.5]
+    fd = Dual(loopdots, NoTangent())
+    for n in 0:4
+        @test frule!!(fd, Dual(v, [1.0, 0.0, 0.0]), const_dual(w), Dual(n, NoTangent())).dx ≈ n*w[1]
+        @test frule!!(fd, const_dual(v), Dual(w, [0.0, 0.0, 1.0]), Dual(n, NoTangent())).dx ≈ n*v[3]
+        @test frule!!(fd, const_dual(v), const_dual(w), Dual(n, NoTangent())).x ≈ loopdots(v, w, n)
+    end
+    checkverify(loopdots, (Vector{Float64}, Vector{Float64}, Int); inactive=(2,))
+end
+
+@testset "activity: a constant array through map's per-element carriers" begin
+    # `map`'s rule builds an inner `Dual` per element; a constant outer array has to reach the inner
+    # `frule!!` as inactive too, not as a zero it would then multiply by.
+    v, w = [1.0, 2.0, 3.0], [0.5, 1.5, 2.5]
+    fd = Dual(mapsin, NoTangent())
+    @test frule!!(fd, Dual(v, [1.0, 0.0, 0.0]), const_dual(w)).dx ≈ sin(w[1])
+    @test frule!!(fd, const_dual(v), Dual(w, [0.0, 0.0, 1.0])).dx ≈ v[3]*cos(w[3])
+    @test frule!!(fd, const_dual(v), const_dual(w)).x ≈ mapsin(v, w)
+    checkverify(mapsin, (Vector{Float64}, Vector{Float64}); inactive=(2,))
 end
 
 @testset "activity: constant-only code is replayed, not differentiated" begin
@@ -130,24 +155,37 @@ end
 end
 
 @testset "activity: an inactive operand feeding an active hand rule" begin
-    # Nested, deliberately: materialisation happens inside `dualize_to_ircode`, so this is the path
-    # that hands the unmodified `dot` rule an ordinary zero rather than an `Inactive()`.
+    # Nested, deliberately: the routing decision happens inside `dualize_to_ircode`, so this is the
+    # path that hands the `dot` rule an `Inactive()` through `frule_split!`.
     v, w = [1.0, 2.0, 3.0], [0.5, 1.5, 2.5]
     fd = Dual(nested_dot, NoTangent())
     @test frule!!(fd, Dual(v, [1.0, 0.0, 0.0]), const_dual(w)).dx ≈ w[1]
     @test frule!!(fd, const_dual(v), Dual(w, [0.0, 0.0, 1.0])).dx ≈ v[3]
     @test frule!!(fd, const_dual(v), const_dual(w)).x ≈ dot(v, w)
     checkverify(nested_dot, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+
+    # The constant operand reaches the rule as `Inactive()`, not as a materialised zero: no
+    # `zero_tangent` call survives for it, and the `frule!!` invoke names `Dual{…,Inactive}`.
+    ir, _ = code_dual_ircode(nested_dot, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    stmts = [sprint(show, ir.stmts[i][:stmt]) for i in 1:length(ir.stmts)]
+    @test !any(s -> occursin("zero_tangent", s), stmts)
+    @test any(s -> occursin("Inactive", s), stmts)
 end
 
-@testset "activity: a hand rule called directly with an Inactive still refuses" begin
-    # Known limitation, pinned so it fails loudly if it ever changes. A rule signature like
-    # `Dual{Vector{Float64}}` leaves the tangent parameter free, so it *matches* `Dual{…,Inactive}`
-    # and then fails inside the body — nothing materialises at the `frule!!` boundary itself. Only
-    # the derived path (the testset above) supports a constant argument today; widening the hand
-    # rules is the deferred half of this feature.
+@testset "activity: a hand rule takes an Inactive shadow directly" begin
+    # A rule signature like `Dual{Vector{Float64}}` leaves the tangent parameter free, so it matches
+    # `Dual{…,Inactive}`; the bodies now handle what they match rather than throwing inside.
     v, w = [1.0, 2.0, 3.0], [0.5, 1.5, 2.5]
-    @test_throws Exception frule!!(Dual(dot, NoTangent()), Dual(v, [1.0, 0.0, 0.0]), const_dual(w))
+    fd = Dual(dot, NoTangent())
+    @test frule!!(fd, Dual(v, [1.0, 0.0, 0.0]), const_dual(w)).dx ≈ w[1]
+    @test frule!!(fd, const_dual(v), Dual(w, [0.0, 0.0, 1.0])).dx ≈ v[3]
+    @test frule!!(fd, const_dual(v), const_dual(w)) === Dual(dot(v, w), 0.0)
+
+    # The structural strong zero the materialised zero forfeited: skipping the `dot(x, dy)` term is
+    # not the same as multiplying by zeros, when `x` holds an `Inf`.
+    vinf, dvinf = [Inf, 1.0, 1.0], [0.0, 1.0, 0.0]
+    @test frule!!(fd, Dual(vinf, dvinf), const_dual(w)).dx == w[2]
+    @test isnan(dot(dvinf, w) + dot(vinf, zero_tangent(w)))     # what a materialised zero gives
 end
 
 @testset "activity: vararg tails and higher order degrade rather than bail" begin

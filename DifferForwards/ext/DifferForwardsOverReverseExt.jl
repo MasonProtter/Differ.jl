@@ -19,7 +19,7 @@ module DifferForwardsOverReverseExt
 import DifferForwards: DifferForwards, Dual, primal, tangent, frule!!, has_hand_frule,
     _is_foreign_mode_carrier, _foreign_mode_primal_ir,
     _foreign_selfsim_shadow_type, _foreign_selfsim_mirror_field,
-    NoTangent, tangent_type, build_tangent
+    NoTangent, tangent_type, build_tangent, isactive, zero_tangent
 
 import DifferReverse: DifferReverse, Stack, SingletonStack, CommsCell, Tape,
     is_reverse_fwds_impl, is_reverse_pullback_impl,

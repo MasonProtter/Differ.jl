@@ -89,7 +89,9 @@ gradient (all current call sites are accumulator-first — audited).
 The strong-zero property is *structural, not numerical*: `Inactive` short-circuits before any
 arithmetic, so `dx += y * dz` never evaluates with an infinite `y`. A materialised zero buffer would
 give `NaN` there, which is a correctness argument for this representation and not only a performance
-one.
+one. It holds in **both** modes: forward's hand rules take `Inactive` directly and skip the term
+(`dot(x, dy)` is never evaluated when `y` is constant), rather than multiplying by a zero the
+transform materialised for them.
 
 `NoTangent` deliberately keeps **no** absorbing arm, so a mis-analysed active value still raises a
 `MethodError` rather than dropping a gradient. Do not add one.

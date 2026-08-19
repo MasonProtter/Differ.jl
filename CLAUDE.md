@@ -35,7 +35,12 @@ hand-written *primitive* rules; a composite function gets a *derived* rule built
 IR.
 
 - **Forward**: `frule!!(Dual(f, tf), Dual(x, dx), …) -> Dual`. `frule!!` has a `@generated`
-  composite fallback, so it works on anything.
+  composite fallback, so it works on anything. A hand rule must accept `Inactive()` in any
+  differentiable slot (the transform routes a constant operand straight to it, which is what keeps
+  the strong zero) and must never *return* it — `frule_split!` declares a nested call's result
+  tangent at `tangent_type(R)` before the callee is compiled. Forward signatures leave the tangent
+  parameter free, so an unwidened rule still matches and fails inside its body;
+  `DifferForwards/test/test_forward_rule_activity.jl` audits every method under every activity mask.
 - **Reverse**: `rrule!!(fcd::CoDual, ctx::AbstractCtx, argcds::CoDual...) -> (ycd, pullback)`, where
   **the pullback closure *is* the tape** — the derived path's `pullback` is literally a `Tape` value.
   `ctx` just holds that same `Tape` object *between calls* so it can be reused instead of reallocated

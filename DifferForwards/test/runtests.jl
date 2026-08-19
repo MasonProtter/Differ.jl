@@ -17,4 +17,5 @@ using SafeTestsets
 @safetestset "rules: broadcast" begin include("test_broadcast_rules.jl") end
 @safetestset "rules: indexing" begin include("test_indexing_rules.jl") end
 @safetestset "rules: linalg" begin include("test_linalg_rules.jl") end
+@safetestset "rules: activity audit" begin include("test_forward_rule_activity.jl") end
 # @safetestset "DifferentiationInterface.jl integration" begin include("test_differentiation_interface.jl") end

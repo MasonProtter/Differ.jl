@@ -507,12 +507,16 @@ const _Intr = Core.Intrinsics
 # The payoff is mostly *coverage*: an inactive call never reaches `frule_split!`, so undifferentiated
 # bookkeeping (logging, `Dict` lookups, string handling) no longer bails the whole build.
 #
+# A constant read by an *active* computation is a separate question, answered by `_materialized`: it
+# travels on as `Inactive()` to a call `frule_split!` routes through `frule!!`, and is materialised
+# as a real zero everywhere else.
+#
 # Ported from `DifferReverse`'s `_activity`; the reverse side's provenance/rdata machinery has no
 # forward counterpart and is deliberately not ported.
 # ===========================================================================
 
 # Values whose primal or tangent this transform reads. Erring wide is safe: over-reporting costs a
-# materialised zero nothing reads, under-reporting leaves an `Inactive()` where a rule wants a
+# materialised zero nothing reads, under-reporting leaves an `Inactive()` where the emission needs a
 # tangent. `:loopinfo`'s arguments aren't operands — `userefs` never visits them either.
 function _each_operand(f, @nospecialize s)
     if isa(s, Core.PiNode) || isa(s, Core.UpsilonNode) || isa(s, Core.ReturnNode)
@@ -653,6 +657,11 @@ function _activity(pir, iworld::UInt, tt, nslots::Int, arg_active::BitVector)
     return active
 end
 
+# Whether a declared type is a specific leaf we can `%new` and freeze into an SSA's type.
+# `isconcretetype(Type{P})` is always `false` (documented Julia quirk), so a `Type{P}`-typed operand
+# takes `frule_split!`'s dynamic path instead of a static `:invoke` — correct, just slower.
+_conc(@nospecialize T) = T isa DataType && isconcretetype(T)
+
 # Unconditionally active, for the same reason `:foreigncall` is: what a pointer addresses is outside
 # this analysis, so how the *address* was computed does not bound what reading through it depends on.
 # Without this `unsafe_load(Ptr{Float64}(u))` for a `u::UInt` comes out inactive and is silently
@@ -674,13 +683,52 @@ function resolve_new_type_at(@nospecialize(T), iworld::UInt)
     return T
 end
 
-# Which inactive values still need a real zero shadow, because something active reads them. Emitting
-# it at the point of *definition* — which dominates every use, including a phi edge — is what lets
-# every hand, intrinsic and builtin rule stay untouched: `Inactive()` never reaches one.
+# Declared primal type of an operand, at module level: the module-level twin of `optype` inside
+# `dualize_to_ircode`, for use before that closure's `argty` exists. Same three cases, same reasons.
+function _act_optype(pir, arg_ptypes::Vector{Any}, iworld::UInt, @nospecialize x)
+    isa(x, Core.Argument) && return x.n <= length(arg_ptypes) ? arg_ptypes[x.n] : Any
+    if isa(x, GlobalRef)
+        ok, gv = _globalref_val(x, iworld)
+        return (ok && _globalref_isconst(x, iworld)) ? Core.Typeof(gv) : Any
+    end
+    return _widen(_optype(pir, x))
+end
+
+# Does this statement's shadow emission tolerate an `Inactive()` operand? True only for a call the
+# main loop hands to `frule_split!`'s *static* path, which wraps the operand as `Dual{P,Inactive}`
+# and lets the callee's own rule decide — a widened hand rule skips the term outright (recovering
+# `Inactive`'s strong zero: `Inf * 0.0` is never evaluated), and the derived fallback runs its own
+# activity analysis over it. Everything else reads operand tangents as values and needs a real one:
+# intrinsic, builtin and `:foreigncall` rules, phi-likes, `%new`, and the `ReturnNode`.
+#
+# Wrong in one direction only. A missed `true` costs a materialised zero; a wrong `true` leaves an
+# `Inactive()` where a rule wants a tangent, which is a `MethodError` inside generated IR rather
+# than a located bail. So this repeats every condition the dispatch arm and `frule_split!` test, and
+# anything it cannot resolve answers `false`.
+function _act_tolerates_inactive(@nospecialize(s), @nospecialize(Ti), pir,
+                                 arg_ptypes::Vector{Any}, iworld::UInt)
+    (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || return false
+    isa(Ti, Core.Const) && return false      # the const-result arm zeroes the shadow instead
+    fpos = s.head === :invoke ? s.args[2] : s.args[1]
+    f = _calleeval(fpos, iworld)
+    (f === nothing || isa(f, Core.IntrinsicFunction) || isa(f, Core.Builtin)) && return false
+    _conc(_typeof(f)) || return false
+    actual = s.head === :invoke ? (@view s.args[3:end]) : (@view s.args[2:end])
+    return all(a -> _conc(_act_optype(pir, arg_ptypes, iworld, a)), actual)
+end
+
+# Which inactive values still need a real zero shadow, because something active reads them —
+# "reads them" meaning a consumer that cannot take an `Inactive()`, per `_act_tolerates_inactive`.
+# A call routed through `frule_split!`'s static path is not such a consumer: it passes the operand
+# on as `Dual{P,Inactive}` and the callee's rule handles it. Everything else is.
+#
+# The zero goes at the point of *definition*, which dominates every use including a phi edge, so a
+# value read by both a tolerant and a demanding consumer is materialised once and both see the zero.
 #
 # A fixpoint rather than a single scan: a phi-like statement's shadow is built from its operands, so
 # materialising one materialises those too, and a loop-carried merge closes back on itself.
-function _materialized(pir, active::BitVector, nslots::Int, arg_active::BitVector)
+function _materialized(pir, active::BitVector, nslots::Int, arg_active::BitVector,
+                       arg_ptypes::Vector{Any}, iworld::UInt)
     stmts = pir.stmts
     N = length(stmts)
     mat = falses(N)
@@ -700,7 +748,12 @@ function _materialized(pir, active::BitVector, nslots::Int, arg_active::BitVecto
         s = stmts[i][:stmt]
         # `ReturnNode` is never *active* (it produces no value of its own), but its operand's tangent
         # goes straight into the returned `Dual`, so seed from it explicitly.
-        (active[i] || isa(s, Core.ReturnNode)) && _each_operand(note!, s)
+        if isa(s, Core.ReturnNode)
+            _each_operand(note!, s)
+        elseif active[i] &&
+               !_act_tolerates_inactive(s, stmts[i][:type], pir, arg_ptypes, iworld)
+            _each_operand(note!, s)
+        end
     end
     changed = true
     while changed
@@ -834,10 +887,6 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # `Dual(...)` call the inliner couldn't reach in synthetic IR.
     dual!(@nospecialize(P), @nospecialize(T), @nospecialize(p), @nospecialize(t)) =
         emit!(Expr(:new, Dual{P,T}, p, t), Dual{P,T})
-    # Whether a declared type is a specific leaf we can `%new` and freeze into an SSA's type.
-    # `isconcretetype(Type{P})` is always `false` (documented Julia quirk), so a `Type{P}`-typed
-    # operand takes the dynamic path below instead of a static `:invoke` — correct, just slower.
-    _conc(@nospecialize T) = T isa DataType && isconcretetype(T)
     # Pack a primal/tangent into a `Dual` for a non-concrete primal type `R` (e.g. `Any`, from a
     # dynamic dispatch). A `%new(Dual{R,tt(R)}, …)` would freeze the over-wide declared type into the
     # value (a boxed `Dual{Any,Any}` that can't flow back into `frule!!`); call the `Dual` constructor
@@ -926,6 +975,21 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         return emit_invoke!(zerotang_g, T, (Tw,), primal_ssa)
     end
 
+    # Shadow of a value the analysis found inactive. `Inactive()` says "a derivative could exist
+    # here and the caller declined it". Two kinds of value get a materialised zero instead:
+    #  * no tangent space at all, where there is nothing to decline — `zero_shadow` answers
+    #    `NoTangent()`, a literal, so this costs nothing;
+    #  * a primal that is itself a `Dual`, i.e. the self-tangent nesting used at order ≥ 2, where a
+    #    shadow must be a `Dual` of that same type (`tangent_type(Dual{P,T}) === Dual{P,T}`) and
+    #    `Inactive` has no room. Order ≥ 2 already degrades an inactive seed to a zero in the
+    #    prologue; this is the same call, made one level up.
+    inactive_shadow(@nospecialize(Ti), @nospecialize(primal_ssa)) = begin
+        Tw = _widen(Ti)
+        (tt(Ti) === NoTangent || (Tw isa Type && Tw !== Union{} && Tw <: Dual)) &&
+            return zero_shadow(Ti, primal_ssa)
+        return Inactive()
+    end
+
     dualparams = impl_mi.specTypes.parameters[2:end]     # the Dual{…} argument types
     vararg_tt = Tuple{dualparams...}                     # dualargs is one vararg tuple (Argument 2)
 
@@ -983,11 +1047,18 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         end
 
         nslots = primal_nfixed === nothing ? n : nfixed + 1
-        arg_active = _arg_active(dualparams, nfixed, nslots, tt)
-        active = _activity(pir, iworld, tt, nslots, arg_active)
-        mat, arg_mat = _materialized(pir, active, nslots, arg_active)
         parg = Vector{Any}(undef, nslots); targ = Vector{Any}(undef, nslots)
         argty = Vector{Any}(undef, nslots)
+        # Settled before the analysis rather than inside the unpacking loop below: `_materialized`
+        # needs each slot's primal type to decide whether a call's operands are concrete enough for
+        # `frule_split!`'s static path.
+        for k in 1:min(nfixed, nslots)
+            argty[k] = _dual_primal_type(dualparams[k])
+        end
+        nslots > nfixed && (argty[nslots] = Pva)
+        arg_active = _arg_active(dualparams, nfixed, nslots, tt)
+        active = _activity(pir, iworld, tt, nslots, arg_active)
+        mat, arg_mat = _materialized(pir, active, nslots, arg_active, argty, iworld)
         pelts = Any[]; telts = Any[]
         for i in 1:n
             Di = dualparams[i]
@@ -997,12 +1068,12 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             p = emit!(Expr(:call, getf, di, 1), Pi)
             if i <= nfixed
                 parg[i]  = p
-                argty[i] = Pi
                 # A constant argument reads no tangent at all: the `getfield(di, 2)` would be dead
-                # code typed `Inactive`. One zero per call — not per use, not per iteration — when
-                # something active still reads it.
+                # code typed `Inactive`. It travels on as `Inactive()` where its consumers can take
+                # one; where any of them cannot, the zero is emitted here — once per call, not per
+                # use and not per iteration.
                 targ[i] = !inact ? emit!(Expr(:call, getf, di, 2), _dual_tangent_type(Di)) :
-                          arg_mat[i] ? zero_shadow(Pi, p) : Inactive()
+                          arg_mat[i] ? zero_shadow(Pi, p) : inactive_shadow(Pi, p)
             else
                 push!(pelts, p)
                 # No tangent read at all for a collapsed vararg tangent — it would be dead code.
@@ -1018,7 +1089,6 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             va = nfixed + 1
             parg[va]  = emit!(Expr(:call, ctuple, pelts...), Pva)
             targ[va]  = Tva === NoTangent ? NoTangent() : emit!(Expr(:call, ctuple, telts...), Tva)
-            argty[va] = Pva
         end
     else
         # Higher-order case: `pir` is a vararg `dualized_impl` whose only real argument is
@@ -1063,7 +1133,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         arg_active = _arg_active(Any[Dual{typeof(dualized_impl),NoTangent},
                                      Dual{Tuple{ptys...},Tuple{ttys...}}], 2, 2, tt)
         active = _activity(pir, iworld, tt, 2, arg_active)
-        mat, arg_mat = _materialized(pir, active, 2, arg_active)
+        mat, arg_mat = _materialized(pir, active, 2, arg_active, argty, iworld)
     end
 
     presolve(@nospecialize x) =
@@ -1100,6 +1170,10 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # A statically-known function is a code constant (zero tangent); a dynamic callee (read out
         # of a container) carries whatever tangent the shadow pass computed for it.
         ftang   = fval === nothing ? tresolve(fpos) : zt(fval)
+        # `fd` below is declared `Dual{ftype,tt(ftype)}`, so an `Inactive()` here would be a type
+        # lie. Unreachable today — a tolerated call has a statically-resolved callee, so a dynamic
+        # one's operands were all materialised — but cheaper to zero than to depend on that.
+        isactive(ftang) || (ftang = zero_shadow(optype(fpos), presolve(fpos)))
         # A call is a genuine dynamic dispatch (`apply_generic`) when its callee or any argument has a
         # non-concrete declared type — the method that runs depends on runtime types unknowable here.
         # Can't wrap such a call statically: a `%new` of a `Dual` would freeze the abstract type into
@@ -1121,8 +1195,14 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 v = _calleeval(a, iworld)
                 if v === nothing                       # genuinely dynamic operand (SSAValue/Argument)
                     P = optype(a)
+                    t = tresolve(a)
+                    # `ttup` is declared `Tuple{ttys...}` at the primal-derived tangent types, so an
+                    # `Inactive()` cannot travel this path. Same reasoning as the callee slot above:
+                    # `_act_tolerates_inactive` already excludes a non-concrete operand, but zero
+                    # here rather than rely on it.
+                    isactive(t) || (t = zero_shadow(P, presolve(a)))
                     push!(pvals, presolve(a)); push!(ptys, P)
-                    push!(tvals, tresolve(a)); push!(ttys, tt(P))
+                    push!(tvals, t); push!(ttys, tt(P))
                 else                                   # statically-known: embed the value + its zero
                     P = _typeof(v)
                     push!(pvals, v); push!(ptys, P)
@@ -1151,8 +1231,14 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             v = _calleeval(a, iworld)
             if v === nothing                            # genuinely dynamic operand
                 P = optype(a)
-                push!(dualtys, Dual{P,tt(P)})
-                push!(duals, dual!(P, tt(P), presolve(a), tresolve(a)))
+                t = tresolve(a)
+                # An operand the caller declared constant is handed on as constant rather than as a
+                # materialised zero: a widened hand rule then skips its term entirely, and the
+                # derived fallback re-runs the activity analysis with that slot inactive. The
+                # resulting `Dual{P,Inactive}` is concrete, and keys its own carrier specialisation.
+                T = isactive(t) ? tt(P) : Inactive
+                push!(dualtys, Dual{P,T})
+                push!(duals, dual!(P, T, presolve(a), t))
             else                                        # statically-known: embed value + its zero tangent
                 P = _typeof(v)
                 push!(dualtys, Dual{P,tt(P)})
@@ -1375,10 +1461,9 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             else
                 primal[i] = presolve(s)           # literal / SSAValue / Argument alias
             end
-            # A zero only where something active reads it — `_materialized` decides, and emitting it
-            # here (at the definition, which dominates every use) is what keeps `Inactive()` out of
-            # every rule.
-            shadow[i] = mat[i] ? zero_shadow(Ti, primal[i]) : Inactive()
+            # A zero only where a consumer that cannot take an `Inactive()` reads it —
+            # `_materialized` decides. At the definition, which dominates every use.
+            shadow[i] = mat[i] ? zero_shadow(Ti, primal[i]) : inactive_shadow(Ti, primal[i])
         elseif !active[i] && !mat[i] && _act_phi_like(s)
             # Same idea for a merge, but a merge's shadow is built from its operands rather than
             # computed fresh, so there is nothing to replay — just emit the primal half and leave the
@@ -1398,7 +1483,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                                 emit!(Core.UpsilonNode(presolve(s.val)), Ti) :
                                 emit!(Core.UpsilonNode(), Ti)
             end
-            shadow[i] = Inactive()
+            shadow[i] = inactive_shadow(Ti, primal[i])
         elseif isa(Ti, Core.Const) && isa(s, Expr) && (s.head === :call || s.head === :invoke)
             # Const-prop proved this call's result is always exactly this literal, so its derivative
             # is definitionally zero regardless of the callee. (Only `Core.Const` licenses this — a

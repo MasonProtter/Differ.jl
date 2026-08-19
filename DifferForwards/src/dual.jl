@@ -25,9 +25,11 @@ is computed, and `tangent` the direction in which it is computed.
 - [`Inactive`](@ref), marking the value as held constant by the caller. Legal for any `P`;
   `tangent_shadow_type(P)` is the pair of them.
 
-`Inactive` is accepted here but never produced by the transform for an intermediate value that
-anything reads: an inactive value consumed by an active one gets a materialised zero instead. So
-`Dual{P,Inactive}` reaches `frule!!` only in argument position.
+`Dual{P,Inactive}` reaches `frule!!` only in argument position, but it does reach it: an inactive
+value consumed by an active call is handed to the rule as-is, so a hand rule can skip the term
+instead of multiplying by a zero. Consumers that read a tangent as a value — intrinsic and builtin
+rules, phi-likes, `%new`, the return — get a materialised zero at the value's definition instead.
+A rule never *returns* `Inactive` (see `dualize_to_ircode`'s `frule_split!`).
 """
 struct Dual{P,T}
     primal::P
@@ -135,6 +137,21 @@ function error_if_incorrect_dual_types(duals::Vararg{Dual,N}) where {N}
 end
 
 @inline uninit_dual(x::P) where {P} = Dual(x, uninit_tangent(x))
+
+# A shadow that contributes nothing to a derivative, for the two distinct reasons a hand rule has to
+# treat alike: `NoTangent` (the type has no tangent space, e.g. an `Int` exponent) and `Inactive`
+# (the caller declared this particular value constant). `isactive` knows only the second.
+_inert(@nospecialize dx) = isa(dx, NoTangent) || isa(dx, Inactive)
+
+# A mutating rule overwrites its destination, so the destination's shadow *is* the result's shadow.
+# Skipping the shadow writes for a destination declared constant would silently drop the derivative
+# flowing from the sources, so refuse instead. Reverse mode refuses the same call for its own reason
+# (there the destination shadow is additionally the backward seed).
+_require_active_dest(::Inactive, what) =
+    error("Differ: `", what, "` into a destination declared constant (`Inactive` shadow) would ",
+          "discard the derivative flowing from the sources — pass a zeroed shadow buffer instead ",
+          "of declaring the destination constant")
+_require_active_dest(@nospecialize(_), @nospecialize(_)) = nothing
 
 # Always sharpen the first thing if it's a type so static dispatch remains possible.
 function Dual(x::Type{P}, dx::NoTangent) where {P}
