@@ -1,0 +1,188 @@
+using Test
+using DifferForwards
+using DifferForwards: Dual, Inactive, NoTangent, frule!!, zero_tangent, isactive,
+    code_dual_ircode, primal, tangent
+using LinearAlgebra: dot
+import DifferentiationInterface as DI
+using DifferForwards: AutoDifferForwards
+
+include(joinpath(@__DIR__, "testutils.jl"))
+
+# `Inactive()` in a `Dual`'s tangent slot declares the value constant. Inside the dualized body,
+# everything reachable only through constants is replayed primally with no shadow at all; a constant
+# read by something active gets a materialised zero at its definition, so no hand rule, intrinsic
+# rule or builtin rule ever sees an `Inactive`.
+#
+# Fixtures are top level where `@noinline` matters (the call must survive into the primal IR rather
+# than be inlined away).
+
+sxy(x, y) = x*y + sin(x)
+sxyz(x, y, z) = x*y + y*z + sin(x*z)
+loopdot(v, w) = (s = 0.0; for i in eachindex(v, w); s += v[i]*w[i]; end; s)
+nested_dot(v, w) = dot(v, w)
+# Growing an array (`Core.memoryrefoffset`) is a construct forward mode cannot dualize at all — the
+# canonical bail. Written inline so it lands in `tagged`'s own IR: behind an `@noinline` call the
+# bail would surface at run time from the callee's own carrier instead of at `code_dual_ircode`.
+tagged(x, v) = x * 2.0 + (push!(v, 1.0); v[1])
+vtail(x, ys...) = x * ys[1] + ys[2]
+
+@testset "activity: an inactive argument is not merely zero-seeded" begin
+    d = const_dual(3.0)
+    @test tangent(d) === Inactive()
+    @test !isactive(tangent(d))
+    @test typeof(d) === Dual{Float64,Inactive}
+    # Distinct from both a zero tangent and `NoTangent()` — either of those says something else.
+    @test tangent(Dual(3.0, 0.0)) === 0.0
+    @test tangent(d) !== NoTangent()
+    @test typeof(const_dual([1.0, 2.0])) === Dual{Vector{Float64},Inactive}
+end
+
+@testset "activity: scalar arguments, every signature" begin
+    x, y = 1.3, 2.1
+    fd = Dual(sxy, NoTangent())
+    # Directional derivative with a unit seed on each active slot, checked against finite differences
+    # and against the corresponding slot of the fully active run.
+    @test frule!!(fd, Dual(x, 1.0), const_dual(y)).dx ≈ central_diff(sxy, x, y, 1)
+    @test frule!!(fd, const_dual(x), Dual(y, 1.0)).dx ≈ central_diff(sxy, x, y, 2)
+    @test frule!!(fd, Dual(x, 1.0), const_dual(y)).dx ≈ frule!!(fd, Dual(x, 1.0), Dual(y, 0.0)).dx
+    @test frule!!(fd, const_dual(x), Dual(y, 1.0)).dx ≈ frule!!(fd, Dual(x, 0.0), Dual(y, 1.0)).dx
+    # Primal is unaffected by any activity signature, including all-constant.
+    for a in (Dual(x, 1.0), const_dual(x)), b in (Dual(y, 1.0), const_dual(y))
+        @test frule!!(fd, a, b).x ≈ sxy(x, y)
+    end
+    for inact in ((), (1,), (2,), (1, 2))
+        checkverify(sxy, (Float64, Float64); inactive=inact)
+    end
+end
+
+@testset "activity: matches the full run slot for slot" begin
+    x, y, z = 0.7, 1.9, 2.3
+    fd = Dual(sxyz, NoTangent())
+    full = (frule!!(fd, Dual(x, 1.0), Dual(y, 0.0), Dual(z, 0.0)).dx,
+            frule!!(fd, Dual(x, 0.0), Dual(y, 1.0), Dual(z, 0.0)).dx,
+            frule!!(fd, Dual(x, 0.0), Dual(y, 0.0), Dual(z, 1.0)).dx)
+    seeds = (x, y, z)
+    for k in 1:3
+        args = ntuple(j -> j == k ? Dual(seeds[j], 1.0) : const_dual(seeds[j]), 3)
+        @test frule!!(fd, args...).dx ≈ full[k]
+    end
+    for inact in ((), (1,), (2,), (3,), (1, 2), (1, 3), (2, 3), (1, 2, 3))
+        checkverify(sxyz, (Float64, Float64, Float64); inactive=inact)
+    end
+end
+
+@testset "activity: array arguments" begin
+    v, w = [1.0, 2.0, 3.0], [0.5, 1.5, 2.5]
+    fd = Dual(loopdot, NoTangent())
+    dv = [1.0, 0.0, 0.0]
+    @test frule!!(fd, Dual(v, dv), const_dual(w)).dx ≈ w[1]
+    @test frule!!(fd, Dual(v, dv), const_dual(w)).dx ≈
+          frule!!(fd, Dual(v, dv), Dual(w, zeros(3))).dx
+    @test frule!!(fd, const_dual(v), Dual(w, [0.0, 1.0, 0.0])).dx ≈ v[2]
+    @test frule!!(fd, const_dual(v), const_dual(w)).x ≈ loopdot(v, w)
+    for inact in ((), (1,), (2,), (1, 2))
+        checkverify(loopdot, (Vector{Float64}, Vector{Float64}); inactive=inact)
+    end
+end
+
+@testset "activity: loops run more than twice" begin
+    # ISSUES #52's lesson: a dataflow change touching phis can be right for 0 and 1 iterations and
+    # corrupt everything from the second onward. Run a range of trip counts.
+    for n in 0:4
+        v, w = collect(1.0:n), collect(0.5:1.0:(n - 0.5))
+        for k in 1:n
+            dv = zeros(n); dv[k] = 1.0
+            @test frule!!(Dual(loopdot, NoTangent()), Dual(v, dv), const_dual(w)).dx ≈ w[k]
+        end
+        @test frule!!(Dual(loopdot, NoTangent()), const_dual(v), const_dual(w)).x ≈ loopdot(v, w)
+    end
+end
+
+@testset "activity: constant-only code is replayed, not differentiated" begin
+    # The coverage payoff, and the reason this feature is worth more than the elided shadow
+    # arithmetic: `growread` is code the transform cannot dualize at all. Active, it bails; constant,
+    # it is replayed primally and never reaches `frule_split!`.
+    r_active = bail_reason(tagged, (Float64, Vector{Float64}))
+    @test r_active !== nothing
+    @test occursin("memoryrefoffset", r_active)
+    @test bail_reason(tagged, (Float64, Vector{Float64}); inactive=(2,)) === nothing
+
+    v = [4.0]
+    r = frule!!(Dual(tagged, NoTangent()), Dual(2.0, 1.0), const_dual(v))
+    @test r.x ≈ tagged(2.0, [4.0])          # the primal still runs, mutation and all
+    @test r.dx ≈ 2.0                        # only `x * 2.0` contributes
+    @test length(v) == 2                    # `push!` was genuinely replayed
+    checkverify(tagged, (Float64, Vector{Float64}); inactive=(2,))
+end
+
+@testset "activity: no shadow is emitted for an inactive subgraph" begin
+    # The elision is real, not merely unused: the constant operand's shadow work is gone from the
+    # carrier, so the inactive dualization is strictly smaller than the fully active one.
+    at = (Vector{Float64}, Vector{Float64})
+    n_full = length(code_dual_ircode(loopdot, at)[1].stmts)
+    n_cut  = length(code_dual_ircode(loopdot, at; inactive=(2,))[1].stmts)
+    @test n_cut < n_full
+    # With nothing active at all, no tangent is read out of any carrier and no zero is materialised
+    # — the whole body is primal replay.
+    stmts = [string(s) for s in code_dual_ircode(loopdot, at; inactive=(1, 2))[1].stmts.stmt]
+    @test !any(s -> occursin("zero_tangent", s), stmts)
+    @test length(stmts) < n_cut
+end
+
+@testset "activity: an inactive operand feeding an active hand rule" begin
+    # Nested, deliberately: materialisation happens inside `dualize_to_ircode`, so this is the path
+    # that hands the unmodified `dot` rule an ordinary zero rather than an `Inactive()`.
+    v, w = [1.0, 2.0, 3.0], [0.5, 1.5, 2.5]
+    fd = Dual(nested_dot, NoTangent())
+    @test frule!!(fd, Dual(v, [1.0, 0.0, 0.0]), const_dual(w)).dx ≈ w[1]
+    @test frule!!(fd, const_dual(v), Dual(w, [0.0, 0.0, 1.0])).dx ≈ v[3]
+    @test frule!!(fd, const_dual(v), const_dual(w)).x ≈ dot(v, w)
+    checkverify(nested_dot, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+end
+
+@testset "activity: a hand rule called directly with an Inactive still refuses" begin
+    # Known limitation, pinned so it fails loudly if it ever changes. A rule signature like
+    # `Dual{Vector{Float64}}` leaves the tangent parameter free, so it *matches* `Dual{…,Inactive}`
+    # and then fails inside the body — nothing materialises at the `frule!!` boundary itself. Only
+    # the derived path (the testset above) supports a constant argument today; widening the hand
+    # rules is the deferred half of this feature.
+    v, w = [1.0, 2.0, 3.0], [0.5, 1.5, 2.5]
+    @test_throws Exception frule!!(Dual(dot, NoTangent()), Dual(v, [1.0, 0.0, 0.0]), const_dual(w))
+end
+
+@testset "activity: vararg tails and higher order degrade rather than bail" begin
+    # A constant trailing element is materialised in the prologue, so the packed tangent tuple keeps
+    # its primal-derived type and the rest of the transform needs no vararg awareness.
+    fd = Dual(vtail, NoTangent())
+    @test frule!!(fd, Dual(2.0, 1.0), const_dual(3.0), const_dual(4.0)).x ≈ 10.0
+    @test frule!!(fd, Dual(2.0, 1.0), const_dual(3.0), const_dual(4.0)).dx ≈ 3.0
+    @test frule!!(fd, const_dual(2.0), Dual(3.0, 1.0), const_dual(4.0)).dx ≈ 2.0
+    checkverify(vtail, (Float64, Float64, Float64); inactive=(2, 3))
+
+    # Order >= 2 with a constant seed: correct, with the elision happening one order down.
+    sq(x, y) = x*x*y
+    r = frule!!(Dual(Dual(sq, NoTangent()), Dual(sq, NoTangent())),
+                Dual(Dual(1.5, 1.0), Dual(1.0, 0.0)), const_dual(Dual(2.0, 0.0)))
+    @test r.x.x ≈ sq(1.5, 2.0)
+    checkverify2(sq, (Float64, Float64); order=2, inactive=(2,))
+end
+
+@testset "activity: DI.Constant maps to Inactive, DI.Cache stays active" begin
+    f(x, w) = sum(x .* w)
+    x, w = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    tx = ([1.0, 0.0, 0.0],)
+    # A `DI.Constant` context is seeded `Dual(w, Inactive())` by `_ctx_dual`, so the pushforward
+    # matches the one where `w` is an ordinary argument with a zero tangent.
+    ty = DI.pushforward(f, AutoDifferForwards(), x, tx, DI.Constant(w))
+    @test only(ty) ≈ w[1]
+    # `DI.Cache` stays active — deliberately not mapped to `Inactive`.
+    fcache(x, c) = sum(x .* c)
+    @test only(DI.pushforward(fcache, AutoDifferForwards(), x, tx, DI.Cache(copy(w)))) ≈ w[1]
+end
+
+@testset "activity: out-of-range inactive positions are rejected" begin
+    @test_throws ArgumentError code_dual_ircode(sxy, (Float64, Float64); inactive=(3,))
+    @test_throws ArgumentError code_dual_ircode(sxy, (Float64, Float64); inactive=(0,))
+    @test_throws MethodError code_dual_ircode(sxy, (Float64, Float64); inactive=[2])
+    checkverify(sxy, (Float64, Float64); inactive=2)   # a bare Int is accepted
+end

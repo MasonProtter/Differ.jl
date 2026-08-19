@@ -16,16 +16,41 @@
 _nest_dual(@nospecialize(T), order::Int) =
     order <= 1 ? Dual{T,tangent_type(T)} : (S = _nest_dual(T, order - 1); Dual{S,tangent_type(S)})
 
+# The same seed for an argument the caller holds constant: `Inactive` in the *outermost* tangent
+# slot, the nesting below it unchanged. At order >= 2 the transform materialises a zero for it
+# rather than threading the constancy inward, so only the outer level is marked.
+_nest_dual_inactive(@nospecialize(T), order::Int) =
+    order <= 1 ? Dual{T,Inactive} : Dual{_nest_dual(T, order - 1),Inactive}
+
 """
-    code_dual_ircode(f, argtypes::Tuple; order=1, world=Base.get_world_counter()) -> Pair{IRCode,Any}
+    _inactive_positions(inactive, nargs) -> Tuple{Vararg{Int}}
+
+Validate a user-supplied set of constant-argument positions (1-based, counting the arguments only,
+not `f`), returning them as a tuple. Mirrors `DifferReverse`'s function of the same name, including
+its `Int`-or-tuple-of-`Int` signature: a `Vector` or a range is rejected with a `MethodError` naming
+the type rather than surfacing further downstream.
+"""
+_inactive_positions(inactive::Int, nargs::Int) = _inactive_positions((inactive,), nargs)
+function _inactive_positions(inactive::Tuple{Vararg{Int}}, nargs::Int)
+    for p in inactive
+        1 <= p <= nargs ||
+            throw(ArgumentError("inactive argument position $p is out of range for $nargs arguments"))
+    end
+    return inactive
+end
+
+"""
+    code_dual_ircode(f, argtypes::Tuple; order=1, world=Base.get_world_counter(), inactive=()) -> Pair{IRCode,Any}
 
 Return `ir => rettype`, the optimized dualized `IRCode` for differentiating `f` at arguments of
 types `argtypes` (each primal type `T` is seeded with a `Dual{T,T}`; the function itself with
 `Dual{typeof(f),NoTangent}`). `order` requests a higher derivative by nesting *all* seeds uniformly
 to that depth — `order=2` seeds each `T` with `Dual{Dual{T,T},Dual{T,T}}` and the function with
 `Dual{Dual{typeof(f),NoTangent},Dual{typeof(f),NoTangent}}` — which is useful for running
-`Core.Compiler.verify_ir` on the higher-order IR without a live call. Errors if dualization bails
-(e.g. array indexing — not yet supported).
+`Core.Compiler.verify_ir` on the higher-order IR without a live call. `inactive` names argument
+positions (1-based, not counting `f`) the caller holds constant, seeding those with
+`Dual{T,Inactive}` — the same thing `frule!!(…, Dual(x, Inactive()))` does at a live call. Errors if
+dualization bails (e.g. array indexing — not yet supported).
 
 # Examples
 ```julia
@@ -36,12 +61,13 @@ code_dual_ircode(x -> x*x, (Float64,); order=2)   # second-derivative IR
 See also [`@code_dual_ircode`](@ref).
 """
 function code_dual_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
-                          order::Int = 1, world::UInt = Base.get_world_counter())
+                          order::Int = 1, world::UInt = Base.get_world_counter(), inactive = ())
     interp = ContextualInterpreter(Forward(), nothing; world)
+    inact = _inactive_positions(inactive, length(argtypes))
     dualtys = Any[_nest_dual(_typeof(f), order)]
-    for T in argtypes
+    for (j, T) in enumerate(argtypes)
         (T isa Type) || throw(ArgumentError("argtypes must be a tuple of types, got $(repr(T))"))
-        push!(dualtys, _nest_dual(T, order))
+        push!(dualtys, j in inact ? _nest_dual_inactive(T, order) : _nest_dual(T, order))
     end
     impl_tt = Tuple{typeof(dualized_impl), dualtys...}
     match, _ = CC.findsup(impl_tt, CC.method_table(interp))

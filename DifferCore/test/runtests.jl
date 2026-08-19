@@ -82,6 +82,20 @@ mutable struct MPoint; x::Float64; y::Float64; end
         v = [Point(1.0, 2.0), Point(3.0, 4.0)]
         zt = zero_tangent(v)
         @test zt == [zero_tangent(Point(1.0, 2.0)), zero_tangent(Point(3.0, 4.0))]
+
+        # A bare `Memory`/`MemoryRef` primal: same-shape, matching its `tangent_type`. Without these
+        # arms the generic struct fallback tries to build a `Memory{Float64}` out of its own fields'
+        # tangents. Forward mode's activity materialisation asks for exactly this.
+        m = Memory{Float64}(undef, 3); fill!(m, 7.0)
+        zm = zero_tangent(m)
+        @test typeof(zm) === tangent_type(Memory{Float64}) === Memory{Float64}
+        @test all(iszero, zm) && length(zm) == 3
+        @test typeof(zero_tangent(Memory{Int}(undef, 2))) === Memory{NoTangent}
+
+        r = Core.memoryref(m, 2)
+        zr = zero_tangent(r)
+        @test typeof(zr) === tangent_type(Core.MemoryRef{Float64}) === Core.MemoryRef{Float64}
+        @test Base.memoryrefoffset(zr) == 2
     end
 
     @testset "Inactive" begin

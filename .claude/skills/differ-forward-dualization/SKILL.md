@@ -158,6 +158,90 @@ two-pass renumbering because `PhiNode.values` is a plain mutable `Vector` even t
 itself is immutable. `PhiCNode` (try/catch capture collection) reuses the identical
 `resolve_phi_values`/`pending` mechanism.
 
+## Activity: constant arguments (`_activity` / `_materialized`)
+
+`Inactive()` in a `Dual`'s tangent slot is the caller declaring that argument **constant**:
+`frule!!(fd, Dual(x, dx), Dual(w, Inactive()))`. `Dual`'s inner constructors were relaxed to admit it
+(they used to enforce `tangent_type(P) == T` flatly); `tangent_shadow_type(P) =
+Union{tangent_type(P), Inactive}` is the validity predicate, and `code_dual_ircode(f, at;
+inactive=(2,))` seeds it for reflection. See `differ-tangent-system` for `Inactive` itself and
+`differ-reverse-engine` for reverse mode's much larger version of this.
+
+Three module-level functions, all called once at the top of `dualize_to_ircode`:
+
+- **`_arg_active(dualparams, nfixed, nslots, tt)`** — which argument slots carry a derivative, in the
+  *packed* space the primal IR's `Core.Argument` numbering lives in. `Inactive` in the tangent slot
+  says constant; `tangent_type(P) === NoTangent` says the same from the type alone. A vararg
+  primal's packed tail slot is active if *any* trailing element is.
+- **`_activity(pir, iworld, tt, nslots, arg_active)`** — a monotone least fixpoint over the primal
+  IR (a loop-carried `PhiNode` reads a back-edge value not yet computed). Conservatism grows "may be
+  active", so an unrecognised value-producing `Expr` defaults to **active**.
+- **`_materialized(pir, active, nslots, arg_active)`** — which *inactive* values nonetheless need a
+  real zero, because something active reads them.
+
+An inactive statement is **replayed primally** — the primal reconstructed faithfully, no shadow
+emitted, `shadow[i] = Inactive()`. An inactive `PhiNode`/`PhiCNode`/`UpsilonNode` emits only its
+primal half, so a loop-carried constant costs no shadow phi at all. `_act_replayable`/`_act_phi_like`
+decide which arms these are; control-flow nodes and the marker `Expr` heads stay on their existing
+arms.
+
+**Materialisation is what keeps every rule file untouched.** Reverse mode lets `Inactive` flow *into*
+rules, which is why all its multi-argument `rrule!!`s had to be widened and guarded. Here, the moment
+an inactive value is read by an active one, `zero_shadow(Ti, primal[i])` supplies an ordinary zero at
+the value's *definition* — which dominates every use, including a phi edge. So `Inactive()` never
+reaches `frule_split!`, `ctx.tresolve`, or any hand/intrinsic/builtin rule, and none of them needed a
+line changed. (Reverse's #117 needed a per-`(phi, edge)` zero hoisted into the entry block precisely
+because a phi must lead its block; defining-point materialisation dissolves that case.) The fixpoint
+in `_materialized` exists because a phi-like statement builds its shadow from its *operands* rather
+than from `zero_shadow` — materialising one materialises those too.
+
+**The payoff is coverage, not speed.** An inactive `:call` never reaches `frule_split!`, so a callee
+the transform could not have dualized at all (a `Dict` lookup, logging, string handling) no longer
+bails the whole build. Elided shadow arithmetic is the secondary win.
+
+**Four rules that are load-bearing:**
+
+- **"Result type has no tangent space ⇒ inactive" gates only the alias/merge/`%new` arms, never a
+  call.** A generic call routinely returns `Nothing` while writing through an argument
+  (`Base._growend_internal!`, `copyto!`, `mul!`), so calls go by their operands alone.
+- **Forward mode does *not* copy reverse's exemption for a rule-less `Core.Builtin`/intrinsic.**
+  Reverse needs it (`x === y` on active operands would otherwise have no rule and bail); forward
+  already has rules for `===`/`isdefined` and the `@inactive_builtin` group, and here a rule-less
+  builtin's bail is load-bearing — it is how growable-array mutation (`push!`, via
+  `Core.memoryrefoffset`) is refused. Marking one inactive replays it primally and walks on into code
+  the transform cannot handle. This was caught by `test_forward_arrays.jl`'s growable-array bail.
+- **A raw pointer is an activity root** — any statement whose type is `<: Ptr`, plus
+  `pointerref`/`pointerset`/their atomic forms (`_act_ptr_deref`). Same rationale as `:foreigncall`:
+  what a pointer addresses is outside the analysis, so how the *address* was computed does not bound
+  what reading through it depends on. Without it, `unsafe_load(Ptr{Float64}(u))` for a `u::UInt` (no
+  tangent space, hence inactive) is silently zeroed where forward mode deliberately bails — caught by
+  `test_forward_pointers.jl`'s "graceful bails" testset.
+- **A locally allocated mutable object is an activity root**, not a function of its initialiser
+  operands (`%new` of a mutable type with a non-trivial tangent, `Core.memorynew`): an active value
+  may be written into it later. `:foreigncall` is unconditionally active for the same reason.
+
+**Vararg tails and order ≥ 2 degrade rather than bail.** A constant trailing element gets a
+materialised zero in the prologue instead of an `Inactive()` slot, which keeps the packed tangent
+tuple at its primal-derived type `Tva` — so nothing downstream needs vararg activity awareness, and
+`vttys` is reconstructed from the materialised types for the existing shape check. Same for an
+inactive seed on the higher-order (`pir_is_vararg`) path: correct, with the elision happening one
+order down. Reverse mode instead models per-element tail activity with a mixed `Tuple{…,Inactive,…}`
+shadow type (ISSUES #116); forward mode deliberately does not.
+
+**Known limitations**, all deferred deliberately (see ISSUES):
+
+- A hand rule called *directly* with an `Inactive` argument still throws. A signature like
+  `Dual{Vector{Float64}}` leaves the tangent parameter free, so it matches `Dual{…,Inactive}` and
+  then fails in the body — nothing materialises at the `frule!!` boundary itself. Only the derived
+  path supports a constant argument. Widening the rules is the other half of this feature.
+- Materialising forfeits `Inactive`'s *structural* strong zero: `Inf * 0.0` is `NaN` where reverse's
+  `@ifactive` short-circuits before the arithmetic. Rule widening is what would recover it.
+- A materialised zero inside a loop is recomputed per iteration (free for scalars, an allocation for
+  an array). Reverse hoists loop-invariant ones; forward does not yet.
+- The returned carrier is always `Dual{R, tangent_type(R)}` — an inactive result is materialised at
+  the `ReturnNode` rather than returned as `Dual{R,Inactive}`, which would entangle with
+  `frule_split!`'s declared result type the way reverse's #126/#127 did.
+
 ## Recursion
 
 A surviving call's *derived* (non-hand-ruled) carrier can resolve back to the very `impl_mi` this

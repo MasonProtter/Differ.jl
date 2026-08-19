@@ -60,17 +60,38 @@ macro ifactive(dx, expr)
 end
 
 """
-    shadow_type(P::Type)
+    fdata_shadow_type(P::Type)
 
-The types a shadow for a primal of type `P` may legally have: its ordinary fdata type, or
-`Inactive` if the value is held constant.
+The types a *reverse-mode* shadow for a primal of type `P` may legally have: its ordinary fdata
+type, or `Inactive` if the value is held constant. This is what a `CoDual`'s second slot admits.
 
 **A validity predicate, never a declaration.** Use it in `<:` checks and rule-signature
 constraints. Every declared slot, field, comms item and SSA type must stay concrete — the engines
 pick the concrete alternative from their own per-value activity, so no union ever reaches a hot
 path.
+
+See [`tangent_shadow_type`](@ref) for the forward-mode half.
 """
-shadow_type(::Type{P}) where {P} = Union{fdata_type(tangent_type(P)),Inactive}
+fdata_shadow_type(::Type{P}) where {P} = Union{fdata_type(tangent_type(P)),Inactive}
+
+"""
+    tangent_shadow_type(P::Type)
+
+The types a *forward-mode* shadow for a primal of type `P` may legally have: its ordinary tangent
+type, or `Inactive` if the value is held constant. This is what a `Dual`'s second slot admits.
+
+Forward mode carries the whole tangent rather than the fdata half, which is the only difference
+from [`fdata_shadow_type`](@ref). The same "validity predicate, never a declaration" rule applies.
+"""
+tangent_shadow_type(::Type{P}) where {P} = Union{tangent_type(P),Inactive}
+
+"""
+    shadow_type(P::Type)
+
+Deprecated alias for [`fdata_shadow_type`](@ref). Named before forward mode carried `Inactive`,
+when there was only one shadow half to describe.
+"""
+shadow_type(::Type{P}) where {P} = fdata_shadow_type(P)
 
 # `Inactive` is its own fdata and its own rdata — that is what lets it survive into an aggregate's
 # shadow, which `NoTangent` cannot do.

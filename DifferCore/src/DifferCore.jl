@@ -32,6 +32,6 @@ export increment!!, set_to_zero!!
 export build_tangent, get_tangent_field, set_tangent_field!
 export as_tangent, unit_tangent
 export LazyZeroRData
-export Inactive, shadow_type, isactive, @ifactive
+export Inactive, fdata_shadow_type, tangent_shadow_type, shadow_type, isactive, @ifactive
 
 end # module DifferCore

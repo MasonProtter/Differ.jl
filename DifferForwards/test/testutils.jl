@@ -5,7 +5,7 @@
 
 using Test
 using DifferForwards
-using DifferForwards: code_dual_ircode
+using DifferForwards: code_dual_ircode, Dual, Inactive
 
 # Central finite difference, one argument.
 central_diff(f, x; h=1e-6) = (f(x + h) - f(x - h)) / 2h
@@ -14,15 +14,19 @@ central_diff(f, x; h=1e-6) = (f(x + h) - f(x - h)) / 2h
 central_diff(f, x, y, k::Int; h=1e-6) =
     k == 1 ? (f(x+h, y) - f(x-h, y)) / 2h : (f(x, y+h) - f(x, y-h)) / 2h
 
-# Forward-mode dualized IR is legal (order-1).
-checkverify(f, at) = Core.Compiler.verify_ir(code_dual_ircode(f, at)[1])
+# A `Dual` carrier for an argument the caller holds constant.
+const_dual(x) = Dual(x, Inactive())
+
+# Forward-mode dualized IR is legal (order-1). `inactive` names argument positions held constant.
+checkverify(f, at; inactive=()) =
+    Core.Compiler.verify_ir(code_dual_ircode(f, at; inactive)[1])
 
 # The bail message for a function Differ declines to dualize, or `nothing` if it dualizes fine.
 # Every graceful bail is supposed to name a *reason*, so tests assert on this rather than just on
 # "it threw".
-function bail_reason(f, at)
+function bail_reason(f, at; inactive=())
     try
-        code_dual_ircode(f, at)
+        code_dual_ircode(f, at; inactive)
         return nothing
     catch e
         return sprint(showerror, e)
@@ -30,4 +34,5 @@ function bail_reason(f, at)
 end
 
 # Forward-mode dualized IR is legal at a given nesting order.
-checkverify2(f, at; order=2) = Core.Compiler.verify_ir(code_dual_ircode(f, at; order)[1])
+checkverify2(f, at; order=2, inactive=()) =
+    Core.Compiler.verify_ir(code_dual_ircode(f, at; order, inactive)[1])

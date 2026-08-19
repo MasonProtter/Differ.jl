@@ -53,15 +53,25 @@ unit_tangent
 ## Activity marking (`DifferCore`)
 
 `Inactive` marks a value the caller holds constant: no derivative is propagated to or from it. It
-is a legal inhabitant of a shadow slot alongside the primal-derived fdata type — `shadow_type(P)`
-gives that legal set. `Inactive` is distinct from `NoTangent`, which says a *type* has no tangent
-space rather than that a particular value was declared constant; see the `Inactive` docstring for
-why the two can't be merged. Currently exercised by `DifferReverse` — a `CoDual`'s shadow can be
-`Inactive`, and [`build_ctx`](@ref) accepts it both via its `inactive=` positional-index form and
-by reading it straight off `CoDual` carriers.
+is a legal inhabitant of a shadow slot alongside the primal-derived one — `fdata_shadow_type(P)`
+gives that legal set for reverse mode's `CoDual`, `tangent_shadow_type(P)` for forward mode's `Dual`
+(which carries the whole tangent rather than the fdata half). `shadow_type` is a deprecated alias for
+the former. `Inactive` is distinct from `NoTangent`, which says a *type* has no tangent space rather
+than that a particular value was declared constant; see the `Inactive` docstring for why the two
+can't be merged.
+
+Both modes carry it. In reverse mode a `CoDual`'s shadow can be `Inactive`, and [`build_ctx`](@ref)
+accepts it both via its `inactive=` positional-index form and by reading it straight off `CoDual`
+carriers. In forward mode a `Dual`'s tangent slot can be `Inactive` — `frule!!(…, Dual(w,
+Inactive()))` — and [`code_dual_ircode`](@ref) takes the same `inactive=` position list. Everything
+reachable only through constants is replayed primally with no tangent computed at all; a constant
+read by an active computation gets a zero materialised at its definition, so hand-written rules see
+an ordinary tangent. Widening the forward hand rules to take `Inactive` directly is future work.
 
 ```@docs
 Inactive
+fdata_shadow_type
+tangent_shadow_type
 shadow_type
 isactive
 @ifactive
@@ -69,9 +79,10 @@ isactive
 
 ## Forward mode (`DifferForwards`)
 
-`Dual` pairs a primal value with its full tangent; `frule!!` is the forward-mode rule, dispatched
-on `Dual` arguments, with an `@generated` fallback that derives a rule for any composite function
-from its IR.
+`Dual` pairs a primal value with its full tangent — or with [`Inactive`](@ref) for an argument the
+caller holds constant; see [Activity marking](#Activity-marking-(DifferCore)). `frule!!` is the
+forward-mode rule, dispatched on `Dual` arguments, with an `@generated` fallback that derives a rule
+for any composite function from its IR.
 
 ```@docs
 Dual

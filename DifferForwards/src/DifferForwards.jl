@@ -8,7 +8,7 @@ using Contextual: Contextual, ContextualInterpreter, expr_to_codeinfo, run_ipo_p
     carrier_world_range, at_world, mt_edge!
 import Contextual: build_contextual_ir
 
-import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangent, MutableTangent,
+import DifferCore: DifferCore, NoTangent, Inactive, isactive, NoFData, NoRData, FData, RData, Tangent, MutableTangent,
     PossiblyUninitTangent, tangent_type, fdata_type, rdata_type,
     zero_tangent, zero_rdata, randn_tangent, increment!!, set_to_zero!!,
     build_tangent, get_tangent_field, set_tangent_field!,
@@ -47,7 +47,8 @@ include("adtypes.jl")
 
 export DifferCore
 
-export Dual, primal, tangent, NoTangent, frule!!
+export Dual, primal, tangent, NoTangent, Inactive, frule!!
+export isactive
 export code_dual_ircode, @code_dual_ircode
 export tangent_type, fdata_type, rdata_type
 export Tangent, MutableTangent, PossiblyUninitTangent

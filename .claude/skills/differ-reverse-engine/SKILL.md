@@ -472,8 +472,9 @@ was added to handle, and this specific shape of it still isn't reachable.
 
 `Inactive` in a `CoDual`'s shadow slot means the caller declared that value **constant**:
 `CoDual(x, Inactive())`. This is a third flavour of the carrier alongside `fcodual_type`'s fdata form
-and `codual_type`'s full-tangent form. `CoDual` has no inner constructor to relax (unlike `Dual`,
-which enforces `tangent_type(P) == T` and will have to be loosened before forward mode can carry one).
+and `codual_type`'s full-tangent form. `CoDual` has no inner constructor to relax; `Dual`'s did have
+to be (it enforced `tangent_type(P) == T`) — forward mode now carries `Inactive` too, on a
+deliberately simpler scheme described in `differ-forward-dualization`.
 `isactive(dx) = !isa(dx, Inactive)` and `@ifactive(dx, expr)` (`DifferCore/src/inactive.jl`) are the
 rule-author predicates, and unlike the old `NoTangent` encoding **`isactive` is decidable from the
 shadow type in every position** — see `differ-tangent-system` for why `NoTangent` could not do this

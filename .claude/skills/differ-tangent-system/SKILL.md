@@ -25,7 +25,7 @@ Include order, from `DifferCore.jl`: `tangent_utils.jl` → `tangents.jl` → `f
 | `tangent_utils.jl` | Generic helpers the port needs: `@foldable`, `_typeof`, `tuple_map`, `tuple_fill`, `_findall`, `stable_all`, `_map`, `_map_if_assigned!`, `always_initialised`/`is_always_initialised`/`is_always_fully_initialised`, `_new_`, boxed-error printing, base `_copy` methods. |
 | `tangents.jl` | `NoTangent`, `PossiblyUninitTangent`, `Tangent`, `MutableTangent`, `tangent_type(P)`, `zero_tangent`/`randn_tangent`/`increment!!`/`set_to_zero!!`/`_scale`/`_dot`/`_add_to_primal`, `build_tangent`/`get_tangent_field`/`set_tangent_field!`, `as_tangent`/`unit_tangent`, `tangent_to_primal!!`/`primal_to_tangent!!`, `require_tangent_cache`. |
 | `fwds_rvs_data.jl` | The fdata/rdata split: `NoFData`/`FData`/`NoRData`/`RData`, `fdata_type`/`rdata_type`, `fdata`/`rdata`/`tangent(f,r)`, `zero_rdata`/`LazyZeroRData`/`ZeroRData`. |
-| `inactive.jl` | `Inactive` (a value held constant), `shadow_type`, `isactive`/`@ifactive`, and the `Inactive` arms of every operation above. Included after the two files it extends. |
+| `inactive.jl` | `Inactive` (a value held constant), `fdata_shadow_type`/`tangent_shadow_type` (and the deprecated `shadow_type` alias), `isactive`/`@ifactive`, and the `Inactive` arms of every operation above. Included after the two files it extends. |
 | `array_tangents.jl` | Element-wise `Array` tangent *value* ops (`zero_tangent_internal`, `increment_internal!!`, etc. specialised to `Array`). |
 | `shared_ir_helpers.jl` | Small, mode-agnostic IR-inspection helpers used by both `DifferForwards` and `DifferReverse`'s own dualization/pullback engines. No tangent-system logic of its own. |
 
@@ -39,7 +39,8 @@ Exports: `tangent_type`, `fdata_type`, `rdata_type`; `Tangent`, `MutableTangent`
 `PossiblyUninitTangent`, `NoTangent`; `NoFData`, `NoRData`, `FData`, `RData`; `fdata`, `rdata`,
 `tangent`, `primal`, `zero_tangent`, `zero_rdata`, `randn_tangent`; `increment!!`, `set_to_zero!!`;
 `build_tangent`, `get_tangent_field`, `set_tangent_field!`; `as_tangent`, `unit_tangent`;
-`LazyZeroRData`; `Inactive`, `shadow_type`, `isactive`, `@ifactive`.
+`LazyZeroRData`; `Inactive`, `fdata_shadow_type`, `tangent_shadow_type`, `shadow_type`, `isactive`,
+`@ifactive`.
 
 ## `Inactive`: a value held constant
 
@@ -47,13 +48,18 @@ Exports: `tangent_type`, `fdata_type`, `rdata_type`; `Tangent`, `MutableTangent`
 slot has one more legal inhabitant:
 
 ```julia
-shadow_type(P) = Union{fdata_type(tangent_type(P)), Inactive}
+fdata_shadow_type(P)   = Union{fdata_type(tangent_type(P)), Inactive}   # a `CoDual`'s shadow slot
+tangent_shadow_type(P) = Union{tangent_type(P), Inactive}               # a `Dual`'s tangent slot
 ```
+
+One per carrier, because reverse mode carries the fdata half and forward mode the whole tangent.
+`shadow_type` is a deprecated alias for `fdata_shadow_type`, named before forward mode carried
+`Inactive` at all.
 
 **A validity predicate, never a declaration.** Use it in `<:` checks and rule-signature constraints
 only. Every declared slot, field, comms item and SSA type stays concrete — the engine picks the
-concrete alternative from its own per-value activity (`_shadow_types`, `differ-reverse-engine`), so
-no union reaches a hot path.
+concrete alternative from its own per-value activity (`_shadow_types`, `differ-reverse-engine`;
+`_activity`/`_materialized`, `differ-forward-dualization`), so no union reaches a hot path.
 
 **Why not `NoTangent`.** `NoTangent` already means "this *type* has no tangent space", and it is
 closed under the split the wrong way: `fdata_type(NoTangent) === NoFData`, which is also an active
@@ -232,15 +238,21 @@ Element-wise `Array` tangent *value* operations only: `zero_tangent_internal`,
 `Array{tangent_type(P),N}` tangent element-wise, aliasing/circular-reference-aware via the same
 cache convention as the generic scalar/struct implementations in `tangents.jl`.
 
+Plus two `zero_tangent_internal` arms for a bare `Memory{P}`/`MemoryRef{P}` primal, matching the
+same-shape `tangent_type` rules in `tangents.jl`. Nothing asked for one until forward mode's activity
+materialisation did (ISSUES #139); without them the generic struct fallback tries to build a
+`Memory{Float64}` out of its own fields' tangents. The `MemoryRef` arm keeps no cache entry — it is
+immutable, and the underlying `Memory` carries the aliasing identity.
+
 Deliberately **not** ported from Mooncake, still true as of this split:
 
 - Mooncake's `Memory`/`MemoryRef`-internals array path (its `src/rules/memory.jl`), which is fused
   with Mooncake's reverse-mode primitive-rule system (`frule!!`/`rrule!!`/`@is_primitive`) — out of
   scope for `DifferCore`, which has zero rule-system logic of its own. `tangent_type(MemoryRef{P})`/
-  `tangent_type(Memory{P})` (type-level bookkeeping only, needed so `DifferForwards`'s array
-  builtins can type their shadow SSAs) live in `tangents.jl` instead, next to the `Array`/`Ptr`
-  methods — they don't conflict with this file's scope, they're just type-level rather than
-  value-level.
+  `tangent_type(Memory{P})` live in `tangents.jl` instead, next to the `Array`/`Ptr` methods; only
+  their `zero_tangent` counterparts are here. The other value-level operations
+  (`increment_internal!!`, `set_to_zero_internal!!`, …) still have no `Memory` arm — add one when
+  something actually reaches for it, the way #139 did.
 - Mooncake's `AbstractDict`/`AsPrimal` "friendly" tangent path — confirmed absent (no `AsPrimal` or
   `AbstractDict` reference anywhere in `DifferCore`).
 

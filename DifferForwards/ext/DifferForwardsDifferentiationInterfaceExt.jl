@@ -2,9 +2,16 @@ module DifferForwardsDifferentiationInterfaceExt
 
 import DifferentiationInterface as DI
 using DifferForwards: DifferForwards, AutoDifferForwards, Dual, primal, tangent, frule!!, zero_tangent,
-    set_to_zero!!
+    set_to_zero!!, Inactive
 
 DI.check_available(::AutoDifferForwards) = true
+
+# Only `DI.Constant` maps to an inactive `Dual` — not `Cache` (its own docstring example writes an
+# *active* argument into it), not `ConstantOrCache` (conservatively active), not `FunctionContext`
+# (may carry a function with differentiable captures). Never dispatch on `GeneralizedConstant`.
+# Mirrors `_ctx_codual` in the DifferReverse extension.
+_ctx_dual(c::DI.Constant) = Dual(DI.unwrap(c), Inactive())
+_ctx_dual(c::DI.Context) = (v = DI.unwrap(c); Dual(v, zero_tangent(v)))
 
 # ===========================================================================
 # Forward mode: pushforward, built on frule!!/Dual.
@@ -33,12 +40,11 @@ function DI.value_and_pushforward(
         contexts::Vararg{DI.Context,C},
     ) where {F,B,C}
     DI.check_prep(f, prep, backend, x, tx, contexts...)
-    cargs = map(DI.unwrap, contexts)
     # `y` must come out of the closure's return value, not a reassigned outer variable — assigning
     # to a captured variable from inside a closure forces Julia to heap-box it, and a closure that
     # calls out to `frule!!` (non-inlinable) is exactly the case escape analysis can't undo.
     outs = ntuple(Val(B)) do i
-        cduals = map(c -> Dual(c, zero_tangent(c)), cargs)
+        cduals = map(_ctx_dual, contexts)
         yd = frule!!(prep.fdual, Dual(x, tx[i]), cduals...)
         (primal(yd), tangent(yd))
     end
@@ -90,10 +96,9 @@ function DI.value_and_pushforward(
         contexts::Vararg{DI.Context,C},
     ) where {F,B,C}
     DI.check_prep(f!, y, prep, backend, x, tx, contexts...)
-    cargs = map(DI.unwrap, contexts)
     ty = ntuple(Val(B)) do i
         dy = zero_tangent(y)  # fresh per tangent, and zero since y is an output, not an input
-        cduals = map(c -> Dual(c, zero_tangent(c)), cargs)
+        cduals = map(_ctx_dual, contexts)
         frule!!(prep.fdual, Dual(y, dy), Dual(x, tx[i]), cduals...)
         dy
     end
@@ -106,10 +111,9 @@ function DI.value_and_pushforward!(
         contexts::Vararg{DI.Context,C},
     ) where {F,B,C}
     DI.check_prep(f!, y, prep, backend, x, tx, contexts...)
-    cargs = map(DI.unwrap, contexts)
     for i in 1:B
         dy = set_to_zero!!(ty[i])
-        cduals = map(c -> Dual(c, zero_tangent(c)), cargs)
+        cduals = map(_ctx_dual, contexts)
         frule!!(prep.fdual, Dual(y, dy), Dual(x, tx[i]), cduals...)
     end
     return y, ty

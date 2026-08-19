@@ -3,8 +3,8 @@
 # element-wise, aliasing/circular-reference aware via the cache, matching the generic
 # scalar/struct implementations in `tangents.jl`. An `Array{P,N}`'s tangent is
 # `Array{tangent_type(P),N}`, its fdata is itself, and its rdata is `NoRData` (handled generically
-# in `fwds_rvs_data.jl`); Memory/MemoryRef primals themselves are not covered here — their
-# type-level `tangent_type` rules live in `tangents.jl`.
+# in `fwds_rvs_data.jl`). Bare `Memory`/`MemoryRef` primals get value-level `zero_tangent` arms
+# below to match the type-level `tangent_type` rules in `tangents.jl`.
 
 @inline function zero_tangent_internal(x::Array{P,N}, dict::MaybeCache) where {P,N}
     haskey(dict, x) && return dict[x]::tangent_type(typeof(x))
@@ -14,6 +14,23 @@
     return _map_if_assigned!(
         Base.Fix2(zero_tangent_internal, dict), zt, x
     )::Array{tangent_type(P),N}
+end
+
+# A bare `Memory`/`MemoryRef` primal, same shape as its `Array` counterpart above. Reachable once a
+# zero tangent is asked for one directly — forward mode's activity analysis materialises exactly that
+# for a constant array read by an active computation. Without these the generic struct fallback
+# fires and tries to build a `Memory{Float64}` out of its fields' tangents.
+@inline function zero_tangent_internal(x::Memory{P}, dict::MaybeCache) where {P}
+    haskey(dict, x) && return dict[x]::tangent_type(typeof(x))
+
+    zt = Memory{tangent_type(P)}(undef, length(x))
+    dict[x] = zt
+    return _map_if_assigned!(Base.Fix2(zero_tangent_internal, dict), zt, x)::Memory{tangent_type(P)}
+end
+
+# Immutable, so nothing to cache on its own — the underlying `Memory` carries the aliasing identity.
+@inline function zero_tangent_internal(x::MemoryRef{P}, dict::MaybeCache) where {P}
+    return Core.memoryref(zero_tangent_internal(x.mem, dict), Base.memoryrefoffset(x))
 end
 
 function randn_tangent_internal(
