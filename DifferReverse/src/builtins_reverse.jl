@@ -74,6 +74,14 @@ _bi_tracked(@nospecialize(node), ctx) =
 @noinline _rr_zero_fdata(p) = fdata(zero_tangent(p))
 @noinline _rr_build_tangent(::Type{P}, fields...) where {P} = build_tangent(P, fields...)
 
+# Runtime aliasing guard (`_collect_alias_guard_globals` in `reverse_interp.jl`): an active argument
+# that is identically a module global reverse mode replays as a constant would otherwise get a
+# silently wrong gradient. `@noinline` for the usual carrier-embedding reason above.
+@noinline function _rr_check_global_alias(argval, gv, msg::String)
+    argval === gv && error(msg)
+    return nothing
+end
+
 # Save/restore of a `Memory` slot that may not be assigned yet: a fresh array's `Core.memorynew`
 # leaves every slot undefined, so `memoryrefset!`'s read of the value it overwrites throws
 # `UndefRefError` for a non-`isbits` element. Restoring `nothing` leaves the slot undefined, which is

@@ -1779,6 +1779,51 @@ function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
     return arg_active, active
 end
 
+# Runtime aliasing guard, collection half. A global read is replayed as a constant (see `presolve`'s
+# `GlobalRef` arm below) — sound for a genuinely separate object, silently wrong if the caller
+# differentiates w.r.t. the very object a global aliases. Finds every `GlobalRef` the primal reads
+# (as a bare statement or as an operand embedded in another statement) whose resolved value has a
+# non-trivial fdata — a mutable global holding a `Bool`/`Symbol`/other untangented value needs no
+# guard, only one with caller-visible shadow state does. `reverse_fwds_to_ircode` emits one check per
+# (global, active argument whose declared type could hold it) pair found this way.
+#
+# Only direct argument identity is checked — aliasing through a container (`x[1] === gv`) is not
+# detected.
+function _collect_alias_guard_globals(pir, iworld::UInt)
+    targets = Tuple{GlobalRef,Any}[]
+    seen = Set{GlobalRef}()
+    visit(@nospecialize node) = begin
+        isa(node, GlobalRef) || return nothing
+        node in seen && return nothing
+        push!(seen, node)
+        ok, gv = _globalref_val(node, iworld)
+        (ok && fdtype(iworld, _typeof(gv)) !== NoFData) && push!(targets, (node, gv))
+        return nothing
+    end
+    for i in 1:length(pir.stmts)
+        s = pir.stmts[i][:stmt]
+        visit(s)
+        if isa(s, Expr)
+            for a in s.args
+                visit(a)
+            end
+        elseif isa(s, Core.ReturnNode)
+            isdefined(s, :val) && visit(s.val)
+        elseif isa(s, Core.GotoIfNot)
+            visit(s.cond)
+        elseif isa(s, Core.PiNode)
+            visit(s.val)
+        elseif isa(s, Core.PhiNode) || isa(s, Core.PhiCNode)
+            for j in 1:length(s.values)
+                isassigned(s.values, j) && visit(s.values[j])
+            end
+        elseif isa(s, Core.UpsilonNode)
+            isdefined(s, :val) && visit(s.val)
+        end
+    end
+    return targets
+end
+
 # Whether `node` is a transparent view onto a value the caller declared constant, walking the
 # same steps `_fc_ptr_origin` recognizes (in the opposite direction, so the two must stay in step).
 # Never through a `PhiNode`: a phi merging an inactive edge with an active one is active, and must
@@ -2977,6 +3022,29 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
         carg[i] = ci
         parg[i] = emit!(Expr(:call, getf, ci, 1), Pi)
         Fi !== NoFData && (farg[i] = emit!(Expr(:call, getf, ci, 2), Fi))
+    end
+    # --- Runtime aliasing guard: an active argument identically equal to a mutable, tangent-carrying
+    # global the primal reads would get a silently wrong gradient (the global is replayed as a
+    # constant — see `presolve`'s `GlobalRef` arm below). Nothing is emitted unless some global
+    # qualifies (`_collect_alias_guard_globals`) *and* some active argument's declared type could
+    # actually hold it — the common case (no such global, or none type-compatible) costs zero
+    # statements. An `Inactive`-declared argument is skipped: aliasing a constant global with a
+    # constant argument is harmless. ---
+    alias_targets = _collect_alias_guard_globals(pir, iworld)
+    if !isempty(alias_targets)
+        flat_arg_active = _arg_active(iworld, n, codualparams)
+        for (gr, gv) in alias_targets
+            GT = _typeof(gv)
+            for i in 2:n
+                flat_arg_active[i] || continue
+                Pi = _codual_primal_type(codualparams[i])
+                GT <: Pi || continue
+                msg = "argument $(i - 1) aliases the module global $(gr.mod).$(gr.name), which " *
+                      "reverse mode treats as a constant — gradients w.r.t. it would be silently " *
+                      "wrong; pass the object as an argument everywhere instead"
+                icall!(_rr_check_global_alias, Nothing, (Pi, GT, String), parg[i], gv, msg)
+            end
+        end
     end
     # `carg`/`args_tup_ssa`/`ArgsTT` stay flat: the tape and the pullback's return arity are keyed
     # by the caller's actual argument list.
