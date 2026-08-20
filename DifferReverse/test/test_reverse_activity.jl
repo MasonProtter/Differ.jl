@@ -4,6 +4,7 @@ using DifferReverse: rev_gradient, value_and_gradient!, increment!!,
                      _intrinsic_needed_operands, intrinsic_rrule_deps,
                      code_reverse_fwds_ircode, rrule!!
 using LinearAlgebra: dot
+using SpecialFunctions: besselj
 import DifferentiationInterface as DI
 include("testutils.jl")
 
@@ -1034,4 +1035,97 @@ end
     @test err isa ErrorException
     # Pins that the arity check is what fired, not some unrelated error.
     @test occursin("3-element tuple of rdatas", err.msg)
+end
+
+@testset "activity: NoPullback hands back NoRData for a constant argument" begin
+    NoPullback = DifferReverse.NoPullback
+    pb = NoPullback(zero_fcodual(sin), zero_fcodual(1.0), const_codual(2.0),
+                    const_codual([1.0, 2.0]))
+    @test pb(NoRData()) == (NoRData(), 0.0, NoRData(), NoRData())
+    # No constant arguments: every slot keeps its lazily-built zero rdata.
+    @test NoPullback(zero_fcodual(sin), zero_fcodual(1.0))(NoRData()) == (NoRData(), 0.0)
+end
+
+# A statically-known code constant whose tangent is fdata-free reaches a rule callsite as
+# `CoDual{P,Inactive}`, not as an active zero. Nothing can write to such a constant, so its shadow
+# could only ever stay zero; `Inactive` says the same thing and lets a widened rule skip the term.
+
+@noinline const_scaleadd(a, x) = a * x + sin(x) * a
+const_literal_call(x) = const_scaleadd(2.5, x)
+
+@noinline const_mulc(a, x) = a * x
+function const_literal_loop(x)
+    s = 0.0
+    for i in 1:3
+        s += const_mulc(2.5, x * i)
+    end
+    return s
+end
+
+@noinline function const_fill_scaled!(out, a, x)
+    for i in eachindex(out)
+        out[i] = a * x * i
+    end
+    return nothing
+end
+function const_literal_store(x)
+    out = zeros(3)
+    const_fill_scaled!(out, 2.5, x)
+    return sum(out)
+end
+
+@noinline const_weightdot(w::NTuple{2,Float64}, x) = w[1]*x + w[2]*x*x
+const_literal_tuple(x) = const_weightdot((2.0, 3.0), x)
+
+@testset "activity: a literal operand reaches a hand rule as `Inactive`" begin
+    # `besselj`'s order has no implemented derivative, so the rule refuses a live shadow in that
+    # slot. A literal order does not carry one: the rule sees `CoDual{Float64,Inactive}` and
+    # `_no_param_rdata` answers `NoRData()`.
+    f(x) = besselj(1.5, x)
+    g = rev_gradient(f, 1.3)
+    @test length(g) == 2                     # only the real argument gets a gradient slot
+    @test isfinite(g[2])
+    @test g[2] ≈ central_diff(f, 1.3) rtol = 1e-6
+    checkverify_rev(f, (Float64,))
+
+    # Present in the carrier, not merely implied by the answer. Checked on the pre-inlining IR: a
+    # hand rule's callsite is opted into inlining, which then folds the `%new` away.
+    interp = DifferReverse.build_reverse_interp()
+    impl_tt = Tuple{typeof(DifferReverse.reverse_fwds_impl),
+                    DifferReverse.fcodual_type(DifferReverse._typeof(f)),
+                    Ctx{Nothing}, CoDual{Float64,NoFData}}
+    match, _ = Core.Compiler.findsup(impl_tt, Core.Compiler.method_table(interp))
+    impl_mi = Base.specialize_method(match.method, match.spec_types, match.sparams)
+    ir = DifferReverse.build_reverse_fwds_ir(interp, impl_mi)
+    @test ir !== nothing
+    # Types print module-qualified from a `@safetestset` module, so match tolerantly.
+    @test occursin(r"CoDual\{(?:[\w.]+\.)?Float64,\s*(?:[\w.]+\.)?Inactive\}", string(ir))
+end
+
+@testset "activity: a literal operand reaches a derived callee as `Inactive`" begin
+    @test rev_gradient(const_literal_call, 1.3)[2] ≈ 2.5 + 2.5cos(1.3) rtol = 1e-12
+    checkverify_rev(const_literal_call, (Float64,))
+    # A derived callee's `:invoke` is never inlined, so its argument coduals survive optimization.
+    ir = code_reverse_fwds_ircode(const_literal_call, (Float64,))[1]
+    @test occursin(r"CoDual\{(?:[\w.]+\.)?Float64,\s*(?:[\w.]+\.)?Inactive\}", string(ir))
+
+    # A literal aggregate qualifies too: `Tuple{Float64,Float64}`'s tangent is fdata-free, so the
+    # whole tuple is handed on as one constant rather than a zero-filled shadow tuple.
+    @test rev_gradient(const_literal_tuple, 1.3)[2] ≈ 2.0 + 6.0*1.3 rtol = 1e-12
+    ir2 = string(code_reverse_fwds_ircode(const_literal_tuple, (Float64,))[1])
+    @test occursin(r"%new\((?:[\w.]+\.)?CoDual\{Tuple\{Float64, ?Float64\},\s*(?:[\w.]+\.)?Inactive\}",
+                   ir2)
+    checkverify_rev(const_literal_tuple, (Float64,))
+end
+
+@testset "activity: a masked literal still works for a demanding consumer" begin
+    # Loop-carried: the callsite runs once per iteration and its result feeds the accumulator phi.
+    @test rev_gradient(const_literal_loop, 1.3)[2] ≈ 15.0 rtol = 1e-12
+    checkverify_rev(const_literal_loop, (Float64,))
+    check_stack_balance(const_literal_loop, 1.3)
+
+    # The masked literal flows into a mutating store inside the callee, whose destination is the
+    # caller's own array — the shadow-chain path, not just scalar rdata routing.
+    @test rev_gradient(const_literal_store, 1.3)[2] ≈ 15.0 rtol = 1e-12
+    checkverify_rev(const_literal_store, (Float64,))
 end

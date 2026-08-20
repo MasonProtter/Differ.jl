@@ -221,7 +221,8 @@ declares every nested call's result slot at `tangent_type(R)` before the callee 
 same entanglement #138 describes. Forward signatures leave the tangent parameter free, so a rule
 that has *not* been widened still matches and fails inside its body; `test_forward_rule_activity.jl`
 audits every method under every activity mask, including that no rule has been added without a
-fixture. `ext/rules_ad_runtime.jl`'s reverse-runtime rules are in the same table: their value slots
+fixture. A fixture can also name a `frozen` slot — a parameter with no implemented derivative, such
+as a Bessel order — which the rule must refuse when handed a nonzero tangent. `ext/rules_ad_runtime.jl`'s reverse-runtime rules are in the same table: their value slots
 materialise a zero rather than skipping, because a push must pair with a pop whatever the pushed
 value's activity.
 

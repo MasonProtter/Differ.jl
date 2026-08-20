@@ -41,13 +41,16 @@ end
 function rrule!!(
     ::CoDual{typeof(LinearAlgebra.norm),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Vector{Float64},Vector{Float64}},
+    (; x, dx)::CoDual{Vector{Float64},<:Union{Vector{Float64},Inactive}},
 )
     nrm = norm(x)
+    xactive = isactive(dx)
     function norm_pullback(dy)
-        c = dy / nrm
-        for i in eachindex(x, dx)
-            dx[i] = increment!!(dx[i], c * x[i])
+        if xactive
+            c = dy / nrm
+            for i in eachindex(x, dx)
+                dx[i] = increment!!(dx[i], c * x[i])
+            end
         end
         return (NoRData(), NoRData())
     end
@@ -61,16 +64,19 @@ end
 function rrule!!(
     ::CoDual{typeof(LinearAlgebra.tr),NoFData},
     ::AbstractCtx,
-    (; x, dx)::CoDual{Matrix{Float64},Matrix{Float64}},
+    (; x, dx)::CoDual{Matrix{Float64},<:Union{Matrix{Float64},Inactive}},
 )
+    xactive = isactive(dx)
     n = size(x, 1)
     s = 0.0
     for i in 1:n
         s += x[i, i]
     end
     function tr_pullback(dy)
-        for i in 1:n
-            dx[i, i] = increment!!(dx[i, i], dy)
+        if xactive
+            for i in 1:n
+                dx[i, i] = increment!!(dx[i, i], dy)
+            end
         end
         return (NoRData(), NoRData())
     end

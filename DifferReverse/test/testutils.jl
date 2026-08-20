@@ -1,7 +1,8 @@
-# Shared test infrastructure: IR-verification wrappers and tape-hygiene checks reused across many
-# test files. Not test fixtures — nothing here is itself differentiated. `checkverify` is
-# duplicated from DifferForwards' testutils (one line) because a couple of reverse-mode test files
-# cross-check a reverse-mode bail against forward mode still working fine on the same primal.
+# Shared test infrastructure: IR-verification wrappers, finite-difference checks and tape-hygiene
+# checks reused across many test files. Not test fixtures — nothing here is itself differentiated.
+# `checkverify` is duplicated from DifferForwards' testutils (one line) because a couple of
+# reverse-mode test files cross-check a reverse-mode bail against forward mode still working fine
+# on the same primal.
 
 using Test
 using DifferReverse
@@ -20,6 +21,14 @@ const_codual(x) = DifferReverse.CoDual(x, Inactive())
 arg_codual_types(f, at; inactive=()) =
     DifferReverse._arg_codual_types(Base.get_world_counter(), at,
                                     DifferReverse._inactive_positions(inactive, length(at)))
+
+# The `rrule!!` method a call on these carriers resolves to, and whether that method is the derived
+# `@generated` fallback rather than a hand-written rule. Mirrors the engine's own query
+# (`hand_reverse_rule_match`): the ctx slot is `Ctx{Nothing}`, and every method declares that slot
+# `::AbstractCtx`, so only the callee and argument carriers select the method.
+rrule_method(f, argcds) =
+    which(rrule!!, Tuple{CoDual{typeof(f),NoFData},Ctx{Nothing},map(typeof, argcds)...})
+is_derived_rrule(m::Method) = DifferReverse.is_generated_reverse_fwds_fallback(m)
 
 # Central finite difference, one argument.
 central_diff(f, x; h=1e-6) = (f(x + h) - f(x - h)) / 2h
@@ -168,4 +177,79 @@ function check_tape_size(f, at; bytes::Union{Int,Nothing}=nothing, isbits::Union
     bytes === nothing || @test sum(sizeof, ts; init=0) == bytes
     stacks === nothing || @test length(ts) == stacks
     return ts
+end
+
+# Generic checks for a unary scalar function: reverse gradient against central differences, at
+# every x in xs, plus an IR-legality check. Forward mode's counterpart lives in
+# DifferForwards/test/testutils.jl, whose `check_unary` explains why every check runs against both
+# `f` and a trivial wrapper around it — the wrapper is what makes the transform route the rule at a
+# call site instead of resolving it at the top level. The closure's own gradient slot collapses to
+# `NoRData`, so the returned tuple has the same shape either way.
+function check_unary(f, xs; rtol=1e-6)
+    wrapped(x) = f(x)
+    for g in (f, wrapped), x in xs
+        _, gx = rev_gradient(g, x)
+        @test gx ≈ central_diff(f, x) rtol = rtol
+    end
+    checkverify_rev(wrapped, (Float64,))
+end
+
+# Generic checks for a binary scalar function f(x, y): reverse gradient against central
+# differences, plus an IR-legality check.
+function check_binary(f, xys; rtol=1e-6)
+    wrapped(x, y) = f(x, y)
+    for g in (f, wrapped), (x, y) in xys
+        _, gx, gy = rev_gradient(g, x, y)
+        @test gx ≈ central_diff(f, x, y, 1) rtol = rtol
+        @test gy ≈ central_diff(f, x, y, 2) rtol = rtol
+    end
+    checkverify_rev(wrapped, (Float64, Float64))
+end
+
+# Central difference of a 3-argument function w.r.t. argument k (1, 2, or 3), mirroring
+# `central_diff(f, x, y, k)` above for one more argument.
+function central_diff3(f, x, y, z, k::Int; h=1e-6)
+    if k == 1
+        return (f(x + h, y, z) - f(x - h, y, z)) / 2h
+    elseif k == 2
+        return (f(x, y + h, z) - f(x, y - h, z)) / 2h
+    else
+        return (f(x, y, z + h) - f(x, y, z - h)) / 2h
+    end
+end
+
+# Generic checks for a ternary scalar function f(x, y, z), mirroring `check_binary`.
+function check_ternary(f, xyzs; rtol=1e-6)
+    wrapped(x, y, z) = f(x, y, z)
+    for g in (f, wrapped), (x, y, z) in xyzs
+        _, gx, gy, gz = rev_gradient(g, x, y, z)
+        @test gx ≈ central_diff3(f, x, y, z, 1) rtol = rtol
+        @test gy ≈ central_diff3(f, x, y, z, 2) rtol = rtol
+        @test gz ≈ central_diff3(f, x, y, z, 3) rtol = rtol
+    end
+    checkverify_rev(wrapped, (Float64, Float64, Float64))
+end
+
+# `f(ν, x)` with an integer order: `ν` has no tangent space at all, so only the `x` gradient is
+# checked.
+function check_order(f, ν::Integer, xs; rtol=1e-6)
+    wrapped(ν, x) = f(ν, x)
+    for g in (f, wrapped), x in xs
+        _, _, gx = rev_gradient(g, ν, x)
+        @test gx ≈ central_diff(t -> f(ν, t), x) rtol = rtol
+    end
+    checkverify_rev(wrapped, (typeof(ν), Float64))
+end
+
+# `f(a, x)` with a real parameter whose derivative is not implemented: `a` is held constant, so
+# this goes through `rrule!!` directly rather than `rev_gradient` — the latter has nowhere to say
+# which slot is constant.
+function check_param(f, a::Real, xs; rtol=1e-6)
+    wrapped(a, x) = f(a, x)
+    for g in (f, wrapped), x in xs
+        y, pb = rrule!!(zero_fcodual(g), Ctx(), const_codual(a), CoDual(x, NoFData()))
+        @test primal(y) ≈ f(a, x)
+        @test pb(1.0)[3] ≈ central_diff(t -> f(a, t), x) rtol = rtol
+    end
+    checkverify_rev(wrapped, (typeof(a), Float64); inactive=(1,))
 end

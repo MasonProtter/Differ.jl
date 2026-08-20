@@ -4,56 +4,6 @@ using DifferReverse: rev_gradient, CoDual, NoFData, RData, Ctx, rrule!!, zero_fc
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
-# Generic checks for a unary scalar function: reverse gradient against central differences, at
-# every x in xs, plus an IR-legality check. Forward-mode half of this file's original combined
-# check lives in DifferForwards/test/test_math_rules.jl.
-function check_unary(f, xs; rtol=1e-6)
-    for x in xs
-        _, gx = rev_gradient(f, x)
-        @test gx ≈ central_diff(f, x) rtol = rtol
-    end
-    # See the comment in DifferForwards/test/test_math_rules.jl's `check_unary` for why `f` is
-    # wrapped before verifying.
-    wrapped(x) = f(x)
-    checkverify_rev(wrapped, (Float64,))
-end
-
-# Generic checks for a binary scalar function f(x, y): reverse gradient against central
-# differences, plus an IR-legality check.
-function check_binary(f, xys; rtol=1e-6)
-    for (x, y) in xys
-        _, gx, gy = rev_gradient(f, x, y)
-        @test gx ≈ central_diff(f, x, y, 1) rtol = rtol
-        @test gy ≈ central_diff(f, x, y, 2) rtol = rtol
-    end
-    wrapped(x, y) = f(x, y)
-    checkverify_rev(wrapped, (Float64, Float64))
-end
-
-# Central difference of a 3-argument function w.r.t. argument k (1, 2, or 3). Local to this file,
-# mirroring `central_diff(f, x, y, k)` in `testutils.jl` for one more argument.
-function central_diff3(f, x, y, z, k::Int; h=1e-6)
-    if k == 1
-        return (f(x + h, y, z) - f(x - h, y, z)) / 2h
-    elseif k == 2
-        return (f(x, y + h, z) - f(x, y - h, z)) / 2h
-    else
-        return (f(x, y, z + h) - f(x, y, z - h)) / 2h
-    end
-end
-
-# Generic checks for a ternary scalar function f(x, y, z), mirroring `check_binary`.
-function check_ternary(f, xyzs; rtol=1e-6)
-    for (x, y, z) in xyzs
-        _, gx, gy, gz = rev_gradient(f, x, y, z)
-        @test gx ≈ central_diff3(f, x, y, z, 1) rtol = rtol
-        @test gy ≈ central_diff3(f, x, y, z, 2) rtol = rtol
-        @test gz ≈ central_diff3(f, x, y, z, 3) rtol = rtol
-    end
-    wrapped(x, y, z) = f(x, y, z)
-    checkverify_rev(wrapped, (Float64, Float64, Float64))
-end
-
 @testset "exp/log family" begin
     check_unary(exp, (-1.3, 0.2, 2.5))
     check_unary(log, (0.3, 1.7, 4.2))

@@ -15,8 +15,9 @@
 
 function rrule!!(
     ::CoDual{typeof(Base.getindex),NoFData}, ::AbstractCtx,
-    (; x, dx)::CoDual{X,X}, (; y)::CoDual{M}
+    (; x, dx)::CoDual{X,<:Union{X,Inactive}}, (; y)::CoDual{M}
 ) where {N,X<:Array{<:IEEEFloat,N},M<:AbstractArray{Bool}}
+    xactive = isactive(dx)
     n = count(y)
     out = Vector{eltype(X)}(undef, n)
     k = 0
@@ -31,10 +32,12 @@ function rrule!!(
         # Named `kk`, not `k`: reusing `k` here would capture (and box) the forward pass's own `k`
         # above, rather than declaring a fresh local — `function`-in-`function` doesn't shadow.
         kk = 0
-        for i in eachindex(dx, y)
-            if y[i]
-                kk += 1
-                dx[i] = increment!!(dx[i], dout[kk])
+        if xactive
+            for i in eachindex(dx, y)
+                if y[i]
+                    kk += 1
+                    dx[i] = increment!!(dx[i], dout[kk])
+                end
             end
         end
         return (NoRData(), NoRData(), NoRData())
@@ -44,8 +47,9 @@ end
 
 function rrule!!(
     ::CoDual{typeof(Base.getindex),NoFData}, ::AbstractCtx,
-    (; x, dx)::CoDual{X,X}, (; y)::CoDual{I}
+    (; x, dx)::CoDual{X,<:Union{X,Inactive}}, (; y)::CoDual{I}
 ) where {N,X<:Array{<:IEEEFloat,N},I<:AbstractVector{<:Union{Signed,Unsigned}}}
+    xactive = isactive(dx)
     n = length(y)
     out = Vector{eltype(X)}(undef, n)
     for k in eachindex(y)
@@ -53,9 +57,11 @@ function rrule!!(
     end
     dout = zero_tangent(out)
     function idxvec_getindex_pullback(_)
-        for k in eachindex(y)
-            i = y[k]
-            dx[i] = increment!!(dx[i], dout[k])
+        if xactive
+            for k in eachindex(y)
+                i = y[k]
+                dx[i] = increment!!(dx[i], dout[k])
+            end
         end
         return (NoRData(), NoRData(), NoRData())
     end

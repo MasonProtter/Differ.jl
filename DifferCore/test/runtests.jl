@@ -115,6 +115,17 @@ mutable struct MPoint; x::Float64; y::Float64; end
         @test shadow_type(Vector{Float64}) === Union{Vector{Float64},Inactive}
         @test shadow_type(Float64) === Union{NoFData,Inactive}
 
+        # Which code constants the engines may mint as `Inactive`: those with a tangent space whose
+        # tangent is fdata-free. `NoTangent` primals keep their free collapse; anything with fdata
+        # keeps a zero shadow so a write-then-read still threads gradients.
+        @test inactive_constant_type(Float64)
+        @test inactive_constant_type(ComplexF64)
+        @test inactive_constant_type(Tuple{Float64,Float64})
+        @test !inactive_constant_type(Int)
+        @test !inactive_constant_type(typeof(sin))
+        @test !inactive_constant_type(Vector{Float64})
+        @test !inactive_constant_type(Inactive)
+
         # The mixed-activity tuple arm must not capture homogeneously-typed tuples: those keep the
         # general entry point's aliasing/circular-reference cache. Uncached, a mutable tangent
         # reachable through two slots is counted twice.

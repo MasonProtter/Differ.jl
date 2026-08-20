@@ -69,38 +69,6 @@ _codual_fdata_type(@nospecialize P) = fieldtype(P, 2)
 # ===========================================================================
 
 """
-    rrule!!(fcd::CoDual, ctx::AbstractCtx, argcds::CoDual...) -> (ycd, pullback)
-
-Reverse-mode rule for `primal(fcd)(primal.(argcds)...)`, returning the result as a `CoDual` plus a
-pullback. Call the pullback with an rdata seed for the result to get the tuple of rdatas for
-`(f, args...)`; fdata-carried gradients (arrays, mutable structs) are accumulated in place into the
-`CoDual`s' own shadows instead.
-
-Hand-written primitives (see `src/rrules.jl` for the `sin`/`cos` rules and the shape to follow) are
-methods with a specific `fcd`/`argcds` shape; a composite function is handled by an `@generated`
-fallback that derives the rule from `f`'s IR. `ctx::`[`AbstractCtx`](@ref) carries the tape (build a
-reusable one with [`build_ctx`](@ref)); a hand rule that needs no tape ignores it. A hand rule
-**must** declare its `ctx` slot as `::AbstractCtx` (never a concrete subtype) — that's what keeps
-dispatch against the fallback unambiguous.
-
-Contract for an fdata-carrying result (an array or mutable struct): the returned `CoDual`'s shadow
-must be the exact object the rule's own pullback reads back, never a detached copy — a caller may
-accumulate into it in place before the pullback runs. Every hand-written array rule already
-follows this (`rules_broadcast.jl`, `rules_reductions.jl`, `rules_indexing.jl`, `rules_linalg.jl`).
-"""
-function rrule!! end
-
-"""
-    AbstractCtx
-
-Supertype of reverse-mode differentiation contexts — the argument [`rrule!!`](@ref) threads its
-per-call/per-task state through, chiefly the tape. [`Ctx`](@ref) is the default. Every `rrule!!`
-method dispatches this slot as `::AbstractCtx` (never a concrete subtype), which keeps the
-derived-fallback-vs-hand-rule dispatch ambiguity-free.
-"""
-abstract type AbstractCtx end
-
-"""
     Ctx{P} <: AbstractCtx
 
 The default differentiation context, carrying a pre-allocated tape in `tape::P`.
@@ -1663,7 +1631,7 @@ end
 # untracked-but-differentiable is a real, located bail at the point of use, never silently
 # mishandled.
 #
-# Which arguments carry a derivative. `NoTangent` in a `CoDual`'s shadow slot is the caller declaring
+# Which arguments carry a derivative. `Inactive` in a `CoDual`'s shadow slot is the caller declaring
 # that argument constant; a primal type with no tangent space says the same from the type alone. A
 # non-concrete `codualparams[k]` yields `Any` here, which reads as active — sound.
 #
@@ -2210,11 +2178,18 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
     # resolves and annotate the `%new(CoDual{...}, ...)` the emission side builds — a node-shaped
     # answer would both misresolve the rule and emit IR whose declared type doesn't match the value.
     argtypes = Any[_optype_w(pir, iworld, a) for a in actual]
-    # `mask[j]`: operand `j` is differentiable but has no rdata sink (an inactive value from this
-    # callsite's perspective) — passed to the callee as `CoDual{P,Inactive}` rather than the real
-    # fdata carrier. Restricted to `SSAValue`/`Argument` operands: a literal/`GlobalRef` operand's
-    # contribution is already discarded by `route!` at no cost (`has_sink` is `false` for those too,
-    # for an unrelated reason — no node to accumulate into — so it must not be read as "inactive").
+    # `mask[j]`: operand `j` is differentiable but carries no gradient at this callsite — passed to
+    # the callee as `CoDual{P,Inactive}` rather than a real fdata carrier. Two disjoint tests, one
+    # per operand kind:
+    #  * `SSAValue`/`Argument`: no rdata sink, i.e. nowhere for a contribution to be routed back to.
+    #  * a statically-known code constant (literal, `QuoteNode`, `const` `GlobalRef`): `has_sink` is
+    #    meaningless for these — it answers `false` for the unrelated reason that there is no node to
+    #    accumulate into — so what qualifies them instead is a tangent with no fdata. Nothing can
+    #    write to such a constant, so its shadow could only ever stay zero. A constant whose tangent
+    #    *does* carry fdata (a `const` global array) stays unmasked deliberately: its shadow is
+    #    aliased storage a write inside the callee updates, so it keeps a real one.
+    # Keep the constant arm in step with `DifferCore.inactive_constant_type`, where that policy
+    # lives; it is asked through the world-age funnels here rather than called directly.
     mask = falses(length(argtypes))
     for (j, P) in enumerate(argtypes)
         if !(P isa DataType && isconcretetype(P))
@@ -2230,8 +2205,15 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
             return nothing
         end
         a = actual[j]
-        mask[j] = isa(a, Union{Core.SSAValue,Core.Argument}) && _tt(iworld, P) !== NoTangent &&
-                  !has_sink(a)
+        mask[j] = if isa(a, Union{Core.SSAValue,Core.Argument})
+            _tt(iworld, P) !== NoTangent && !has_sink(a)
+        else
+            # `_calleeval !== nothing` is what makes `presolve(a)` at the emission site embed a real
+            # value: a non-`const` `GlobalRef` has none (it is already rejected above, since
+            # `_optype_w` reports it as `Any`), and neither does a binding whose lookup throws.
+            _calleeval(a, iworld) !== nothing && _tt(iworld, P) !== NoTangent &&
+                fdtype(iworld, P) === NoFData
+        end
         if !mask[j] && mixed_shadow(a)
             # The recursion glue declares each unmasked argument codual at the primal-derived fdata
             # type; a value whose shadow is a mixed-activity tuple (a packed vararg tail with some

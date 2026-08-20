@@ -303,3 +303,57 @@ end
     @test_throws MethodError code_dual_ircode(sxy, (Float64, Float64); inactive=[2])
     checkverify(sxy, (Float64, Float64); inactive=2)   # a bare Int is accepted
 end
+
+# A statically-known operand whose tangent has no fdata (a float literal, a `const` global scalar)
+# is minted `Dual{P,Inactive}` at a call, exactly like a caller-declared constant argument. A
+# demanding consumer — an intrinsic, a builtin, a `%new` — still gets a materialised zero, since it
+# reads the tangent structurally rather than dispatching on it.
+@noinline litmix(a, b) = a*b + a/b            # no hand rule: reached through the derived fallback
+struct LitPair
+    a::Float64
+    b::Float64
+end
+@noinline litnew(x) = LitPair(x, 2.5)
+
+lit_hand(x)  = atan(x, 2.5)                   # two-arg `atan` has a hand rule
+lit_derived(x) = litmix(x, 2.5)
+lit_intr(x)  = x*2.5 + 1.5                    # both literals consumed by intrinsics
+lit_field(x) = (p = litnew(x); p.a * p.b)
+
+# Types print module-qualified inside a `SafeTestset`, so match around the qualifiers.
+const inactive_lit_new = r"%new\((\w+\.)?Dual\{Float64, (\w+\.)?Inactive\}, 2\.5, (\w+\.)?Inactive\(\)\)"
+
+@testset "activity: a float literal is minted Inactive at a call" begin
+    x = 1.25
+    # (i) a hand rule.
+    d = frule!!(Dual(lit_hand, NoTangent()), Dual(x, 1.0))
+    @test d.x ≈ lit_hand(x)
+    @test d.dx ≈ 2.5/(x^2 + 2.5^2)
+    ir, _ = code_dual_ircode(lit_hand, (Float64,))
+    stmts = [sprint(show, ir.stmts[i][:stmt]) for i in 1:length(ir.stmts)]
+    @test any(s -> occursin(inactive_lit_new, s), stmts)
+    @test !any(s -> occursin("zero_tangent", s), stmts)
+    checkverify(lit_hand, (Float64,))
+
+    # (ii) the derived fallback of a composite callee.
+    d = frule!!(Dual(lit_derived, NoTangent()), Dual(x, 1.0))
+    @test d.x ≈ lit_derived(x)
+    @test d.dx ≈ 2.5 + 1/2.5
+    ir, _ = code_dual_ircode(lit_derived, (Float64,))
+    stmts = [sprint(show, ir.stmts[i][:stmt]) for i in 1:length(ir.stmts)]
+    @test any(s -> occursin(inactive_lit_new, s), stmts)
+    checkverify(lit_derived, (Float64,))
+
+    # (iii) demanding consumers keep their zero: an intrinsic reads the operand's tangent directly,
+    # and so does the `%new` building a struct's `Tangent`.
+    d = frule!!(Dual(lit_intr, NoTangent()), Dual(x, 1.0))
+    @test d.x ≈ lit_intr(x)
+    @test d.dx ≈ 2.5
+    ir, _ = code_dual_ircode(lit_intr, (Float64,))
+    @test !any(occursin("Inactive", sprint(show, ir.stmts[i][:stmt])) for i in 1:length(ir.stmts))
+
+    d = frule!!(Dual(lit_field, NoTangent()), Dual(x, 1.0))
+    @test d.x ≈ lit_field(x)
+    @test d.dx ≈ 2.5
+    checkverify(lit_field, (Float64,))
+end

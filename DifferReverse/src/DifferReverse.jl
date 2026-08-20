@@ -32,7 +32,9 @@ import DifferCore: DifferCore, NoTangent, Inactive, NoFData, NoRData, FData, RDa
     _getfieldg, _setfieldg, _ctupleg, _ifelseg,
     _fc_parse, _fc_stmt, _fc_ptr_origin, _fc_same_stride, _fc_check_extent,
     _fc_copy_sig_ok, _FC_COPY_ATS, isactive, @ifactive, _require_active_dest, _inactive_positions,
-    _call_parts, _act_ptr_deref, _act_container_result
+    _call_parts, _act_ptr_deref, _act_container_result,
+    CoDual, rrule!!, AbstractCtx, codual_type, fcodual_type, zero_codual, uninit_codual,
+    to_fwds, zero_fcodual, uninit_fcodual, NoPullback, _codual_internal, extract
 
 # `Reverse` is the plugin owner type identifying DifferReverse to `Contextual`'s
 # `ContextualInterpreter{T,S}`. `owner` doubles as the `cache_owner` partition key, so
@@ -56,7 +58,6 @@ function build_reverse_interp(; world::UInt=Base.get_world_counter(),
     return ContextualInterpreter(Reverse(nested_forward), custom_state; world, inf_params, opt_params)
 end
 
-include("codual.jl")
 include("stack.jl")
 include("cfg_ir.jl")
 include("intrinsics_reverse.jl")

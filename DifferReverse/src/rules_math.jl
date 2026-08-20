@@ -9,9 +9,10 @@
 # exp
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(exp),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+function rrule!!(::CoDual{typeof(exp),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
     y = exp(x)
-    exp_pullback(dy) = (NoRData(), y*dy)
+    exp_pullback(dy) = (NoRData(), @ifactive(dx, y*dy))
     CoDual(y, NoFData()), exp_pullback
 end
 
@@ -19,8 +20,9 @@ end
 # log
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(log),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    log_pullback(dy) = (NoRData(), dy/x)
+function rrule!!(::CoDual{typeof(log),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    log_pullback(dy) = (NoRData(), @ifactive(dx, dy/x))
     CoDual(log(x), NoFData()), log_pullback
 end
 
@@ -28,8 +30,9 @@ end
 # log1p
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(log1p),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    log1p_pullback(dy) = (NoRData(), dy/(1+x))
+function rrule!!(::CoDual{typeof(log1p),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    log1p_pullback(dy) = (NoRData(), @ifactive(dx, dy/(1+x)))
     CoDual(log1p(x), NoFData()), log1p_pullback
 end
 
@@ -37,8 +40,9 @@ end
 # expm1
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(expm1),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    expm1_pullback(dy) = (NoRData(), exp(x)*dy)
+function rrule!!(::CoDual{typeof(expm1),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    expm1_pullback(dy) = (NoRData(), @ifactive(dx, exp(x)*dy))
     CoDual(expm1(x), NoFData()), expm1_pullback
 end
 
@@ -46,8 +50,9 @@ end
 # log2
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(log2),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    log2_pullback(dy) = (NoRData(), dy/(x*log(2)))
+function rrule!!(::CoDual{typeof(log2),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    log2_pullback(dy) = (NoRData(), @ifactive(dx, dy/(x*log(2))))
     CoDual(log2(x), NoFData()), log2_pullback
 end
 
@@ -55,8 +60,9 @@ end
 # log10
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(log10),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    log10_pullback(dy) = (NoRData(), dy/(x*log(10)))
+function rrule!!(::CoDual{typeof(log10),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    log10_pullback(dy) = (NoRData(), @ifactive(dx, dy/(x*log(10))))
     CoDual(log10(x), NoFData()), log10_pullback
 end
 
@@ -64,9 +70,10 @@ end
 # exp2
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(exp2),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+function rrule!!(::CoDual{typeof(exp2),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
     y = exp2(x)
-    exp2_pullback(dy) = (NoRData(), y*log(2)*dy)
+    exp2_pullback(dy) = (NoRData(), @ifactive(dx, y*log(2)*dy))
     CoDual(y, NoFData()), exp2_pullback
 end
 
@@ -74,9 +81,10 @@ end
 # exp10
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(exp10),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+function rrule!!(::CoDual{typeof(exp10),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
     y = exp10(x)
-    exp10_pullback(dy) = (NoRData(), y*log(10)*dy)
+    exp10_pullback(dy) = (NoRData(), @ifactive(dx, y*log(10)*dy))
     CoDual(y, NoFData()), exp10_pullback
 end
 
@@ -84,19 +92,22 @@ end
 # sinh / cosh / tanh
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(sinh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    sinh_pullback(dy) = (NoRData(), cosh(x)*dy)
+function rrule!!(::CoDual{typeof(sinh),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    sinh_pullback(dy) = (NoRData(), @ifactive(dx, cosh(x)*dy))
     CoDual(sinh(x), NoFData()), sinh_pullback
 end
 
-function rrule!!(::CoDual{typeof(cosh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    cosh_pullback(dy) = (NoRData(), sinh(x)*dy)
+function rrule!!(::CoDual{typeof(cosh),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    cosh_pullback(dy) = (NoRData(), @ifactive(dx, sinh(x)*dy))
     CoDual(cosh(x), NoFData()), cosh_pullback
 end
 
-function rrule!!(::CoDual{typeof(tanh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+function rrule!!(::CoDual{typeof(tanh),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
     y = tanh(x)
-    tanh_pullback(dy) = (NoRData(), (1-y^2)*dy)
+    tanh_pullback(dy) = (NoRData(), @ifactive(dx, (1-y^2)*dy))
     CoDual(y, NoFData()), tanh_pullback
 end
 
@@ -104,18 +115,21 @@ end
 # asinh / acosh / atanh
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(asinh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    asinh_pullback(dy) = (NoRData(), dy/sqrt(x^2+1))
+function rrule!!(::CoDual{typeof(asinh),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    asinh_pullback(dy) = (NoRData(), @ifactive(dx, dy/sqrt(x^2+1)))
     CoDual(asinh(x), NoFData()), asinh_pullback
 end
 
-function rrule!!(::CoDual{typeof(acosh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    acosh_pullback(dy) = (NoRData(), dy/sqrt(x^2-1))
+function rrule!!(::CoDual{typeof(acosh),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    acosh_pullback(dy) = (NoRData(), @ifactive(dx, dy/sqrt(x^2-1)))
     CoDual(acosh(x), NoFData()), acosh_pullback
 end
 
-function rrule!!(::CoDual{typeof(atanh),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    atanh_pullback(dy) = (NoRData(), dy/(1-x^2))
+function rrule!!(::CoDual{typeof(atanh),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    atanh_pullback(dy) = (NoRData(), @ifactive(dx, dy/(1-x^2)))
     CoDual(atanh(x), NoFData()), atanh_pullback
 end
 
@@ -123,13 +137,15 @@ end
 # asin / acos
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(asin),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    asin_pullback(dy) = (NoRData(), dy/sqrt(1-x^2))
+function rrule!!(::CoDual{typeof(asin),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    asin_pullback(dy) = (NoRData(), @ifactive(dx, dy/sqrt(1-x^2)))
     CoDual(asin(x), NoFData()), asin_pullback
 end
 
-function rrule!!(::CoDual{typeof(acos),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    acos_pullback(dy) = (NoRData(), -dy/sqrt(1-x^2))
+function rrule!!(::CoDual{typeof(acos),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    acos_pullback(dy) = (NoRData(), @ifactive(dx, -dy/sqrt(1-x^2)))
     CoDual(acos(x), NoFData()), acos_pullback
 end
 
@@ -137,8 +153,9 @@ end
 # atan (1-arg and 2-arg)
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(atan),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    atan_pullback(dy) = (NoRData(), dy/(1+x^2))
+function rrule!!(::CoDual{typeof(atan),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    atan_pullback(dy) = (NoRData(), @ifactive(dx, dy/(1+x^2)))
     CoDual(atan(x), NoFData()), atan_pullback
 end
 
@@ -156,9 +173,10 @@ end
 # cbrt
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(cbrt),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+function rrule!!(::CoDual{typeof(cbrt),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
     y = cbrt(x)
-    cbrt_pullback(dy) = (NoRData(), dy/(3*y^2))
+    cbrt_pullback(dy) = (NoRData(), @ifactive(dx, dy/(3*y^2)))
     CoDual(y, NoFData()), cbrt_pullback
 end
 
@@ -216,14 +234,15 @@ end
 # off the (re, im) fields, no conjugation) pulls back via conj(f'(z)) * s — the standard adjoint of
 # the real 2x2 Jacobian of a holomorphic map.
 function rrule!!(
-    ::CoDual{typeof(sqrt),NoFData}, ::AbstractCtx, (; z)::CoDual{ComplexF64,NoFData}
+    ::CoDual{typeof(sqrt),NoFData}, ::AbstractCtx,
+    (; z, dz)::CoDual{ComplexF64,<:Union{NoFData,Inactive}}
 )
     y = sqrt(z)
     function sqrt_pullback(dy)
         s = Complex(dy.data.re, dy.data.im)
         fprime = 1/(2*y)
-        dz = conj(fprime)*s
-        return (NoRData(), RData((re=real(dz), im=imag(dz))))
+        g = conj(fprime)*s
+        return (NoRData(), @ifactive(dz, RData((re=real(g), im=imag(g)))))
     end
     CoDual(y, NoFData()), sqrt_pullback
 end
@@ -233,8 +252,9 @@ end
 # a chance to fire. Forward mode already handles them via `src/intrinsics.jl`.
 # ===========================================================================
 
-function rrule!!(::CoDual{typeof(abs),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    abs_pullback(dy) = (NoRData(), sign(x)*dy)
+function rrule!!(::CoDual{typeof(abs),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    abs_pullback(dy) = (NoRData(), @ifactive(dx, sign(x)*dy))
     CoDual(abs(x), NoFData()), abs_pullback
 end
 
@@ -258,8 +278,9 @@ function rrule!!(
     CoDual(min(x, y), NoFData()), min_pullback
 end
 
-function rrule!!(::CoDual{typeof(sign),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    sign_pullback(_) = (NoRData(), 0.0)
+function rrule!!(::CoDual{typeof(sign),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    sign_pullback(_) = (NoRData(), @ifactive(dx, 0.0))
     CoDual(sign(x), NoFData()), sign_pullback
 end
 
@@ -292,13 +313,15 @@ function rrule!!(
     CoDual(muladd(x, y, z), NoFData()), muladd_pullback
 end
 
-function rrule!!(::CoDual{typeof(abs2),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
-    abs2_pullback(dy) = (NoRData(), 2*x*dy)
+function rrule!!(::CoDual{typeof(abs2),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
+    abs2_pullback(dy) = (NoRData(), @ifactive(dx, 2*x*dy))
     CoDual(abs2(x), NoFData()), abs2_pullback
 end
 
-function rrule!!(::CoDual{typeof(inv),NoFData}, ::AbstractCtx, (; x)::CoDual{Float64,NoFData})
+function rrule!!(::CoDual{typeof(inv),NoFData}, ::AbstractCtx,
+                 (; x, dx)::CoDual{Float64,<:Union{NoFData,Inactive}})
     y = inv(x)
-    inv_pullback(dy) = (NoRData(), -y^2*dy)
+    inv_pullback(dy) = (NoRData(), @ifactive(dx, -y^2*dy))
     CoDual(y, NoFData()), inv_pullback
 end

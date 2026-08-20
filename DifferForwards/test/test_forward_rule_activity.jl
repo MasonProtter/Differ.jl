@@ -5,6 +5,7 @@ using DifferForwards: Dual, Inactive, NoTangent, frule!!, primal, tangent, isact
     tangent_type, zero_tangent
 using DifferForwards: is_generated_frule_fallback, randn_tangent
 using LinearAlgebra: dot, norm, tr, mul!
+using SpecialFunctions
 # Loaded so `DifferForwardsOverReverseExt`'s own `frule!!` methods are present and audited too;
 # without it they would silently escape the completeness check below.
 using DifferReverse
@@ -22,15 +23,17 @@ using DifferReverse: Stack, SingletonStack, _bulk_save!, _bulk_restore!
 #
 # The forward half of `TODO.org`'s "automated audit" item; reverse's equivalent is still open.
 
-# A fixture is a thunk (mutating rules need fresh buffers per mask), the callee, and which argument
-# slot — if any — is a destination the rule is expected to *refuse* when declared constant.
+# A fixture is a thunk (mutating rules need fresh buffers per mask), the callee, and the two slots
+# a rule can refuse: `dest`, a destination it must refuse when declared *constant*, and `frozen`, a
+# parameter with no implemented derivative, which it must refuse when handed a live tangent.
 struct Fixture
     name::String
     f::Any
     args::Function
     dest::Union{Int,Nothing}
+    frozen::Union{Int,Nothing}
 end
-Fixture(name, f, args) = Fixture(name, f, args, nothing)
+Fixture(name, f, args; dest=nothing, frozen=nothing) = Fixture(name, f, args, dest, frozen)
 
 const V = [1.0, 2.0, 3.0]
 const W = [0.5, 1.5, 2.5]
@@ -60,21 +63,53 @@ const FIXTURES = Fixture[
     Fixture("tr", tr, () -> (copy(M),)),
     Fixture("*(M,v)", *, () -> (copy(M), [1.0, 2.0])),
     Fixture("*(M,M)", *, () -> (copy(M), copy(M))),
-    Fixture("mul!(v,M,v)", mul!, () -> (zeros(2), copy(M), [1.0, 2.0]), 1),
-    Fixture("mul!(M,M,M)", mul!, () -> (zeros(2, 2), copy(M), copy(M)), 1),
+    Fixture("mul!(v,M,v)", mul!, () -> (zeros(2), copy(M), [1.0, 2.0]); dest=1),
+    Fixture("mul!(M,M,M)", mul!, () -> (zeros(2, 2), copy(M), copy(M)); dest=1),
     # rules_reductions.jl
     Fixture("cumsum", cumsum, () -> (copy(V),)),
     Fixture("extrema", extrema, () -> (copy(V),)),
     # rules_broadcast.jl
     Fixture("map(f,x)", map, () -> (sin, copy(V))),
     Fixture("map(f,x,y)", map, () -> (atan, copy(V), copy(W))),
-    Fixture("map!(f,d,x)", map!, () -> (sin, zeros(3), copy(V)), 2),
-    Fixture("map!(f,d,x,y)", map!, () -> (atan, zeros(3), copy(V), copy(W)), 2),
+    Fixture("map!(f,d,x)", map!, () -> (sin, zeros(3), copy(V)); dest=2),
+    Fixture("map!(f,d,x,y)", map!, () -> (atan, zeros(3), copy(V), copy(W)); dest=2),
     # rules_indexing.jl
     Fixture("getindex(A,mask)", getindex, () -> (copy(V), copy(MASK))),
     Fixture("getindex(A,idx)", getindex, () -> (copy(V), copy(IDX))),
-    Fixture("setindex!(A,v,mask)", setindex!, () -> (copy(V), [9.0, 9.0], copy(MASK)), 1),
-    Fixture("setindex!(A,v,idx)", setindex!, () -> (copy(V), [9.0, 9.0], copy(IDX)), 1),
+    Fixture("setindex!(A,v,mask)", setindex!, () -> (copy(V), [9.0, 9.0], copy(MASK)); dest=1),
+    Fixture("setindex!(A,v,idx)", setindex!, () -> (copy(V), [9.0, 9.0], copy(IDX)); dest=1),
+    # DifferCoreSpecialFunctionsExt — arguments kept inside each function's real domain.
+    unary(airyai, 0.7), unary(airyaix, 0.7), unary(airyaiprime, 0.7), unary(airyaiprimex, 0.7),
+    unary(airybi, 0.7), unary(airybiprime, 0.7),
+    unary(besselj0, 0.7), unary(besselj1, 0.7), unary(bessely0, 0.7), unary(bessely1, 0.7),
+    Fixture("besselj(ν::Int,x)", besselj, () -> (2, 0.7)),
+    Fixture("besseli(ν::Int,x)", besseli, () -> (2, 0.7)),
+    Fixture("bessely(ν::Int,x)", bessely, () -> (2, 0.7)),
+    Fixture("besselk(ν::Int,x)", besselk, () -> (2, 0.7)),
+    Fixture("besselkx(ν::Int,x)", besselkx, () -> (2, 0.7)),
+    Fixture("besselix(ν::Int,x)", besselix, () -> (2, 0.7)),
+    Fixture("besseljx(ν::Int,x)", besseljx, () -> (2, 0.7)),
+    Fixture("besselyx(ν::Int,x)", besselyx, () -> (2, 0.7)),
+    # A real order has a tangent space, and no derivative with respect to it is implemented.
+    Fixture("besselj(ν::Float64,x)", besselj, () -> (1.5, 0.7); frozen=1),
+    unary(dawson, 0.7),
+    unary(gamma, 0.7), unary(loggamma, 0.7), unary(digamma, 0.7), unary(trigamma, 0.7),
+    unary(invdigamma, 0.7),
+    Fixture("polygamma(m,x)", polygamma, () -> (2, 0.7)),
+    Fixture("beta", beta, () -> (1.5, 2.5)),
+    Fixture("logbeta", logbeta, () -> (1.5, 2.5)),
+    Fixture("gamma(a,x)", gamma, () -> (1.5, 0.7); frozen=1),
+    Fixture("loggamma(a,x)", loggamma, () -> (1.5, 0.7); frozen=1),
+    unary(logabsgamma, 0.7),
+    Fixture("gamma_inc(a,x,IND)", gamma_inc, () -> (1.5, 0.7, 0); frozen=1),
+    unary(erf, 0.7), unary(erfc, 0.7), unary(logerfc, 0.7), unary(erfcx, 0.7),
+    unary(logerfcx, 0.7), unary(erfi, 0.7), unary(erfinv, 0.7), unary(erfcinv, 0.7),
+    Fixture("erf(x,y)", erf, () -> (0.3, 1.2)),
+    unary(expint, 0.7), unary(expintx, 0.7), unary(expinti, 0.7),
+    unary(sinint, 0.7), unary(cosint, 0.7),
+    Fixture("expint(ν,x)", expint, () -> (2, 0.7)),
+    Fixture("expintx(ν,x)", expintx, () -> (2, 0.7)),
+    unary(ellipk, 0.7), unary(ellipe, 0.7),
 ]
 
 # Slots with a tangent space are the ones an activity mask ranges over; the rest can only ever carry
@@ -103,6 +138,13 @@ covered = Set{Method}()
         m = rule_method(fx, duals)
         @test !is_generated_frule_fallback(m)
         push!(covered, m)
+
+        if fx.frozen !== nothing && !(fx.frozen in inactive)
+            # No closed form exists for this parameter's derivative, so a nonzero tangent in
+            # that slot is refused rather than silently contributing nothing.
+            @test_throws ErrorException frule!!(fd, duals...)
+            continue
+        end
 
         if fx.dest !== nothing && fx.dest in inactive
             # A mutating rule overwrites its destination, so the destination's shadow is the
@@ -176,7 +218,8 @@ end
     # several define test-local `frule!!` methods of their own (the world-age and dispatch tests);
     # those are not part of the rule table this audits.
     extmod = Base.get_extension(DifferForwards, :DifferForwardsOverReverseExt)
-    owned(m) = m.module === DifferForwards || m.module === extmod
+    sfmod = Base.get_extension(DifferCore, :DifferCoreSpecialFunctionsExt)
+    owned(m) = m.module === DifferForwards || m.module === extmod || m.module === sfmod
     declared = Set(m for m in methods(frule!!)
                    if owned(m) && !is_generated_frule_fallback(m) && !is_structural(m))
     @test setdiff(declared, covered) == Set{Method}()

@@ -67,7 +67,11 @@ Inactive()))` — and [`code_dual_ircode`](@ref) takes the same `inactive=` posi
 reachable only through constants is replayed primally with no tangent computed at all. A constant
 read by an *active* computation is handed to the rule as `Inactive()` where the rule can take one, so
 the term is skipped rather than multiplied by a zero; elsewhere a zero is materialised at the
-constant's definition. Hand-written rules in both modes accept `Inactive` in any differentiable slot.
+constant's definition. A statically-known code constant — a literal, a `QuoteNode`, a `const`
+`GlobalRef` — is minted `Inactive` too when its tangent carries no fdata ([`inactive_constant_type`](@ref)),
+since nothing can write to it and its shadow could only ever stay zero. Mutable state behind a
+constant keeps a real zero shadow, because a write inside the differentiated function updates it.
+Hand-written rules in both modes accept `Inactive` in any differentiable slot.
 A mutating rule (`mul!`, `map!`, `setindex!`) refuses an inactive *destination* rather than silently
 dropping the derivative flowing from its sources.
 
@@ -76,6 +80,7 @@ Inactive
 fdata_shadow_type
 tangent_shadow_type
 shadow_type
+inactive_constant_type
 isactive
 @ifactive
 ```
