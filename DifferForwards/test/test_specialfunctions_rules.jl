@@ -5,30 +5,6 @@ using SpecialFunctions
 
 include(joinpath(@__DIR__, "testutils.jl"))
 
-# `f(ν, x)` with an integer order: `ν` has no tangent space at all, so only the `x` tangent is
-# checked, and the shadow the transform would hand the rule for `ν` is `NoTangent()`.
-function check_order(f, ν::Integer, xs; rtol=1e-6)
-    for x in xs
-        d = frule!!(Dual(f, NoTangent()), Dual(ν, NoTangent()), Dual(x, 1.0))
-        @test d.x ≈ f(ν, x)
-        @test d.dx ≈ central_diff(t -> f(ν, t), x) rtol = rtol
-    end
-    # See the comment in testutils.jl's `check_unary` for why `f` is wrapped before verifying.
-    wrapped(ν, x) = f(ν, x)
-    checkverify(wrapped, (typeof(ν), Float64))
-end
-
-# `f(a, x)` with a real parameter whose derivative is not implemented: `a` is held constant.
-function check_param(f, a::Real, xs; rtol=1e-6)
-    for x in xs
-        d = frule!!(Dual(f, NoTangent()), const_dual(a), Dual(x, 1.0))
-        @test d.x ≈ f(a, x)
-        @test d.dx ≈ central_diff(t -> f(a, t), x) rtol = rtol
-    end
-    wrapped(a, x) = f(a, x)
-    checkverify(wrapped, (typeof(a), Float64); inactive=(1,))
-end
-
 @testset "airy" begin
     check_unary(airyai, (-1.3, 0.4, 2.0))
     check_unary(airyaiprime, (-1.3, 0.4, 2.0))
