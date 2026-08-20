@@ -562,11 +562,14 @@ Tuple of expressions. The nth computes the rdata backing type of the nth field o
 """
 function rdata_field_types_exprs(::Type{P}) where {P}
     return map(1:fieldcount(P), always_initialised(P)) do n, init
-        Pf = fieldtype(P, n)
+        # `tangent_field_type`, not `tangent_type(fieldtype(P, n))`: a self-referential field is
+        # erased to `Any` in the tangent backing, and recomputing it here would not terminate.
+        # `rdata_type(Any) === Any`, which keeps the two sides in step.
+        T_expr = :(tangent_field_type($P, $n))
         if init
-            return :(rdata_type(tangent_type($Pf)))
+            return :(rdata_type($T_expr))
         else
-            return :(PossiblyUninitTangent{rdata_type(tangent_type($Pf))})
+            return :(PossiblyUninitTangent{rdata_type($T_expr)})
         end
     end
 end
@@ -632,7 +635,12 @@ obtained from `P` alone.
 """
 @foldable @generated function can_produce_zero_rdata_from_type(::Type{P}) where {P}
     if isstructtype(P) && has_definite_fieldcount(P)
-        can_produces = map(_P -> :(can_produce_zero_rdata_from_type($_P)), fieldtypes(P))
+        # A field typed as `P` itself contributes `false` rather than recursing: whether a zero rdata
+        # can be built for the chain behind it depends on how deep the chain runs, which is a
+        # property of the value, not of `P`.
+        can_produces = map(fieldtypes(P)) do _P
+            _is_self_field(P, _P) ? false : :(can_produce_zero_rdata_from_type($_P))
+        end
     else
         can_produces = ()
     end
