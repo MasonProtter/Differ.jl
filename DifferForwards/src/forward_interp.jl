@@ -118,8 +118,16 @@ end
 # The `frule_tt` a hypothetical differentiation of `callee_mi` would resolve against — same shape
 # `frule_codeinstance`/`primal_of_impl` build from a surviving call, but derived from
 # `callee_mi.specTypes` instead. Returns `nothing` for anything the shape doesn't apply to
-# (`Type`-valued parameters, a parameter with no `tangent_type`, …) rather than throwing: `callee_mi`
-# may be an arbitrary callee Julia's compiler discovered, not something Differ validated.
+# (`Type`-valued parameters, …) rather than throwing: `callee_mi` may be an arbitrary callee Julia's
+# compiler discovered, not something Differ validated.
+#
+# Every slot leaves the tangent parameter free (`Dual{P}`, never `Dual{P,tangent_type(P)}`), which
+# is how every hand rule writes its own signature, so `findsup` resolves the same method either way.
+# That keeps this query off `tangent_type` entirely — `src_inlining_policy` asks about every
+# inlining candidate the interpreter sees, most of them Base internals Differ will never
+# differentiate, and `tangent_type` does not terminate on a directly self-referential struct
+# (`Base.ImmutableDict`, held by `IOContext`). The convention is load-bearing here: a rule that
+# pinned its tangent slot would stop being protected from inlining.
 function implicit_frule_tt(interp::ContextualInterpreter, callee_mi::MethodInstance)
     isa(callee_mi.def, Method) || return nothing
     isa(callee_mi.specTypes, DataType) || return nothing   # `UnionAll` sig — see `is_dualized_impl`
@@ -130,17 +138,17 @@ function implicit_frule_tt(interp::ContextualInterpreter, callee_mi::MethodInsta
     try
         # Julia's compilation-signature heuristic collapses a vararg callee's trailing arguments into
         # a single `Vararg{T}`, so `specTypes` doesn't record the call's arity and
-        # `Dual{Vararg{Float64},…}` would throw. Mirror the collapse into the `frule!!` signature as
+        # `Dual{Vararg{Float64}}` would throw. Mirror the collapse into the `frule!!` signature as
         # an open-ended `Vararg` tail instead: `findsup` resolves such a query fine, and a hand rule
         # for a vararg function needs exactly this. An imprecise match only ever restricts (sound).
         rest = Any[params[2:end]...]     # `params[2:end]` is a SimpleVector; need a Vector to `pop!`
         va = !isempty(rest) && isa(last(rest), Core.TypeofVararg) ? pop!(rest) : nothing
-        dualargs = Any[Dual{P,at_world(interp, tangent_type, P)} for P in rest]
+        dualargs = Any[Dual{P} for P in rest]
         if va !== nothing
-            D = Dual{va.T,at_world(interp, tangent_type, va.T)}
+            D = Dual{va.T}
             push!(dualargs, isdefined(va, :N) ? Vararg{D,va.N} : Vararg{D})
         end
-        return Tuple{typeof(frule!!), Dual{ftype,NoTangent}, dualargs...}
+        return Tuple{typeof(frule!!), Dual{ftype}, dualargs...}
     catch
         return nothing
     end
@@ -164,10 +172,31 @@ end
 # fallback, rather than some hand rule, iff its signature is exactly this one.
 is_generated_frule_fallback(m::Method) = m.sig === Tuple{typeof(frule!!), Vararg{Dual}}
 
+# Cheap pre-filter for `has_hand_frule`: could any hand-written `frule!!` match this `ftype` at all?
+# The probe is a superset of every query `implicit_frule_tt` builds, so skipping when only the
+# fallback matches is sound. Mirrors `DifferReverse`'s `_hand_rule_ftype_candidate`; `ftype` alone
+# rejects the overwhelming majority of the callees `src_inlining_policy` asks about.
+function _hand_rule_ftype_candidate(interp::ContextualInterpreter, @nospecialize(ftype))
+    loose_tt = Tuple{typeof(frule!!), Dual{ftype}, Vararg{Any}}
+    matches = CC.findall(loose_tt, CC.method_table(interp))
+    matches === nothing && return true   # unbounded lookup returned "too many" — be conservative
+    for m in matches
+        is_generated_frule_fallback(m.method) || return true
+    end
+    return false
+end
+
 # Does a hand-written `frule!!` (vs. the always-matching generated fallback) apply to a hypothetical
 # differentiation of `callee_mi`? Used by `src_inlining_policy` below to keep such a call from being
 # inlined away before `dualize_to_ircode` can route it through that rule.
 function has_hand_frule(interp::ContextualInterpreter, callee_mi::MethodInstance)
+    isa(callee_mi.def, Method) || return false
+    isa(callee_mi.specTypes, DataType) || return false
+    params = callee_mi.specTypes.parameters
+    isempty(params) && return false
+    ftype = params[1]
+    (ftype isa Type) || return false
+    _hand_rule_ftype_candidate(interp, ftype) || return false
     frule_tt = implicit_frule_tt(interp, callee_mi)
     frule_tt === nothing && return false
     m, _ = CC.findsup(frule_tt, CC.method_table(interp))

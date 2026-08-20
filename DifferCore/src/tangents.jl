@@ -116,13 +116,44 @@ end
     return findfirst(==(s), fieldnames(Tfields))
 end
 
+# Is `P`'s field type `F` a direct reference back to `P` itself (`Base.ImmutableDict`'s
+# `parent::ImmutableDict{K,V}`, a linked list's `next`)? Such a field's tangent type would contain
+# itself, so `tangent_type` recurses forever on it. Direct only: a cycle through another type
+# (`GlobalRef` -> `Core.Binding`) or through a hand override (`Tape` -> `Stack`) is invisible from
+# here and still needs its own `tangent_type` method.
+_is_self_field(P::Type, @nospecialize(F)) = F === P || (F isa Union && P in Base.uniontypes(F))
+
+# Erase a self-referential slot to `Any` instead of recursing. `Any` is a fixed point of
+# `tangent_type`, `fdata_type`, `rdata_type` and `tangent_type(F, R)`, so the fdata/rdata round trip
+# still reconstructs the declared backing exactly; structurally it is the same slot an abstractly
+# typed field has always produced. Everything downstream must read the slot back off
+# `backing_type`/`tangent_field_type` rather than recomputing `tangent_type(fieldtype(P, n))`.
+#
+# Unlike every other slot, an erased one does not type-check what is stored in it, so `build_tangent`
+# would accept e.g. an `Inactive()` there. Nothing routes one in: the only value an erased slot can
+# receive is a tangent of `P` itself, and `P` can never be minted `Inactive` by the forward transform
+# — that needs `fdata_type(tangent_type(P)) === NoFData`, which the erased slot's own `Any` fdata
+# rules out.
 function tangent_field_types_exprs(P::Type)
     tangent_type_exprs = map(fieldtypes(P), always_initialised(P)) do _P, init
-        T_expr = Expr(:call, :tangent_type, _P)
+        T_expr = _is_self_field(P, _P) ? Any : Expr(:call, :tangent_type, _P)
         return init ? T_expr : Expr(:curly, PossiblyUninitTangent, T_expr)
     end
     return tangent_type_exprs
 end
+
+_unwrap_uninit(::Type{PossiblyUninitTangent{T}}) where {T} = T
+_unwrap_uninit(@nospecialize(T::Type)) = T
+
+"""
+    tangent_field_type(P::Type, n::Int)
+
+The tangent type the backing declares for `P`'s `n`th field, with any [`PossiblyUninitTangent`](@ref)
+wrapper removed. `Any` for a self-referential field erased by `tangent_field_types_exprs`. Use this
+anywhere a per-field tangent type is needed: `tangent_type(fieldtype(P, n))` does not terminate on
+such a field, and would disagree with the backing even where it does.
+"""
+tangent_field_type(P::Type, n::Int) = _unwrap_uninit(fieldtype(backing_type(P), n))
 
 # Must be inlined, or the recursion to compute nested tangent types gets slow.
 @generated function tangent_field_types(::Type{P}) where {P}
@@ -447,20 +478,31 @@ end
 
     (isabstracttype(P) || !isconcretetype(P)) && return Any
 
-    # No self-reference guard here, deliberately: a structurally self-referential `P` doesn't
-    # imply non-termination on its own. `GlobalRef`'s cycle (through `Core.Binding`) converges
-    # because every other field is `NoTangent`; `Tape`'s cycle does not, because `Stack`/`Vector`
-    # overrides keep mapping the element type back through `tangent_type`. A static reachability
-    # check can't distinguish the two without computing the fixpoint inference already computes,
-    # and was measured breaking working `GlobalRef` derivation. A self-referential type whose
-    # cycle doesn't converge must get its own `tangent_type` method (see `DifferReverse`'s
-    # `Stack`/`Tape`) or this hangs instead of erroring.
+    # `tangent_field_types_exprs` cuts *direct* self-reference (`fieldtype(P, n) === P`) by erasing
+    # that slot to `Any`. Two other cycle shapes are deliberately not handled here, and still need
+    # their own `tangent_type` method or this hangs instead of erroring:
+    #   * a cycle through another type — `GlobalRef` -> `Core.Binding` -> `GlobalRef`, cut by
+    #     `tangent_type(::Type{Core.Binding}) = NoTangent` above. (`Core.Binding`'s `value::Any` and
+    #     `backedges::Vector{Any}` do not collapse to `NoTangent`, so that method, not convergence,
+    #     is what terminates it.)
+    #   * a cycle routed through a hand override the generic fallback never sees — `Tape`'s, because
+    #     `Stack`/`Vector` map the element type back through `tangent_type` (`DifferReverse`).
+    # Detecting either needs to know which types take this fallback and which take an override, i.e.
+    # a method-table query inside a generator — the world-age pin `at_world` exists for, and what
+    # broke `GlobalRef` derivation when a static reachability check was tried.
 
-    tangent_fields_types_expr = Expr(:curly, Tuple, tangent_field_types_exprs(P)...)
-    T_all_notangent = Tuple{Vararg{NoTangent,fieldcount(P)}}
+    selfmask = map(F -> _is_self_field(P, F), fieldtypes(P))
+    field_type_exprs = tangent_field_types_exprs(P)
+    # An erased slot is `Any`, never `NoTangent`, so it would block the collapse below. Test only the
+    # other fields: `tangent_type(P) = NoTangent` makes the self field's own tangent `NoTangent` too,
+    # so the collapse stays self-consistent. With no self field this is the whole tuple, as before.
+    nonself_exprs = [e for (e, s) in zip(field_type_exprs, selfmask) if !s]
+    tangent_fields_types_expr = Expr(:curly, Tuple, field_type_exprs...)
+    nonself_types_expr = Expr(:curly, Tuple, nonself_exprs...)
+    T_nonself_notangent = Tuple{Vararg{NoTangent,length(nonself_exprs)}}
     return quote
         tangent_field_types_tuple = $tangent_fields_types_expr
-        tangent_field_types_tuple <: $T_all_notangent && return NoTangent
+        $nonself_types_expr <: $T_nonself_notangent && return NoTangent
         bt = NamedTuple{$(fieldnames(P)),tangent_field_types_tuple}
         return $(ismutabletype(P) ? MutableTangent : Tangent){bt}
     end
@@ -600,8 +642,9 @@ end
         if inits[n]
             return :(zero_tangent_internal(getfield(x, $n), d))
         else
-            P_field = fieldtype(P, n)
-            T_field_expr = :(PossiblyUninitTangent{tangent_type($P_field)})
+            # Read the slot off the backing, never `tangent_type(fieldtype(P, n))`: a
+            # self-referential field is erased to `Any` there and would not terminate here.
+            T_field_expr = :(PossiblyUninitTangent{tangent_field_type($P, $n)})
             return quote
                 if isdefined(x, $n)
                     $T_field_expr(zero_tangent_internal(getfield(x, $n), d))
@@ -709,8 +752,9 @@ end
         if inits[n]
             return :(randn_tangent_internal(rng, getfield(x, $n), d))
         else
-            P_field = fieldtype(P, n)
-            T_field_expr = :(PossiblyUninitTangent{tangent_type($P_field)})
+            # Read the slot off the backing, never `tangent_type(fieldtype(P, n))`: a
+            # self-referential field is erased to `Any` there and would not terminate here.
+            T_field_expr = :(PossiblyUninitTangent{tangent_field_type($P, $n)})
             return quote
                 if isdefined(x, $n)
                     $T_field_expr(randn_tangent_internal(rng, getfield(x, $n), d))
@@ -1375,8 +1419,9 @@ end
         if inits[n]
             return :(primal_to_tangent_internal!!(tx.fields[$n], getfield(x, $n), c))
         else
-            P_field = fieldtype(P, n)
-            T_field_expr = :(PossiblyUninitTangent{tangent_type($P_field)})
+            # Read the slot off the backing, never `tangent_type(fieldtype(P, n))`: a
+            # self-referential field is erased to `Any` there and would not terminate here.
+            T_field_expr = :(PossiblyUninitTangent{tangent_field_type($P, $n)})
             return quote
                 if isdefined(x, $n)
                     is_init(tx.fields[$n]) || error(

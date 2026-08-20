@@ -3,14 +3,18 @@
 # DifferForwards.jl/DifferReverse.jl — see those packages' test suites).
 
 using Test
+using Random
 using DifferCore
 using DifferCore: tangent_type, fdata_type, rdata_type, fdata, rdata, tangent, zero_tangent, increment!!
 using DifferCore: Tangent, MutableTangent, NoFData, NoRData, build_tangent
 using DifferCore: NoTangent, require_tangent_cache
 using DifferCore: Inactive, shadow_type, isactive, set_to_zero!!, increment_rdata!!, ZeroRData
+using DifferCore: PossiblyUninitTangent, tangent_field_type, randn_tangent,
+                  can_produce_zero_rdata_from_type
 
 struct Point; x::Float64; y::Float64; end
 mutable struct MPoint; x::Float64; y::Float64; end
+mutable struct CyclicNode; x::Float64; next::CyclicNode; CyclicNode(x::Float64) = new(x); end
 
 @testset "DifferCore.jl" begin
     @testset "tangent_type / fdata_type / rdata_type" begin
@@ -196,5 +200,51 @@ mutable struct MPoint; x::Float64; y::Float64; end
         # Any shadow is valid fdata/rdata for any primal once it is declared inactive.
         @test DifferCore.verify_fdata_type(Vector{Float64}, Inactive) === nothing
         @test DifferCore.verify_rdata_type(Float64, Inactive) === nothing
+    end
+
+    @testset "self-referential types" begin
+        D = Base.ImmutableDict{Symbol,Float64}
+        TD = Tangent{@NamedTuple{
+            parent::PossiblyUninitTangent{Any},
+            key::PossiblyUninitTangent{NoTangent},
+            value::PossiblyUninitTangent{Float64},
+        }}
+        # The `parent::ImmutableDict{K,V}` field is erased to `Any`; without that this recurses
+        # until the stack dies.
+        @test tangent_type(D) === TD
+        @test tangent_field_type(D, 1) === Any        # off the backing, not `tangent_type(D)`
+        @test tangent_field_type(D, 3) === Float64
+        # Reached in practice through `IOContext`'s `dict` field, which is what made compiling
+        # Base's error/`show` machinery under the interpreter blow the stack.
+        @test tangent_type(IOContext{IOBuffer}) isa Type
+
+        d = Base.ImmutableDict(Base.ImmutableDict(D(), :a => 1.0), :b => 2.0)
+        t = zero_tangent(d)
+        @test typeof(t) === TD
+        @test typeof(increment!!(t, zero_tangent(d))) === TD
+        @test typeof(set_to_zero!!(zero_tangent(d))) === TD
+        @test typeof(randn_tangent(Random.default_rng(), d)) === TD
+        # `Any` is a fixed point of all three type functions, so the round trip is exact.
+        @test tangent(fdata(t), rdata(t)) == t
+        # The chain's depth is a property of the value, not of `D`.
+        @test can_produce_zero_rdata_from_type(D) === false
+
+        # Value-level cycles: `zero_tangent`'s cache rebuilds the cycle, and accumulating over it
+        # terminates.
+        n = CyclicNode(3.0)
+        n.next = n
+        TN = MutableTangent{@NamedTuple{x::Float64, next::PossiblyUninitTangent{Any}}}
+        @test tangent_type(CyclicNode) === TN
+        tn = zero_tangent(n)
+        @test DifferCore.val(tn.fields.next) === tn
+        @test typeof(increment!!(tn, zero_tangent(n))) === TN
+
+        # Guard is direct-self-reference only, and must not disturb the two cycle shapes that are
+        # cut by hand: `GlobalRef` -> `Core.Binding` (mutual) is the one in this package.
+        @test tangent_type(GlobalRef) === NoTangent
+        @test tangent_type(Core.Binding) === NoTangent
+        # An ordinary struct is untouched — no erased slot, no change to the collapse rule.
+        @test tangent_type(Point) === Tangent{@NamedTuple{x::Float64, y::Float64}}
+        @test tangent_type(Tuple{Int,Int}) === NoTangent
     end
 end
