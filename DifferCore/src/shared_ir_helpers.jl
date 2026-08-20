@@ -244,3 +244,51 @@ function _fc_copy_sig_ok(fc, ctx, what::String)
                           "types `$(fc.ATs)`")
     return ok
 end
+
+# --- Shared pieces of both engines' `_activity` scans (`DifferForwards`/`DifferReverse`'s own
+# `forward_interp.jl`/`reverse_interp.jl`). The two walkers stay separate — enough of their arms
+# are genuinely mode-specific (Dual/tangent- vs CoDual/fdata-oriented type queries, reverse's
+# mixed-activity vararg-tail and rule-less-builtin exemptions) that a single merged walker would
+# need as many hooks as it saves lines. These are the arms that are byte-identical, or identical
+# up to a mode-supplied hook. ---
+
+# `fpos`/`actual` out of a `:call`/`:invoke` `Expr`.
+_call_parts(s::Expr) = s.head === :invoke ? (s.args[2], @view s.args[3:end]) : (s.args[1], @view s.args[2:end])
+
+# A pointer-typed statement, or a load/store through one, is unconditionally active: what the
+# address addresses is outside static analysis, so how the address was computed does not bound
+# what reading through it depends on. Without this, e.g. `unsafe_load(Ptr{Float64}(u))` for a
+# `u::UInt` (no tangent space, hence inactive) comes out inactive and is silently mishandled.
+function _act_ptr_deref(@nospecialize(s), iworld)
+    (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || return false
+    fpos, _ = _call_parts(s)
+    f = _calleeval(fpos, iworld)
+    return f === Core.Intrinsics.pointerref || f === Core.Intrinsics.pointerset ||
+           f === Core.Intrinsics.atomic_pointerref || f === Core.Intrinsics.atomic_pointerset ||
+           f === Core.Intrinsics.atomic_pointerswap || f === Core.Intrinsics.atomic_pointermodify ||
+           f === Core.Intrinsics.atomic_pointerreplace
+end
+
+# Whether a (widened) type can carry caller-visible mutable shadow state: the same test
+# `fdata_shadow_type`/`CoDual` use for "this needs real shadow storage, not just a value copied
+# through" — `fdata_type(tangent_type(T)) !== NoFData`. A plain differentiable scalar (`Float64`)
+# answers `false` (its fdata is `NoFData`, all information rides in the rdata half); a mutable
+# struct/`Array`/`Memory`, or an immutable type with such a thing nested inside it, answers `true`.
+#
+# Used to make a composite call/invoke an activity root regardless of operand activity when its
+# result could be a fresh mutable container — e.g. a `@noinline` allocation helper behind a
+# function barrier, called with only constant arguments. A store never propagates activity
+# backward into where a container came from, so without this the container is misclassified
+# constant and an active value later written into it is lost.
+#
+# `tt`/`ft` are the caller's tangent/fdata-type queries. `is_composed_carrier(W)` excludes a mode's
+# own higher-order self-tangent carrier (forward's `Dual{T,T}` composing over itself) from being
+# treated as a fresh user-level container — that type has no `fdata_type` method, and a statement
+# typed with it is composed machinery, not something a store could allocate.
+function _act_container_result(@nospecialize(T), tt, ft, is_composed_carrier)
+    T isa Type || return false
+    T === Union{} && return false
+    W = tt(T)
+    (W isa Type && !is_composed_carrier(W)) || return false
+    return ft(W) !== NoFData
+end

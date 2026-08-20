@@ -113,7 +113,7 @@ execution, and a `Stack` never deallocates, so after the first execution the slo
 in already holds a structurally identical tape — the emission site hands that one to the callee (via
 `Ctx{P}` with a concrete `P`, not `Ctx{Nothing}`) instead of allocating fresh (`_inner_ctx`,
 `src/stack.jl`). Any `P` other than `Nothing` is this shape: a tape whose stacks are reset and reused
-per call — either the caller's own top-level tape (`build_ctx(...; prealloc=true)`) or a callee's
+per call — either the caller's own top-level tape (`build_ctx`) or a callee's
 recycled one. Build a top-level one with [`build_ctx`](@ref).
 """
 struct Ctx{P} <: AbstractCtx
@@ -159,12 +159,19 @@ mutable struct Tape{ArgsTT<:Tuple,CS<:Tuple}
     # constructed, even with no self-recursive call (a fresh-tape-construction cost, not a
     # steady-state one).
     const subtapes::Stack{Tape{ArgsTT,CS}}
+    # Trip counts for counted loops: one `Int64` per loop-exit event instead of one block-stack
+    # `Int32` per iteration. A dedicated stack (not the block stack) so the count's width is
+    # independent of the block stack's, and so count pushes never interleave with block-id pushes
+    # on one stack's LIFO order. Sits before `args` so the shorter constructor can leave only
+    # `args` undef (only trailing fields can be).
+    const count_stack::Stack{Int64}
     args::ArgsTT
     Tape{ArgsTT,CS}(block_stack, comms, bufs=_NO_BULK_BUFS,
-                    subtapes=Stack{Tape{ArgsTT,CS}}()) where {ArgsTT<:Tuple,CS<:Tuple} =
-        new{ArgsTT,CS}(block_stack, comms, bufs, subtapes)    # `args` deliberately left undef
-    Tape{ArgsTT,CS}(block_stack, comms, bufs, subtapes, args) where {ArgsTT<:Tuple,CS<:Tuple} =
-        new{ArgsTT,CS}(block_stack, comms, bufs, subtapes, args)
+                    subtapes=Stack{Tape{ArgsTT,CS}}(),
+                    count_stack=Stack{Int64}()) where {ArgsTT<:Tuple,CS<:Tuple} =
+        new{ArgsTT,CS}(block_stack, comms, bufs, subtapes, count_stack)  # `args` left undef
+    Tape{ArgsTT,CS}(block_stack, comms, bufs, subtapes, count_stack, args) where {ArgsTT<:Tuple,CS<:Tuple} =
+        new{ArgsTT,CS}(block_stack, comms, bufs, subtapes, count_stack, args)
 end
 
 # `Tape` needs a hand-written `tangent_type` under forward-over-reverse: it's where the forward
@@ -209,6 +216,7 @@ function set_to_zero_internal!!(c::SetToZeroCache, x::Tape)
     x.block_stack.position = 0
     tuple_map(s -> set_to_zero_internal!!(c, s), x.comms)
     x.subtapes.position = 0
+    x.count_stack.position = 0
     return x
 end
 
@@ -333,8 +341,8 @@ end
 # `tt` calls tangent_type on every argtype, unsafe for arbitrary callees `src_inlining_policy`
 # probes: the generic-struct fallback isn't guaranteed to terminate on a self-referential type
 # (`DifferCore/src/tangents.jl`). `has_hand_reverse_rule` guards via `_hand_rule_ftype_candidate` first.
-function hand_reverse_rule_match(interp::ContextualInterpreter, @nospecialize(ftype), argtypes)
-    tt = Tuple{typeof(rrule!!),CoDual{ftype,NoFData},Ctx{Nothing},(_fcdtype(interp.world, P) for P in argtypes)...}
+function hand_reverse_rule_match(interp::ContextualInterpreter, @nospecialize(ftype), argcodualtys)
+    tt = Tuple{typeof(rrule!!),CoDual{ftype,NoFData},Ctx{Nothing},argcodualtys...}
     m, _ = CC.findsup(tt, CC.method_table(interp))
     (m === nothing || !isa(m.method, Method)) && return nothing
     is_generated_reverse_fwds_fallback(m.method) && return nothing
@@ -384,32 +392,39 @@ function has_hand_reverse_rule(interp::ContextualInterpreter, callee_mi::MethodI
               "argument while building a reverse-mode pass")
     # Skip callees no hand rule could apply to before touching argtypes' tangent_type.
     _hand_rule_ftype_candidate(interp, ftype) || return false
-    return hand_reverse_rule_match(interp, ftype, argtypes) !== nothing
+    argcodualtys = Any[_fcdtype(interp.world, P) for P in argtypes]
+    return hand_reverse_rule_match(interp, ftype, argcodualtys) !== nothing
 end
 
-# Is `mi` itself a `reverse_fwds_impl`/`reverse_pullback_impl` specialization — the target of one of
-# Part 1's recursive `:invoke`s (`reverse_fwds_recursive_ci`/`reverse_pullback_recursive_ci`), hand-
-# written rule or generated fallback alike? A hand rule's body is typically small (e.g. one `sin(x)`
-# call) — small enough that Julia's ordinary cost heuristic would happily inline it, unlike the
-# generated fallback (always sizable) or forward mode's `frule!!` hand rules for the same functions
-# (which call two transcendentals — `Dual(sin(x), cos(x)*dx)` — comfortably over the inlining
-# threshold, so this hazard never arose there). Inlining one back into its recursive caller is never
-# correct here: the inlined statements carry GlobalRefs resolved relative to the callee's own defining
-# module (confirmed empirically — a `sin(x)` call inside a hand rule in `src/rrules.jl` inlines as
-# `GlobalRef(Differ, :sin)`, not `GlobalRef(Base, :sin)`), which `Core.Compiler.verify_ir` rejects as
-# an "unbound or partitioned GlobalRef... in value position" once re-embedded in the caller's own
-# compiled unit. So every recursive carrier invoke must stay a genuine `:invoke`, never inlined,
-# regardless of apparent cost.
+# Is `mi` itself a `reverse_fwds_impl`/`reverse_pullback_impl`/`rrule!!` invoke — the target of one of
+# Part 1's recursive `:invoke`s, or a call to `rrule!!` (hand-written or the derived fallback)? All
+# three stay genuine `:invoke`s by default. The first two: recursion — inlining would unfold the
+# transform's own call graph at compile time. `rrule!!`: `has_hand_reverse_rule` below reads
+# `mi.specTypes.parameters[1]` as the *differentiated primal's* ftype, so a surviving `rrule!!` invoke
+# is the only evidence that a primal called `rrule!!` itself (reverse-over-reverse) — inlining it away
+# before that scan runs would hide the evidence, and the derived fallback's body is too large for
+# ordinary cost-based inlining to matter anyway.
 #
-# Covers the two carriers and the hand-written `rrule!!` primitives. A hand-written pullback has no
-# common supertype to test (it's a method on the closure's own compiler-generated type), so those
-# are blocked at the call site instead: the emitted pullback-recursion `:invoke` carries
-# `CC.IR_FLAG_NOINLINE`, which `resolve_todo` honours regardless of the callee's type.
+# The one opt-out: `reverse_fwds_to_ircode`'s own hand-rule recursive-call emission sets
+# `CC.IR_FLAG_INLINE` on that specific `:invoke` (never under `nested_forward`), and
+# `CC.src_inlining_policy` honours that flag before falling through to this blanket block. A
+# `rrule!!` call embedded in ordinary primal source never carries the flag, so it stays protected.
+#
+# A hand-written pullback has no common supertype to test (it's a method on the closure's own
+# compiler-generated type), so its own recursive calls are blocked at the call site instead: the
+# emitted pullback-recursion `:invoke` carries `CC.IR_FLAG_NOINLINE` there when needed (see the
+# `pb_derived`/`nested_forward` logic further down).
 _is_reverse_carrier_mi(mi::MethodInstance) = isa(mi.def, Method) && isa(mi.specTypes, DataType) &&
     !isempty(mi.specTypes.parameters) &&
     (mi.specTypes.parameters[1] === typeof(reverse_fwds_impl) ||
      mi.specTypes.parameters[1] === typeof(reverse_pullback_impl) ||
      mi.specTypes.parameters[1] === typeof(rrule!!))
+
+# Is `mi` a hand-written `rrule!!` method (not the `@generated` derived fallback)? Used at the
+# `reverse_fwds_to_ircode` emission site to decide whether to opt a call in via `CC.IR_FLAG_INLINE`.
+_is_hand_rrule_mi(mi::MethodInstance) = isa(mi.def, Method) && isa(mi.specTypes, DataType) &&
+    !isempty(mi.specTypes.parameters) && mi.specTypes.parameters[1] === typeof(rrule!!) &&
+    !is_generated_reverse_fwds_fallback(mi.def)
 
 # ---------------------------------------------------------------------------
 # Coupling-point hooks: reverse-over-forward rejection and nested-forward frule protection
@@ -442,7 +457,9 @@ _foreign_has_hand_frule(interp, @nospecialize(mi)) = false
 
 # Never inline a call whose callee has a hand-written reverse-mode rule (so it survives into the
 # primal IR for `_static_recursible_call`'s recursion dispatch), and never inline a recursive
-# reverse-mode carrier invoke once emitted (`_is_reverse_carrier_mi` above).
+# reverse-mode carrier invoke once emitted (`_is_reverse_carrier_mi` above) — except a specific
+# `:invoke` this transform opted in itself via `CC.IR_FLAG_INLINE` (`_is_hand_rrule_mi`'s emission
+# site in `reverse_fwds_to_ircode`), checked first so it bypasses the blanket block below.
 #
 # `_nested_forward_protects_frule` (above) adds a third condition, active only when this interp was
 # built to compile a reverse-mode carrier on behalf of an outer forward-over-reverse dualization:
@@ -451,8 +468,15 @@ _foreign_has_hand_frule(interp, @nospecialize(mi)) = false
 # surviving call. Always `false` for the ordinary (non-nested) reverse path.
 function CC.src_inlining_policy(interp::ContextualInterpreter{Reverse}, mi::MethodInstance,
                                 @nospecialize(src), @nospecialize(info::CC.CallInfo), stmt_flag::UInt32)
-    (_is_reverse_carrier_mi(mi) || has_hand_reverse_rule(interp, mi)) && return false
-    _nested_forward_protects_frule(interp, mi) && return false
+    # Opted in: skip our own blocks and defer entirely to the ordinary policy, which itself checks
+    # `is_stmt_inline(stmt_flag)` — this also gets `src`'s own validity check for free (`nothing`,
+    # i.e. no cached inferred source, must still refuse rather than crash `retrieve_ir_for_inlining`).
+    opted_in = _is_hand_rrule_mi(mi) && CC.is_stmt_inline(stmt_flag)
+    if !opted_in
+        _is_reverse_carrier_mi(mi) && return false
+        has_hand_reverse_rule(interp, mi) && return false
+        _nested_forward_protects_frule(interp, mi) && return false
+    end
     return @invoke CC.src_inlining_policy(interp::CC.AbstractInterpreter, mi::MethodInstance,
                                           src::Any, info::CC.CallInfo, stmt_flag::UInt32)
 end
@@ -460,14 +484,14 @@ end
 # Build a minimal IRCode whose only effect is to `error(msg)` when invoked, installed via the same
 # `finishinfer!`/`optimize` path as a real reverse-mode body. Works for either carrier's argument
 # shape (`_impl_argtypes` below).
-function reverse_error_ircode(impl_mi::MethodInstance, msg::String)
+function reverse_error_ircode(interp, impl_mi::MethodInstance, msg::String)
     stream = CC.InstructionStream(2)
     stream.stmt[1] = Expr(:call, error, msg); stream.type[1] = Union{}; stream.flag[1] = CC.IR_FLAG_NULL
     stream.stmt[2] = Core.ReturnNode();       stream.type[2] = Union{}; stream.flag[2] = CC.IR_FLAG_NULL
     cfg = CC.CFG(CC.BasicBlock[CC.BasicBlock(CC.StmtRange(1, 2), Int[], Int[])], Int[3])
     di = CC.DebugInfoStream(stream.line)
     di.def = impl_mi
-    ir = CC.IRCode(stream, cfg, di, _impl_argtypes(impl_mi), Expr[], CC.VarState[])
+    ir = CC.IRCode(stream, cfg, di, _impl_argtypes(impl_mi), Expr[], CC.VarState[], carrier_world_range(interp))
     CC.verify_ir(ir)
     return ir
 end
@@ -494,7 +518,7 @@ function build_contextual_ir(interp::ContextualInterpreter{Reverse}, mi::MethodI
         interp.transformed_edges[mi] = edges
         if ir === nothing
             interp.custom_state.bail_reasons[mi] = reason[]   # so a recursing caller can report *this* reason
-            return reverse_error_ircode(mi, reason[])
+            return reverse_error_ircode(interp, mi, reason[])
         end
         return ir
     elseif is_reverse_pullback_impl(mi)
@@ -504,7 +528,7 @@ function build_contextual_ir(interp::ContextualInterpreter{Reverse}, mi::MethodI
         interp.transformed_edges[mi] = edges
         if ir === nothing
             interp.custom_state.bail_reasons[mi] = reason[]
-            return reverse_error_ircode(mi, reason[])
+            return reverse_error_ircode(interp, mi, reason[])
         end
         return ir
     end
@@ -562,8 +586,24 @@ end
 function _packed_codualparams(iworld::UInt, codualparams::Vector{Any}, nfixed::Int)
     nfixed < 0 && return codualparams
     tailP = Tuple{(_codual_primal_type(P) for P in codualparams[(nfixed + 1):end])...}
-    return Any[codualparams[1:nfixed]..., _fcdtype(iworld, tailP)]
+    TailF = _packed_tail_shadow_type(iworld, codualparams, nfixed)
+    packed = TailF === fdtype(iworld, tailP) ? _fcdtype(iworld, tailP) : CoDual{tailP,TailF}
+    return Any[codualparams[1:nfixed]..., packed]
 end
+
+# The type the packed tail's shadow is declared at: the primal-derived fdata type when every
+# trailing argument is active (keeping the `NoFData` collapse), else the per-element tuple with
+# `Inactive` in the constant slots — concrete either way, narrower than the primal-derived type in
+# the mixed case. Shared between `_packed_codualparams` and `_pack_vararg_args!` so the declared
+# slot type and the emitted tuple's type cannot disagree.
+function _packed_tail_shadow_type(iworld::UInt, codualparams::Vector{Any}, nfixed::Int)
+    tail = (nfixed + 1):length(codualparams)
+    if any(k -> _codual_fdata_type(codualparams[k]) === Inactive, tail)
+        return Tuple{(_codual_fdata_type(codualparams[k]) for k in tail)...}
+    end
+    return fdtype(iworld, Tuple{(_codual_primal_type(codualparams[k]) for k in tail)...})
+end
+
 
 # Packs a prologue's own flat `parg`/`farg` (positions `nfixed+1:end`) into one slot at
 # `nfixed+1` and truncates both to packed length. Shared between the fwds and pullback prologues.
@@ -575,21 +615,58 @@ function _pack_vararg_args!(emit!::F, ctuple, parg::Vector{Any}, farg::Vector{An
     # Read the flat tail before resizing: with zero trailing arguments, `nfixed+1` is one past
     # `parg`/`farg`'s current length, so the slot doesn't exist to assign into until after `resize!`.
     packed_primal = emit!(Expr(:call, ctuple, (parg[k] for k in (nfixed + 1):n)...), tailP)
-    tailFT = fdtype(iworld, tailP)
+    tailFT = _packed_tail_shadow_type(iworld, codualparams, nfixed)
     packed_fdata = if tailFT === NoFData
         # `tangent_type` collapses an all-`NoTangent`/`Tuple{}` tail to `NoTangent`, so this needs
         # the literal `NoFData()` — an emitted `Core.tuple(NoFData(), ...)` has type
         # `Tuple{NoFData,...}`, not `NoFData`.
         NoFData()
     else
+        # A constant trailing argument's slot gets an `Inactive()` literal, matching the `Inactive`
+        # slot `_packed_tail_shadow_type` declared for it.
         emit!(Expr(:call, ctuple,
-            ((isassigned(farg, k) ? farg[k] : NoFData()) for k in (nfixed + 1):n)...), tailFT)
+            ((_codual_fdata_type(codualparams[k]) === Inactive ? Inactive() :
+              isassigned(farg, k) ? farg[k] : NoFData()) for k in (nfixed + 1):n)...), tailFT)
     end
     resize!(parg, nfixed + 1)
     resize!(farg, nfixed + 1)
     parg[nfixed + 1] = packed_primal
     farg[nfixed + 1] = packed_fdata
     return nothing
+end
+
+# Widens an already-resolved shadow value `sval` (primal `pval`, primal type `P`) from its own,
+# possibly-mixed-activity type `SF` up to the full primal-derived fdata type `FT`, materializing a
+# real zero (`_rr_zero_fdata`) for each constant slot — recursively, so a *nested* mixed tuple
+# (`t2 = (t1, y)` where `t1 = (x, c)` is itself mixed) widens all the way down rather than emitting
+# a `getfield` typed at `FT`'s slot while the value it reads still carries `SF`'s narrower one, one
+# level down (the same declared-vs-actual lie this whole mechanism exists to close). `SF`/`FT` are
+# always the same shape wherever they differ (`_shadow_types` only ever narrows a slot to
+# `Inactive`, never restructures the tuple), so any other mismatch is an internal error, not a
+# normal bail — it means the two disagree about which value this even is.
+function _widen_shadow_val!(emit!::E, icall!::I, getf, ctuple, @nospecialize(pval), @nospecialize(sval),
+                            @nospecialize(P), @nospecialize(SF), @nospecialize(FT)) where {E,I}
+    SF === FT && return sval
+    SF === Inactive && return icall!(_rr_zero_fdata, FT, (P,), pval)
+    if !(SF isa DataType && SF <: Tuple && FT isa DataType && FT <: Tuple &&
+         P isa DataType && P <: Tuple && fieldcount(SF) == fieldcount(FT) == fieldcount(P))
+        error("Differ internal error: cannot widen a mixed shadow of type $(SF) to $(FT) " *
+              "(primal type $(P)) — shapes disagree")
+    end
+    vals = Vector{Any}(undef, fieldcount(FT))
+    for j in 1:fieldcount(FT)
+        FTj = fieldtype(FT, j)
+        SFj = fieldtype(SF, j)
+        if SFj === FTj
+            vals[j] = emit!(Expr(:call, getf, sval, j), FTj)
+        else
+            Pj = fieldtype(P, j)
+            pfield = emit!(Expr(:call, getf, pval, j), Pj)
+            sfield = SFj === Inactive ? nothing : emit!(Expr(:call, getf, sval, j), SFj)
+            vals[j] = _widen_shadow_val!(emit!, icall!, getf, ctuple, pfield, sfield, Pj, SFj, FTj)
+        end
+    end
+    return emit!(Expr(:call, ctuple, vals...), FT)
 end
 
 # Splits the packed tail's one rdata accumulator (`arg_ref_id[nfixed+1]`) back across a flat
@@ -905,15 +982,23 @@ end
 # — governs whether `b` needs to pop the block stack.
 # ===========================================================================
 function _unique_predecessor_info(pir, exit_blocks::Vector{Int}, unreachable::AbstractVector{Bool},
-                                  regions::Dict{Int,Int}, quiet::Set{Int})
+                                  regions::Dict{Int,Int}, quiet::Set{Int},
+                                  served_edges::Set{NTuple{2,Int}}=Set{NTuple{2,Int}}())
     nblocks = length(pir.cfg.blocks)
     preds = [filter(!=(0), pir.cfg.blocks[b].preds) for b in 1:nblocks]
     succs = [pir.cfg.blocks[b].succs for b in 1:nblocks]
 
+    # Per-edge push predicate: `b` pushes on `b -> s` iff `s`'s arrival is genuinely ambiguous and
+    # the edge isn't served by some other disambiguation mechanism (`served_edges`): a counted
+    # loop's trip count (`_counted_loops` — both edges into a counted header are resolved by the
+    # countdown) or an implied merge's branch direction (`_implied_merges` — both edges into the
+    # merge are resolved by which arm of the downstream branch the reverse walk arrives from).
+    needs_push(b, s) = length(preds[s]) > 1 && (b, s) ∉ served_edges
+
     is_unique_pred = falses(nblocks)
     for b in 1:nblocks
         ss = succs[b]
-        is_unique_pred[b] = !isempty(ss) && all(s -> length(preds[s]) == 1, ss)
+        is_unique_pred[b] = !isempty(ss) && all(s -> !needs_push(b, s), ss)
     end
     # A lone reachable exit is the only way control can leave the function, so it's a de facto
     # unique predecessor of "the pullback's entry routing" even though `succs[b]` is empty for it.
@@ -1031,6 +1116,342 @@ function _collapsible_regions(pir, unreachable::AbstractVector{Bool},
 end
 
 # ===========================================================================
+# Counted loops: compress a single-latch loop's block-stack traffic to one trip count.
+#
+# For a reducible single-latch natural loop, the header's only arrival ambiguity is "preheader or
+# latch", and the pop sequence the pullback would see is fully determined by the number of back-edge
+# traversals `C`: the latch, `C` times, then the preheader once. So instead of pushing a block id on
+# every edge into the header (one `Int32` per iteration), the forwards carrier maintains a synthetic
+# `Int64` counter phi at the header — `c = φ(preheader ⇒ 0, latch ⇒ c+1)` — and pushes the phi's
+# value once, on the loop-exit edge, onto the tape's dedicated `count_stack`. The pullback pops that
+# count where its reverse walk enters the loop region and runs a countdown instead of popping per
+# arrival: the header's reverse block takes the latch arm while the countdown is positive and the
+# preheader arm at zero.
+#
+# The count rides its own `Stack{Int64}`, not the block stack: the exiting block's own
+# disambiguation push (when its in-loop arm is also ambiguous) would otherwise contend with the
+# count for one stack's LIFO order, and `Int64` makes overflow unreachable — compression is exactly
+# what makes >2^31 iterations affordable, since an eligible comms-free loop's tape becomes O(1).
+#
+# Like the per-edge push split below, this is a two-sided change: the forwards suppression
+# (`_unique_predecessor_info`'s `counted_edges` + the counter/relay stages of
+# `_split_ambiguous_block_pushes`) and the pullback's counted dispatch
+# (`reverse_pullback_to_ircode`) must always agree, or replay desynchronizes into silently wrong
+# gradients for any loop iterating >= 2 times.
+# ===========================================================================
+
+struct CountedLoop
+    header::Int       # loop header `h`: the back edge's target, dominating the whole body
+    latch::Int        # the single back-edge source `l`
+    preheader::Int    # `h`'s unique predecessor outside the body
+    exiting::Int      # the single body block `x` with an edge leaving the body
+    exit_target::Int  # that edge's target `e` (outside the body)
+    inloop_succ::Int  # `x`'s other successor (inside the body)
+end
+
+# The edges whose block-stack pushes the counted scheme replaces: both arrivals at each header.
+function _counted_edges(counted::Vector{CountedLoop})
+    edges = Set{NTuple{2,Int}}()
+    for cl in counted
+        push!(edges, (cl.preheader, cl.header))
+        push!(edges, (cl.latch, cl.header))
+    end
+    return edges
+end
+
+"""
+    _counted_loops(pir, unreachable, regions, quiet)::Vector{CountedLoop}
+
+Natural loops of `pir` eligible for trip-count compression. A loop qualifies iff: it has exactly
+one back edge (single latch); the header has exactly two predecessors (the outside preheader and
+the latch); exactly one edge leaves the body toward code that can still return, from a
+`GotoIfNot`-terminated block; all six characteristic blocks are reachable and the exit target
+isn't the entry block; and none of the boundary blocks participate in a collapsible region
+(`regions`/`quiet`), whose pullback routing overrides would silently reroute around the counted
+dispatch. An edge into throw-only code (a target that cannot reach a valued return — every
+bounds-checked array access in the body has one) is not an exit the scheme has to serve: a call
+that takes it never runs the pullback, so no count is ever popped, and the prologue reset keeps an
+aborted forwards pass from corrupting a reused tape. Anything that doesn't qualify keeps the
+ordinary per-edge push/pop scheme — this analysis only ever removes traffic from loops it can
+prove simple, never guesses.
+"""
+function _counted_loops(pir, unreachable::AbstractVector{Bool},
+                        regions::Dict{Int,Int}, quiet::Set{Int})::Vector{CountedLoop}
+    cfg = pir.cfg
+    nb = length(cfg.blocks)
+    preds = [filter(!=(0), cfg.blocks[b].preds) for b in 1:nb]
+    succs = [cfg.blocks[b].succs for b in 1:nb]
+    dt = CC.construct_domtree(cfg.blocks)
+
+    # Backwards reachability from every valued return: `can_return[b]` iff some path from `b` ends
+    # in a real `return` rather than a throw. Transitive, so a multi-block throw path (error
+    # construction spread over several blocks) is recognized whole, not just its final
+    # `unreachable`-terminated block.
+    can_return = falses(nb)
+    worklist = Int[]
+    for b in 1:nb
+        if !unreachable[b] && isa(pir.stmts[cfg.blocks[b].stmts.stop][:stmt], Core.ReturnNode)
+            can_return[b] = true
+            push!(worklist, b)
+        end
+    end
+    while !isempty(worklist)
+        b = pop!(worklist)
+        for p in preds[b]
+            (1 <= p <= nb && !can_return[p]) || continue
+            can_return[p] = true
+            push!(worklist, p)
+        end
+    end
+
+    latches = Dict{Int,Vector{Int}}()   # header -> back-edge sources
+    for b in 1:nb, s in succs[b]
+        (1 <= s <= nb) || continue
+        CC.dominates(dt, s, b) && push!(get!(Vector{Int}, latches, s), b)
+    end
+
+    loops = CountedLoop[]
+    for h in sort!(collect(keys(latches)))
+        length(latches[h]) == 1 || continue
+        l = only(latches[h])
+        # Natural loop body: `h` plus everything reaching `l` without passing through `h`.
+        body = falses(nb)
+        body[h] = true
+        worklist = Int[l]
+        while !isempty(worklist)
+            x = pop!(worklist)
+            (1 <= x <= nb) || continue
+            body[x] && continue
+            body[x] = true
+            append!(worklist, preds[x])
+        end
+        length(preds[h]) == 2 || continue
+        p = preds[h][1] == l ? preds[h][2] : preds[h][1]
+        (p != l && !body[p]) || continue
+        exits = NTuple{2,Int}[]
+        for b in 1:nb
+            body[b] || continue
+            for s in succs[b]
+                (1 <= s <= nb && !body[s] && can_return[s]) && push!(exits, (b, s))
+            end
+        end
+        length(exits) == 1 || continue
+        x, e = only(exits)
+        length(succs[x]) == 2 || continue
+        s_in = succs[x][1] == e ? succs[x][2] : succs[x][1]
+        (s_in != e && body[s_in]) || continue
+        e == 1 && continue
+        any(b -> unreachable[b], (h, l, p, x, s_in, e)) && continue
+        # `h` or `s_in` may be a collapsible region's *entry* (the bounds compare often lands right
+        # in the header, or in the first body block): the region forcing only concerns that block's
+        # outgoing diamond pushes, while the counted scheme only touches `h`'s incoming edges and
+        # never references `s_in` at all — and neither can be a region interior (`h` has two
+        # predecessors; `s_in` is only shape sanity). `x` and `e` stay excluded: `x` hosts the count
+        # push and `e`'s reverse arm hosts the pop, so their routing must be the ordinary kind.
+        any(in(quiet), (x, e)) && continue
+        any(b -> haskey(regions, b), (h, s_in, e)) && continue
+        push!(loops, CountedLoop(h, l, p, x, e, s_in))
+    end
+    return loops
+end
+
+# ===========================================================================
+# Implied merges: recover a merge's predecessor from the reverse walk's own direction.
+#
+# The `iterate`-end diamond every `for` loop lowers to merges two arms at a block `m` whose
+# following branch is decided by a value like `not_int(φ(#a ⇒ true, #b ⇒ false))` — the branch
+# direction is a pure function of which predecessor fired. The pullback's reverse walk already
+# knows that direction: its arms into the branch block's reverse code are per-successor. So
+# neither edge into `m` needs a block-stack push; instead, each reverse arm into the branch
+# block's reverse code stores the predecessor it implies into a per-merge `Ref{Int32}` cell, and
+# `m`'s reverse block dispatches on the cell instead of popping. This is what takes a `for` loop's
+# residual per-iteration block-stack traffic (left after counted-loop compression) to zero.
+#
+# The merge and the branch may be different blocks: iterator-protocol lowering routinely puts the
+# `φ(… ⇒ false, … ⇒ true)` merge and the `GotoIfNot` one or two blocks apart, connected by a
+# single-predecessor/single-successor chain. The chain's shape is what keeps the scheme sound:
+# every visit of `m` reaches the branch exactly once, and the reverse routing from the branch back
+# to `m` is unconditional, so between the arm's store and `m`'s read only that visit's own reverse
+# code runs.
+#
+# Like the counted-loop scheme this is a two-sided change — the forwards suppression (via
+# `served_edges`) and the pullback's cell store/dispatch must always agree — but unlike it the
+# forwards carrier needs no new instrumentation at all: it just stops pushing on the two edges.
+# ===========================================================================
+
+struct ImpliedMerge
+    merge::Int      # m: the 2-predecessor merge whose push/pop pair is eliminated
+    branch::Int     # d: the GotoIfNot block whose direction implies m's predecessor (may be m)
+    dest_pred::Int  # m's pred when d takes its `dest` arm (condition evaluated false)
+    fall_pred::Int  # m's pred when d falls through (condition evaluated true)
+end
+
+# The edges whose block-stack pushes the implied-merge scheme replaces: both arrivals at each merge.
+function _implied_edges(implied::Vector{ImpliedMerge})
+    edges = Set{NTuple{2,Int}}()
+    for im in implied
+        push!(edges, (im.dest_pred, im.merge))
+        push!(edges, (im.fall_pred, im.merge))
+    end
+    return edges
+end
+
+# Abstract values for `_branch_cond_eval`: a known constant is represented by itself, an unknown
+# value by its widened type, and `_CondBail` poisons the whole evaluation (an unassigned phi edge,
+# a value cycle). `_CondUnknown`/`_CondBail` instances never appear as primal IR constants, so the
+# three cases can't be confused.
+struct _CondUnknown
+    typ::Type
+end
+struct _CondBail end
+
+# Evaluate `node` under the assumption that block `m` was entered from predecessor `P`, using only
+# statements inside `region` (the m -> branch chain); anything defined outside is unknown-by-type.
+# Deliberately narrow: `φ`-at-`m` leaves, chain-block phis, `PiNode`s, `not_int`, and `===` (via
+# egal's type-disjointness/singleton rules) are the whole language — a genuinely data-dependent
+# condition evaluates to unknown and disqualifies the merge, never guesses.
+function _branch_cond_eval(pir, iworld::UInt, block_of::Vector{Int}, region::Set{Int}, m::Int,
+                           P::Int, @nospecialize(node), seen::Set{Int})
+    if isa(node, Core.SSAValue)
+        i = node.id
+        # `seen` holds the SSA ids currently on the evaluation stack — a revisit is a genuine value
+        # cycle (a loop-carried phi), not mere sharing, and poisons the evaluation.
+        i in seen && return _CondBail()
+        push!(seen, i)
+        r = _branch_cond_eval_ssa(pir, iworld, block_of, region, m, P, i, seen)
+        delete!(seen, i)
+        return r
+    elseif isa(node, Core.Argument)
+        return _CondUnknown(_widen(pir.argtypes[node.n]))
+    elseif isa(node, GlobalRef)
+        # A non-`const` binding is only knowable at run time; even a `const` one is left unknown —
+        # nothing observed needs more than the `===` type rules.
+        return _CondUnknown(Any)
+    elseif isa(node, QuoteNode)
+        return node.value
+    end
+    return node
+end
+
+function _branch_cond_eval_ssa(pir, iworld::UInt, block_of::Vector{Int}, region::Set{Int}, m::Int,
+                               P::Int, i::Int, seen::Set{Int})
+    b = block_of[i]
+    b in region || return _CondUnknown(_stype(pir.stmts, i))
+    s = pir.stmts[i][:stmt]
+    recur(@nospecialize v) = _branch_cond_eval(pir, iworld, block_of, region, m, P, v, seen)
+    if isa(s, Core.PhiNode)
+        # At `m`, the edge for `P` is the whole point; at a chain block the single real edge is
+        # the only one that can fire. An unassigned edge would be an undef read — bail.
+        want = b == m ? P : begin
+            bpreds = filter(!=(0), pir.cfg.blocks[b].preds)
+            length(bpreds) == 1 || return _CondBail()
+            only(bpreds)
+        end
+        eidx = findfirst(==(Int32(want)), s.edges)
+        (eidx === nothing || !isassigned(s.values, eidx)) && return _CondBail()
+        return recur(s.values[eidx])
+    elseif isa(s, Core.PiNode)
+        r = recur(s.val)
+        return r isa _CondUnknown ? _CondUnknown(_stype(pir.stmts, i)) : r
+    elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
+        fpos, actual = _call_parts(s)
+        f = _calleeval(fpos, iworld)
+        if f === Core.Intrinsics.not_int && length(actual) == 1
+            r = recur(actual[1])
+            r isa _CondBail && return r
+            return r isa Bool ? !r : _CondUnknown(_stype(pir.stmts, i))
+        elseif f === Core.:(===) && length(actual) == 2
+            a = recur(actual[1])
+            a isa _CondBail && return a
+            c = recur(actual[2])
+            c isa _CondBail && return c
+            if !(a isa _CondUnknown) && !(c isa _CondUnknown)
+                return a === c
+            end
+            ta = a isa _CondUnknown ? a.typ : typeof(a)
+            tc = c isa _CondUnknown ? c.typ : typeof(c)
+            # Egal implies identical concrete type: disjoint types decide `false`, a shared
+            # singleton type decides `true`, anything else stays unknown.
+            typeintersect(ta, tc) === Union{} && return false
+            (ta === tc && Base.issingletontype(ta)) && return true
+            return _CondUnknown(Bool)
+        end
+        return _CondUnknown(_stype(pir.stmts, i))
+    end
+    return _CondUnknown(_stype(pir.stmts, i))
+end
+
+"""
+    _implied_merges(pir, iworld, unreachable, regions, quiet, counted)::Vector{ImpliedMerge}
+
+Merges of `pir` whose predecessor is statically implied by the direction of the following branch.
+A block `m` qualifies iff: it is reachable with exactly two distinct reachable predecessors; it
+is not a collapsible-region block (`regions`/`quiet` — a region entry's reverse code is entered
+from the region merge unconditionally, which erases the arm information this scheme reads) and
+not a counted loop's header (those edges are already served by the countdown, and the two
+dispatch kinds must stay mutually exclusive); a `GotoIfNot` block `d` is reachable from `m`
+through single-predecessor/single-successor blocks only (possibly `d == m`), with two distinct
+successors; and `d`'s branch condition evaluates to a known `Bool` under each predecessor
+assumption (`_branch_cond_eval`), with the two values differing. Anything that doesn't qualify
+keeps the ordinary per-edge push/pop scheme.
+"""
+function _implied_merges(pir, iworld::UInt, unreachable::AbstractVector{Bool},
+                         regions::Dict{Int,Int}, quiet::Set{Int},
+                         counted::Vector{CountedLoop})::Vector{ImpliedMerge}
+    cfg = pir.cfg
+    nb = length(cfg.blocks)
+    preds = [filter(!=(0), cfg.blocks[b].preds) for b in 1:nb]
+    succs = [cfg.blocks[b].succs for b in 1:nb]
+    counted_headers = Set{Int}(cl.header for cl in counted)
+    term(b) = pir.stmts[cfg.blocks[b].stmts.stop][:stmt]
+    block_of = _stmt_block_map(pir)
+
+    implied = ImpliedMerge[]
+    for m in 1:nb
+        unreachable[m] && continue
+        length(preds[m]) == 2 || continue
+        p, q = preds[m]
+        (p != q && !unreachable[p] && !unreachable[q]) || continue
+        (m in quiet || haskey(regions, m) || m in counted_headers) && continue
+
+        # Walk m -> d: the branch may sit a few blocks downstream (iterator-protocol lowering puts
+        # the constant-`φ` merge and its `GotoIfNot` in separate blocks). Every step must be a
+        # single-pred/single-succ block so each visit of `m` reaches `d` exactly once and the
+        # reverse routing back is unconditional.
+        d = m
+        region = Int[m]
+        ok = true
+        while !isa(term(d), Core.GotoIfNot)
+            length(succs[d]) == 1 || (ok = false; break)
+            s = only(succs[d])
+            (1 <= s <= nb && !unreachable[s] && length(preds[s]) == 1 && s ∉ quiet &&
+             !haskey(regions, s) && s ∉ region && length(region) <= nb) || (ok = false; break)
+            push!(region, s)
+            d = s
+        end
+        ok || continue
+        gin = term(d)::Core.GotoIfNot
+        dest, fall = Int(gin.dest), d + 1
+        dest == fall && continue
+        # An arm into block 1 has no reverse dispatch to decorate with the cell store (the
+        # pullback's block-1 code is its final block and never routes) — same exclusion as
+        # `_counted_loops`' `e == 1`.
+        (dest == 1 || fall == 1) && continue
+
+        rset = Set{Int}(region)
+        vp = _branch_cond_eval(pir, iworld, block_of, rset, m, p, gin.cond, Set{Int}())
+        vp isa Bool || continue
+        vq = _branch_cond_eval(pir, iworld, block_of, rset, m, q, gin.cond, Set{Int}())
+        vq isa Bool || continue
+        vp != vq || continue
+        # `GotoIfNot` takes `dest` when the condition is false.
+        dest_pred, fall_pred = vp ? (q, p) : (p, q)
+        push!(implied, ImpliedMerge(m, d, dest_pred, fall_pred))
+    end
+    return implied
+end
+
+# ===========================================================================
 # ISSUES #52: split a block's stack push per edge rather than per block.
 #
 # `is_unique_pred[b] == false` makes `emit_epilogue!` push block `b`'s number unconditionally, but a
@@ -1069,45 +1490,70 @@ function _is_expected_block_push(inst::CC.NewInstruction, b::Int)::Bool
 end
 
 """
-    _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool})::CC.IRCode
+    _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool},
+                                  counted=CountedLoop[], count_stack_ssa=0,
+                                  mk_count_push=nothing, implied_edges=Set{NTuple{2,Int}}())::CC.IRCode
 
 Post-processes the already-built forwards-carrier `ir` (still 1:1 in block topology with the primal
-`pir`) so a block with a `GotoIfNot` terminator where exactly one arm is ambiguous no longer pushes
-its block number on the unambiguous arm. Three stages: classify candidates in primal block-number
-space (Stage 0), splice a relay block per candidate plus fix up any `PhiNode` edge the redirect
-disturbs (Stage 1), reassemble and lower back to a real `IRCode` (Stage 2). Returns `ir` unchanged
-(no round trip through the `cfg_ir.jl` layer) when there is nothing to split.
+`pir`) so a block with a `GotoIfNot` terminator where exactly one arm needs a block-stack push no
+longer pushes on the other arm, and so each counted loop (`_counted_loops`) gets its trip counter:
+a synthetic `Int64` phi/increment pair in the header and a single count push spliced onto the
+loop-exit arm. `count_stack_ssa` is the prologue statement index of the tape's `count_stack`;
+`mk_count_push(stack_id, val_id)` builds the push instruction (both supplied by
+`reverse_fwds_to_ircode`, unused when `counted` is empty).
+
+Stages: classify push relocations in primal block-number space (Stage 0), build one relay per
+rewritten arm — a relocated push, a count push, or both sharing one relay (Stage 1), insert each
+counted header's counter phi + increment (Stage 1c), fix up every `PhiNode` edge the redirects
+disturbed — including counter phis another loop's relay may have re-edged (Stage 1p), reassemble
+and lower back to a real `IRCode` (Stage 2). Returns `ir` unchanged when there is nothing to do.
 """
-function _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool})::CC.IRCode
+function _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::AbstractVector{Bool},
+                                       counted::Vector{CountedLoop}=CountedLoop[],
+                                       count_stack_ssa::Int=0,
+                                       mk_count_push=nothing,
+                                       implied_edges::Set{NTuple{2,Int}}=Set{NTuple{2,Int}}())::CC.IRCode
     nblocks = length(pir.cfg.blocks)
+    served_edges = union!(_counted_edges(counted), implied_edges)
+    npreds(s) = length(filter(!=(0), pir.cfg.blocks[s].preds))
+    # Must match `_unique_predecessor_info`'s formula exactly — same per-edge predicate, same
+    # counted-/implied-edge exclusion — or push and pop desynchronize.
+    needs_push(b, s) = npreds(s) > 1 && (b, s) ∉ served_edges
 
     # Stage 0: classify, in primal block-number space — no IR construction yet.
-    candidates = Tuple{Int,Symbol,Int}[]   # (b, :dest|:fallthrough, ambiguous target block number)
+    candidates = Tuple{Int,Symbol,Int}[]   # (b, :dest|:fallthrough, push-needing target block number)
     for b in 1:(nblocks - 1)
         is_unique_pred[b] && continue
         term = pir.stmts[pir.cfg.blocks[b].stmts.stop][:stmt]
         isa(term, Core.GotoIfNot) || continue    # the only 2-successor terminator kind in primal IR
         dest, fall = Int(term.dest), b + 1
-        npd = length(filter(!=(0), pir.cfg.blocks[dest].preds))
-        npf = length(filter(!=(0), pir.cfg.blocks[fall].preds))
-        if npd > 1 && npf > 1
-            continue                              # both already ambiguous — nothing to split off
-        elseif npd > 1
+        nd, nf = needs_push(b, dest), needs_push(b, fall)
+        if nd && nf
+            continue                              # both arms need it — the per-block push stays
+        elseif nd
             push!(candidates, (b, :dest, dest))
-        elseif npf > 1
+        elseif nf
             push!(candidates, (b, :fallthrough, fall))
         end
-        # else: neither ambiguous — contradicts `!is_unique_pred[b]`; skip defensively.
+        # else: neither arm needs a push — contradicts `!is_unique_pred[b]`; skip defensively.
     end
-    isempty(candidates) && return ir
+    isempty(candidates) && isempty(counted) && return ir
 
-    # Stage 1: surgery + PhiNode fixup.
     blks = _ircode_to_cfg_blocks(ir)          # blks[b] is primal block b — order-preserving
+    if !isempty(counted)
+        (mk_count_push !== nothing && 1 <= count_stack_ssa <= length(blks[1])) ||
+            error("Differ internal error: counted loops need the count-stack prologue statement " *
+                  "and a push builder")
+    end
+    count_stack_id = isempty(counted) ? nothing : blks[1].inst_ids[count_stack_ssa]
+    cnt_phi_ids = [ID() for _ in counted]     # minted first — the exit relays reference them
 
-    rewritten = Dict{Int,CFGBlock}()          # b -> its push-stripped (maybe re-terminated) block
-    append_relays = CFGBlock[]                # `:dest` relays — appended at the very end
-    insert_after = Dict{Int,CFGBlock}()       # b -> its `:fallthrough` relay, inserted right after b
-    phi_fixups = Tuple{Int,ID,ID}[]           # (target block#, old pred ID, relay ID) — pre-mutation
+    # Stage 1: one relay per rewritten arm. A relay body starts with its pushes (a relocated
+    # block-id push, a trip-count push, or both — they target different stacks, so their relative
+    # order is immaterial) and ends with a goto to the arm's original target.
+    relay_body = Dict{NTuple{2,Any},Vector{IDInstPair}}()  # (b, side) -> push instructions
+    relay_target = Dict{NTuple{2,Any},Int}()               # (b, side) -> target block number
+    strip_push = Set{Int}()                                # blocks whose own push was relocated
 
     for (b, side, target) in candidates
         blk = blks[b]
@@ -1118,30 +1564,70 @@ function _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::Abstr
         _is_expected_block_push(push_inst, b) ||
             error("Differ internal error: expected a block-stack push as the second-to-last " *
                   "instruction of block $b, found `$(push_inst.stmt)`")
+        relay_body[(b, side)] = IDInstPair[(push_id, push_inst)]
+        relay_target[(b, side)] = target
+        push!(strip_push, b)
+    end
+    for (li, cl) in enumerate(counted)
+        x, e = cl.exiting, cl.exit_target
+        term = pir.stmts[pir.cfg.blocks[x].stmts.stop][:stmt]
+        isa(term, Core.GotoIfNot) ||
+            error("Differ internal error: counted loop's exiting block $x is not GotoIfNot-terminated")
+        side = Int(term.dest) == e ? :dest : :fallthrough
+        side === :fallthrough && x + 1 != e &&
+            error("Differ internal error: counted loop's exit edge $x -> $e matches neither arm")
+        body = get!(Vector{IDInstPair}, relay_body, (x, side))
+        pushfirst!(body, (ID(), mk_count_push(count_stack_id, cnt_phi_ids[li])))
+        relay_target[(x, side)] = e
+    end
 
+    rewritten = Dict{Int,CFGBlock}()          # b -> its current rewritten version
+    curblk(b) = get(rewritten, b, blks[b])
+    append_relays = CFGBlock[]                # `:dest` relays — appended at the very end
+    insert_after = Dict{Int,CFGBlock}()       # b -> its `:fallthrough` relay, inserted right after b
+    phi_fixups = Tuple{Int,ID,ID}[]           # (target block#, old pred ID, relay ID) — pre-mutation
+
+    for ((b, side), body) in relay_body
+        target = relay_target[(b, side)]
         relay_id = ID()
-        relay = CFGBlock(relay_id, [push_id, ID()],
-                         CC.NewInstruction[push_inst, new_inst(IDGotoNode(blks[target].id), Any)])
-
+        push!(body, (ID(), new_inst(IDGotoNode(blks[target].id), Any)))
+        relay = CFGBlock(relay_id, body)
+        blk = curblk(b)
+        keep = b in strip_push && !haskey(rewritten, b) ? (1:(length(blk) - 2)) : (1:(length(blk) - 1))
         term_id, term_inst = blk.inst_ids[end], blk.insts[end]
         if side === :dest
             old_term = term_inst.stmt::IDGotoIfNot
-            new_term = CC.NewInstruction(term_inst; stmt=IDGotoIfNot(old_term.cond, relay_id))
+            term_inst = CC.NewInstruction(term_inst; stmt=IDGotoIfNot(old_term.cond, relay_id))
             push!(append_relays, relay)
-        else
-            new_term = term_inst              # dest untouched — only the implicit fallthrough moves
+        else                                  # dest untouched — only the implicit fallthrough moves
             insert_after[b] = relay
         end
-        rewritten[b] = CFGBlock(blk.id, vcat(blk.inst_ids[1:(end - 2)], term_id),
-                                vcat(blk.insts[1:(end - 2)], new_term))
+        rewritten[b] = CFGBlock(blk.id, vcat(blk.inst_ids[keep], term_id),
+                                vcat(blk.insts[keep], term_inst))
         push!(phi_fixups, (target, blk.id, relay_id))
     end
 
-    # Applied in one dedicated pass, over the pre-mutation candidate list, so a target block number
-    # being before or after `b` (a loop back-edge target has a *lower* number) can't cause ordering
-    # or aliasing bugs.
+    # Stage 1c: each counted header gets `c = φ(preheader ⇒ 0, latch ⇒ c+1)` right after its
+    # existing leading phis, then the increment. The exit relay above pushes the *phi* value — the
+    # number of back-edge traversals at the moment the exit edge is taken.
+    for (li, cl) in enumerate(counted)
+        hb = curblk(cl.header)
+        nphi = something(findlast(x -> x.stmt isa IDPhiNode, hb.insts), 0)
+        inc_id = ID()
+        phi = IDPhiNode(ID[blks[cl.preheader].id, blks[cl.latch].id], Any[Int64(0), inc_id])
+        inc = Expr(:call, GlobalRef(Core.Intrinsics, :add_int), cnt_phi_ids[li], Int64(1))
+        rewritten[cl.header] = CFGBlock(hb.id,
+            vcat(hb.inst_ids[1:nphi], cnt_phi_ids[li], inc_id, hb.inst_ids[(nphi + 1):end]),
+            vcat(hb.insts[1:nphi], new_inst(phi, Int64), new_inst(inc, Int64),
+                 hb.insts[(nphi + 1):end]))
+    end
+
+    # Stage 1p: applied in one dedicated pass over the *current* block versions, so a target block
+    # number being before or after `b` (a loop back-edge target has a *lower* number) can't cause
+    # ordering or aliasing bugs, and a counter phi inserted above is re-edged too when another
+    # loop's exit relay lands on one of its header's incoming edges.
     for (target, old_id, relay_id) in phi_fixups
-        _, phis = phi_nodes(blks[target])
+        _, phis = phi_nodes(curblk(target))
         for phi_inst in phis
             phi = phi_inst.stmt::IDPhiNode
             for j in eachindex(phi.edges)
@@ -1153,7 +1639,7 @@ function _split_ambiguous_block_pushes(ir::CC.IRCode, pir, is_unique_pred::Abstr
     # Stage 2: reassemble in primal block order, then lower back to a real IRCode.
     final = CFGBlock[]
     for b in 1:nblocks
-        push!(final, get(rewritten, b, blks[b]))
+        push!(final, curblk(b))
         haskey(insert_after, b) && push!(final, insert_after[b])
     end
     append!(final, append_relays)
@@ -1177,13 +1663,347 @@ end
 # untracked-but-differentiable is a real, located bail at the point of use, never silently
 # mishandled.
 #
-# Which top-level (fwds-carrier) arguments carry non-trivial fdata. Factored out of
-# `_fdata_tracked` so `_static_recursible_call`'s array-argument-recursion guard can check a bare
-# `Core.Argument` operand directly without recomputing this.
-function _arg_fdata_tracked(iworld::UInt, n::Int, codualparams::Vector{Any})
+# Which arguments carry a derivative. `NoTangent` in a `CoDual`'s shadow slot is the caller declaring
+# that argument constant; a primal type with no tangent space says the same from the type alone. A
+# non-concrete `codualparams[k]` yields `Any` here, which reads as active — sound.
+#
+# Not shared with `DifferForwards`' function of the same name despite the shared purpose: `n`/
+# `codualparams` here are already the *packed* list (`_activity_layers` always calls this with
+# `packed_codualparams`), so a vararg tail's combined activity falls out of the ordinary per-slot
+# check with no reduction of its own — forward mode instead packs inside its own `_arg_active`, from
+# the raw argument list. Reconciling the two would mean restructuring one side's established vararg
+# handling, not just factoring out shared logic.
+function _arg_active(iworld::UInt, n::Int, codualparams::Vector{Any})
+    arg_active = falses(n)
+    for k in 1:n
+        _codual_fdata_type(codualparams[k]) === Inactive && continue
+        arg_active[k] = _tt(iworld, _widen(_codual_primal_type(codualparams[k]))) !== NoTangent
+    end
+    return arg_active
+end
+
+# `_act_ptr_deref` (pointer-typed statement / load-store-through-a-pointer is unconditionally
+# active) and `_call_parts` (fpos/actual out of a `:call`/`:invoke`) are shared with `DifferForwards`
+# in `DifferCore/src/shared_ir_helpers.jl`.
+
+# Which SSA values may carry a derivative. Anything reached only through inactive values is replayed
+# primally instead — no shadow, no rdata accumulator, no rule.
+#
+# Monotone least fixpoint, same shape and same reason as `_fdata_tracked` (a loop-carried `PhiNode`
+# reads a back-edge value not yet computed), but the conservatism runs the other way: this grows
+# "may be active", so an unrecognised value-producing statement must default to *active*.
+#
+# Same shape as `DifferForwards`' `_activity` (`forward_interp.jl`), arm for arm, but not merged into
+# one walker — see the comment at the top of that function for why. The genuinely shared leaf pieces
+# (`_call_parts`, `_act_ptr_deref`, `_act_container_result`) live in
+# `DifferCore/src/shared_ir_helpers.jl`; keep the two walkers' arm order and comments in step by hand
+# when either changes.
+function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
+    N = length(pir.stmts)
+    arg_active = _arg_active(iworld, n, codualparams)
+    active = falses(N)
+    operand_active(@nospecialize node) =
+        isa(node, Core.SSAValue) ? active[node.id] :
+        isa(node, Core.Argument) ? (node.n <= n && arg_active[node.n]) : false
+    changed = true
+    while changed
+        changed = false
+        for i in 1:N
+            active[i] && continue
+            s = pir.stmts[i][:stmt]
+            (isa(s, Core.GotoNode) || isa(s, Core.GotoIfNot) || isa(s, Core.ReturnNode) ||
+             isa(s, Core.EnterNode)) && continue
+            isa(s, Expr) && s.head in
+                (:boundscheck, :loopinfo, :gc_preserve_begin, :gc_preserve_end) && continue
+            # "Result has no tangent space ⇒ inactive" holds only for a *pure value producer*. A
+            # generic call or foreigncall routinely returns `Nothing` while writing through an
+            # argument (`Base._growend_internal!`, `copyto!`, `mul!`), so those go by their operands
+            # alone. A rule-less `Core.Builtin`/intrinsic keeps the shortcut: without it `x === y` on
+            # active operands would have no rule and bail.
+            notan = _tt(iworld, _stype(pir.stmts, i)) === NoTangent
+            # `Union{} <: Ptr` is true, so excluding it keeps `throw`-typed statements from becoming
+            # activity roots and dragging their operands into materialisation.
+            Tw = _stype(pir.stmts, i)
+            act = if (Tw isa Type && Tw !== Union{} && Tw <: Ptr) || _act_ptr_deref(s, iworld)
+                true                      # raw pointer, or a load/store through one — see below
+            elseif isa(s, Core.PiNode)
+                !notan && operand_active(s.val)
+            elseif isa(s, Core.PhiNode) || isa(s, Core.PhiCNode)
+                vals = s.values
+                !notan && any(j -> isassigned(vals, j) && operand_active(vals[j]), 1:length(vals))
+            elseif isa(s, Core.UpsilonNode)
+                !notan && isdefined(s, :val) && operand_active(s.val)
+            elseif isa(s, Expr) && s.head === :new
+                # An activity root, not a function of its initialiser operands: an active value may be
+                # written into it further down. Same roots `_fdata_tracked` treats as provenance roots.
+                T = _calleeval(s.args[1], iworld)
+                if T isa DataType && ismutabletype(T) && fdtype(iworld, T) !== NoFData
+                    true
+                else
+                    !notan && any(operand_active, @view s.args[2:end])
+                end
+            elseif isa(s, Expr) && (s.head === :call || s.head === :invoke)
+                fpos, actual = _call_parts(s)
+                f = _calleeval(fpos, iworld)
+                if f === Core.memorynew
+                    # The array-allocation half of the same root case.
+                    true
+                # Forward mode's `_activity` has an extra arm here, `_act_container_result`
+                # (`DifferCore/src/shared_ir_helpers.jl`): a composite call whose result could carry
+                # a fresh mutable container is a root regardless of operand activity, so a `@noinline`
+                # allocation helper called with only constant arguments still gets an active result.
+                # Reverse mode doesn't need the analogous arm: `_fdata_tracked`'s own root set
+                # (`%new`/`memorynew` appearing directly in the primal IR, not behind an opaque call)
+                # is strictly narrower than what this arm would mark active, so a composite call's
+                # result is never provenance-tracked here regardless of how `_activity` classifies
+                # it — a later active store into it still bails cleanly via the array/struct-write
+                # provenance guard, not a dropped gradient. Confirmed empirically: inlined, the
+                # allocation is a direct `memorynew`/`:new` and already an unconditional root above;
+                # not inlined, the write bails with "no differentiable provenance traceable to a
+                # function argument" either way.
+                elseif f === Core.getfield &&
+                       _inactive_arg_root(Core.SSAValue(i), pir, iworld, arg_active, codualparams)
+                    # A read of a constant slot in a mixed-activity tuple argument (the packed
+                    # vararg tail): held constant even though the tuple as a whole is active.
+                    false
+                elseif notan && (isa(f, Core.Builtin) || isa(f, Core.IntrinsicFunction))
+                    false
+                else
+                    operand_active(fpos) || any(operand_active, actual)
+                end
+            elseif isa(s, Expr) && s.head === :foreigncall
+                # Always active: native code can write through any pointer it is handed, so operand
+                # activity does not bound its effects, and staying uniformly gated keeps the comms
+                # push/pop pairing in sync across all three passes.
+                true
+            elseif isa(s, Expr)
+                true
+            elseif isa(s, Core.SSAValue) || isa(s, Core.Argument)
+                !notan && operand_active(s)
+            else
+                false
+            end
+            if act
+                active[i] = true
+                changed = true
+            end
+        end
+    end
+    return arg_active, active
+end
+
+# Runtime aliasing guard, collection half. A global read is replayed as a constant (see `presolve`'s
+# `GlobalRef` arm below) — sound for a genuinely separate object, silently wrong if the caller
+# differentiates w.r.t. the very object a global aliases. Finds every `GlobalRef` the primal reads
+# (as a bare statement or as an operand embedded in another statement) whose resolved value has a
+# non-trivial fdata — a mutable global holding a `Bool`/`Symbol`/other untangented value needs no
+# guard, only one with caller-visible shadow state does. `reverse_fwds_to_ircode` emits one check per
+# (global, active argument whose declared type could hold it) pair found this way.
+#
+# Only direct argument identity is checked — aliasing through a container (`x[1] === gv`) is not
+# detected.
+function _collect_alias_guard_globals(pir, iworld::UInt)
+    targets = Tuple{GlobalRef,Any}[]
+    seen = Set{GlobalRef}()
+    visit(@nospecialize node) = begin
+        isa(node, GlobalRef) || return nothing
+        node in seen && return nothing
+        push!(seen, node)
+        ok, gv = _globalref_val(node, iworld)
+        (ok && fdtype(iworld, _typeof(gv)) !== NoFData) && push!(targets, (node, gv))
+        return nothing
+    end
+    for i in 1:length(pir.stmts)
+        s = pir.stmts[i][:stmt]
+        visit(s)
+        if isa(s, Expr)
+            for a in s.args
+                visit(a)
+            end
+        elseif isa(s, Core.ReturnNode)
+            isdefined(s, :val) && visit(s.val)
+        elseif isa(s, Core.GotoIfNot)
+            visit(s.cond)
+        elseif isa(s, Core.PiNode)
+            visit(s.val)
+        elseif isa(s, Core.PhiNode) || isa(s, Core.PhiCNode)
+            for j in 1:length(s.values)
+                isassigned(s.values, j) && visit(s.values[j])
+            end
+        elseif isa(s, Core.UpsilonNode)
+            isdefined(s, :val) && visit(s.val)
+        end
+    end
+    return targets
+end
+
+# Whether `node` is a transparent view onto a value the caller declared constant, walking the
+# same steps `_fc_ptr_origin` recognizes (in the opposite direction, so the two must stay in step).
+# Never through a `PhiNode`: a phi merging an inactive edge with an active one is active, and must
+# keep bailing rather than be zeroed. A global read or call result stops the walk — only an argument
+# carries the caller's no-aliasing promise. Two root shapes: a bare `Core.Argument` whose whole
+# shadow is `Inactive`, and a `getfield` slot read off an argument whose declared shadow is a
+# mixed-activity tuple with `Inactive` at that slot — the packed vararg tail, or a caller-built
+# mixed carrier. `codualparams` is the *packed* codual type list (the space the primal IR's
+# `Core.Argument` numbering lives in).
+function _inactive_arg_root(@nospecialize(node), pir, iworld::UInt, arg_active::BitVector,
+                            codualparams::Vector{Any}, depth::Int = 0)
+    n = length(codualparams)
+    isa(node, Core.Argument) && return node.n <= n && !arg_active[node.n]
+    (depth > 8 || !isa(node, Core.SSAValue)) && return false
+    s = pir.stmts[node.id][:stmt]
+    if isa(s, Core.PiNode)
+        return _inactive_arg_root(s.val, pir, iworld, arg_active, codualparams, depth + 1)
+    elseif isa(s, Expr) && s.head === :call && length(s.args) >= 2
+        f = _calleeval(s.args[1], iworld)
+        if f === Core.Intrinsics.bitcast && length(s.args) == 3
+            Pin = _optype(pir, s.args[3])
+            (Pin isa DataType && Pin <: Ptr) || return false
+            return _inactive_arg_root(s.args[3], pir, iworld, arg_active, codualparams, depth + 1)
+        elseif f === Core.getfield && length(s.args) >= 3
+            nm = s.args[3]
+            isa(nm, QuoteNode) && (nm = nm.value)
+            nm === :ref &&
+                return _inactive_arg_root(s.args[2], pir, iworld, arg_active, codualparams, depth + 1)
+            # Slot read off a mixed-activity tuple argument. The object must be a bare
+            # `Core.Argument` (through `PiNode`s): only an argument's declared shadow type carries
+            # the constancy promise — an SSA aggregate's slots go by `_shadow_types` instead.
+            obj = s.args[2]
+            d = depth
+            while isa(obj, Core.SSAValue) && (d += 1) <= 8
+                so = pir.stmts[obj.id][:stmt]
+                isa(so, Core.PiNode) || break
+                obj = so.val
+            end
+            (isa(obj, Core.Argument) && obj.n <= n) || return false
+            F = _codual_fdata_type(codualparams[obj.n])
+            (F isa DataType && F <: Tuple && isconcretetype(F)) || return false
+            nm isa Int && return 1 <= nm <= fieldcount(F) && fieldtype(F, nm) === Inactive
+            # Dynamic index: constant only when every slot is — then it doesn't matter which.
+            return isa(nm, Union{Core.SSAValue,Core.Argument}) && fieldcount(F) > 0 &&
+                   all(T -> T === Inactive, F.parameters)
+        elseif f === Base.memoryrefnew && length(s.args) >= 2
+            return _inactive_arg_root(s.args[2], pir, iworld, arg_active, codualparams, depth + 1)
+        end
+    end
+    return false
+end
+
+# Whether `node`'s rdata contribution has anywhere to route to — the same test the pullback makes
+# at build time (`needs_ref`, the `arg_ref_id` gate, `ref_for`), recomputed here so
+# `_scan_block_comms`'s declared comms items and the pullback's actual routing agree by
+# construction rather than by coincidence. `stmt_block` is `_stmt_block_map(pir)`; `npacked` is the
+# packed argument count (`length(codualparams)` at every call site).
+function _has_rdata_sink(@nospecialize(node), pir, active::BitVector, arg_active::BitVector,
+                         unreachable::BitVector, stmt_block::Vector{Int}, npacked::Int, nfixed::Int)
+    if isa(node, Core.SSAValue)
+        i = node.id
+        active[i] || return false
+        unreachable[stmt_block[i]] && return false
+        s = pir.stmts[i][:stmt]
+        isa(s, Union{Core.GotoNode,Core.GotoIfNot,Core.ReturnNode}) && return false
+        isa(s, Expr) && s.head in (:boundscheck, :loopinfo) && return false
+        return true
+    elseif isa(node, Core.Argument)
+        return node.n <= npacked && (arg_active[node.n] || (nfixed >= 0 && node.n == nfixed + 1))
+    end
+    return false
+end
+
+# Operand positions whose primal must be recorded, given which contributions (`wanted(j)`, one per
+# operand — contributions are 1:1 with operands) actually have a sink. `nothing` (conservative:
+# every operand needed) when `intrinsic_rrule_deps` doesn't apply to this callee — no declaration,
+# or its arity disagrees with `nops`. Shared between `_scan_block_comms` (declares comms items) and
+# the pullback (builds `pvals`), so both agree on exactly what was recorded.
+function _intrinsic_needed_operands(f, nops::Int, wanted)
+    deps = intrinsic_rrule_deps(Val(f))
+    (deps === nothing || length(deps) != nops) && return nothing
+    needed = BitSet()
+    for j in 1:nops
+        wanted(j) && union!(needed, deps[j])
+    end
+    return needed
+end
+
+"""
+    _shadow_types(pir, iworld, n, arg_active) -> Vector{Any}
+
+The type each SSA's fwds-carrier shadow is declared at. Equal to `fdtype(iworld, Ti)` everywhere
+except an aggregate built from a mix of active and inactive operands, whose shadow carries
+`Inactive` in the constant slots instead of a synthesised zero, and a value read back out of one.
+
+Recomputed from identical inputs at each of the three sites that must agree about it (the comms
+scan and both builders), exactly as `_activity` and `_fdata_tracked` already are.
+
+A single forward pass, not a fixpoint: a non-phi operand always dominates its use, and a `PhiNode`
+is pinned to its own primal-derived type (a merge normalises back to `fdtype`, materialising a zero
+on any inactive edge), so no mixed type is ever carried around a loop.
+"""
+function _shadow_types(pir, iworld::UInt, n::Int, arg_active::BitVector,
+                       codualparams::Vector{Any})
+    N = length(pir.stmts)
+    sty = Vector{Any}(undef, N)
+    inact(@nospecialize node) = _inactive_arg_root(node, pir, iworld, arg_active, codualparams)
+    opsty(@nospecialize a) =
+        isa(a, Core.SSAValue) ? (isassigned(sty, a.id) ? sty[a.id] : fdtype(iworld, _widen(_optype(pir, a)))) :
+        isa(a, Core.Argument) && a.n <= n ? _codual_fdata_type(codualparams[a.n]) :
+        inact(a) ? Inactive : fdtype(iworld, _widen(_optype(pir, a)))
+    for i in 1:N
+        if inact(Core.SSAValue(i))
+            sty[i] = Inactive
+            continue
+        end
+        Ti = _widen(_stype(pir.stmts, i))
+        sty[i] = fdtype(iworld, Ti)
+        sty[i] === NoFData && continue
+        s = pir.stmts[i][:stmt]
+        if isa(s, Core.PiNode)
+            # Pure passthrough (a type refinement, not a new value) — the emission side literally
+            # aliases the operand's own shadow (`sresolve(s.val)`, never a fresh `emit!`), so the
+            # declared type has to inherit the operand's own `sty`, mixed or not, rather than default
+            # to the primal-derived one like every other statement kind does.
+            F = opsty(s.val)
+            F isa DataType && F <: Tuple && Ti isa DataType && Ti <: Tuple && isconcretetype(Ti) &&
+                fieldcount(F) == fieldcount(Ti) && (sty[i] = F)
+            continue
+        end
+        (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || continue
+        fpos, actual = _call_parts(s)
+        f = _calleeval(fpos, iworld)
+        if f === Core.tuple
+            (Ti isa DataType && Ti <: Tuple && isconcretetype(Ti) &&
+             fieldcount(Ti) == length(actual)) || continue
+            sty[i] = Tuple{(fdtype(iworld, fieldtype(Ti, j)) === NoFData ? NoFData :
+                            opsty(actual[j]) for j in eachindex(actual))...}
+        elseif f === Core.getfield && length(actual) >= 2 && _bi_literal_index(actual[2])
+            # Reading a constant slot back out of a mixed aggregate yields `Inactive`, not that
+            # slot's primal-derived fdata type.
+            Fo = opsty(actual[1])
+            (Fo isa DataType && Fo <: Tuple) || continue
+            idx = _bi_fieldname(actual[2])
+            idx isa Int && 1 <= idx <= fieldcount(Fo) && (sty[i] = fieldtype(Fo, idx))
+        end
+    end
+    return sty
+end
+
+# `_shadow_types` for an arbitrary operand node rather than an SSA id.
+_shadow_type_of(sty::Vector{Any}, pir, iworld::UInt, arg_active::BitVector,
+                codualparams::Vector{Any}, n::Int, @nospecialize(a)) =
+    isa(a, Core.SSAValue) ? sty[a.id] :
+    isa(a, Core.Argument) && a.n <= n ? _codual_fdata_type(codualparams[a.n]) :
+    _inactive_arg_root(a, pir, iworld, arg_active, codualparams) ? Inactive :
+    fdtype(iworld, _widen(_optype(pir, a)))
+
+# Which top-level (fwds-carrier) arguments carry non-trivial fdata. Factored out of `_fdata_tracked`
+# so `_static_recursible_call`'s array-argument-recursion guard can check a bare `Core.Argument`
+# operand directly without recomputing this. Gated on activity: an inactive argument has no shadow at
+# all — not a zero one — so untracking it routes reads off it to primal replay rather than a bail.
+function _arg_fdata_tracked(iworld::UInt, n::Int, codualparams::Vector{Any}, arg_active::BitVector)
     arg_tracked = falses(n)
     for k in 1:n
-        arg_tracked[k] = fdtype(iworld, _codual_primal_type(codualparams[k])) !== NoFData
+        arg_tracked[k] = arg_active[k] &&
+                         fdtype(iworld, _codual_primal_type(codualparams[k])) !== NoFData
     end
     return arg_tracked
 end
@@ -1193,13 +2013,24 @@ end
 # every caller that needs it only ever looks the chain up starting from an `SSAValue`, never a bare
 # `Argument` directly (array-argument recursion in `_static_recursible_call` needs `arg_tracked`
 # itself, exposed separately via `_arg_fdata_tracked` above).
-function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
+function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any},
+                        arg_active::BitVector, active::BitVector)
     N = length(pir.stmts)
     tracked = falses(N)
-    arg_tracked = _arg_fdata_tracked(iworld, n, codualparams)
+    arg_tracked = _arg_fdata_tracked(iworld, n, codualparams, arg_active)
     provenance_tracked(@nospecialize node) =
         isa(node, Core.SSAValue) ? tracked[node.id] :
         isa(node, Core.Argument) ? (node.n <= n && arg_tracked[node.n]) : false
+    # `Core.tuple` synthesises a fresh zero for an inactive operand rather than aliasing a shadow, so
+    # such an operand must not fail the tuple's trackedness the way an untraceable-but-active one does.
+    operand_inactive(@nospecialize node) = _inactive_arg_root(node, pir, iworld, arg_active, codualparams)
+    # An inactive edge into an otherwise-tracked `PhiNode` supplies a synthesised zero rather than a
+    # traced shadow — the merge is active (any active edge makes it so) and normalises to its own
+    # primal-derived shadow type, so something real has to arrive on the constant arm. Restricted to
+    # a bare `Core.Argument`, which is exactly what the fwds builder can hoist a zero for, so this
+    # declaration and that emission cannot disagree.
+    phi_inactive_edge(@nospecialize node) =
+        isa(node, Core.Argument) && node.n <= n && operand_inactive(node)
     # `tracked` is monotone (false -> true only), so a loop-carried `PhiNode` reading a
     # not-yet-computed back-edge is handled by rescanning to a fixpoint rather than a separate
     # pre-pass. Least fixpoint = "provably traceable"; anything left untracked bails at point of use.
@@ -1208,6 +2039,9 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
         changed = false
         for i in 1:N
             was = tracked[i]
+            # An inactive value has no shadow to trace to, so it is never tracked — which also keeps
+            # the generic-call arm below from promising a shadow the fwds pass won't build.
+            active[i] || continue
             s = pir.stmts[i][:stmt]
             if isa(s, Core.PiNode)
                 tracked[i] = provenance_tracked(s.val)
@@ -1216,7 +2050,8 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
                 if fdtype(iworld, Ti) !== NoFData
                     ok = true
                     for j in 1:length(s.values)
-                        if !isassigned(s.values, j) || !provenance_tracked(s.values[j])
+                        v = isassigned(s.values, j) ? s.values[j] : nothing
+                        if v === nothing || !(provenance_tracked(v) || phi_inactive_edge(v))
                             ok = false
                             break
                         end
@@ -1281,7 +2116,8 @@ function _fdata_tracked(pir, iworld, n::Int, codualparams::Vector{Any})
                     if fdtype(iworld, Ti) !== NoFData && T isa DataType && T <: Tuple && isconcretetype(T) &&
                        !(!isempty(T.parameters) && isa(last(T.parameters), Core.TypeofVararg)) &&
                        fieldcount(T) == length(actual)
-                        tracked[i] = all(j -> fdtype(iworld, fieldtype(T, j)) === NoFData || provenance_tracked(actual[j]),
+                        tracked[i] = all(j -> fdtype(iworld, fieldtype(T, j)) === NoFData ||
+                                              provenance_tracked(actual[j]) || operand_inactive(actual[j]),
                                          eachindex(actual))
                     end
                 elseif !(f isa Core.Builtin) && !(f isa Core.IntrinsicFunction) &&
@@ -1312,11 +2148,6 @@ _fdtype_impl(@nospecialize W) = fdata_type(tangent_type(W))
 rdtype(world::UInt, @nospecialize P) = at_world(world, _rdtype_impl, _widen(P))
 fdtype(world::UInt, @nospecialize P) = at_world(world, _fdtype_impl, _widen(P))
 
-# Extract the callee-position node and actual-argument nodes from a `:call`/`:invoke` statement —
-# the same split used at every call-statement site in this file, factored out since the recursion
-# path needs it independently from the main dispatch loops.
-_call_parts(s::Expr) = s.head === :invoke ? (s.args[2], @view s.args[3:end]) : (s.args[1], @view s.args[2:end])
-
 # Is call statement `i` (`s`, already known to be a surviving, non-intrinsic, non-`getfield`,
 # non-array-builtin `:call`/`:invoke`) a candidate for Part 1's recursive `rrule` support? Purely
 # static (no compilation): resolves the callee value and argument/result types only. Returns
@@ -1335,7 +2166,8 @@ _call_parts(s::Expr) = s.head === :invoke ? (s.args[2], @view s.args[3:end]) : (
 # The call's own result may carry fdata (an array/mutable-struct return) — the emission side routes
 # its shadow into `shadow_map` for the caller to accumulate into.
 function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{String},
-                                 arg_tracked::BitVector, fdata_tracked::BitVector)
+                                 arg_tracked::BitVector, fdata_tracked::BitVector, has_sink,
+                                 mixed_shadow)
     fpos, actual = _call_parts(s)
     fval = _calleeval(fpos, iworld)
     # `_calleeval` returns `nothing` for a callee in argument position (an `Argument`/`SSAValue`,
@@ -1378,6 +2210,12 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
     # resolves and annotate the `%new(CoDual{...}, ...)` the emission side builds — a node-shaped
     # answer would both misresolve the rule and emit IR whose declared type doesn't match the value.
     argtypes = Any[_optype_w(pir, iworld, a) for a in actual]
+    # `mask[j]`: operand `j` is differentiable but has no rdata sink (an inactive value from this
+    # callsite's perspective) — passed to the callee as `CoDual{P,Inactive}` rather than the real
+    # fdata carrier. Restricted to `SSAValue`/`Argument` operands: a literal/`GlobalRef` operand's
+    # contribution is already discarded by `route!` at no cost (`has_sink` is `false` for those too,
+    # for an unrelated reason — no node to accumulate into — so it must not be read as "inactive").
+    mask = falses(length(argtypes))
     for (j, P) in enumerate(argtypes)
         if !(P isa DataType && isconcretetype(P))
             reason[] = "recursive call has a non-concrete argument type $(P) at %$i: `$(_stmt_str(s))`"
@@ -1391,14 +2229,25 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
                        "supported yet at %$i: `$(_stmt_str(s))`"
             return nothing
         end
-        if fdtype(iworld, P) !== NoFData
+        a = actual[j]
+        mask[j] = isa(a, Union{Core.SSAValue,Core.Argument}) && _tt(iworld, P) !== NoTangent &&
+                  !has_sink(a)
+        if !mask[j] && mixed_shadow(a)
+            # The recursion glue declares each unmasked argument codual at the primal-derived fdata
+            # type; a value whose shadow is a mixed-activity tuple (a packed vararg tail with some
+            # trailing arguments held constant) cannot be stated at that type.
+            reason[] = "recursive call with an argument whose shadow is a mixed-activity tuple " *
+                       "(some slots held constant) is not supported at %$i: `$(_stmt_str(s))`"
+            return nothing
+        end
+        if fdtype(iworld, P) !== NoFData && !mask[j]
             # Any fdata shape is allowed through: fdata is the identity-carrying half of a tangent,
             # so an immutable aggregate's is a value wrapper whose leaves are the caller's own shared
             # shadow arrays/`MutableTangent`s — a callee accumulates into the caller's real buffers
             # either way, and the value half comes back as the call's returned rdata. What must be
             # guarded is that the fdata is the caller's real shadow and not a detached zero, which is
-            # the provenance check below.
-            a = actual[j]
+            # the provenance check below. Masked positions skip this: no shadow is threaded through
+            # for them at all.
             tracked_here = isa(a, Core.Argument) ? (a.n <= length(arg_tracked) && arg_tracked[a.n]) :
                            isa(a, Core.SSAValue) ? fdata_tracked[a.id] : false
             if !tracked_here
@@ -1410,7 +2259,7 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
         end
     end
     # No result-fdata guard here; a mismatch is caught at the emission site instead.
-    return (fval, ftype, argtypes)
+    return (fval, ftype, argtypes, mask)
 end
 
 # Resolve (and compile, under the caller's own `interp`) the `CodeInstance` for the callee's
@@ -1468,7 +2317,9 @@ end
 function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_primal_mi::MethodInstance,
                                    @nospecialize(ftype), argtypes::Vector{Any}, @nospecialize(R),
                                    edges::Vector{Any}, reason::Ref{String};
-                                   @nospecialize(own_TapeT=nothing))
+                                   @nospecialize(own_TapeT=nothing),
+                                   mask::BitVector=falses(length(argtypes)),
+                                   @nospecialize(self_FCDT=CoDual{R,NoFData}))
     # `has_hand_reverse_rule` already rejects a surviving call with a `Dual` callee/argument during
     # inlining, so this shouldn't be reachable — kept as a `reason[]`-based fallback in case some path
     # reaches recursion without going through that check, rather than crashing in `fcodual_type` below.
@@ -1481,8 +2332,12 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
         reason[] = msg
         return nothing
     end
-    argcodualtys = Any[_fcdtype(interp.world, P) for P in argtypes]
-    hand = hand_reverse_rule_match(interp, ftype, argtypes)
+    # Masked position `j`: the operand is inactive at this callsite, so the callee sees
+    # `CoDual{P,Inactive}` rather than the caller's own fdata carrier — same encoding as a
+    # top-level constant argument.
+    argcodualtys = Any[mask[j] ? CoDual{argtypes[j],Inactive} : _fcdtype(interp.world, argtypes[j])
+                       for j in eachindex(argtypes)]
+    hand = hand_reverse_rule_match(interp, ftype, argcodualtys)
     if hand !== nothing
         tt, fm = hand
         callee_val = rrule!!
@@ -1506,7 +2361,7 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
                 # so if that sibling's own scan eagerly tried to compile its apparent self-edge
                 # target too, it would recurse straight back into the still-mid-construction
                 # `Ctx{Nothing}` build, and `in_progress` would (correctly) flag that as a cycle.
-                own_TapeT === nothing && return nothing, reverse_fwds_impl, CoDual{R,NoFData}, Tape
+                own_TapeT === nothing && return nothing, reverse_fwds_impl, self_FCDT, Tape
                 tt_self = Tuple{typeof(reverse_fwds_impl),CoDual{ftype,NoFData},Ctx{own_TapeT},
                                 argcodualtys...}
                 push!(edges, tt_self, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
@@ -1522,11 +2377,11 @@ function reverse_fwds_recursive_ci(interp, impl_mi::MethodInstance, current_prim
                 callee_impl_mi = specialize_method(matches[1])::MethodInstance
                 if callee_impl_mi === impl_mi
                     CC.add_inlining_edge!(edges, callee_impl_mi)
-                    return callee_impl_mi, reverse_fwds_impl, CoDual{R,NoFData}, Tape
+                    return callee_impl_mi, reverse_fwds_impl, self_FCDT, Tape
                 else
                     ci = CC.typeinf_ext_toplevel(interp, callee_impl_mi, CC.SOURCE_MODE_ABI)::CodeInstance
                     CC.add_invoke_edge!(edges, tt_self, ci)
-                    return ci, reverse_fwds_impl, CoDual{R,NoFData}, Tape
+                    return ci, reverse_fwds_impl, self_FCDT, Tape
                 end
             end
         end
@@ -1599,8 +2454,11 @@ end
 # `reverse_fwds_recursive_ci` leaves in a cyclic block's comms type — never a concrete type there,
 # so it can't be resolved into a `tt` directly. The concrete type is `own_TapeT`, the current
 # pullback build's own tape type: a self-recursive callee's tape is by construction the same type as
-# the caller's own. The callee's rettype is likewise closed-form regardless of whether compiling
-# turns out to be needed below, computed straight from `own_codualparams`.
+# the caller's own. The callee's rettype is `own_RdatasT`, the caller's *own* returned-rdatas type,
+# passed in rather than recomputed: the callee is this same build, so the declared `:invoke` type and
+# the tuple the pullback actually builds must be one expression. Recomputing it from the codual
+# params instead is how it came to ignore the inactive -> `NoRData` substitution the return applies,
+# declaring a slot the callee never fills.
 #
 # Whether compiling is needed mirrors the fwds side's reasoning, but the source of the mismatch
 # differs: the pullback carrier has no ctx-type variance, but the recursive call's own seed type
@@ -1610,8 +2468,9 @@ end
 # (same tape, different seed type); that nested compile's own recursive edge targets its own seed
 # type, so it resolves via the literal-identity branch and terminates.
 function reverse_pullback_recursive_ci(interp, impl_mi::MethodInstance, @nospecialize(own_TapeT),
-                                       own_codualparams::Vector{Any}, @nospecialize(InnerTapeT),
-                                       @nospecialize(InnerSeedT), edges::Vector{Any}, reason::Ref{String})
+                                       @nospecialize(own_RdatasT), @nospecialize(InnerTapeT),
+                                       @nospecialize(InnerSeedT), edges::Vector{Any}, reason::Ref{String},
+                                       nargs::Int)
     if InnerTapeT === Tape
         tt = Tuple{typeof(reverse_pullback_impl),own_TapeT,InnerSeedT}
         push!(edges, tt, Core.methodtable)   # mt-backedge: a new applicable method must invalidate
@@ -1622,14 +2481,21 @@ function reverse_pullback_recursive_ci(interp, impl_mi::MethodInstance, @nospeci
             return nothing
         end
         pb_mi = specialize_method(matches[1])::MethodInstance
-        InnerRdatasT = Tuple{(zero_like_rdata_type(_codual_primal_type(c)) for c in own_codualparams)...}
         if pb_mi === impl_mi
             CC.add_inlining_edge!(edges, pb_mi)
-            return pb_mi, true, InnerRdatasT
+            return pb_mi, true, own_RdatasT
         else
             ci = CC.typeinf_ext_toplevel(interp, pb_mi, CC.SOURCE_MODE_ABI)::CodeInstance
+            # A sibling (same tape, different seed type) is already compiled here, so its rettype is
+            # real — check it rather than trusting the closed form, which only the literal-identity
+            # arm above is forced to.
+            if ci.rettype !== own_RdatasT
+                reason[] = "the recursive (self-cyclic) pullback build for `$(tt)` returned " *
+                           "$(ci.rettype), which does not match this build's own $(own_RdatasT)"
+                return nothing
+            end
             CC.add_invoke_edge!(edges, tt, ci)
-            return ci, true, InnerRdatasT
+            return ci, true, own_RdatasT
         end
     end
     # Mirrors the fwds side's two shapes. A derived inner pullback is a `Tape`, so we target its
@@ -1654,6 +2520,17 @@ function reverse_pullback_recursive_ci(interp, impl_mi::MethodInstance, @nospeci
                 "the pullback resolved for `$(tt)` never returns — either its own derived build " *
                 "bailed, or it cannot run on that tape/seed" :
                 "the pullback resolved for `$(tt)` returned `$(ci.rettype)`, not a tuple of rdatas"
+        return nothing
+    end
+    # A wrong-arity hand pullback (the derived path always gets this right by construction) would
+    # otherwise fail as a `getfield` error inside generated IR once the emission side indexes past it.
+    # Not `isconcretetype`: a derived pullback's own slots are `zero_like_rdata_type`s, which include
+    # `ZeroRData` unions whenever an argument type isn't concrete enough to zero from its type alone.
+    expected = nargs + 1
+    if Base.isvatuple(ci.rettype) || length(ci.rettype.parameters) != expected
+        reason[] = "the pullback resolved for `$(tt)` returned `$(ci.rettype)`, expected a " *
+                   "$(expected)-element tuple of rdatas (one slot per primal argument, plus the " *
+                   "callee's own)"
         return nothing
     end
     CC.add_invoke_edge!(edges, tt, ci)
@@ -1715,13 +2592,28 @@ end
 # independently), so only intrinsic operands (`:primal`), recursive-call inner tapes (`:subtape`),
 # and tracked array reads (`:shadow_ref`) ever need comms.
 #
+# The activity/shadow-type/provenance layer for one carrier build: a pure function of
+# `(pir, iworld, packed_codualparams)`, computed once here and threaded through the comms scan and
+# both emission builders rather than recomputed at each — they used to each recompute it from the
+# same inputs, which is exactly what let the scan and an emission builder disagree about a packed
+# vararg tail's activity (fixed by "pass the packed codual list to emission-side inactivity checks").
+function _activity_layers(pir, iworld::UInt, packed_codualparams::Vector{Any})
+    n = length(packed_codualparams)
+    arg_active, active = _activity(pir, iworld, n, packed_codualparams)
+    shadow_types = _shadow_types(pir, iworld, n, arg_active, packed_codualparams)
+    fdata_tracked = _fdata_tracked(pir, iworld, n, packed_codualparams, arg_active, active)
+    arg_tracked = _arg_fdata_tracked(iworld, n, packed_codualparams, arg_active)
+    return arg_active, active, shadow_types, fdata_tracked, arg_tracked
+end
+
 # NOT side-effect-free once recursion is present: resolving a `:subtape` candidate compiles that
 # callee's own `reverse_fwds_impl` (via `reverse_fwds_recursive_ci`) — a deliberate departure from
 # "pure static scan". Both builders still derive it identically because `cache_owner` is a
 # mode-level singleton: a `CodeInstance` compiled while scanning from one builder's `interp` is
 # found, not recompiled, when the other builder's separate `interp` resolves the same callsite.
 function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::MethodInstance, pir, iworld,
-                           unreachable, codualparams::Vector{Any}, reason::Ref{String}, edges::Vector{Any})
+                           unreachable, codualparams::Vector{Any}, reason::Ref{String}, edges::Vector{Any},
+                           nfixed::Int)
     nblocks = length(pir.cfg.blocks)
     nodes = [Any[] for _ in 1:nblocks]
     # Widened on the way in: these become `Tuple{types[b]...}`, and the hoisting/fusion decisions
@@ -1735,8 +2627,7 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
     self_recursive_ssas = BitSet()
     block_has_subtape = falses(nblocks)
     n = length(codualparams)
-    fdata_tracked = _fdata_tracked(pir, iworld, n, codualparams)
-    arg_tracked = _arg_fdata_tracked(iworld, n, codualparams)
+    arg_active, active, shadow_types, fdata_tracked, arg_tracked = _activity_layers(pir, iworld, codualparams)
     # A `Core.Argument`'s primal value never needs a comms slot: `Tape.args` already holds every
     # argument codual, and the pullback's own `pb_presolve` already falls back to `parg_pb[a.n]`
     # whenever no comms item was declared for it. Guarded on type: a declared item's type can be
@@ -1752,6 +2643,12 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
     bulk_args = _bulk_save_args(pir, iworld, arg_primal_types)
     bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
     block_of = _stmt_block_map(pir)
+    has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable,
+                                                    block_of, n, nfixed)
+    mixed_shadow(@nospecialize node) = begin
+        F = _shadow_type_of(shadow_types, pir, iworld, arg_active, codualparams, n, node)
+        F isa DataType && F <: Tuple && any(T -> T === Inactive, F.parameters)
+    end
     for i in 1:length(pir.stmts)
         b = block_of[i]
         unreachable[b] && continue
@@ -1780,7 +2677,8 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                   calleeval=(@nospecialize x) -> _calleeval(x, iworld),
                   optype=(@nospecialize x) -> _widen(_optype(pir, x)), reason=reason,
                   tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
-                  tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i))
+                  tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i),
+                  inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, codualparams))
             if fc === nothing
                 reason[] = "reverse mode does not support a `:foreigncall` with a runtime function " *
                            "pointer target at %$i: `$(_stmt_str(s))`"
@@ -1802,16 +2700,23 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             continue
         end
         (isa(s, Expr) && (s.head === :call || s.head === :invoke)) || continue
+        # An inactive call is replayed primally by both builders: no comms of its own, no recursion
+        # resolution. An active consumer that reads its *value* still records that as its own
+        # `:primal` item, from its own operand scan.
+        active[i] || continue
         fpos, actual = _call_parts(s)
         f = _calleeval(fpos, iworld)
         if isa(f, Core.IntrinsicFunction)
-            # Two reasons an intrinsic operand needs no comms slot, both decided purely from the
+            # Three reasons an intrinsic operand needs no comms slot, all decided purely from the
             # primal IR so fwds and pullback builders derive identical tuple types: the statement
-            # carries no gradient at all (`NoRData` result), or the rule for this specific intrinsic
-            # doesn't read that operand (see `intrinsic_rrule_operands` — a linear op like
-            # `add_float` reads neither addend).
+            # carries no gradient at all (`NoRData` result); a linear op's rule never reads a given
+            # operand at all (`intrinsic_rrule_deps`); or every contribution that would read a given
+            # operand has nowhere to route to (`_has_rdata_sink` on the operand it routes to — an
+            # inactive argument or a discarded literal contribution).
             rdtype(iworld, _stype(pir.stmts, i)) === NoRData && continue
-            needed = intrinsic_rrule_operands(Val(f))
+            wanted = j -> _has_rdata_sink(actual[j], pir, active, arg_active, unreachable, block_of,
+                                          n, nfixed)
+            needed = _intrinsic_needed_operands(f, length(actual), wanted)
             for (k, a) in enumerate(actual)
                 (isa(a, Core.SSAValue) || isa(a, Core.Argument)) || continue
                 (needed === nothing || k in needed) || continue
@@ -1835,7 +2740,13 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
                   fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
                   # A `MemoryRef` statically re-derivable from an argument + literal index need not
                   # be pushed (see `_static_ref_derivation`). Consulted by `builtins_reverse.jl`.
-                  static_ref=(@nospecialize x) -> _static_ref_derivation(pir, iworld, x))
+                  static_ref=(@nospecialize x) -> _static_ref_derivation(pir, iworld, x),
+                  # The shadow type a node's shadow is actually declared at — differs from `fdtype`
+                  # for a mixed-activity aggregate. Lets the `getfield` rule refuse a dynamic index
+                  # into one at scan time, before either builder runs.
+                  sty=(@nospecialize a) -> _shadow_type_of(shadow_types, pir, iworld, arg_active,
+                                                           codualparams, n, a),
+                  inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, codualparams))
             result = builtin_rrule_comms(Val(f), actual, _stype(pir.stmts, i), ctx)
             result === false && return nothing
             if result !== nothing
@@ -1850,12 +2761,12 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
             # A surviving high-level call: attempt static recursion. Not qualifying is not an error
             # at scan time (mirrors how an unregistered intrinsic isn't flagged here either); only a
             # genuine attempted-and-failed resolution propagates as a real bail here.
-            info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, fdata_tracked)
+            info = _static_recursible_call(pir, iworld, i, s, Ref(""), arg_tracked, fdata_tracked, has_sink, mixed_shadow)
             info === nothing && continue
-            _, ftype, argtypes = info
+            _, ftype, argtypes, mask = info
             R = _stype_invoke(pir.stmts, i)
             resolved = reverse_fwds_recursive_ci(interp, scan_impl_mi, primal_mi, ftype, argtypes, R,
-                                                 edges, reason)
+                                                 edges, reason; mask)
             if resolved === nothing
                 reason[] *= " — at %$i: `$(_stmt_str(s))`"
                 return nothing
@@ -1981,7 +2892,8 @@ function _scan_block_comms(interp, scan_impl_mi::MethodInstance, primal_mi::Meth
     end
 
     return nodes, types, bulk_args, self_recursive_ssas, block_has_subtape, block_hoisted_refs,
-           block_fused_refs, regions, quiet
+           block_fused_refs, regions, quiet, block_of, inloop, arg_active, active, shadow_types,
+           fdata_tracked, arg_tracked
 end
 
 # ===========================================================================
@@ -2018,7 +2930,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     ArgsTT = Tuple{codualparams...}
     packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed)
 
-    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges)
+    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges, nfixed)
     scan === nothing && return nothing
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element. Derived inside the scan so both builders get it identically —
@@ -2028,14 +2940,62 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # the `:subtape` inner-tape recycling lookup below reads a block's comms stack directly rather
     # than through `presolve`, so it needs to know where a fused item actually landed.
     block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, _, _, block_fused_refs,
-        regions, quiet = scan
+        regions, quiet, block_of, inloop, arg_active, active, shadow_types, fdata_tracked,
+        arg_tracked = scan
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
-    is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions, quiet)
+    # Recomputed from the same threaded inputs at every site that needs it (here, the pullback
+    # builder), like `_unique_predecessor_info` — a pure function of identical arguments, so the
+    # sides agree by construction.
+    counted = _counted_loops(pir, unreachable_block, regions, quiet)
+    implied = _implied_merges(pir, iworld, unreachable_block, regions, quiet, counted)
+    is_unique_pred, _, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions,
+                                                    quiet, union!(_counted_edges(counted),
+                                                                  _implied_edges(implied)))
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
-    fdata_tracked = _fdata_tracked(pir, iworld, length(packed_codualparams), packed_codualparams)
-    arg_tracked = _arg_fdata_tracked(iworld, length(packed_codualparams), packed_codualparams)
+    npacked = length(packed_codualparams)
+    has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable_block,
+                                                    block_of, npacked, nfixed)
+    mixed_shadow(@nospecialize node) = begin
+        F = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked, node)
+        F isa DataType && F <: Tuple && any(T -> T === Inactive, F.parameters)
+    end
+
+    # The carrier a `return` builds. A mixed-activity aggregate's shadow is narrower than the
+    # primal-derived carrier would declare, so the `CoDual` has to come from the shadow's own type;
+    # every other return keeps `_fcdtype`'s result byte-for-byte (it handles `Type` primals and
+    # non-concrete `R`, which this does not).
+    carrier_ty(@nospecialize(R), @nospecialize(FRs)) =
+        FRs === fdtype(iworld, R) ? _fcdtype(iworld, R) : CoDual{R,FRs}
+    ret_carrier(@nospecialize(node), @nospecialize(R)) = begin
+        FRs = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked,
+                              node)
+        (FRs, carrier_ty(R, FRs))
+    end
+
+    # A self-recursive `:invoke`'s declared result carrier is closed-form — its callee is this same
+    # build — so it has to equal what this build's own returns produce, activity included. Computed
+    # before emission because the recursive call is emitted before the exits are. Exits that disagree
+    # would need a fixpoint over the return shadow type (the recursive call's own shadow type feeds
+    # back into it), which this engine does not solve.
+    has_self_edge = !isempty(self_recursive_ssas)
+    self_FRs = NoFData
+    if has_self_edge
+        exit_FRs = Any[]
+        for b in exit_blocks
+            v = pstmts[pir.cfg.blocks[b].stmts.stop][:stmt].val
+            F = ret_carrier(v, _optype_w(pir, iworld, v))[1]
+            F in exit_FRs || push!(exit_FRs, F)
+        end
+        if length(exit_FRs) != 1
+            reason[] = "a self-recursive primal whose returns disagree on their shadow type " *
+                       "($(join(exit_FRs, ", "))) is not supported — the recursive call's own " *
+                       "result carrier then has no single closed-form type"
+            return nothing
+        end
+        self_FRs = exit_FRs[1]
+    end
 
     getf = GlobalRef(Core, :getfield)
     setf = GlobalRef(Core, :setfield!)
@@ -2043,8 +3003,9 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     push_g = Base.push!
     zerofcodual_g = zero_fcodual
 
-    code = Any[]; types = Any[]
-    emit!(ex, @nospecialize(ty)) = (push!(code, ex); push!(types, ty); Core.SSAValue(length(code)))
+    code = Any[]; types = Any[]; flags = UInt32[]
+    emit!(ex, @nospecialize(ty), flag=CC.IR_FLAG_NULL) =
+        (push!(code, ex); push!(types, ty); push!(flags, flag); Core.SSAValue(length(code)))
     opf(name, ty, args...) = emit!(Expr(:call, GlobalRef(Core.Intrinsics, name), args...), ty)
 
     # Emit a call to a runtime helper as a static `:invoke` (see `helper_ci` for why a plain `:call`
@@ -2076,9 +3037,90 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
         parg[i] = emit!(Expr(:call, getf, ci, 1), Pi)
         Fi !== NoFData && (farg[i] = emit!(Expr(:call, getf, ci, 2), Fi))
     end
+    # --- Runtime aliasing guard: an active argument identically equal to a mutable, tangent-carrying
+    # global the primal reads would get a silently wrong gradient (the global is replayed as a
+    # constant — see `presolve`'s `GlobalRef` arm below). Nothing is emitted unless some global
+    # qualifies (`_collect_alias_guard_globals`) *and* some active argument's declared type could
+    # actually hold it — the common case (no such global, or none type-compatible) costs zero
+    # statements. An `Inactive`-declared argument is skipped: aliasing a constant global with a
+    # constant argument is harmless. ---
+    alias_targets = _collect_alias_guard_globals(pir, iworld)
+    if !isempty(alias_targets)
+        flat_arg_active = _arg_active(iworld, n, codualparams)
+        for (gr, gv) in alias_targets
+            GT = _typeof(gv)
+            for i in 2:n
+                flat_arg_active[i] || continue
+                Pi = _codual_primal_type(codualparams[i])
+                GT <: Pi || continue
+                msg = "argument $(i - 1) aliases the module global $(gr.mod).$(gr.name), which " *
+                      "reverse mode treats as a constant — gradients w.r.t. it would be silently " *
+                      "wrong; pass the object as an argument everywhere instead"
+                icall!(_rr_check_global_alias, Nothing, (Pi, GT, String), parg[i], gv, msg)
+            end
+        end
+    end
     # `carg`/`args_tup_ssa`/`ArgsTT` stay flat: the tape and the pullback's return arity are keyed
     # by the caller's actual argument list.
     _pack_vararg_args!(emit!, ctuple, parg, farg, codualparams, iworld, nfixed)
+    # One zero per inactive `PhiNode` edge. Collected here but emitted below, after the tape
+    # prologue: the zero lives in the tape's `bufs`, so a pre-allocated context reuses it instead of
+    # rebuilding it every call. Still entry-block emission — a phi must lead its block, so the zero
+    # cannot be emitted beside it, and a loop-carried merge would otherwise rebuild it every
+    # iteration. Keyed by (phi, edge) — per edge, not per phi, since `sresolve` still serves every
+    # other edge.
+    phi_zero_edges = Tuple{Tuple{Int,Int},Int,Any,Any}[]   # ((phi, edge), argument, primal, fdata type)
+    phi_zero_keys = Set{Tuple{Int,Int}}()
+    phi_edge_zero = Dict{Tuple{Int,Int},Any}()             # filled by the emission after the prologue
+    for i in 1:length(pir.stmts)
+        fdata_tracked[i] || continue
+        s = pir.stmts[i][:stmt]
+        isa(s, Core.PhiNode) || continue
+        FTi = fdtype(iworld, _stype(pir.stmts, i))
+        FTi === NoFData && continue
+        for j in 1:length(s.values)
+            isassigned(s.values, j) || continue
+            v = s.values[j]
+            (isa(v, Core.Argument) && v.n <= npacked) || continue
+            _inactive_arg_root(v, pir, iworld, arg_active, packed_codualparams) || continue
+            Pv = _codual_primal_type(packed_codualparams[v.n])
+            fdtype(iworld, Pv) <: FTi || continue
+            push!(phi_zero_edges, ((i, j), v.n, Pv, FTi))
+            push!(phi_zero_keys, (i, j))
+        end
+    end
+    # An `SSAValue` edge whose own shadow is a mixed-activity tuple (a `Core.tuple` of mixed
+    # operands, say), narrower than the phi's own primal-derived type, needs the same widening —
+    # but unlike a bare `Core.Argument` (which dominates everywhere, so its zero can be hoisted to
+    # the entry block) an arbitrary SSA value's widening has to be emitted right where the value
+    # itself is built, in its own defining block, not at the phi (which must lead its own block).
+    # `phi_norm_target[v.id]` records the one target type an SSA id must be widened to; the main
+    # walk below fills `phi_norm_map[v.id]` with the widened result immediately after `v`'s own
+    # shadow is built, and the phi consults it in place of a bare `sresolve`.
+    phi_norm_target = Dict{Int,Any}()
+    for i in 1:length(pir.stmts)
+        fdata_tracked[i] || continue
+        s = pir.stmts[i][:stmt]
+        isa(s, Core.PhiNode) || continue
+        FTi = fdtype(iworld, _stype(pir.stmts, i))
+        FTi === NoFData && continue
+        for j in 1:length(s.values)
+            isassigned(s.values, j) || continue
+            v = s.values[j]
+            isa(v, Core.SSAValue) || continue
+            (i, j) in phi_zero_keys && continue
+            SF = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked, v)
+            SF === FTi && continue
+            prev = get(phi_norm_target, v.id, nothing)
+            if prev !== nothing && prev !== FTi
+                reason[] = "SSA value %$(v.id) would need widening to two different shadow types " *
+                           "($(prev) vs $(FTi)) for two different `PhiNode`s — not supported"
+                return nothing
+            end
+            phi_norm_target[v.id] = FTi
+        end
+    end
+    phi_norm_map = Dict{Int,Any}()
     # Packed once here rather than at each use: both tape shapes below need it, and the
     # pre-allocated shape stores it in the prologue (not at the return) so an early bail can't sink
     # the store past a point where the tape is already visible to the caller.
@@ -2090,7 +3132,6 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # `push!`/`pop!`/`position`/boundscheck. A loop block or non-`isbits` tuple keeps `Stack{T}`; an
     # empty tuple uses `SingletonStack`.
     comms_stack_ty = Vector{Any}(undef, nblocks)
-    inloop = _loop_blocks(pir)
     for b in 1:nblocks
         CommsT = Tuple{block_comms_types[b]...}
         if Base.issingletontype(CommsT)
@@ -2118,9 +3159,10 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             comms_stack_ssa[b] = ST <: SingletonStack ? emit!(Expr(:new, ST), ST) : icall!(ST, ST, ())
         end
         subtapes_ssa = icall!(Stack{TapeT}, Stack{TapeT}, ())
+        count_stack_ssa = icall!(Stack{Int64}, Stack{Int64}, ())
     else
         # Pre-allocated mode: read the caller's tape out of the `ctx` and reuse its stacks — the
-        # whole point of `build_ctx(...; prealloc=true)`, since a `Stack` is three heap objects.
+        # whole point of `build_ctx`, since a `Stack` is three heap objects.
         if PreTapeT !== TapeT
             reason[] = "the pre-allocated tape has type $(PreTapeT), but this primal's tape shape is " *
                        "$(TapeT) — rebuild the context with `build_ctx` for these exact argument types"
@@ -2133,6 +3175,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             comms_stack_ssa[b] = emit!(Expr(:call, getf, comms_tuple_in, b), comms_stack_ty[b])
         end
         subtapes_ssa = emit!(Expr(:call, getf, tape_ssa, 4), Stack{TapeT})
+        count_stack_ssa = emit!(Expr(:call, getf, tape_ssa, 5), Stack{Int64})
         # Reset every reusable stack to empty. Balanced push/pop already leaves them at 0 after a
         # completed round trip, but resetting here makes reuse correct unconditionally — a caller
         # can run the forwards pass and never call the pullback, or bail out partway through.
@@ -2145,18 +3188,20 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             emit!(Expr(:call, setf, comms_stack_ssa[b], 2, 0), Any)
         end
         emit!(Expr(:call, setf, subtapes_ssa, 2, 0), Any)
+        emit!(Expr(:call, setf, count_stack_ssa, 2, 0), Any)
         # This call's coduals replace the previous call's. A re-used context therefore keeps the
         # previous call's arguments (and their shadows) alive until the next call overwrites them —
         # noted in `build_ctx`'s docstring; the field is concretely typed, so there's nothing to null
-        # it to in between. `args` is field 5 now that `subtapes` (field 4) sits before it.
-        emit!(Expr(:call, setf, tape_ssa, 5, args_tup_ssa), Any)
+        # it to in between. `args` is field 6, after `subtapes` (4) and `count_stack` (5).
+        emit!(Expr(:call, setf, tape_ssa, 6, args_tup_ssa), Any)
     end
 
     # --- Bulk primal save. Still in the prologue, before any primal statement has run, so it captures
     # the arguments exactly as the call found them. The buffers live on the tape, so a pre-allocated
     # context reuses them across calls and a steady-state call allocates nothing; a `Ctx()` call
-    # allocates each buffer once, on its tape's first (and only) use. ---
-    bufs_ssa = if isempty(bulk_args)
+    # allocates each buffer once, on its tape's first (and only) use. The inactive-phi-edge zeros
+    # below share these buffers, one slot each after the bulk-saved ones. ---
+    bufs_ssa = if isempty(bulk_args) && isempty(phi_zero_edges)
         # Shared empty sentinel: nothing will ever index it, and this way a primal that bulk-saves
         # nothing pays no allocation for the field.
         emit!(GlobalRef(@__MODULE__(), :_NO_BULK_BUFS), Vector{Any})
@@ -2171,6 +3216,14 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
         Pk = _widen(_codual_primal_type(packed_codualparams[k]))
         icall!(_bulk_save!, Nothing, (Vector{Any}, Int, Pk), bufs_ssa, bulk_slot[k], parg[k])
     end
+    # Inactive-phi-edge zeros, in `bufs` slots after the bulk-saved ones. `_rr_cached_zero_fdata!`
+    # re-zeroes a cached one and rebuilds it if this call's argument no longer fits it, so a reused
+    # context repeats allocation-free while a changed argument shape still gets a correct zero.
+    for (z, (key, an, Pv, FTi)) in enumerate(phi_zero_edges)
+        phi_edge_zero[key] =
+            icall!(_rr_cached_zero_fdata!, FTi, (Vector{Any}, Int, Pv, Type{FTi}),
+                   bufs_ssa, length(bulk_args) + z, parg[an], FTi)
+    end
 
     primal_map = Vector{Any}(undef, N)
     shadow_map = Vector{Any}(undef, N)   # Part 2: array shadow (MemoryRef) chain, sparse — only
@@ -2184,6 +3237,22 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
         isa(x, GlobalRef) ? _calleeval(x, iworld) : x
     sresolve(@nospecialize x) =
         isa(x, Core.SSAValue) ? shadow_map[x.id] : isa(x, Core.Argument) ? farg[x.n] : x
+
+    # `sresolve`, but widens a mixed-activity shadow (an `Inactive` slot in some sub-position, at
+    # any nesting depth, or the whole thing `Inactive`) up to the full primal-derived fdata type
+    # `FT` first — needed wherever a value flows into a slot declared at `FT` rather than its own
+    # (possibly narrower) `sty`: a `PhiNode` edge, or the value operand of a mutating store. A
+    # constant slot gets a real zero (`_rr_zero_fdata`, the same materializer `phi_edge_zero`
+    # already uses for a bare `Core.Argument` edge) rather than the `Inactive` sentinel — later
+    # contributions into it are discarded, which is exactly `Inactive`'s strong-zero meaning
+    # carried across the boundary. Pass-through when `node`'s own shadow type already is `FT`. Thin
+    # wrapper: `_widen_shadow_val!` is the actual (recursive) work, operating on resolved values.
+    normalize_shadow!(@nospecialize(node), @nospecialize(FT)) = begin
+        SF = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked, node)
+        SF === FT && return sresolve(node)
+        P = _widen(_optype(pir, node))
+        _widen_shadow_val!(emit!, icall!, getf, ctuple, presolve(node), sresolve(node), P, SF, FT)
+    end
 
     # Part 1: which block's own recursive-call `:subtape` comms item already has its inner `Tape`
     # SSA value computed, so `emit_epilogue!` can find it (sparse, parallel to `primal_map`).
@@ -2331,10 +3400,26 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             # lattice-faithful and can return a `Core.PartialStruct` (e.g. a tuple return narrowed by
             # const-prop), but `fcodual_type` below needs a bare `Type`.
             R = isa(s.val, GlobalRef) ? Core.Typeof(ret_val) : _widen(_optype(pir, s.val))
-            FR = _fcdtype(iworld, R)
+            FRs, FR = ret_carrier(s.val, R)
+            # The pre-pass above declared every self-recursive `:invoke` in this build to return
+            # `self_FRs`. It reads `R` off the return node itself (`_optype_w`) where this arm reads
+            # it off `ret_val` for a `GlobalRef`, so catch a disagreement rather than emit an
+            # `:invoke` whose declared type this return contradicts.
+            if has_self_edge && FRs !== self_FRs
+                reason[] = "a self-recursive build's return shadow type ($(FRs)) disagrees with " *
+                           "the one its recursive calls were declared with ($(self_FRs)) at %$i: " *
+                           "`$(_stmt_str(s))`"
+                return nothing
+            end
             has_shadow = isa(s.val, Core.SSAValue) ? isassigned(shadow_map, s.val.id) :
                          isa(s.val, Core.Argument) ? isassigned(farg, s.val.n) : false
-            result_cd = if fdtype(iworld, R) === NoFData
+            result_cd = if FRs === Inactive
+                # Returning a value the caller declared constant: the carrier has to say so, since
+                # `FR` above was chosen from the shadow type. Not `zero_fcodual` — that builds the
+                # *primal-derived* shadow, which for a `NoFData` primal is `NoFData()`, a different
+                # type from `FR` and a `TypeError` at the `%new`.
+                emit!(Expr(:new, FR, ret_val, Inactive()), FR)
+            elseif fdtype(iworld, R) === NoFData
                 icall!(zerofcodual_g, FR, (R,), ret_val)
             elseif has_shadow
                 emit!(Expr(:new, FR, ret_val, sresolve(s.val)), FR)
@@ -2349,7 +3434,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             if tape === nothing
                 comms_tuple = emit!(Expr(:call, ctuple, comms_stack_ssa...), Tuple{comms_stack_ty...})
                 tape = emit!(Expr(:new, TapeT, block_stack_ssa, comms_tuple, bufs_ssa, subtapes_ssa,
-                                  args_tup_ssa), TapeT)
+                                  count_stack_ssa, args_tup_ssa), TapeT)
             end
             final = emit!(Expr(:call, ctuple, result_cd, tape), Tuple{FR,TapeT})
             emit!(Core.ReturnNode(final), Any)
@@ -2473,7 +3558,8 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                     calleeval=(@nospecialize x) -> _calleeval(x, iworld),
                     tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                     fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
-                    tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i))
+                    tracked=fdata_tracked, arg_tracked=arg_tracked, ssa=Core.SSAValue(i),
+                    inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, packed_codualparams))
             result = fc === nothing ? nothing : apply_foreigncall_rrule_fwds!(Val(fc.name), fc, Ti, fcctx)
             if result === nothing
                 reason[] = "reverse mode does not support foreigncall target " *
@@ -2496,32 +3582,49 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                        ssa=Core.SSAValue(i), bulk_saved=pb_bulk_saved,
                        tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                        rdtype=(@nospecialize(T) -> rdtype(iworld, T)),
-                       fdtype=(@nospecialize(T) -> fdtype(iworld, T)))
-                result = apply_builtin_rrule_fwds!(Val(f), actual, Ti, bctx)
+                       fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
+                       # The shadow type a node's shadow is actually declared at, which differs from
+                       # `fdtype` for a mixed-activity aggregate. Emission must use this, never
+                       # `fdtype`, wherever it types a shadow read off an operand.
+                       sty=(@nospecialize a) -> _shadow_type_of(shadow_types, pir, iworld, arg_active,
+                                                                packed_codualparams, npacked, a),
+                       normalize_shadow!,
+                       inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, packed_codualparams))
+                # `_scan_block_comms` skips an inactive statement, so a rule firing here would push
+                # comms items that were never declared.
+                result = active[i] ? apply_builtin_rrule_fwds!(Val(f), actual, Ti, bctx) : nothing
                 if result !== nothing
                     p, shadow, saved = result
                     primal_map[i] = p
                     shadow !== nothing && (shadow_map[i] = shadow)
                     isempty(saved) || merge!(block_saved[bidx], saved)
-                elseif _tt(iworld, _widen(Ti)) === NoTangent
-                    # A non-differentiable builtin result (`===`, `isa`, comparisons, ... — e.g. the
-                    # `Base.iterate`-state check a `for i in 1:length(x)` loop's own lowering embeds) has
-                    # no gradient to route, so no rule/comms is needed — just replay it primally, the
-                    # same treatment `GlobalRef`/literal statements already get.
+                elseif !active[i]
+                    # Nothing to route back: the result has no tangent space (`===`, `isa`, the
+                    # `Base.iterate`-state check a `for i in 1:length(x)` loop embeds), or every
+                    # operand is held constant. Replay it primally, as literals already are.
                     primal_map[i] = emit!(Expr(:call, f, (presolve(a) for a in actual)...), Ti)
                 else
                     reason[] = "reverse mode does not support builtin `$(f)` with a differentiable " *
                                "result ($(Ti)) and no reverse rule at %$i: `$(_stmt_str(s))`"
                     return nothing
                 end
+            elseif !active[i]
+                # Every operand is held constant, so this call contributes no gradient whatever it
+                # computes. Replaying it skips `_static_recursible_call`, whose concrete-argtype /
+                # traceable-provenance / no-differentiable-captures gates would otherwise bail the
+                # whole build over code the derivative never depends on.
+                Ti = _stype_invoke(pstmts, i)
+                fv = f === nothing ? presolve(fpos) : f
+                primal_map[i] = emit!(Expr(:call, fv, (presolve(a) for a in actual)...), Ti)
             else
                 Ti = _stype_invoke(pstmts, i)
-                info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked)
+                info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked, has_sink, mixed_shadow)
                 info === nothing && return nothing
-                fval, ftype, argtypes = info
+                fval, ftype, argtypes, mask = info
                 R = _widen(Ti)
                 resolved = reverse_fwds_recursive_ci(interp, impl_mi, primal_mi, ftype, argtypes, R,
-                                                     edges, reason; own_TapeT=TapeT)
+                                                     edges, reason; own_TapeT=TapeT, mask,
+                                                     self_FCDT=carrier_ty(R, self_FRs))
                 if resolved === nothing
                     reason[] *= " — at %$i: `$(_stmt_str(s))`"
                     return nothing
@@ -2539,6 +3642,13 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                 fcodual = emit!(Expr(:new, FCT, fval === nothing ? presolve(fpos) : fval, NoFData()), FCT)
                 argcoduals = Any[]
                 for (j, a) in enumerate(actual)
+                    if mask[j]
+                        # Inactive at this callsite: no shadow to resolve at all (there is none to
+                        # `sresolve` — that call is today's `foreigncall`/provenance bail).
+                        Cj = CoDual{argtypes[j],Inactive}
+                        push!(argcoduals, emit!(Expr(:new, Cj, presolve(a), Inactive()), Cj))
+                        continue
+                    end
                     Cj = _fcdtype(iworld, argtypes[j])
                     # Thread the argument's real shadow through when its fdata is non-trivial (an
                     # array whose identity `_static_recursible_call` already confirmed is traceable
@@ -2578,8 +3688,13 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                     icall!(_inner_ctx, Ctx{InnerTapeT}, (ST, Val{k}, Type{InnerTapeT}),
                            comms_stack_ssa[host_b], Val(k), InnerTapeT)
                 end
+                # Hand-rule callee, ordinary (non-nested-forward) build: opt this specific `:invoke`
+                # into inlining (see `_is_reverse_carrier_mi`'s comment) — never under `nested_forward`,
+                # symmetric with the pullback-recursion site's `IR_FLAG_NOINLINE` below.
+                pair_flag = callee_val !== reverse_fwds_impl && !interp.owner.nested_forward ?
+                    CC.IR_FLAG_INLINE : CC.IR_FLAG_NULL
                 pair = emit!(Expr(:invoke, ci, callee_val, fcodual, ctx_val, argcoduals...),
-                            Tuple{InnerFCoDualT,InnerTapeT})
+                            Tuple{InnerFCoDualT,InnerTapeT}, pair_flag)
                 result_cd = emit!(Expr(:call, getf, pair, 1), InnerFCoDualT)
                 primal_map[i] = emit!(Expr(:call, getf, result_cd, 1), Ti)
                 if fdtype(iworld, Ti) !== NoFData
@@ -2616,16 +3731,28 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             k = length(s.values)
             pvals = Vector{Any}(undef, k)
             want_shadow = fdata_tracked[i]
+            FTi = want_shadow ? fdtype(iworld, Ti) : NoFData
             svals = want_shadow ? Vector{Any}(undef, k) : nothing
             for j in 1:k
                 isassigned(s.values, j) || continue
                 v = s.values[j]
-                if isa(v, Core.SSAValue) && !isassigned(primal_map, v.id)
+                z = want_shadow ? get(phi_edge_zero, (i, j), nothing) : nothing
+                if z !== nothing
+                    # Inactive edge: the hoisted zero, never `sresolve` — no shadow was built for it.
+                    pvals[j] = presolve(v)
+                    svals[j] = z
+                elseif isa(v, Core.SSAValue) && !isassigned(primal_map, v.id)
                     push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (pvals, j, true))
                     want_shadow && push!(get!(() -> Tuple{Vector{Any},Int,Bool}[], pending, v.id), (svals, j, false))
                 else
                     pvals[j] = presolve(v)
-                    want_shadow && (svals[j] = sresolve(v))
+                    # `phi_norm_map[v.id]`, not a bare `sresolve`, when present: an SSA edge's own
+                    # shadow can be a mixed-activity tuple (a `Core.tuple` of mixed operands),
+                    # narrower than this phi's own primal-derived `FTi` — the widened value was
+                    # already built right after `v`'s own shadow (see the main walk below), since a
+                    # phi must lead its own block and can't emit the widening beside itself.
+                    want_shadow && (svals[j] = isa(v, Core.SSAValue) && haskey(phi_norm_map, v.id) ?
+                                               phi_norm_map[v.id] : sresolve(v))
                 end
             end
             primal_map[i] = emit!(Core.PhiNode(s.edges, pvals), Ti)
@@ -2633,7 +3760,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             # (`verify_ir`). `rdata_type` of an fdata-carrying value is always `NoRData`, so no
             # pullback comms needed; `getfield`/`memoryrefget` off this phi resolves via `sresolve`
             # like any tracked node.
-            want_shadow && (shadow_map[i] = emit!(Core.PhiNode(s.edges, svals), fdtype(iworld, Ti)))
+            want_shadow && (shadow_map[i] = emit!(Core.PhiNode(s.edges, svals), FTi))
         elseif isa(s, GlobalRef)
             primal_map[i] = emit!(s, Ti)
         elseif !isa(s, Expr)
@@ -2642,9 +3769,15 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             reason[] = "unsupported statement kind $(typeof(s)) at %$i: `$(_stmt_str(s))`"
             return nothing
         end
+        # `i`'s own shadow may need widening for a phi elsewhere (`phi_norm_target`, built ahead of
+        # time) — emitted right here, immediately after `i`'s own shadow, so it lands in `i`'s own
+        # (dominating) block rather than at the consuming phi. Must run before the `pending`
+        # backpatch below, which prefers this widened value over the raw one when present.
+        haskey(phi_norm_target, i) && (phi_norm_map[i] = normalize_shadow!(Core.SSAValue(i), phi_norm_target[i]))
         if haskey(pending, i)
             for (arr, slot, wantp) in pending[i]
-                arr[slot] = wantp ? primal_map[i] : shadow_map[i]
+                arr[slot] = wantp ? primal_map[i] :
+                            haskey(phi_norm_map, i) ? phi_norm_map[i] : shadow_map[i]
             end
             delete!(pending, i)
         end
@@ -2667,7 +3800,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     for i in 1:len
         stream.stmt[i] = code[i]
         stream.type[i] = types[i]
-        stream.flag[i] = CC.IR_FLAG_NULL
+        stream.flag[i] = flags[i]
     end
     new_blocks = Vector{CC.BasicBlock}(undef, nblocks)
     for b in 1:nblocks
@@ -2683,16 +3816,23 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # `_impl_argtypes(impl_mi)`, which is what the bail path (`reverse_error_ircode`) uses.
     argtypes = Any[impl_mi.specTypes.parameters[1], impl_mi.specTypes.parameters[2],
                    impl_mi.specTypes.parameters[3], vararg_tt]
-    # `pir.valid_worlds`, not the constructor's unbounded default — see the matching comment in
-    # `forward_interp.jl`'s `dualize_to_ircode` and `cfg_ir.jl`'s `lower_cfg_blocks_to_ir`.
-    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[], pir.valid_worlds)
+    # See `carrier_world_range` (Contextual.jl) for why this world range.
+    ir = CC.IRCode(stream, cfg, di, argtypes, Expr[], CC.VarState[], carrier_world_range(interp, pir))
     # `_split_ambiguous_block_pushes` (fixes ISSUES #52): relocate the per-block block-stack push
     # onto only the ambiguous arm of a mixed `GotoIfNot`, making the forwards push per-edge — the
     # companion to the per-edge `pred_is_unique_pred` formula above (`length(preds[b]) <= 1`). The
     # two changes are coupled; neither is correct alone (a first fwds-only attempt at this shipped
     # verify_ir-clean IR and passed its own tests but silently corrupted gradients for any loop
-    # iterating >= 2 times — see `_emit_switch!` below for the root cause).
-    ir = _split_ambiguous_block_pushes(ir, pir, is_unique_pred)
+    # iterating >= 2 times — see `_emit_switch!` below for the root cause). The same pass also
+    # installs each counted loop's trip counter (see `_counted_loops`), whose pullback companion is
+    # `reverse_pullback_to_ircode`'s counted dispatch — the same both-sides-or-neither coupling.
+    count_push_ci = isempty(counted) ? nothing :
+        helper_ci(interp, Tuple{typeof(Base.push!),Stack{Int64},Int64}, edges, hcache)
+    mk_count_push(cs_id, val_id) = new_inst(
+        count_push_ci === nothing ? Expr(:call, push_g, cs_id, val_id) :
+                                    Expr(:invoke, count_push_ci, push_g, cs_id, val_id), Any)
+    ir = _split_ambiguous_block_pushes(ir, pir, is_unique_pred, counted, count_stack_ssa.id,
+                                       mk_count_push, _implied_edges(implied))
     CC.verify_ir(ir)
     return ir
 end
@@ -2702,17 +3842,19 @@ end
 # a `Switch` into a `GotoIfNot` chain), using the `ID`/`CFGBlock` layer from `cfg_ir.jl`. rdata
 # accumulators are real mutable `Ref`s, one per primal SSA + one per argument.
 
-# `Base.pop!`, not a bare `pop!`: inlined into synthetic carrier IR, where a bare call would
-# resolve as `GlobalRef(Differ, :pop!)` and trip `verify_ir`.
-@inline __pop_blk_stack!(block_stack) = Base.pop!(block_stack)::Int32
-# Fully qualified for the same reason as `__pop_blk_stack!` above.
-@inline __switch_case(id::Int32, prev::Int32) = Base.:!(Core.:(===)(id, prev))
+@inline __pop_blk_stack!(block_stack) = pop!(block_stack)::Int32
+@inline __switch_case(id::Int32, prev::Int32) = !(id === prev)
+# Counted-loop countdown pieces (see `_counted_loops`): pop one recorded trip count, decrement it,
+# and test it for the `Switch` polarity `_emit_switch!` also uses (`false` selects the dest arm).
+@inline __pop_count_stack!(count_stack) = pop!(count_stack)::Int64
+@inline __count_dec(c::Int64) = c - Int64(1)
+@inline __count_case(c::Int64) = !(c === Int64(0))
 
 # Materializes a real zero rdata from `acc` when it's the `ZeroRData` placeholder. Needed wherever a
 # `deref_and_zero!`-derived accumulator must be treated as an actual `RDataT` value (e.g. decomposed
-# field-by-field for an immutable `%new`) rather than merely `increment!!`-ed into. `@noinline`: gets
-# threaded through `icall` into hand-built carrier IR; without it, inlining the tiny body would
-# re-embed a bare call as `GlobalRef(Differ, ...)`, which `verify_ir` rejects.
+# field-by-field for an immutable `%new`) rather than merely `increment!!`-ed into. `@noinline`: gets threaded
+# through `icall` into hand-built carrier IR, where keeping it a real call avoids re-inferring the
+# tiny body at every emission site.
 @noinline _rr_realize_rdata(acc, ::Type{RDataT}) where {RDataT} =
     (acc isa ZeroRData ? zero_rdata_from_type(RDataT) : acc)::RDataT
 
@@ -2741,7 +3883,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     comms_stack_ty = Any[CS.parameters...]
     packed_codualparams = _packed_codualparams(iworld, codualparams, nfixed)
 
-    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges)
+    scan = _scan_block_comms(interp, impl_mi, primal_mi, pir, iworld, unreachable_block, packed_codualparams, reason, edges, nfixed)
     scan === nothing && return nothing
     # `bulk_args`: argument positions whose primal contents are saved/restored once per call rather
     # than per overwritten element — derived inside the scan so both builders agree.
@@ -2749,14 +3891,49 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # out of block `d`'s own comms slot instead of popping it locally. `block_fused_refs[b]`: same
     # `(item, host, slot)` shape, but read out of the tuple the *host* block's reverse code popped.
     block_comms_nodes, block_comms_types, bulk_args, self_recursive_ssas, _,
-        block_hoisted_refs, block_fused_refs, regions, quiet = scan
-    _, pred_is_unique_pred, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions, quiet)
+        block_hoisted_refs, block_fused_refs, regions, quiet, block_of, _, arg_active, active,
+        shadow_types, fdata_tracked, arg_tracked = scan
+    # Recomputed from the same threaded inputs as the forwards builder's copy — a pure function of
+    # identical arguments, so the two sides agree by construction.
+    counted = _counted_loops(pir, unreachable_block, regions, quiet)
+    implied = _implied_merges(pir, iworld, unreachable_block, regions, quiet, counted)
+    _, pred_is_unique_pred, _ = _unique_predecessor_info(pir, exit_blocks, unreachable_block, regions,
+                                                         quiet, union!(_counted_edges(counted),
+                                                                       _implied_edges(implied)))
+    # Where the reverse walk enters each counted loop's region (pop the recorded trip count there)
+    # and which reverse blocks dispatch on the countdown instead of popping the block stack.
+    counted_exit = Dict((cl.exiting, cl.exit_target) => li for (li, cl) in enumerate(counted))
+    counted_header = Dict(cl.header => li for (li, cl) in enumerate(counted))
+    # Implied merges (`_implied_merges`): which reverse blocks dispatch on the per-merge cell
+    # instead of popping, and — keyed like `counted_exit`, `(pred p, current block b)` — which
+    # reverse arms store the predecessor the arriving direction implies. The two arms into the
+    # branch block's reverse code come from its two successors, and each names a distinct pred.
+    implied_merge = Dict(im.merge => ii for (ii, im) in enumerate(implied))
+    implied_store = Dict{NTuple{2,Int},Tuple{Int,Int32}}()
+    for (ii, im) in enumerate(implied)
+        gin = pstmts[pir.cfg.blocks[im.branch].stmts.stop][:stmt]::Core.GotoIfNot
+        implied_store[(im.branch, Int(gin.dest))] = (ii, Int32(im.dest_pred))
+        implied_store[(im.branch, im.branch + 1)] = (ii, Int32(im.fall_pred))
+    end
     bulk_slot = Dict(k => j for (j, k) in enumerate(sort!(collect(bulk_args))))
     # Same predicate `_scan_block_comms` used to decide the comms items, recomputed here so the
     # emission sides agree with the declaration side by construction.
     pb_bulk_saved(@nospecialize ref_node) = _is_bulk_saved(pir, iworld, bulk_args, ref_node)
-    fdata_tracked = _fdata_tracked(pir, iworld, length(packed_codualparams), packed_codualparams)
-    arg_tracked = _arg_fdata_tracked(iworld, length(packed_codualparams), packed_codualparams)
+
+    # The rdatas tuple this pullback returns, one slot per primal argument (`#self#` first). Defined
+    # here, not at the return below, because a self-recursive `:invoke` has to declare exactly this
+    # type — its callee is this same build — and deriving it a second time there is what let the
+    # declared and actual types drift. `nfixed_eff` is `n` when non-vararg, so the vararg tail branch
+    # at the return never fires. An inactive argument has no accumulator to read: its slot is the
+    # `NoRData()` literal, and `ret_rt` types both that slot and the returned tuple. A vararg tail
+    # position goes by its own flat carrier — the packed slot's activity is per-element.
+    is_vararg = nfixed >= 0
+    nfixed_eff = is_vararg ? nfixed : n
+    ret_inactive(k::Int) = k <= nfixed_eff ? !arg_active[k] :
+                           _codual_fdata_type(codualparams[k]) === Inactive
+    ret_rt(k::Int) = ret_inactive(k) ? NoRData :
+                     zero_like_rdata_type(_codual_primal_type(codualparams[k]))
+    own_RdatasT = Tuple{(ret_rt(k) for k in 1:n)...}
 
     getf = GlobalRef(Core, :getfield)
     setf = GlobalRef(Core, :setfield!)
@@ -2776,15 +3953,17 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         ci === nothing ? Expr(:call, f, args...) : Expr(:invoke, ci, f, args...)
     end
 
-    # Which block each statement belongs to (reused throughout).
-    stmt_block = _stmt_block_map(pir)
-
     # Every statement except a pure control marker (or one living in a throw-only block) gets a `Ref`
     # to accumulate rdata into; literal/GlobalRef/`:boundscheck`/`:loopinfo` operands never do (both
     # always have `NoRData`, so skipping them here just avoids a useless allocation — not load-bearing).
-    needs_ref(i) = !unreachable_block[stmt_block[i]] &&
-                   !isa(pstmts[i][:stmt], Union{Core.GotoNode,Core.GotoIfNot,Core.ReturnNode}) &&
-                   !(isa(pstmts[i][:stmt], Expr) && (pstmts[i][:stmt]::Expr).head in (:boundscheck, :loopinfo))
+    needs_ref(i) = _has_rdata_sink(Core.SSAValue(i), pir, active, arg_active, unreachable_block,
+                                   block_of, npacked, nfixed)
+    has_sink(@nospecialize node) = _has_rdata_sink(node, pir, active, arg_active, unreachable_block,
+                                                    block_of, npacked, nfixed)
+    mixed_shadow(@nospecialize node) = begin
+        F = _shadow_type_of(shadow_types, pir, iworld, arg_active, packed_codualparams, npacked, node)
+        F isa DataType && F <: Tuple && any(T -> T === Inactive, F.parameters)
+    end
 
     entry_id = ID()
     block_id = [ID() for _ in 1:nblocks]
@@ -2817,6 +3996,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # Direct self-recursion's dedicated storage (`Tape.subtapes`, field 4). Unconditionally unpacked
     # (unused/DCE'd by `run_ipo_passes!` when this primal has no self-recursive call).
     subtapes_id = eemit!(Expr(:call, getf, tape_id, 4), Stack{TapeT})
+    count_stack_id = eemit!(Expr(:call, getf, tape_id, 5), Stack{Int64})
 
     comms_obj_id = Vector{Any}(undef, nblocks)
     for b in 1:nblocks
@@ -2831,7 +4011,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # same `entry_stmts` vector, and anything appended after that would land past a terminator. ---
     parg_pb = Vector{Any}(undef, n)
     farg_pb = Vector{Any}(undef, n)
-    let args_tup_id = eemit!(Expr(:call, getf, tape_id, 5), ArgsTT)
+    let args_tup_id = eemit!(Expr(:call, getf, tape_id, 6), ArgsTT)
         for k in 1:n
             Ck = codualparams[k]
             Pk = _codual_primal_type(Ck)
@@ -2846,6 +4026,12 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     npacked = length(packed_codualparams)
     arg_ref_id = Vector{Any}(undef, npacked)
     for k in 1:npacked
+        # An inactive argument accumulates nothing and returns `NoRData()`, so it gets no `Ref`. The
+        # packed vararg tail is exempt: the scatter at the pullback's return reads its accumulator
+        # for every non-constant flat position (`ret_inactive` gates per position, not per slot), and
+        # an all-`NoTangent` tail is inactive by type anyway.
+        _has_rdata_sink(Core.Argument(k), pir, active, arg_active, unreachable_block, block_of,
+                        npacked, nfixed) || continue
         Pk = _codual_primal_type(packed_codualparams[k])
         # `zero_like_rdata_type`/`zero_like_rdata_from_type`, not `rdtype`/`zero_rdata_from_type`: when
         # `Pk` isn't concrete enough to produce a real zero rdata from its type alone (e.g. an
@@ -2872,9 +4058,34 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         ssa_ref_id[i] = eemit!(Expr(:new, Base.RefValue{RT}, zero_like_rdata_from_type(Ti)), Base.RefValue{RT})
     end
 
-    ref_for(@nospecialize node) =
-        isa(node, Core.SSAValue) ? ssa_ref_id[node.id] :
-        isa(node, Core.Argument) ? arg_ref_id[node.n] : nothing
+    # One countdown cell per counted loop, initialized from the popped trip count at the loop
+    # region's reverse entry and decremented at each reverse header visit. A `Ref` rather than a
+    # phi threaded through the reverse CFG: every other piece of pullback state already routes
+    # through `Ref`s SROA scalarizes, it dominates everything from here, and a missed
+    # scalarization costs a load/store per reverse iteration, never correctness.
+    cnt_ref_id = [eemit!(Expr(:new, Base.RefValue{Int64}, Int64(0)), Base.RefValue{Int64})
+                  for _ in counted]
+
+    # One predecessor cell per implied merge, stored by the reverse arm entering the branch
+    # block's reverse code and read by the merge's reverse dispatch in place of a block-stack pop.
+    # A `Ref` for the same reason as the countdown cells above: SROA scalarizes it, and a missed
+    # scalarization costs a load/store, never correctness.
+    imp_ref_id = [eemit!(Expr(:new, Base.RefValue{Int32}, Int32(0)), Base.RefValue{Int32})
+                  for _ in implied]
+
+    # An unassigned slot *in range* is an inactive statement/argument; `route!` discards a `nothing`
+    # target, exactly as it already does for a literal operand. Out of range is an internal error, not
+    # inactivity — `isassigned` alone can't tell the two apart.
+    function ref_for(@nospecialize node)
+        if isa(node, Core.SSAValue)
+            node.id <= N || error("Differ internal error: SSA %$(node.id) is out of range")
+            return isassigned(ssa_ref_id, node.id) ? ssa_ref_id[node.id] : nothing
+        elseif isa(node, Core.Argument)
+            node.n <= npacked || error("Differ internal error: argument $(node.n) is out of range")
+            return isassigned(arg_ref_id, node.n) ? arg_ref_id[node.n] : nothing
+        end
+        return nothing
+    end
 
     # One small routing block per exit: seed *that* exit's own return-value `Ref` from `seed`, then
     # jump to its reverse code. Which one runs is chosen by the switch below, popping the block
@@ -3065,6 +4276,10 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         end
         for i in reverse((phi_end + 1):hi)
             s = pstmts[i][:stmt]; Ti = _stype(pstmts, i)
+            # Inactive: replayed primally by the fwds pass with no comms recorded, so nothing to pop
+            # and nothing to route. Any rdata an active consumer left in its `Ref` correctly ends
+            # here — every operand it would route to is inactive too.
+            active[i] || continue
             if isa(s, Core.GotoNode) || isa(s, Core.GotoIfNot) || isa(s, Core.ReturnNode)
                 continue
             elseif isa(s, Expr) && s.head === :boundscheck
@@ -3092,7 +4307,8 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                         ssa=Core.SSAValue(i), ref_for,
                         tt=(@nospecialize(T) -> _tt(iworld, _widen(T))),
                         rdtype=(@nospecialize(T) -> rdtype(iworld, T)),
-                        fdtype=(@nospecialize(T) -> fdtype(iworld, T)))
+                        fdtype=(@nospecialize(T) -> fdtype(iworld, T)),
+                        inactive=(@nospecialize node) -> _inactive_arg_root(node, pir, iworld, arg_active, packed_codualparams))
                 contribs = fc === nothing ? nothing : apply_foreigncall_rrule!(Val(fc.name), fc, Ti, fcctx)
                 if contribs === nothing
                     reason[] = "reverse mode does not support foreigncall target " *
@@ -3176,23 +4392,25 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     # exist and shouldn't — nothing flows backward through them.
                     if rdtype(iworld, Ti) !== NoRData
                         acc = deref_and_zero!(ssa_ref_id[i], Ti)
-                        # Operands the forwards pass deliberately didn't record (see
-                        # `intrinsic_rrule_operands`, consulted identically in `_scan_block_comms`) come
-                        # through as `UnrecordedOperand`, and `opf` refuses to emit anything referencing
-                        # one. So a rule whose declaration understates what it reads fails here, loudly
-                        # and located, instead of silently emitting IR against a value that was never put
-                        # on the tape.
-                        needed = intrinsic_rrule_operands(Val(f))
-                        pvals = Tuple((needed === nothing || k in needed) ? pb_presolve(a) :
-                                      UnrecordedOperand(k) for (k, a) in enumerate(actual))
+                        # `wanted(j)`: operand `j`'s own contribution has somewhere to route to —
+                        # `ref_for` here, `_has_rdata_sink` in the scan, same answer either way.
+                        # `needed`: which operand primals a wanted contribution reads, i.e. exactly
+                        # what the scan recorded.
+                        wanted = j -> ref_for(actual[j]) !== nothing
+                        needed = _intrinsic_needed_operands(f, length(actual), wanted)
+                        # A literal costs nothing to resolve, so `UnrecordedOperand` only ever stands
+                        # for a node the scan genuinely skipped.
+                        unrecorded(k::Int, @nospecialize a) =
+                            (isa(a, Core.SSAValue) || isa(a, Core.Argument)) &&
+                            needed !== nothing && !(k in needed)
+                        pvals = Tuple(unrecorded(k, a) ? UnrecordedOperand(k) : pb_presolve(a)
+                                      for (k, a) in enumerate(actual))
+                        # `opf` propagates an `UnrecordedOperand` rather than erroring: a contribution
+                        # that will be discarded is allowed to read one, and nested chains (like
+                        # `div_float`'s `db`) then propagate it for free.
                         ctx = (opf=(name, ty, args...) -> begin
                                    for a in args
-                                       isa(a, UnrecordedOperand) || continue
-                                       error("Differ internal error: the reverse rule for intrinsic " *
-                                             "`$(nameof(f))` reads operand $(a.position), but " *
-                                             "`intrinsic_rrule_operands(Val($(nameof(f))))` does not " *
-                                             "list it, so the forwards pass never recorded it. Fix " *
-                                             "that declaration in src/intrinsics_reverse.jl.")
+                                       isa(a, UnrecordedOperand) && return a
                                    end
                                    emit!(Expr(:call, GlobalRef(Core.Intrinsics, name), args...), ty)
                                end,
@@ -3210,6 +4428,16 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                             return nothing
                         end
                         for (a, c) in zip(actual, contribs)
+                            if isa(c, UnrecordedOperand)
+                                # No sink: this contribution was going to be discarded anyway.
+                                # Otherwise `intrinsic_rrule_deps` understates what its rule reads.
+                                ref_for(a) === nothing && continue
+                                error("Differ internal error: the reverse rule for intrinsic " *
+                                      "`$(nameof(f))` reads operand $(c.position), but " *
+                                      "`intrinsic_rrule_deps(Val($(nameof(f))))` does not list it " *
+                                      "there, so the forwards pass never recorded it. Fix that " *
+                                      "declaration in src/intrinsics_reverse.jl.")
+                            end
                             route!(a, c, zero_like_rdata_type(_widen(_optype(pir, a))))
                         end
                     end
@@ -3239,9 +4467,9 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     end
                 else
                     Ti = _stype_invoke(pstmts, i)
-                    info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked)
+                    info = _static_recursible_call(pir, iworld, i, s, reason, arg_tracked, fdata_tracked, has_sink, mixed_shadow)
                     info === nothing && return nothing
-                    _, ftype, argtypes = info
+                    _, ftype, argtypes, mask = info
                     acc = deref_and_zero!(ssa_ref_id[i], Ti)   # this call's own seed for the inner pullback
                     # A direct self-recursive call's inner tape was pushed onto `Tape.subtapes` (fwds
                     # side), not a per-block comms item. Pop it back off `subtapes_id` directly
@@ -3257,32 +4485,50 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     # inner pullback must be resolved to accept exactly that (possibly wider) seed type —
                     # its own exit-route `increment!!` already tolerates `ZeroRData` generically.
                     SeedT = zero_like_rdata_type(_widen(Ti))
-                    pb_resolved = reverse_pullback_recursive_ci(interp, impl_mi, TapeT, codualparams,
-                                                                 InnerTapeT, SeedT, edges, reason)
+                    pb_resolved = reverse_pullback_recursive_ci(interp, impl_mi, TapeT, own_RdatasT,
+                                                                 InnerTapeT, SeedT, edges, reason,
+                                                                 length(argtypes))
                     if pb_resolved === nothing
                         reason[] *= " — at %$i: `$(_stmt_str(s))`"
                         return nothing
                     end
                     pb_ci, pb_derived, InnerRdatasT = pb_resolved
                     # A derived inner pullback goes through its carrier (`reverse_pullback_impl` the
-                    # callee, tape an argument); a hand-written one is the callee. The hand-written
-                    # case is flagged `IR_FLAG_NOINLINE`: inlining a rule author's body back in here
-                    # would re-embed its `GlobalRef`s relative to its defining module (a bare `cos`
-                    # becomes `GlobalRef(Differ, :cos)`), which `verify_ir` rejects. `_is_reverse_carrier_mi`
-                    # can't cover this case by type — a hand pullback has no common supertype.
+                    # callee, tape an argument); a hand-written one is the callee directly. Only under
+                    # forward-over-reverse (`nested_forward`) does the hand-written case stay
+                    # `IR_FLAG_NOINLINE` — that composition has never been exercised against an inlined
+                    # pullback body. `_is_reverse_carrier_mi` can't cover this case by type — a hand
+                    # pullback has no common supertype.
                     pb_stmt = pb_derived ? Expr(:invoke, pb_ci, reverse_pullback_impl, inner_tape, acc) :
                                            Expr(:invoke, pb_ci, inner_tape, acc)
                     inner_rdatas = emit!(pb_stmt, InnerRdatasT,
-                                         pb_derived ? CC.IR_FLAG_REFINED : CC.IR_FLAG_NOINLINE)
+                                         pb_derived ? CC.IR_FLAG_REFINED :
+                                         (interp.owner.nested_forward ? CC.IR_FLAG_NOINLINE : CC.IR_FLAG_NULL))
                     # Slot 1 is the callee's own rdata — guaranteed `NoRData` by
                     # `_static_recursible_call`'s callee guard, discarded exactly like `ref_for` already
                     # discards any literal operand's contribution — so routing starts at 2.
+                    if InnerRdatasT.parameters[1] !== NoRData
+                        reason[] = "recursive pullback returns its own rdata as " *
+                                   "`$(InnerRdatasT.parameters[1])`, expected `NoRData` at %$i: " *
+                                   "`$(_stmt_str(s))`"
+                        return nothing
+                    end
                     for (j, a) in enumerate(actual)
+                        # Masked position: the callee saw `CoDual{P,Inactive}` for this argument, so
+                        # its slot is `NoRData` regardless of what `argtypes[j]`'s own rdata type would
+                        # otherwise be — nothing to route, and `route!` would discard it anyway.
+                        mask[j] && continue
                         # `zero_like_rdata_type`: the callee's own `argtypes[j]`-th argument rdata (this
                         # same function, recursively, for the callee) can likewise be `ZeroRData` when
                         # that argument's type isn't concrete enough.
                         Fty = zero_like_rdata_type(_widen(argtypes[j]))
                         Fty === NoRData && continue
+                        RTj = InnerRdatasT.parameters[j + 1]
+                        if !(RTj <: Fty)
+                            reason[] = "recursive pullback returns argument $(j)'s rdata as `$(RTj)`, " *
+                                       "not a subtype of the declared `$(Fty)` at %$i: `$(_stmt_str(s))`"
+                            return nothing
+                        end
                         contrib = emit!(Expr(:call, getf, inner_rdatas, j + 1), Fty)
                         route!(a, contrib, Fty)
                     end
@@ -3299,9 +4545,67 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
         haskey(regions, b) && (preds = [regions[b]])
         phi_acc = Any[]
         for i in lo:phi_end
-            Ti = _stype(pstmts, i)
-            push!(phi_acc, deref_and_zero!(ssa_ref_id[i], Ti))
+            # `nothing` marks an inactive phi: no accumulator, and the routing loop below skips it.
+            push!(phi_acc, active[i] ? deref_and_zero!(ssa_ref_id[i], _stype(pstmts, i)) : nothing)
         end
+
+        # Dispatch to the chosen predecessor's target: the block-stack pop/switch for an ordinary
+        # block, or — for a counted loop's header — the countdown test, with no pop at all: the
+        # popped trip count (stored at the loop region's reverse entry, see `counted_exit` below)
+        # replaces every per-arrival push this block used to consume. The decrement is
+        # unconditional; the stale store on the final (preheader) arm is harmless because any
+        # re-entry into the loop region re-pops first.
+        emit_pred_dispatch!(preds_, targets_::Vector{ID}) = begin
+            li = get(counted_header, b, nothing)
+            ii = get(implied_merge, b, nothing)
+            if li === nothing && ii !== nothing
+                # Implied merge: the arriving arm already stored the predecessor it implies into
+                # this merge's cell — dispatch on that instead of popping.
+                im = implied[ii]
+                (length(preds_) == 2 && im.dest_pred in preds_ && im.fall_pred in preds_) ||
+                    error("Differ internal error: implied merge $b's predecessors $(preds_) do " *
+                          "not match its analysis ($(im.dest_pred), $(im.fall_pred))")
+                pv = emit!(Expr(:call, getf, imp_ref_id[ii], 1), Int32)
+                _emit_switch!(emit!, icall, block_stack_id, preds_, targets_; prev_id=pv)
+            elseif li === nothing
+                _emit_switch!(emit!, icall, block_stack_id, preds_, targets_;
+                             skip_pop=pred_is_unique_pred[b])
+            else
+                cl = counted[li]
+                (length(preds_) == 2 && cl.preheader in preds_ && cl.latch in preds_) ||
+                    error("Differ internal error: counted header $b's predecessors $(preds_) " *
+                          "do not match its loop (preheader $(cl.preheader), latch $(cl.latch))")
+                ip = findfirst(==(cl.preheader), preds_)
+                cref = cnt_ref_id[li]
+                cd = emit!(Expr(:call, getf, cref, 1), Int64)
+                dec = emit!(icall(__count_dec, (Int64,), cd), Int64)
+                emit!(Expr(:call, setf, cref, 1, dec), Any)
+                cond = emit!(icall(__count_case, (Int64,), cd), Bool)
+                emit!(Switch(Any[cond], ID[targets_[ip]], targets_[ip == 1 ? 2 : 1]), Any)
+            end
+            nothing
+        end
+        # The arm routing to a counted loop's exiting block is where the reverse walk enters that
+        # loop's region: recover this entry's trip count before anything inside the region runs.
+        count_pop!(remit!, p) = begin
+            li = get(counted_exit, (p, b), nothing)
+            li === nothing && return nothing
+            c = remit!(icall(__pop_count_stack!, (Stack{Int64},), count_stack_id), Int64)
+            remit!(Expr(:call, setf, cnt_ref_id[li], 1, c), Any)
+            nothing
+        end
+        # The arm routing to an implied merge's branch block records which predecessor this
+        # arrival direction implies. Between here and the merge's own dispatch only this visit's
+        # branch/chain reverse code runs, and only arms into the branch block store this cell, so
+        # the read always sees this visit's store.
+        store_pred!(remit!, p) = begin
+            e = get(implied_store, (p, b), nothing)
+            e === nothing && return nothing
+            ii, predid = e
+            remit!(Expr(:call, setf, imp_ref_id[ii], 1, predid), Any)
+            nothing
+        end
+        arm_decorated(p) = haskey(counted_exit, (p, b)) || haskey(implied_store, (p, b))
 
         if b == 1
             # No predecessors: this is the pullback's own final block — the last thing that runs.
@@ -3317,19 +4621,23 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                 end
             end
             # Read out every argument's accumulated rdata and return them as a tuple, flat arity.
-            # `nfixed_eff` is `n` when non-vararg, so the tail branch below never fires.
-            is_vararg = nfixed >= 0
-            nfixed_eff = is_vararg ? nfixed : n
+            # `is_vararg`/`nfixed_eff`/`ret_inactive`/`ret_rt` are defined with `own_RdatasT` above.
             result_ids = Vector{Any}(undef, n)
             for k in 1:nfixed_eff
-                Pk = _codual_primal_type(codualparams[k])
-                result_ids[k] = emit!(Expr(:call, getf, arg_ref_id[k], 1), zero_like_rdata_type(Pk))
+                result_ids[k] = ret_inactive(k) ? NoRData() :
+                    emit!(Expr(:call, getf, arg_ref_id[k], 1), ret_rt(k))
             end
             if is_vararg
                 tailPk = _codual_primal_type(packed_codualparams[nfixed_eff + 1])
                 tailRT = zero_like_rdata_type(tailPk)
                 tail_acc = emit!(Expr(:call, getf, arg_ref_id[nfixed_eff + 1], 1), tailRT)
                 for k in (nfixed_eff + 1):n
+                    # A trailing argument held constant accumulates nothing; its accumulator slot
+                    # stays at zero and is never read.
+                    if ret_inactive(k)
+                        result_ids[k] = NoRData()
+                        continue
+                    end
                     Pk = _codual_primal_type(codualparams[k])
                     RTk = zero_like_rdata_type(Pk)
                     j = k - nfixed_eff
@@ -3337,13 +4645,39 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                                                 tail_acc, Val(j), Pk), RTk)
                 end
             end
-            res = emit!(Expr(:call, ctuple, result_ids...),
-                       Tuple{(zero_like_rdata_type(_codual_primal_type(c)) for c in codualparams)...})
+            res = emit!(Expr(:call, ctuple, result_ids...), own_RdatasT)
             emit!(Core.ReturnNode(res), Any)
         elseif phi_end < lo
-            # No PhiNodes at the top of this block: switch straight to each predecessor's own block.
-            _emit_switch!(emit!, icall, block_stack_id, preds, ID[block_id[p] for p in preds];
-                         skip_pop=pred_is_unique_pred[b])
+            # No PhiNodes at the top of this block: switch straight to each predecessor's own
+            # block, via a small routing block only where the arm must first recover a counted
+            # loop's trip count or record an implied merge's predecessor. A sole predecessor's
+            # decorations can sit inline instead — the dispatch below is then a plain goto.
+            target_ids = ID[]
+            new_blocks = CFGBlock[]
+            for p in preds
+                if !arm_decorated(p)
+                    push!(target_ids, block_id[p])
+                elseif length(preds) == 1
+                    count_pop!(emit!, p)
+                    store_pred!(emit!, p)
+                    push!(target_ids, block_id[p])
+                else
+                    rstmts = IDInstPair[]
+                    remit!(ex, @nospecialize(ty)) = begin
+                        id = ID()
+                        push!(rstmts, (id, new_inst(ex, ty)))
+                        id
+                    end
+                    count_pop!(remit!, p)
+                    store_pred!(remit!, p)
+                    rid = ID()
+                    remit!(IDGotoNode(block_id[p]), Any)
+                    push!(new_blocks, CFGBlock(rid, rstmts))
+                    push!(target_ids, rid)
+                end
+            end
+            emit_pred_dispatch!(preds, target_ids)
+            append!(blocks, new_blocks)
         else
             # PhiNodes: route each predecessor's own edge value, in a small dedicated block per pred.
             phi_ids = lo:phi_end
@@ -3360,6 +4694,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     phi = pstmts[i][:stmt]::Core.PhiNode
                     eidx = findfirst(==(Int32(p)), phi.edges)
                     (eidx === nothing || !isassigned(phi.values, eidx)) && continue
+                    phi_acc[j] === nothing && continue
                     v = phi.values[eidx]
                     tgt = ref_for(v)
                     tgt === nothing && continue
@@ -3377,12 +4712,14 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
                     new = remit!(icall(increment_g, (RTcur, RTacc), cur, phi_acc[j]), RTcur)
                     remit!(Expr(:call, setf, tgt, 1, new), Any)
                 end
+                count_pop!(remit!, p)
+                store_pred!(remit!, p)
                 rid = ID()
                 remit!(IDGotoNode(block_id[p]), Any)
                 push!(new_blocks, CFGBlock(rid, rstmts))
                 push!(target_ids, rid)
             end
-            _emit_switch!(emit!, icall, block_stack_id, preds, target_ids; skip_pop=pred_is_unique_pred[b])
+            emit_pred_dispatch!(preds, target_ids)
             append!(blocks, new_blocks)
         end
 
@@ -3401,27 +4738,31 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
     # `_remove_unreachable_cfg_blocks!` drops the throw-only-primal-block stubs: nothing in the
     # pullback ever pushes/routes to them, so they're genuinely unreachable here.
     blocks = _remove_unreachable_cfg_blocks!(_sort_cfg_blocks!(blocks))
-    ir2 = lower_cfg_blocks_to_ir(blocks, pir; argtypes=Any[impl_mi.specTypes.parameters...], def=impl_mi)
+    ir2 = lower_cfg_blocks_to_ir(blocks, pir; argtypes=Any[impl_mi.specTypes.parameters...], def=impl_mi,
+                                 valid_worlds=carrier_world_range(interp, pir))
     CC.verify_ir(ir2)
     return ir2
 end
 
 # Emits a plain goto (`skip_pop`, the only path a single-predecessor block takes under the per-edge
 # formula) or `pop!(block_stack)` followed by a `Switch` comparing the popped id against each
-# candidate (`preds[1:end-1]`), falling through to `preds[end]`.
+# candidate (`preds[1:end-1]`), falling through to `preds[end]`. `prev_id` supplies an
+# already-emitted block id to dispatch on instead of popping — an implied merge's cell read.
 #
 # The `length(preds) == 1` branch below is dead code under the current `pred_is_unique_pred[b] =
 # length(preds[b]) <= 1` formula (every single-predecessor block returns early via `skip_pop`
 # above). Kept as a defensive no-op, not removed — the old per-block push/pop scheme needed a
 # balance-pop here (ISSUES #52); the two schemes must not be mixed.
 function _emit_switch!(emit!, icall, block_stack_id, preds::Vector{Int}, targets::Vector{ID};
-                       skip_pop::Bool=false)
+                       skip_pop::Bool=false, prev_id=nothing)
     if skip_pop
         @assert length(targets) == 1 "skip_pop requires an unambiguous (single) target"
         emit!(IDGotoNode(targets[1]), Any)
         return nothing
     end
-    prev_id = emit!(icall(__pop_blk_stack!, (Stack{Int32},), block_stack_id), Int32)
+    if prev_id === nothing
+        prev_id = emit!(icall(__pop_blk_stack!, (Stack{Int32},), block_stack_id), Int32)
+    end
     if length(preds) == 1
         # Dead under the per-edge formula (see above) — defensive balance-pop, kept for safety.
         emit!(IDGotoNode(targets[1]), Any)
@@ -3503,16 +4844,48 @@ refresh_pullback_entry()
 # ===========================================================================
 
 """
-    build_ctx(f, argtypes::Tuple; prealloc=true) -> Ctx
+    build_ctx(::Type{CDs}) -> Ctx
+    build_ctx(fcd::CoDual, argcds::CoDual...) -> Ctx
+    build_ctx(f, argtypes::Tuple; inactive=()) -> Ctx
 
-Build a reusable differentiation context for `f` applied to arguments of types `argtypes` — a
-[`Ctx`](@ref) wrapping a tape sized for `f`'s derived rule (obtained by transforming `f`'s optimized
-IR). Pass it to [`rrule!!`](@ref) / [`value_and_gradient!`](@ref) / [`rev_gradient!`](@ref).
+Build a reusable differentiation context — a [`Ctx`](@ref) wrapping a tape sized for the derived
+rule of the call it describes (obtained by transforming the primal's optimized IR). Pass it to
+[`rrule!!`](@ref) / [`value_and_gradient!`](@ref) / [`rev_gradient!`](@ref).
 
-With `prealloc=true` (the default) the tape is allocated once, and its stacks are reset and reused on
-every call — the whole point of holding onto a context rather than differentiating afresh. That makes
-the context **single-use at a time**: it is not reentrant and not thread-safe, so give each task its
-own. `prealloc=false` returns `Ctx()` — a context that allocates a fresh tape per call instead.
+`CDs` is the `Tuple` of `CoDual` types the call will be made with, the function's own carrier first
+— exactly `rrule!!`'s argument list minus the context. This is the primary form: everything the tape
+shape depends on, activity included, is already a type parameter, so the result type is a pure
+function of `CDs` with no const-folding involved.
+
+```julia
+ctx = build_ctx(Tuple{typeof(fcd),typeof(vcd),typeof(acd)})
+```
+
+The `CoDual` form is the same thing spelled with the carriers themselves, and is usually what you
+want when you have them to hand — it cannot disagree with the call, because it *is* the call's
+argument list:
+
+```julia
+acd = CoDual(a, Inactive())            # held constant, stated once
+ctx = build_ctx(fcd, vcd, acd)
+y, pb = rrule!!(fcd, ctx, vcd, acd)
+```
+
+The primal-types form is the convenience spelling for when no carriers exist yet; it derives each
+argument's carrier from its primal type.
+
+`; inactive=(p, …)` marks argument positions (1-based, arguments only) the caller holds constant:
+the tape is sized for the `CoDual{P,Inactive}` carriers those slots must arrive as. It is an `Int`
+or a tuple of them — nothing else, since the positions ride into `_build_tape`'s generator as a
+`Val` type parameter and only those are constructible as one. It should also be a **compile-time
+constant** (a literal, or a locally-constructed constant the compiler can fold): one the compiler
+cannot fold still works at run time, but `build_ctx`'s return type is then not inferable, and the
+adjacent `rrule!!` dispatches dynamically. The two carrier forms above have neither restriction.
+
+The tape is allocated once, and its stacks are reset and reused on every call — the whole point of
+holding onto a context rather than differentiating afresh. That makes the context **single-use at a
+time**: it is not reentrant and not thread-safe, so give each task its own. For a context that
+allocates a fresh tape per call instead, construct `Ctx()` directly; there is no flag for it.
 
 A reused tape also holds onto the *previous* call's argument coduals (the pullback reaches primal
 argument values through them) — and so keeps their shadows alive — until the next call overwrites
@@ -3524,12 +4897,37 @@ y, pb = rrule!!(zero_fcodual(f), ctx, CoDual(x, dx))
 _, gx = pb(1.0)
 ```
 """
-function build_ctx(@nospecialize(f), @nospecialize(argtypes::Tuple); prealloc::Bool=true)
-    prealloc || return Ctx()
+build_ctx(::Type{CDs}) where {CDs<:Tuple} = Ctx(_build_tape(CDs))
+
+# `typeof` of each carrier folds to a constant here — the method is already specialized on those
+# types — so the `Tuple{…}` this hands to the type form is a constant too.
+build_ctx(fcd::CoDual, argcds::Vararg{CoDual,N}) where {N} =
+    build_ctx(Tuple{typeof(fcd),map(typeof, argcds)...})
+
+function build_ctx(@nospecialize(f), @nospecialize(argtypes::Tuple);
+                   inactive::Union{Int,Tuple{Vararg{Int}}}=())
     # `Base.to_tuple_type` moves the argument types into a type parameter, which is the only way
     # `_build_tape`'s generator can see them: a runtime tuple of types has type `Tuple{DataType,…}`,
-    # which says nothing about which types they were.
-    return Ctx(_build_tape(f, Base.to_tuple_type(argtypes)))
+    # which says nothing about which types they were. `inactive` rides in a `Val` for the same
+    # reason — but only if the call site const-folds it to a constant type parameter, which
+    # requires `_inactive_positions` to stay pure and allocation-free.
+    return Ctx(_build_tape(f, Base.to_tuple_type(argtypes),
+                           Val(_inactive_positions(inactive, length(argtypes)))))
+end
+
+"""
+    _arg_codual_types(world, argtypes, inactive) -> Vector{Any}
+
+The argument `CoDual` types an entry point should build: the ordinary fdata carrier, or
+`CoDual{P,Inactive}` for a position the caller declared constant.
+"""
+function _arg_codual_types(world::UInt, argtypes, inactive::Tuple)
+    out = Any[]
+    for (j, T) in enumerate(argtypes)
+        (T isa Type) || throw(ArgumentError("argtypes must be a tuple of types, got $(repr(T))"))
+        push!(out, j in inactive ? CoDual{T,Inactive} : _fcdtype(world, T))
+    end
+    return out
 end
 
 """
@@ -3537,25 +4935,77 @@ end
 
 Allocate a fresh `Tape` of exactly the shape `f`'s derived rule will use — same block stack, same
 per-block comms stacks. Generated: the tape type is read off the tape-allocating carrier's return type
-at generation time, so at run time this is just the allocations.
+at generation time, so at run time this is just the allocations. At run time the `Val`'s parameter
+is the positions tuple value (a constant type parameter); if inference handed the generator a
+type-level parameter instead, it yields `nothing` and `build_ctx` returns the per-call allocating
+`Ctx{Nothing}` rather than a mistyped tape.
 """
-function _build_tape_body(world::UInt, source, self, ftype, argst)
-    argnames = Any[Symbol("#self#"), :f, :ArgsT]
+function _build_tape_body(world::UInt, source, self, ftype, argst, inactivet)
+    argnames = Any[Symbol("#self#"), :f, :ArgsT, :Positions]
     bail(msg) = expr_to_codeinfo(@__MODULE__(), argnames, [], (), :(error($msg)), false)
     (argst isa DataType && argst <: Type) ||
         return bail("Differ.build_ctx: argtypes must be a tuple of types")
     ArgsT = argst.parameters[1]
     (ArgsT isa DataType && ArgsT <: Tuple) ||
         return bail("Differ.build_ctx: argtypes must be a tuple of types")
-    interp = build_reverse_interp(; world)
-    codualtys = Any[_fcdtype(world, ftype)]
+    (inactivet isa DataType && inactivet <: Val) ||
+        return bail("Differ.build_ctx: inactive positions must be a `Val` of a tuple of Ints")
+    # The parameter is the positions tuple *value*, folded or not — a generator only ever sees
+    # concrete argument types, so `Val`'s parameter is whatever was actually constructed.
+    # `build_ctx` admits only an `Int` or a tuple of them, so this is unreachable from there; it
+    # stays as a guard for a direct `_build_tape` call, and errors rather than quietly handing back
+    # a context that allocates a tape per call when a pre-allocated one was asked for.
+    inactive = inactivet.parameters[1]
+    (inactive isa Tuple) ||
+        return bail("Differ.build_ctx: inactive positions must be a `Val` of a tuple of Ints, got " *
+                    "`Val{$(inactive)}`")
     for T in ArgsT.parameters
         (T isa Type) || return bail("Differ.build_ctx: argtypes must be a tuple of types")
-        push!(codualtys, _fcdtype(world, T))
     end
+    codualtys = Any[_fcdtype(world, ftype)]
+    append!(codualtys, _arg_codual_types(world, ArgsT.parameters, inactive))
+    return _tape_codeinfo(world, argnames, codualtys, Tuple{ftype,ArgsT.parameters...})
+end
+
+"""
+    _build_tape(::Type{CDs}) -> Tape
+
+Carrier-type form: `CDs` is the `Tuple` of `CoDual` types the call will be made with, the function's
+own carrier first. Nothing is derived from primal types here, so there is no `Val` and no reliance
+on const-folding — the tape shape is a function of `CDs` alone, and `CDs` is a type parameter
+already.
+"""
+function _build_tape_cds_body(world::UInt, source, self, cdst)
+    argnames = Any[Symbol("#self#"), :CDs]
+    bail(msg) = expr_to_codeinfo(@__MODULE__(), argnames, [], (), :(error($msg)), false)
+    (cdst isa DataType && cdst <: Type) ||
+        return bail("Differ.build_ctx: expected a `Tuple` type of `CoDual` types")
+    CDs = cdst.parameters[1]
+    (CDs isa DataType && CDs <: Tuple) ||
+        return bail("Differ.build_ctx: expected a `Tuple` type of `CoDual` types, got `$(CDs)`")
+    isempty(CDs.parameters) &&
+        return bail("Differ.build_ctx: the tuple must start with the function's own `CoDual` type")
+    codualtys = Any[]
+    for C in CDs.parameters
+        # A `UnionAll` (`CoDual{Float64}`) or a union fails `isa DataType`, which is what keeps a
+        # partially-specified carrier from reaching `findsup`.
+        (C isa DataType && C <: CoDual) ||
+            return bail("Differ.build_ctx: every element must be a fully-specified `CoDual` type, " *
+                        "got `$(C)`")
+        push!(codualtys, C)
+    end
+    primal_tt = Tuple{(_codual_primal_type(C) for C in codualtys)...}
+    return _tape_codeinfo(world, argnames, codualtys, primal_tt)
+end
+
+# Shared tail of both `_build_tape` generators: given the carrier types (`fcd` first), read the tape
+# shape off the tape-allocating carrier's return type and return the `CodeInfo` that constructs one.
+# `primal_tt` is only ever used in error messages.
+function _tape_codeinfo(world::UInt, argnames, codualtys, @nospecialize(primal_tt))
+    bail(msg) = expr_to_codeinfo(@__MODULE__(), argnames, [], (), :(error($msg)), false)
+    interp = build_reverse_interp(; world)
     # Carrier layout is `reverse_fwds_impl(fcd, ctx, argcds...)`: fcd first, then `Ctx{Nothing}`
     # (tape-allocating mode — this only reads its return type), then the argument coduals.
-    primal_tt = Tuple{ftype,ArgsT.parameters...}
     impl_tt = Tuple{typeof(reverse_fwds_impl),codualtys[1],Ctx{Nothing},codualtys[2:end]...}
     match, _ = CC.findsup(impl_tt, CC.method_table(interp))
     match === nothing &&
@@ -3587,7 +5037,8 @@ function _fresh_tape_expr(@nospecialize(TapeT))
     slots = Any[S <: SingletonStack ? :($S()) :
                 S <: CommsCell ? :($S()) :
                 :($S(1)) for S in CS.parameters]
-    return :($TapeT($(Stack{Int32})(1), ($(slots...),), $(Vector{Any})(), $(Stack{TapeT})()))
+    return :($TapeT($(Stack{Int32})(1), ($(slots...),), $(Vector{Any})(), $(Stack{TapeT})(),
+                    $(Stack{Int64})(1)))
 end
 
 # Nested-tape recycling (`_inner_ctx`, `stack.jl`): allocate a fresh tape of exactly the shape
@@ -3601,9 +5052,13 @@ end
 end
 
 function refresh_build_tape()
-    @eval function _build_tape(f, ArgsT)
+    @eval function _build_tape(f, ArgsT, Positions)
         $(Expr(:meta, :generated_only))
         $(Expr(:meta, :generated, _build_tape_body))
+    end
+    @eval function _build_tape(CDs)
+        $(Expr(:meta, :generated_only))
+        $(Expr(:meta, :generated, _build_tape_cds_body))
     end
 end
 refresh_build_tape()
@@ -3627,7 +5082,7 @@ end
 # `rev_gradient` above calls `zero_fcodual` on `f` and every argument, allocating a fresh shadow per
 # call (for an `Array` argument: the shadow array itself). These variants instead take the caller's
 # own `CoDual`s, so the shadow buffers are owned and reused by the caller. Pair them with a
-# `build_ctx(...; prealloc=true)` context and a steady-state call allocates essentially nothing.
+# `build_ctx` context and a steady-state call allocates essentially nothing.
 #
 # The gradient w.r.t. an argument arrives one of two ways, decided by the argument's type, not by
 # this API:

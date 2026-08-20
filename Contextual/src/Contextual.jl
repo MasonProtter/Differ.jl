@@ -199,14 +199,9 @@ function CC.finishinfer!(me::CC.InferenceState, interp::ContextualInterpreter, c
                          opt_cache::IdDict{MethodInstance, CodeInstance})
     ir = build_contextual_ir(interp, me.linfo)
     if ir !== nothing
-        # `build_contextual_ir`'s 6-arg `CC.IRCode(...)` constructor defaults `valid_worlds` to
-        # the unbounded sentinel `WorldRange(0, typemax(UInt))`, which fails
-        # `abstract_eval_globalref_type`'s partition-coverage check for any `GlobalRef` whose
-        # binding partition starts at a finite world (e.g. `Base.add_float`, pulled in via
-        # inlining) — such calls get mislabeled "dynamic" instead of ordinary builtin/intrinsic
-        # calls. Fix by giving `ir` a real world range from `interp.world` onward.
+        # See `carrier_world_range` for why this world range, not the constructor's unbounded default.
         ir = CC.IRCode(ir.stmts, ir.cfg, ir.debuginfo, ir.argtypes, ir.meta, ir.sptypes,
-                       CC.WorldRange(interp.world, typemax(UInt)))
+                       carrier_world_range(interp))
         interp.transformed_ir[me.linfo] = ir
         me.bestguess = CC.compute_ir_rettype(ir)
         # Fold in backedges the plugin's transform discovered, before delegating to the generic
@@ -262,7 +257,18 @@ function run_ipo_passes!(ir::IRCode, opt::CC.OptimizationState)
     return ir
 end
 
-export ContextualInterpreter, build_contextual_ir, expr_to_codeinfo, run_ipo_passes!
+# The world range synthetic carrier IR must carry. `verify_ir` exempts `Core`/`Base` GlobalRefs but
+# requires every other module's binding partition to cover `ir.valid_worlds`; a plugin's own
+# GlobalRefs (and those in any inlined body) have partitions starting at the plugin package's load
+# world. `pir.valid_worlds` alone isn't enough — its `min_world` is the *primal method's* definition
+# world, which for a Base primal long predates that load world — and the 6-arg `CC.IRCode`
+# constructor's `WorldRange(0, typemax)` default is worse. Intersecting with `interp.world..typemax`
+# keeps the "valid as long as `pir`" upper bound while lifting `min_world` to a world at which every
+# binding this IR references was already resolved.
+carrier_world_range(interp, pir) = CC.intersect(pir.valid_worlds, CC.WorldRange(interp.world, typemax(UInt)))
+carrier_world_range(interp) = CC.WorldRange(interp.world, typemax(UInt))
+
+export ContextualInterpreter, build_contextual_ir, expr_to_codeinfo, run_ipo_passes!, carrier_world_range
 export at_world, mt_edge!
 
 end # module Contextual

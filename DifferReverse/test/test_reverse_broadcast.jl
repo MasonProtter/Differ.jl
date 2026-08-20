@@ -79,17 +79,13 @@ const w9 = [1.7, 0.4, -0.9]
     end
 end
 
-# Scalar-operand broadcast pullback hits a reflection-tool-only `verify_ir` failure in
-# `code_reverse_pullback_ircode` — confirmed not to affect the real carrier: `checkverify_prealloc`
-# and `code_reverse_fwds_ircode` both pass, and `f_scalar`/`f_fused` above confirm gradient
-# correctness via central differences. Pins the reflection-tool gap so a fix gets noticed rather
-# than silently regressing to a crash.
+# Scalar-operand broadcast pullback: `code_reverse_pullback_ircode` used to fail `verify_ir` here
+# (a reflection-tool-only gap — the real carrier via `checkverify_prealloc` was always fine). Fixed
+# by giving carrier IR its own world range (`carrier_world_range`) instead of inheriting the
+# primal's. Kept as a regression pin.
 @testset "reverse mode: broadcast pullback reflection gap" begin
     f_scalar2(x) = sum(x .+ 1.0)
-    checkverify_prealloc(f_scalar2, (Vector{Float64},))
-    Core.Compiler.verify_ir(code_reverse_fwds_ircode(f_scalar2, (Vector{Float64},))[1])
-    @test_throws ErrorException Core.Compiler.verify_ir(
-        code_reverse_pullback_ircode(f_scalar2, (Vector{Float64},))[1])
+    checkverify_rev(f_scalar2, (Vector{Float64},))
 end
 
 @testset "reverse mode: branch-merged array phi feeding an element read" begin

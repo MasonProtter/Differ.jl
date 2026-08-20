@@ -30,12 +30,17 @@ apply_foreigncall_rrule!(::Val{F}, fc, Ti, ctx) where {F} = nothing
 # into the source, then restores what the destination held before (same old-tangent-restore
 # discipline as `Base.memoryrefset!`'s rule and `mapbang_pullback`, `rules_broadcast.jl`).
 #
-# Both buffers must be provenance-tracked (`_bi_tracked`, `builtins_reverse.jl`) — same requirement
-# `memoryrefget`/`memoryrefset!`/`setfield!` already impose.
+# Three modes:
+#   - both buffers provenance-tracked (`_bi_tracked`, `builtins_reverse.jl`) — the ordinary case
+#     above, same requirement `memoryrefget`/`memoryrefset!`/`setfield!` already impose.
+#   - both-sides-`NoTangent` (`copy(::Vector{Int})`, a `Bool` mask) — emits the primal call alone.
+#   - destination tracked, source declared inactive (`ctx.inactive`) — no source shadow and no
+#     accumulation; the destination's cotangent has nowhere to go and is discarded. Gated on
+#     activity, never on `_bi_tracked`: an active-but-untraceable source still bails below, since
+#     dropping *its* gradient would be wrong.
 #
-# Both-sides-`NoTangent` (`copy(::Vector{Int})`, a `Bool` mask) emits the primal call alone: copying
-# nothing is the tangent of copying non-differentiable data. A mixed pair bails, as does a pair whose
-# tangent element types differ — the accumulation step needs `increment!!(::Td, ::Td)`.
+# A mixed tracked/`NoTangent` pair bails, as does a pair of tracked buffers whose tangent element
+# types differ — the accumulation step needs `increment!!(::Td, ::Td)`.
 # ---------------------------------------------------------------------------
 
 # Normalizes `Memory`/`MemoryRef` to `MemoryRef` so loops below only walk `MemoryRef`s. Plain runtime
@@ -83,6 +88,18 @@ end
     return nothing
 end
 
+# Restore-only sibling of `_fc_accum_restore!`, for the "destination tracked, source inactive" mode:
+# there's no source to accumulate into, just restore `dst[i]` to what `_fc_save_zero!` saved.
+@noinline function _fc_restore!(dref::Union{Memory{Td},MemoryRef{Td}}, saved::Memory{Td},
+                                nelem::Int) where {Td}
+    dr = _fc_as_ref(dref)
+    for i in 1:nelem
+        di = Core.memoryrefnew(dr, i, false)
+        di[] = saved[i]
+    end
+    return nothing
+end
+
 function _fcr_comms(fc, Ti, ctx, what::String)
     _fc_copy_sig_ok(fc, ctx, what) || return false
     dstx, srcx, nx = fc.args[1], fc.args[2], fc.args[3]
@@ -109,7 +126,12 @@ function _fcr_comms(fc, Ti, ctx, what::String)
                        "counterpart"
         return false
     end
+    # Third mode: destination tracked, source declared inactive (constant). The source needs no
+    # shadow at all, so it skips the stride/shape/provenance checks below — an active-but-untraceable
+    # source (not `ctx.inactive`, still `!_bi_tracked`) still falls through to the ordinary bail.
+    src_inactive = ctx.inactive(walked[2][2])
     for ((x, side), o) in zip(sides, walked)
+        side == "source" && src_inactive && continue
         P = o[1]
         if !_fc_same_stride(ctx.tt, P)
             T = ctx.tt(P)
@@ -132,18 +154,19 @@ function _fcr_comms(fc, Ti, ctx, what::String)
     end
     dst_o, src_o = walked[1], walked[2]
     Td_dst, Td_src = ctx.tt(dst_o[1]), ctx.tt(src_o[1])
-    if Td_dst !== Td_src
+    if !src_inactive && Td_dst !== Td_src
         ctx.reason[] = "`$what` between buffers whose tangent element types differ ($(Td_dst) vs " *
                        "$(Td_src)) — the pullback's accumulation step requires them to match"
         return false
     end
     dst_ref, src_ref = dst_o[2], src_o[2]
-    return Tuple{Any,Any}[
+    items = Tuple{Any,Any}[
         ((:fshadow, dst_ref), ctx.tt(ctx.optype(dst_ref))),
-        ((:fshadow, src_ref), ctx.tt(ctx.optype(src_ref))),
         ((:primal, nx), Csize_t),
         ((:old_tangent, ctx.ssa), Memory{Td_dst}),
     ]
+    src_inactive || insert!(items, 2, ((:fshadow, src_ref), ctx.tt(ctx.optype(src_ref))))
+    return items
 end
 
 function _fcr_fwds!(fc, Ti, ctx, what::String)
@@ -157,16 +180,21 @@ function _fcr_fwds!(fc, Ti, ctx, what::String)
     end
     os = _fc_ptr_origin(srcx, ctx)
     dst_ref, src_ref = od[2], os[2]
+    src_inactive = ctx.inactive(src_ref)
     Td = ctx.tt(P)
     Tref_dst = ctx.tt(ctx.optype(dst_ref))
-    Tref_src = ctx.tt(ctx.optype(src_ref))
-    s_dst, s_src = ctx.sresolve(dst_ref), ctx.sresolve(src_ref)
+    s_dst = ctx.sresolve(dst_ref)
     stride = Base.aligned_sizeof(P)
     nelem = _fc_emit_nelem!(ctx.emit!, pn, stride)
     # Extent-guards both shadows (`_fc_check_extent`) before the primal call, so a short tangent
-    # array fails before the primal runs — same as the forward rule.
+    # array fails before the primal runs — same as the forward rule. Inactive source has no shadow
+    # to guard.
     ctx.icall!(_fc_check_extent, Nothing, (Tref_dst, Int), s_dst, nelem)
-    ctx.icall!(_fc_check_extent, Nothing, (Tref_src, Int), s_src, nelem)
+    if !src_inactive
+        Tref_src = ctx.tt(ctx.optype(src_ref))
+        s_src = ctx.sresolve(src_ref)
+        ctx.icall!(_fc_check_extent, Nothing, (Tref_src, Int), s_src, nelem)
+    end
     p = ctx.emit!(_fc_stmt(fc, (pdst, psrc, pn), map(ctx.presolve, fc.roots)), Ti)
     # Reads the dest primal ref after the primal call, so `zero_tangent` sees the post-copy value
     # (immaterial since `P` is `isbits`, but consistent with `memoryrefset!`'s `zero_tangent(p, f)`
@@ -185,17 +213,22 @@ function _fcr_pullback!(fc, Ti, ctx, what::String)
     ctx.tt(P) === NoTangent && return nores
     os = _fc_ptr_origin(srcx, ctx)
     dst_ref, src_ref = od[2], os[2]
+    src_inactive = ctx.inactive(src_ref)
     Td = ctx.tt(P)
     Tref_dst = ctx.tt(ctx.optype(dst_ref))
-    Tref_src = ctx.tt(ctx.optype(src_ref))
     stride = Base.aligned_sizeof(P)
     pn = ctx.fetch_primal(nx)
     nelem = _fc_emit_nelem!(ctx.emit!, pn, stride)
     s_dst = ctx.fetch_shadow(dst_ref)
-    s_src = ctx.fetch_shadow(src_ref)
     saved = ctx.fetch_saved((:old_tangent, ctx.ssa))
-    ctx.emit!(ctx.icall(_fc_accum_restore!, (Tref_dst, Tref_src, Memory{Td}, Int),
-                        s_dst, s_src, saved, nelem), Nothing)
+    if src_inactive
+        ctx.emit!(ctx.icall(_fc_restore!, (Tref_dst, Memory{Td}, Int), s_dst, saved, nelem), Nothing)
+    else
+        Tref_src = ctx.tt(ctx.optype(src_ref))
+        s_src = ctx.fetch_shadow(src_ref)
+        ctx.emit!(ctx.icall(_fc_accum_restore!, (Tref_dst, Tref_src, Memory{Td}, Int),
+                            s_dst, s_src, saved, nelem), Nothing)
+    end
     return nores
 end
 

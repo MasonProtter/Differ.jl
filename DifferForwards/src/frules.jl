@@ -8,10 +8,14 @@
 # `sincos` call. First-order results and allocation-freedom are unchanged (both stay `:invoke`s to
 # libm).
 function frule!!(::Dual{typeof(sin)}, (; x, dx)::Dual)
-    Dual(sin(x), cos(x)*dx)
+    y = sin(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, cos(x)*dx)
 end
 function frule!!(::Dual{typeof(cos)}, (; x, dx)::Dual)
-    Dual(cos(x), -sin(x)*dx)
+    y = cos(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, -sin(x)*dx)
 end
 
 # Arithmetic (`+`, `-`, `*`, `/`) and comparisons deliberately have no `frule!!` methods here. They

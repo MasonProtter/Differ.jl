@@ -2,13 +2,22 @@
 # Copyright (c) 2024 Will Tebbutt and Hong Ge, licensed under the MIT License.
 
 """
-    CoDual(primal, shadow)
+    CoDual{Tx,Tdx}
 
-Pairs a `primal` value with a `shadow` for reverse-mode AD. Unlike `DifferForwards.Dual`, `shadow`
-isn't fixed to `tangent_type(typeof(primal))`: during the forwards pass of [`rrule!!`](@ref) it is
-usually the fdata component ([`FData`](@ref)/[`NoFData`](@ref)) — the piece of the tangent that
-must be carried alongside the primal because the pullback reads it back later. [`zero_fcodual`](@ref)
-builds a `CoDual` in that fdata-carrying shape.
+A primal value paired with its shadow. `Tdx` is one of:
+
+- `fdata_type(tangent_type(Tx))` — the ordinary active carrier, built by [`fcodual_type`](@ref);
+- `tangent_type(Tx)` — the full-tangent flavour, built by [`codual_type`](@ref);
+- [`Inactive`](@ref) — the value is *held constant*: no derivative is propagated to or from it.
+
+The third case is what [`isactive`](@ref) tests, and it is decidable from `Tdx` alone. That is why
+it is `Inactive` rather than `NoTangent`: an active `Float64`'s shadow is `NoFData()`, so an empty
+fdata cannot mean "constant", and `NoTangent` is already the tangent of a type with no tangent
+space.
+
+Marking an argument constant is a promise about aliasing: an inactive value must not share memory
+with an active one, and an active value must not be stored into an inactive container. Neither is
+checkable here.
 """
 struct CoDual{Tx,Tdx}
     x::Tx
@@ -16,15 +25,15 @@ struct CoDual{Tx,Tdx}
 end
 
 function Base.getproperty(d::CoDual, s::Symbol)
-    if s === :x || s === :y || s === :z || s === :primal
+    if s === :x || s === :y || s === :z || s === :w || s === :primal
         getfield(d, :x)
-    elseif s === :dx || s === :dy || s === :dz || s === :tangent
+    elseif s === :dx || s === :dy || s === :dz || s === :dw || s === :tangent
         getfield(d, :dx)
     else
         getfield(d, s)
     end
 end
-Base.propertynames(::CoDual) = (:primal, :tangent, :x, :y, :z, :dx, :dy, :dz)
+Base.propertynames(::CoDual) = (:primal, :tangent, :x, :y, :z, :w, :dx, :dy, :dz, :dw)
 
 # Always sharpen the first thing if it's a type so static dispatch remains possible.
 function CoDual(x::Type{P}, dx::NoFData) where {P}
@@ -33,6 +42,10 @@ end
 
 function CoDual(x::Type{P}, dx::NoTangent) where {P}
     return CoDual{@isdefined(P) ? Type{P} : typeof(x),NoTangent}(P, dx)
+end
+
+function CoDual(x::Type{P}, dx::Inactive) where {P}
+    return CoDual{@isdefined(P) ? Type{P} : typeof(x),Inactive}(P, dx)
 end
 
 primal(x::CoDual) = x.x
@@ -124,6 +137,11 @@ end
 to_fwds(x::CoDual) = CoDual(primal(x), fdata(tangent(x)))
 
 to_fwds(x::CoDual{Type{P}}) where {P} = CoDual{Type{P},NoFData}(primal(x), NoFData())
+
+# No `NoTangent` arm: `zero_codual` yields `CoDual{P,NoTangent}` for every primal whose own
+# `tangent_type` is `NoTangent`, and converting those to `NoFData` is exactly this function's job. An
+# inactive carrier (`Inactive` shadow) is built by the caller, already in fdata form, and never
+# routed through here.
 
 """
     zero_fcodual(x)

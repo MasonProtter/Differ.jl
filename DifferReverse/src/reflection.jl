@@ -15,14 +15,12 @@ ir, rt = code_reverse_fwds_ircode(x -> x*x + x, (Float64,))
 See also [`@code_reverse_fwds_ircode`](@ref) and [`code_reverse_pullback_ircode`](@ref).
 """
 function code_reverse_fwds_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
-                                  world::UInt=Base.get_world_counter())
+                                  world::UInt=Base.get_world_counter(), inactive=())
     interp = build_reverse_interp(; world)
     codualtys = Any[fcodual_type(_typeof(f))]
-    for T in argtypes
-        (T isa Type) || throw(ArgumentError("argtypes must be a tuple of types, got $(repr(T))"))
-        push!(codualtys, fcodual_type(T))
-    end
-    # Inspect the tape-allocating shape (`Ctx{Nothing}`) — the one `build_ctx(...; prealloc=false)`
+    append!(codualtys,
+            _arg_codual_types(world, argtypes, _inactive_positions(inactive, length(argtypes))))
+    # Inspect the tape-allocating shape (`Ctx{Nothing}`) — the one a bare `Ctx()`
     # uses, and the shape a pre-allocated context differs from only in its prologue. Carrier layout is
     # `reverse_fwds_impl(fcd, ctx, argcds...)`: fcd first, then the ctx, then the argument coduals.
     impl_tt = Tuple{typeof(reverse_fwds_impl), codualtys[1], Ctx{Nothing}, codualtys[2:end]...}
@@ -66,9 +64,10 @@ ir, rt = code_reverse_pullback_ircode(x -> x*x + x, (Float64,))
 See also [`@code_reverse_pullback_ircode`](@ref) and [`code_reverse_fwds_ircode`](@ref).
 """
 function code_reverse_pullback_ircode(@nospecialize(f), @nospecialize(argtypes::Tuple);
-                                      seedtype::Type=Float64, world::UInt=Base.get_world_counter())
+                                      seedtype::Type=Float64, world::UInt=Base.get_world_counter(),
+                                      inactive=())
     interp = build_reverse_interp(; world)
-    _, fwds_rt = code_reverse_fwds_ircode(f, argtypes; world)
+    _, fwds_rt = code_reverse_fwds_ircode(f, argtypes; world, inactive)
     TapeT = fwds_rt.parameters[2]
     impl_tt = Tuple{typeof(reverse_pullback_impl), TapeT, seedtype}
     match, _ = CC.findsup(impl_tt, CC.method_table(interp))
@@ -92,8 +91,8 @@ exactly as `code_reverse_pullback_ircode` does it, so this reports the tape both
 Chiefly useful with [`comms_element_types`](@ref) for asserting on tape layout in tests.
 """
 function tape_type(@nospecialize(f), @nospecialize(argtypes::Tuple);
-                   world::UInt=Base.get_world_counter())
-    return code_reverse_fwds_ircode(f, argtypes; world)[2].parameters[2]
+                   world::UInt=Base.get_world_counter(), inactive=())
+    return code_reverse_fwds_ircode(f, argtypes; world, inactive)[2].parameters[2]
 end
 
 """

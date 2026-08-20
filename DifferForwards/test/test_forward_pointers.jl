@@ -205,3 +205,22 @@ end
         @test !occursin("no rule registered", bail_reason(f_at[1], f_at[2]))
     end
 end
+
+@testset "atomic pointer intrinsics are activity roots" begin
+    # `atomic_pointerswap`/`atomic_pointermodify`/`atomic_pointerreplace` have no rule (unlike
+    # `atomic_pointerref`/`atomic_pointerset`, which do). Without listing them as pointer-deref
+    # activity roots, a call reached only through untangented operands (an abstract `Ptr` argument
+    # has no tangent space, and the literal operands aren't SSA-tracked) is classified inactive and
+    # dualizes silently with a zeroed shadow instead of hitting the "no rule registered" bail.
+    swap(p::Ptr) = Core.Intrinsics.atomic_pointerswap(p, 3.0, :monotonic)
+    modify(p::Ptr) = Core.Intrinsics.atomic_pointermodify(p, +, 3.0, :monotonic)
+    replace_(p::Ptr) = Core.Intrinsics.atomic_pointerreplace(p, 1.0, 3.0, :monotonic, :monotonic)
+
+    for (f, name) in ((swap, "atomic_pointerswap"), (modify, "atomic_pointermodify"),
+                       (replace_, "atomic_pointerreplace"))
+        r = bail_reason(f, (Ptr,))
+        @test r !== nothing
+        @test occursin(name, r)
+        @test occursin("no rule registered", r)
+    end
+end

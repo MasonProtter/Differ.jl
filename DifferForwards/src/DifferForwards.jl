@@ -5,10 +5,10 @@ using LinearAlgebra
 using Random: AbstractRNG
 
 using Contextual: Contextual, ContextualInterpreter, expr_to_codeinfo, run_ipo_passes!,
-    at_world, mt_edge!
+    carrier_world_range, at_world, mt_edge!
 import Contextual: build_contextual_ir
 
-import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangent, MutableTangent,
+import DifferCore: DifferCore, NoTangent, Inactive, isactive, NoFData, NoRData, FData, RData, Tangent, MutableTangent,
     PossiblyUninitTangent, tangent_type, fdata_type, rdata_type,
     zero_tangent, zero_rdata, randn_tangent, increment!!, set_to_zero!!,
     build_tangent, get_tangent_field, set_tangent_field!,
@@ -20,7 +20,8 @@ import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangen
     _bi_literal_index, _bi_homog_tangent_type, _tangent_field_slot, _widen,
     _getfieldg, _setfieldg, _ctupleg, _ifelseg,
     _fc_parse, _fc_stmt, _fc_ptr_origin, _fc_same_stride, _fc_check_extent,
-    _fc_copy_sig_ok, _FC_COPY_ATS
+    _fc_copy_sig_ok, _FC_COPY_ATS, _require_active_dest, _inactive_positions,
+    _call_parts, _act_ptr_deref, _act_container_result
 
 using Core: MethodInstance, CodeInstance, CodeInfo, Compiler
 const CC = Core.Compiler
@@ -45,7 +46,10 @@ include("rules_linalg.jl")
 include("reflection.jl")
 include("adtypes.jl")
 
-export Dual, primal, tangent, NoTangent, frule!!
+export DifferCore
+
+export Dual, primal, tangent, NoTangent, Inactive, frule!!
+export isactive
 export code_dual_ircode, @code_dual_ircode
 export tangent_type, fdata_type, rdata_type
 export Tangent, MutableTangent, PossiblyUninitTangent

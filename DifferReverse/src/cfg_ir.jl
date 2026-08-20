@@ -364,18 +364,20 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    lower_cfg_blocks_to_ir(blks::Vector{CFGBlock}, ir::CC.IRCode; argtypes=ir.argtypes, def=ir.debuginfo.def)::CC.IRCode
+    lower_cfg_blocks_to_ir(blks::Vector{CFGBlock}, ir::CC.IRCode;
+                          argtypes=ir.argtypes, def=ir.debuginfo.def, valid_worlds=ir.valid_worlds)::CC.IRCode
 
-Produce an `IRCode` equivalent to `blks`. Non-statement metadata (`sptypes`, debug info, `meta`,
-valid worlds) is taken from `ir`; `argtypes` and the debug info's `def` (the owning `MethodInstance`)
-may be overridden — the forwards- and pullback-pass carriers have different argument types and are
-different `MethodInstance`s from the primal `ir` was taken from. Shares no memory with `blks`/`ir`.
+Produce an `IRCode` equivalent to `blks`. Non-statement metadata (`sptypes`, debug info, `meta`) is
+taken from `ir`; `argtypes`, the debug info's `def` (the owning `MethodInstance`), and `valid_worlds`
+may be overridden — the forwards- and pullback-pass carriers have different argument types, are
+different `MethodInstance`s from the primal `ir` was taken from, and (see `carrier_world_range` in
+Contextual.jl) need a wider world range than `ir`'s own. Shares no memory with `blks`/`ir`.
 
 Every `IDPhiNode`/`IDGotoIfNot`/`IDGotoNode` becomes a `Core.PhiNode`/`GotoIfNot`/`GotoNode`; every
 `Switch` is lowered into a semantically equivalent `GotoIfNot` chain.
 """
 function lower_cfg_blocks_to_ir(blks::Vector{CFGBlock}, ir::CC.IRCode;
-                                argtypes=ir.argtypes, def=ir.debuginfo.def)
+                                argtypes=ir.argtypes, def=ir.debuginfo.def, valid_worlds=ir.valid_worlds)
     blks = _cfg_lower_switch_statements(blks)
     blks = _cfg_remove_double_edges(blks)
     insts = _ids_to_line_numbers(blks)
@@ -390,7 +392,7 @@ function lower_cfg_blocks_to_ir(blks::Vector{CFGBlock}, ir::CC.IRCode;
         Any[x.stmt for x in insts], Any[x.type for x in insts],
         CC.CallInfo[x.info for x in insts], lines, UInt32[x.flag for x in insts],
     )
-    return CC.IRCode(stream, cfg, debuginfo, Any[argtypes...], copy(ir.meta), copy(ir.sptypes), ir.valid_worlds)
+    return CC.IRCode(stream, cfg, debuginfo, Any[argtypes...], copy(ir.meta), copy(ir.sptypes), valid_worlds)
 end
 
 """

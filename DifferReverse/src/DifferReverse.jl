@@ -9,13 +9,13 @@ const CC = Core.Compiler
 using Base: specialize_method
 
 using Contextual: Contextual, ContextualInterpreter, expr_to_codeinfo, run_ipo_passes!,
-    at_world, mt_edge!
+    carrier_world_range, at_world, mt_edge!
 import Contextual: build_contextual_ir
 
 # Any name DifferReverse adds new methods to (not just calls) must come in via `import`, not bare
 # `using DifferCore`/`using DifferCore: name` — otherwise it either errors ("must be explicitly
 # imported to be extended") or silently creates a disconnected same-named local function.
-import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangent, MutableTangent,
+import DifferCore: DifferCore, NoTangent, Inactive, NoFData, NoRData, FData, RData, Tangent, MutableTangent,
     PossiblyUninitTangent, tangent_type, fdata_type, rdata_type,
     zero_tangent, zero_rdata, randn_tangent, increment!!, set_to_zero!!,
     build_tangent, get_tangent_field, set_tangent_field!,
@@ -31,7 +31,8 @@ import DifferCore: DifferCore, NoTangent, NoFData, NoRData, FData, RData, Tangen
     _bi_literal_index, _bi_homog_tangent_type, _tangent_field_slot, _widen,
     _getfieldg, _setfieldg, _ctupleg, _ifelseg,
     _fc_parse, _fc_stmt, _fc_ptr_origin, _fc_same_stride, _fc_check_extent,
-    _fc_copy_sig_ok, _FC_COPY_ATS
+    _fc_copy_sig_ok, _FC_COPY_ATS, isactive, @ifactive, _require_active_dest, _inactive_positions,
+    _call_parts, _act_ptr_deref, _act_container_result
 
 # `Reverse` is the plugin owner type identifying DifferReverse to `Contextual`'s
 # `ContextualInterpreter{T,S}`. `owner` doubles as the `cache_owner` partition key, so
@@ -80,7 +81,9 @@ Selects Differ's reverse mode for DifferentiationInterface.jl. Method implementa
 struct AutoDifferReverse <: ADTypes.AbstractADType end
 ADTypes.mode(::AutoDifferReverse) = ADTypes.ReverseMode()
 
-export CoDual, primal, tangent, NoTangent, rrule!!
+export DifferCore
+
+export CoDual, primal, tangent, NoTangent, Inactive, rrule!!
 export AbstractCtx, Ctx, build_ctx
 export value_and_gradient!, zero_fcodual
 export code_reverse_fwds_ircode, @code_reverse_fwds_ircode
@@ -91,8 +94,9 @@ export Tangent, MutableTangent, PossiblyUninitTangent
 export NoFData, NoRData, FData, RData
 export fdata, rdata, zero_tangent
 export as_tangent, unit_tangent
+export isactive, @ifactive
 export AutoDifferReverse
 
-public rev_gradient, rev_gradient!
+public rev_gradient, rev_gradient!, fcodual_type, codual_type
 
 end # module DifferReverse

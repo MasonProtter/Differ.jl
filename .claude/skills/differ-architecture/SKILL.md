@@ -129,7 +129,7 @@ a reverse pass) — the fdata/rdata split is what `CoDual` uses that `Dual` does
   concrete subtype), which is what keeps hand-rule-vs-fallback dispatch unambiguous (dispatch
   specificity is decided entirely by the `fcd`/arg slots). `build_ctx(f, argtypes)` returns a `Ctx`
   wrapping a tape allocated once and reused per call (the pre-allocated fast path, not
-  reentrant/thread-safe — one per task); `build_ctx(...; prealloc=false)` returns a fresh-tape
+  reentrant/thread-safe — one per task); a bare `Ctx()` is a fresh-tape
   `Ctx()` per call, used by every recursive inner call and by plain `gradient`.
 - User-facing entry points: `rev_gradient(f, args...)` (allocates everything) and
   `rev_gradient!`/`value_and_gradient!(ctx, fcd, argcds...)` (caller supplies the context and each

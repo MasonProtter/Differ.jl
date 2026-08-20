@@ -22,9 +22,6 @@ end
 
 _copy(::Stack{T}) where {T} = Stack{T}()
 
-# `Base.push!` is qualified (not bare `push!`) because this body gets inlined into synthetic
-# carrier IR; a bare name would re-embed as `GlobalRef(Differ, :push!)`, an unbound GlobalRef
-# `verify_ir` rejects. Same hazard as elsewhere in this file and in `reverse_interp.jl`.
 @inline function Base.push!(x::Stack{T}, val::T) where {T}
     position = x.position + 1
     memory = x.memory
@@ -32,7 +29,7 @@ _copy(::Stack{T}) where {T} = Stack{T}()
     if position <= length(memory)
         @inbounds memory[position] = val
     else
-        Base.push!(memory, val)
+        push!(memory, val)
     end
     return nothing
 end
@@ -47,26 +44,23 @@ end
 # Reusable buffers for bulk primal save/restore (`_bulk_save_args`, `reverse_interp.jl`), held in a
 # `Tape`'s `bufs` field, one slot per bulk-saved argument, assigned statically by the transform.
 # `Any` element type since slots have unrelated types.
-#
-# `Base.copyto!`/`Base.similar` are qualified for the same GlobalRef-inlining reason as `Base.push!`
-# above.
 const _NO_BULK_BUFS = Any[]
 
 @noinline function _bulk_save!(bufs::Vector{Any}, slot::Int, src::M) where {M}
-    length(bufs) < slot && Base.resize!(bufs, slot)
-    b = Base.isassigned(bufs, slot) ? bufs[slot] : nothing
+    length(bufs) < slot && resize!(bufs, slot)
+    b = isassigned(bufs, slot) ? bufs[slot] : nothing
     # Reallocate only when the buffer can't be reused, so a pre-allocated context calling
     # repeatedly with same-shaped arguments allocates here exactly once, ever.
-    if !isa(b, M) || Base.length(b::M) != Base.length(src)
-        b = Base.similar(src)
+    if !isa(b, M) || length(b::M) != length(src)
+        b = similar(src)
         bufs[slot] = b
     end
-    Base.copyto!(b::M, src)
+    copyto!(b::M, src)
     return nothing
 end
 
 @noinline function _bulk_restore!(bufs::Vector{Any}, slot::Int, dst::M) where {M}
-    Base.copyto!(dst, bufs[slot]::M)
+    copyto!(dst, bufs[slot]::M)
     return nothing
 end
 
@@ -91,13 +85,10 @@ end
 # first execution the next push's slot already holds a structurally identical inner tape from the
 # previous call — handing the callee that recycled tape (via `Ctx{<:Tape}`) instead of a fresh
 # `Ctx()` is what makes steady-state nested/recursive calls allocation-free.
-#
-# `Base.length`/`Base.isassigned` are qualified for the same GlobalRef-inlining reason as
-# `Base.push!` above.
 @inline function _inner_ctx(st::Stack{CommsT}, ::Val{k}, ::Type{TapeT}) where {CommsT,k,TapeT}
     p = st.position + 1
     mem = st.memory
-    if p <= Base.length(mem) && Base.isassigned(mem, p)
+    if p <= length(mem) && isassigned(mem, p)
         t = Core.getfield(@inbounds(mem[p]), k)
         # Direct self-recursion routes through `_inner_self_ctx` below instead, so this callee's
         # comms declaration always names `TapeT` concretely — the `isa` narrows to a no-op.
@@ -111,7 +102,7 @@ end
 @inline function _inner_self_ctx(st::Stack{TapeT}) where {TapeT}
     p = st.position + 1
     mem = st.memory
-    if p <= Base.length(mem) && Base.isassigned(mem, p)
+    if p <= length(mem) && isassigned(mem, p)
         return Ctx(@inbounds mem[p])
     end
     return Ctx(_alloc_tape(TapeT))

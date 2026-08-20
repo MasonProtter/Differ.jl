@@ -13,6 +13,14 @@ using DifferForwards: code_dual_ircode
 # Forward-mode dualized IR is legal (order-1).
 checkverify(f, at) = Core.Compiler.verify_ir(code_dual_ircode(f, at)[1])
 
+# The `CoDual` for an argument held constant: `Inactive` in the shadow slot (see `CoDual`).
+const_codual(x) = DifferReverse.CoDual(x, Inactive())
+
+# The argument `CoDual` types a call with these constant positions will be built from.
+arg_codual_types(f, at; inactive=()) =
+    DifferReverse._arg_codual_types(Base.get_world_counter(), at,
+                                    DifferReverse._inactive_positions(inactive, length(at)))
+
 # Central finite difference, one argument.
 central_diff(f, x; h=1e-6) = (f(x + h) - f(x - h)) / 2h
 
@@ -21,14 +29,18 @@ central_diff(f, x, y, k::Int; h=1e-6) =
     k == 1 ? (f(x+h, y) - f(x-h, y)) / 2h : (f(x, y+h) - f(x, y-h)) / 2h
 
 # `code_reverse_fwds_ircode`/`code_reverse_pullback_ircode` inspect the tape-*allocating* carrier
-# shape (`Ctx{Nothing}`). A `build_ctx(...; prealloc=true)` context compiles a different prologue
+# shape (`Ctx{Nothing}`). A `build_ctx` context compiles a different prologue
 # (reads the caller's stacks out of the ctx and resets them), so it needs its own check.
-function checkverify_prealloc(f, at)
-    ctx = build_ctx(f, at)
+function checkverify_prealloc(f, at; inactive=())
+    ctx = build_ctx(f, at; inactive)
+    # If `build_ctx` ever fell back to the tape-allocating `Ctx{Nothing}`, `typeof(ctx)` below would
+    # make this verify the tape-allocating carrier instead of the pre-allocated one — fail loudly
+    # rather than check the wrong shape.
+    @test ctx isa Ctx{<:DifferReverse.Tape}
     interp = DifferReverse.build_reverse_interp()
     tt = Tuple{typeof(DifferReverse.reverse_fwds_impl),
                DifferReverse.fcodual_type(DifferReverse._typeof(f)), typeof(ctx),
-               (DifferReverse.fcodual_type(T) for T in at)...}
+               arg_codual_types(f, at; inactive)...}
     mi = Base.specialize_method(
         Core.Compiler.findall(tt, Core.Compiler.method_table(interp))[1])
     reason = Ref("no specific reason recorded")
@@ -37,10 +49,10 @@ function checkverify_prealloc(f, at)
     Core.Compiler.verify_ir(ir)
 end
 
-function checkverify_rev(f, at)
-    Core.Compiler.verify_ir(code_reverse_fwds_ircode(f, at)[1])
-    Core.Compiler.verify_ir(code_reverse_pullback_ircode(f, at)[1])
-    checkverify_prealloc(f, at)
+function checkverify_rev(f, at; inactive=())
+    Core.Compiler.verify_ir(code_reverse_fwds_ircode(f, at; inactive)[1])
+    Core.Compiler.verify_ir(code_reverse_pullback_ircode(f, at; inactive)[1])
+    checkverify_prealloc(f, at; inactive)
 end
 
 # `checkverify_rev` minus the `code_reverse_pullback_ircode` check — that reflection helper alone
@@ -70,6 +82,9 @@ function _assert_tape_balanced(tape::DifferReverse.Tape, seen::Base.IdSet{Any}=B
     for i in eachindex(tape.subtapes.memory)
         isassigned(tape.subtapes.memory, i) && _assert_tape_balanced(tape.subtapes.memory[i], seen)
     end
+    # Counted-loop trip counts: every count pushed on a loop exit must have been popped at the
+    # matching reverse region entry.
+    @test tape.count_stack.position == 0
     return nothing
 end
 function _assert_comms_balanced(s::DifferReverse.Stack, seen)
@@ -86,7 +101,7 @@ _assert_tuple_balanced(t::Tuple, seen) = foreach(v -> v isa DifferReverse.Tape &
 # full rule+pullback round trip. The pullback *is* the tape, so this just calls it and confirms
 # every `Stack`'s `position` is back to 0, recursively into any recycled inner tape.
 #
-# Doubly load-bearing since a `build_ctx(...; prealloc=true)` context *reuses* its tape across
+# Doubly load-bearing since a `build_ctx` context *reuses* its tape across
 # calls: balance is what makes reuse correct, so this also runs each case twice through one
 # pre-allocated context and checks the answers agree.
 #
@@ -94,7 +109,7 @@ _assert_tuple_balanced(t::Tuple, seen) = foreach(v -> v isa DifferReverse.Tape &
 # tuple-valued `f`). That also skips the pre-allocated half below, which reaches the pullback
 # through `rev_gradient!` and so seeds with `one(y)` itself.
 function check_stack_balance(f, args...; seed=nothing)
-    ctx = build_ctx(f, map(DifferReverse._typeof, args); prealloc=false)
+    ctx = Ctx()
     fcd, argcds = zero_fcodual(f), map(zero_fcodual, args)
     ycd, pb = rrule!!(fcd, ctx, argcds...)
     pb(seed === nothing ? one(DifferReverse.primal(ycd)) : seed)
@@ -118,13 +133,26 @@ end
 # traffic (a real data-dependent branch or loop) — a regression guard against the optimization
 # over-firing.
 function check_block_stack_traffic(f, args...; expect_zero::Bool)
-    ctx = build_ctx(f, map(DifferReverse._typeof, args); prealloc=false)
+    ctx = Ctx()
     fcd, argcds = zero_fcodual(f), map(zero_fcodual, args)
     ycd, pb = rrule!!(fcd, ctx, argcds...)
     pb(one(DifferReverse.primal(ycd)))
     grew = length(pb.block_stack.memory) > 0
     @test grew == !expect_zero
     return nothing
+end
+
+# Peak stack usage of one fresh round trip: (block-stack slots, count-stack slots). A `Stack`
+# never shrinks its backing memory, so the lengths after a balanced round trip are the high-water
+# marks.
+function loop_traffic(f, args...)
+    ctx = Ctx()
+    fcd, argcds = zero_fcodual(f), map(zero_fcodual, args)
+    ycd, pb = rrule!!(fcd, ctx, argcds...)
+    pb(one(DifferReverse.primal(ycd)))
+    @test pb.block_stack.position == 0
+    @test pb.count_stack.position == 0
+    return length(pb.block_stack.memory), length(pb.count_stack.memory)
 end
 
 # Tape size. Asserts on properties of the whole set of comms element types, never a particular
@@ -134,8 +162,8 @@ end
 # be pointer-free. `stacks` is the number of comms stacks — distinct from `bytes` because comms
 # fusion can merge two stacks' values onto one without changing the byte total.
 function check_tape_size(f, at; bytes::Union{Int,Nothing}=nothing, isbits::Union{Bool,Nothing}=nothing,
-                         stacks::Union{Int,Nothing}=nothing)
-    ts = comms_element_types(tape_type(f, at))
+                         stacks::Union{Int,Nothing}=nothing, inactive=())
+    ts = comms_element_types(tape_type(f, at; inactive))
     isbits === nothing || @test all(isbitstype, ts) == isbits
     bytes === nothing || @test sum(sizeof, ts; init=0) == bytes
     stacks === nothing || @test length(ts) == stacks

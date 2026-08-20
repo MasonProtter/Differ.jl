@@ -210,6 +210,98 @@ tr_fn(A) = tr(A)
         @test dC2 == [10.0 20.0; 30.0 40.0]
     end
 
+    @testset "activity: widened multi-argument linalg rules" begin
+        @testset "dot, inactive y" begin
+            x = [1.0, 2.0, 3.0]
+            y = [4.0, -1.0, 0.5]
+            dx = zeros(3)
+            _, pb = rrule!!(zero_fcodual(dot), Ctx(), CoDual(x, dx), const_codual(y))
+            @test pb(1.0) == (NoRData(), NoRData(), NoRData())
+            @test dx ≈ y
+            checkverify_rev((x, y) -> dot(x, y), (Vector{Float64}, Vector{Float64}); inactive=(2,))
+        end
+
+        @testset "* (matrix-vector), inactive x" begin
+            A = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+            x = [1.5, -0.5]
+            dA = zeros(size(A))
+            ycd, pb = rrule!!(zero_fcodual(*), Ctx(), CoDual(A, dA), const_codual(x))
+            @test primal(ycd) == A * x
+            seed = [1.0, 2.0, 3.0]
+            tangent(ycd) .= seed
+            @test pb(NoRData()) == (NoRData(), NoRData(), NoRData())
+            @test dA ≈ seed * x'
+            checkverify_rev((A, x) -> A * x, (Matrix{Float64}, Vector{Float64}); inactive=(2,))
+        end
+
+        @testset "* (matrix-matrix), inactive B" begin
+            A = [1.0 2.0; 3.0 4.0]
+            B = [5.0 6.0; 7.0 8.0]
+            dA = zeros(size(A))
+            Ycd, pb = rrule!!(zero_fcodual(*), Ctx(), CoDual(A, dA), const_codual(B))
+            @test primal(Ycd) == A * B
+            seed = [1.0 0.5; -0.5 2.0]
+            tangent(Ycd) .= seed
+            @test pb(NoRData()) == (NoRData(), NoRData(), NoRData())
+            @test dA ≈ seed * B'
+            checkverify_rev((A, B) -> A * B, (Matrix{Float64}, Matrix{Float64}); inactive=(2,))
+        end
+
+        @testset "mul! (matrix-vector), inactive source" begin
+            A = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+            x = [1.5, -0.5]
+            y = zeros(3)
+            dA = zeros(size(A))
+            ycd, Acd, xcd = CoDual(y, zeros(3)), CoDual(A, dA), const_codual(x)
+            outcd, pb = rrule!!(zero_fcodual(mul!), Ctx(), ycd, Acd, xcd)
+            @test y == A * x
+            seed = [1.0, 2.0, 3.0]
+            tangent(outcd) .= seed
+            @test pb(NoRData()) == (NoRData(), NoRData(), NoRData(), NoRData())
+            @test dA ≈ seed * x'
+            checkverify_rev((y, A, x) -> mul!(y, A, x),
+                            (Vector{Float64}, Matrix{Float64}, Vector{Float64}); inactive=(3,))
+        end
+
+        @testset "mul! (matrix-vector), constant destination is refused" begin
+            # The destination's shadow is both the backward seed and the result's shadow, so writing
+            # into a constant one would silently zero the factors' gradients. The engine already
+            # refuses the equivalent generic write ("no differentiable provenance"); this rule must
+            # not be laxer. A write-only buffer wants a zeroed shadow, not `NoTangent`.
+            A = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+            x = [1.5, -0.5]
+            y = zeros(3)
+            ycd = const_codual(y)
+            Acd, xcd = CoDual(A, zeros(size(A))), CoDual(x, zeros(size(x)))
+            @test_throws "declared constant" rrule!!(zero_fcodual(mul!), Ctx(), ycd, Acd, xcd)
+        end
+
+        @testset "mul! (matrix-matrix), inactive source" begin
+            A = [1.0 2.0; 3.0 4.0]
+            B = [5.0 6.0; 7.0 8.0]
+            C = zeros(2, 2)
+            dA = zeros(size(A))
+            Ccd, Acd, Bcd = CoDual(C, zeros(2, 2)), CoDual(A, dA), const_codual(B)
+            outcd, pb = rrule!!(zero_fcodual(mul!), Ctx(), Ccd, Acd, Bcd)
+            @test C == A * B
+            seed = [1.0 0.5; -0.5 2.0]
+            tangent(outcd) .= seed
+            @test pb(NoRData()) == (NoRData(), NoRData(), NoRData(), NoRData())
+            @test dA ≈ seed * B'
+            checkverify_rev((C, A, B) -> mul!(C, A, B),
+                            (Matrix{Float64}, Matrix{Float64}, Matrix{Float64}); inactive=(3,))
+        end
+
+        @testset "mul! (matrix-matrix), constant destination is refused" begin
+            A = [1.0 2.0; 3.0 4.0]
+            B = [5.0 6.0; 7.0 8.0]
+            C = zeros(2, 2)
+            Ccd = const_codual(C)
+            Acd, Bcd = CoDual(A, zeros(size(A))), CoDual(B, zeros(size(B)))
+            @test_throws "declared constant" rrule!!(zero_fcodual(mul!), Ctx(), Ccd, Acd, Bcd)
+        end
+    end
+
     @testset "reverse mode over a Transpose/Adjoint" begin
         # `sum(::Transpose)` misses the `sum` hand rules (they require `X<:Array{<:IEEEFloat}`) and
         # falls through to Base's pairwise `mapreduce_impl`, which is self-recursive and bottoms

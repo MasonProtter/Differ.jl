@@ -15,6 +15,7 @@
 
 function frule!!(::Dual{typeof(exp)}, (; x, dx)::Dual)
     y = exp(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
     Dual(y, y*dx)
 end
 
@@ -23,7 +24,9 @@ end
 # ===========================================================================
 
 function frule!!(::Dual{typeof(log)}, (; x, dx)::Dual)
-    Dual(log(x), dx/x)
+    y = log(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, dx/x)
 end
 
 # ===========================================================================
@@ -31,7 +34,9 @@ end
 # ===========================================================================
 
 function frule!!(::Dual{typeof(log1p)}, (; x, dx)::Dual)
-    Dual(log1p(x), dx/(1+x))
+    y = log1p(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, dx/(1+x))
 end
 
 # ===========================================================================
@@ -39,7 +44,9 @@ end
 # ===========================================================================
 
 function frule!!(::Dual{typeof(expm1)}, (; x, dx)::Dual)
-    Dual(expm1(x), exp(x)*dx)
+    y = expm1(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, exp(x)*dx)
 end
 
 # ===========================================================================
@@ -47,7 +54,9 @@ end
 # ===========================================================================
 
 function frule!!(::Dual{typeof(log2)}, (; x, dx)::Dual)
-    Dual(log2(x), dx/(x*log(2)))
+    y = log2(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, dx/(x*log(2)))
 end
 
 # ===========================================================================
@@ -55,7 +64,9 @@ end
 # ===========================================================================
 
 function frule!!(::Dual{typeof(log10)}, (; x, dx)::Dual)
-    Dual(log10(x), dx/(x*log(10)))
+    y = log10(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, dx/(x*log(10)))
 end
 
 # ===========================================================================
@@ -64,6 +75,7 @@ end
 
 function frule!!(::Dual{typeof(exp2)}, (; x, dx)::Dual)
     y = exp2(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
     Dual(y, y*log(2)*dx)
 end
 
@@ -73,6 +85,7 @@ end
 
 function frule!!(::Dual{typeof(exp10)}, (; x, dx)::Dual)
     y = exp10(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
     Dual(y, y*log(10)*dx)
 end
 
@@ -81,15 +94,20 @@ end
 # ===========================================================================
 
 function frule!!(::Dual{typeof(sinh)}, (; x, dx)::Dual)
-    Dual(sinh(x), cosh(x)*dx)
+    y = sinh(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, cosh(x)*dx)
 end
 
 function frule!!(::Dual{typeof(cosh)}, (; x, dx)::Dual)
-    Dual(cosh(x), sinh(x)*dx)
+    y = cosh(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, sinh(x)*dx)
 end
 
 function frule!!(::Dual{typeof(tanh)}, (; x, dx)::Dual)
     y = tanh(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
     Dual(y, (1-y^2)*dx)
 end
 
@@ -98,15 +116,21 @@ end
 # ===========================================================================
 
 function frule!!(::Dual{typeof(asinh)}, (; x, dx)::Dual)
-    Dual(asinh(x), dx/sqrt(x^2+1))
+    y = asinh(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, dx/sqrt(x^2+1))
 end
 
 function frule!!(::Dual{typeof(acosh)}, (; x, dx)::Dual)
-    Dual(acosh(x), dx/sqrt(x^2-1))
+    y = acosh(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, dx/sqrt(x^2-1))
 end
 
 function frule!!(::Dual{typeof(atanh)}, (; x, dx)::Dual)
-    Dual(atanh(x), dx/(1-x^2))
+    y = atanh(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, dx/(1-x^2))
 end
 
 # ===========================================================================
@@ -114,11 +138,15 @@ end
 # ===========================================================================
 
 function frule!!(::Dual{typeof(asin)}, (; x, dx)::Dual)
-    Dual(asin(x), dx/sqrt(1-x^2))
+    y = asin(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, dx/sqrt(1-x^2))
 end
 
 function frule!!(::Dual{typeof(acos)}, (; x, dx)::Dual)
-    Dual(acos(x), -dx/sqrt(1-x^2))
+    y = acos(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, -dx/sqrt(1-x^2))
 end
 
 # ===========================================================================
@@ -126,14 +154,16 @@ end
 # ===========================================================================
 
 function frule!!(::Dual{typeof(atan)}, (; x, dx)::Dual)
-    Dual(atan(x), dx/(1+x^2))
+    y = atan(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, dx/(1+x^2))
 end
 
 function frule!!(::Dual{typeof(atan)}, (; y, dy)::Dual, (; x, dx)::Dual)
     r2 = x^2+y^2
     z = atan(y, x)
-    dzy = dy isa NoTangent ? zero(z) : x*dy/r2
-    dzx = dx isa NoTangent ? zero(z) : -y*dx/r2
+    dzy = _inert(dy) ? zero(z) : x*dy/r2
+    dzx = _inert(dx) ? zero(z) : -y*dx/r2
     Dual(z, dzy + dzx)
 end
 
@@ -143,6 +173,7 @@ end
 
 function frule!!(::Dual{typeof(cbrt)}, (; x, dx)::Dual)
     y = cbrt(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
     Dual(y, dx/(3*y^2))
 end
 
@@ -152,8 +183,8 @@ end
 
 function frule!!(::Dual{typeof(^)}, (; x, dx)::Dual, (; y, dy)::Dual)
     z = x^y
-    dzx = dx isa NoTangent ? zero(z) : y*x^(y-1)*dx
-    dzy = dy isa NoTangent ? zero(z) : z*log(x)*dy
+    dzx = _inert(dx) ? zero(z) : y*x^(y-1)*dx
+    dzy = _inert(dy) ? zero(z) : z*log(x)*dy
     Dual(z, dzx + dzy)
 end
 
@@ -163,8 +194,8 @@ end
 
 function frule!!(::Dual{typeof(hypot)}, (; x, dx)::Dual, (; y, dy)::Dual)
     r = hypot(x, y)
-    drx = dx isa NoTangent ? zero(r) : x*dx/r
-    dry = dy isa NoTangent ? zero(r) : y*dy/r
+    drx = _inert(dx) ? zero(r) : x*dx/r
+    dry = _inert(dy) ? zero(r) : y*dy/r
     Dual(r, drx + dry)
 end
 
@@ -175,9 +206,10 @@ end
 function frule!!(::Dual{typeof(sqrt)}, dz::Dual{ComplexF64})
     z = primal(dz)
     dzt = tangent(dz)
+    y = sqrt(z)
+    isactive(dzt) || return Dual(y, zero_tangent(y))
     dz_re = get_tangent_field(dzt, :re)
     dz_im = get_tangent_field(dzt, :im)
-    y = sqrt(z)
     dy = Complex(dz_re, dz_im)/(2*y)
     Dual(y, build_tangent(ComplexF64, real(dy), imag(dy)))
 end

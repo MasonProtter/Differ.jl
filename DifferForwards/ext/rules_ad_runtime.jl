@@ -15,6 +15,15 @@
 # override is what keeps a call to any of these surviving, un-inlined, in the IR this file's rules
 # actually get to see. This file only needs the rules to exist so `has_hand_frule`
 # (`forward_interp.jl`) has something to find.
+#
+# Activity: stacks, buffers and tapes are activity roots (`%new` of a mutable, `Core.memorynew`,
+# `_alloc_tape`), so only the *recorded value* slots below can arrive with an `Inactive()` shadow —
+# a constant argument being pushed onto the tape. These rules are plumbing, not derivative
+# arithmetic: every push must pair with a pop and every save with a restore whatever the value's
+# activity, so an inactive value gets a real zero here rather than being skipped. A structural slot
+# that somehow did arrive inactive raises a `MethodError` rather than silently desynchronizing the
+# stacks.
+_rt_tangent(d::Dual) = isactive(tangent(d)) ? tangent(d) : zero_tangent(primal(d))
 
 # ===========================================================================
 # Stack push!/pop!
@@ -36,7 +45,7 @@
 
 function frule!!(::Dual{typeof(push!)}, sd::Dual{Stack{T}}, vd::Dual{T}) where {T}
     push!(primal(sd), primal(vd))
-    tangent_type(T) !== NoTangent && push!(tangent(sd), tangent(vd))
+    tangent_type(T) !== NoTangent && push!(tangent(sd), _rt_tangent(vd))
     return Dual(nothing, NoTangent())
 end
 
@@ -54,7 +63,7 @@ end
 
 function frule!!(::Dual{typeof(push!)}, sd::Dual{SingletonStack{T}}, vd::Dual) where {T}
     push!(primal(sd), primal(vd))
-    push!(tangent(sd), tangent(vd))
+    push!(tangent(sd), _rt_tangent(vd))
     return Dual(nothing, NoTangent())
 end
 
@@ -94,7 +103,7 @@ function frule!!(
     ::Dual{typeof(_bulk_save!)}, bufsd::Dual{Vector{Any}}, slotd::Dual{Int}, srcd::Dual{M},
 ) where {M}
     _bulk_save!(primal(bufsd), primal(slotd), primal(srcd))
-    _bulk_save!(tangent(bufsd), primal(slotd), tangent(srcd))
+    _bulk_save!(tangent(bufsd), primal(slotd), _rt_tangent(srcd))
     return Dual(nothing, NoTangent())
 end
 
@@ -102,7 +111,7 @@ function frule!!(
     ::Dual{typeof(_bulk_restore!)}, bufsd::Dual{Vector{Any}}, slotd::Dual{Int}, dstd::Dual{M},
 ) where {M}
     _bulk_restore!(primal(bufsd), primal(slotd), primal(dstd))
-    _bulk_restore!(tangent(bufsd), primal(slotd), tangent(dstd))
+    _bulk_restore!(tangent(bufsd), primal(slotd), _rt_tangent(dstd))
     return Dual(nothing, NoTangent())
 end
 

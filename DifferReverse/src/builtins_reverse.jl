@@ -59,10 +59,8 @@ _bi_tracked(@nospecialize(node), ctx) =
     false
 
 # `@noinline` wrappers around the small `Tangent`-system accessors threaded through `icall`/`icall!`
-# into hand-built carrier IR. Without this, inlining the real (tiny, `@inline`) bodies would re-embed
-# their bare `getfield`/`setfield!` calls as `GlobalRef(Differ, :getfield)` — an unbound GlobalRef
-# `verify_ir` rejects (same hazard as `reverse_interp.jl`'s control-flow helpers). `@noinline` keeps
-# each a genuine `:invoke`, so its internals are never re-embedded.
+# into hand-built carrier IR. `@noinline` keeps each a genuine `:invoke` rather than expanding the
+# tiny body at every emission site.
 @noinline _rr_get_tangent_field(t, i) = get_tangent_field(t, i)
 @noinline _rr_set_tangent_field!(t, i, x) = set_tangent_field!(t, i, x)
 @noinline _rr_get_fdata_field(f, name) = _get_fdata_field(f, name)
@@ -72,7 +70,41 @@ _bi_tracked(@nospecialize(node), ctx) =
 @noinline _rr_increment_rdata!!(t, r) = increment_rdata!!(t, r)
 
 @noinline _rr_zero_tangent2(p, f) = zero_tangent(p, f)
+# An inactive value's shadow slot: a fresh zero, since there is no real shadow to alias.
+@noinline _rr_zero_fdata(p) = fdata(zero_tangent(p))
+# The same zero, but cached in the tape's `bufs` at a slot the transform assigns statically, so a
+# pre-allocated context materializes it once instead of once per call. Re-zeroed on reuse: the
+# fwds pass can write through it and the pullback can accumulate into it, and a constant's shadow
+# must start every call at zero. Rebuilt whenever the cached value can't serve this call's primal —
+# same reuse discipline as `_bulk_save!`.
+@noinline function _rr_cached_zero_fdata!(bufs::Vector{Any}, slot::Int, p, ::Type{F}) where {F}
+    length(bufs) < slot && resize!(bufs, slot)
+    if isassigned(bufs, slot)
+        b = bufs[slot]
+        if b isa F && _rr_zero_reusable(b, p)
+            return set_to_zero!!(b)::F
+        end
+    end
+    z = fdata(zero_tangent(p))::F
+    bufs[slot] = z
+    return z
+end
+
+# Is re-zeroing `b` in place enough to make it a fresh zero fdata for `p`? Only for an array of a
+# bits tangent element, whose whole structure is fixed by its size. Anything else (a nested array,
+# a mutable tangent) is rebuilt per call.
+_rr_zero_reusable(@nospecialize(b), @nospecialize(p)) = false
+_rr_zero_reusable(b::Array, p::Array) = isbitstype(eltype(b)) && size(b) == size(p)
+
 @noinline _rr_build_tangent(::Type{P}, fields...) where {P} = build_tangent(P, fields...)
+
+# Runtime aliasing guard (`_collect_alias_guard_globals` in `reverse_interp.jl`): an active argument
+# that is identically a module global reverse mode replays as a constant would otherwise get a
+# silently wrong gradient. `@noinline` for the usual carrier-embedding reason above.
+@noinline function _rr_check_global_alias(argval, gv, msg::String)
+    argval === gv && error(msg)
+    return nothing
+end
 
 # Save/restore of a `Memory` slot that may not be assigned yet: a fresh array's `Core.memorynew`
 # leaves every slot undefined, so `memoryrefset!`'s read of the value it overwrites throws
@@ -154,6 +186,20 @@ function builtin_rrule_comms(::Val{Core.getfield}, actual, Ti, ctx)
     obj = actual[1]
     P = ctx.optype(obj)
     dyn = !_bi_literal_index(actual[2])
+    if dyn
+        # A dynamic index into a mixed-activity tuple (a packed vararg tail with some trailing
+        # arguments held constant) cannot be resolved: which slot is read — and so whether it is
+        # constant — is not statically decidable. All-constant never reaches here (the read itself
+        # is inactive and replayed primally), so this is a genuine mix.
+        Fobj = ctx.sty(obj)
+        if Fobj isa DataType && Fobj <: Tuple && any(T -> T === Inactive, Fobj.parameters)
+            ctx.reason[] = "reverse mode `getfield` with a dynamic (non-literal) index into a " *
+                           "tuple of mixed activity (shadow type $(Fobj)) is not supported: hold " *
+                           "the trailing arguments uniformly active, or all constant, at " *
+                           "%$(ctx.ssa.id)"
+            return false
+        end
+    end
     if dyn && ctx.tt(_widen(Ti)) !== NoTangent
         # Dynamic (non-literal) field index into a differentiable field: two accepted shapes, both
         # requiring a homogeneous Tuple/NamedTuple (or mutable struct, pure-rdata case only) —
@@ -217,13 +263,13 @@ function apply_builtin_rrule_fwds!(::Val{Core.getfield}, actual, Ti, ctx)
         if (P isa DataType && P <: Array) || !_bi_literal_index(actual[2])
             # Array shadow, or a homogeneous fdata-tuple's own dynamic-index shadow (both a plain
             # `getfield` at `ctx.fdtype(Ti)` — homogeneity makes the result type static).
-            shadow = ctx.emit!(Expr(:call, _getfieldg, ctx.sresolve(obj), ctx.presolve(actual[2])), ctx.fdtype(Ti))
+            shadow = ctx.emit!(Expr(:call, _getfieldg, ctx.sresolve(obj), ctx.presolve(actual[2])), ctx.sty(ctx.ssa))
         else
             # General struct, literal index: pull the field's fdata out of the object's fdata
             # handle, covering an `FData`-wrapped immutable struct and a raw `MutableTangent`
             # uniformly.
             fname = _bi_fieldname(actual[2])
-            shadow = ctx.icall!(_rr_get_fdata_field, ctx.fdtype(Ti), (ctx.fdtype(P), typeof(fname)),
+            shadow = ctx.icall!(_rr_get_fdata_field, ctx.sty(ctx.ssa), (ctx.sty(obj), typeof(fname)),
                                 ctx.sresolve(obj), actual[2])
         end
     end
@@ -312,6 +358,8 @@ function builtin_rrule_comms(::Val{Core.tuple}, actual, Ti, ctx)
         for j in eachindex(actual)
             ctx.fdtype(fieldtype(T, j)) === NoFData && continue
             _bi_tracked(actual[j], ctx) && continue
+            # Inactive: the fwds pass synthesises a fresh zero for this slot instead of aliasing.
+            ctx.inactive(actual[j]) && continue
             ctx.reason[] = "reverse mode `tuple` operand $(j) (type $(fieldtype(T, j))) carries " *
                            "fdata but has no provenance traceable to a function argument at " *
                            "%$(ctx.ssa.id)"
@@ -327,9 +375,23 @@ function apply_builtin_rrule_fwds!(::Val{Core.tuple}, actual, Ti, ctx)
     shadow = nothing
     if _bi_tracked(ctx.ssa, ctx)
         T = _widen(Ti)
-        FT = ctx.fdtype(T)
+        # `ctx.sty`, not `ctx.fdtype`: an inactive operand's slot is declared `Inactive`, so the
+        # shadow tuple's type is not the primal-derived one.
+        FT = ctx.sty(ctx.ssa)
         shadow = ctx.emit!(Expr(:call, _ctupleg,
-                     (ctx.fdtype(fieldtype(T, j)) === NoFData ? NoFData() : ctx.sresolve(actual[j])
+                     (begin
+                          FTj = ctx.fdtype(fieldtype(T, j))
+                          if FTj === NoFData
+                              NoFData()
+                          elseif ctx.inactive(actual[j])
+                              # Nothing to synthesise: `Inactive` is zero-size and absorbs whatever
+                              # is accumulated into it, so the slot costs neither an allocation nor
+                              # a word of storage.
+                              Inactive()
+                          else
+                              ctx.sresolve(actual[j])
+                          end
+                      end
                       for j in eachindex(actual))...), FT)
     end
     return p, shadow, Dict{Any,Any}()
@@ -553,7 +615,8 @@ function builtin_rrule_comms(::Val{Core.setfield!}, actual, Ti, ctx)
     fname = _bi_fieldname(actual[2])
     if ctx.fdtype(ctx.tt(fieldtype(P, fname))) !== NoFData
         val_node = actual[3]
-        if !_bi_tracked(val_node, ctx)
+        # Inactive: the fwds pass zeroes the field's shadow instead, severing the gradient chain.
+        if !_bi_tracked(val_node, ctx) && !ctx.inactive(val_node)
             ctx.reason[] = "reverse mode `setfield!` of a field whose tangent carries fdata " *
                            "($(fieldtype(P, fname))) requires the assigned value's own fdata to be " *
                            "traceable to a function argument at %$(ctx.ssa.id)"
@@ -586,8 +649,14 @@ function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
         if FTi === NoFData && TF <: IEEEFloat
             zt = ctx.emit!(zero(TF), TF)
         else
-            fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
-            zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTi), ctx.presolve(val_node), fdata_val)
+            # Inactive forces the fresh-zero branch; `FTarg` must then be `NoFData`, not `FTi` —
+            # it declares `fdata_val`'s actual runtime type. `normalize_shadow!`, not a bare
+            # `sresolve`: the assigned value's own shadow can be a mixed-activity tuple (narrower
+            # than `FTi`), which must be widened to `FTi` before it reaches this `:invoke`.
+            inact = ctx.inactive(val_node)
+            fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.normalize_shadow!(val_node, FTi)
+            FTarg = (FTi === NoFData || inact) ? NoFData : FTi
+            zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTarg), ctx.presolve(val_node), fdata_val)
         end
         _emit_stf!(ctx, mt, slot, zt)
     else
@@ -596,9 +665,12 @@ function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
         # fabricating a fresh zero when the field carries fdata — that embedding is the alias that
         # makes later in-place accumulation into this field flow into the assigned value's own
         # shadow. `f = NoFData()` for a pure-rdata field collapses to the original fresh-zero
-        # behavior.
-        fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
-        zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTi), ctx.presolve(val_node), fdata_val)
+        # behavior — also what an inactive `val_node` forces, since it has no real shadow to embed.
+        # `normalize_shadow!`, not a bare `sresolve` — see the same note above.
+        inact = ctx.inactive(val_node)
+        fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.normalize_shadow!(val_node, FTi)
+        FTarg = (FTi === NoFData || inact) ? NoFData : FTi
+        zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTarg), ctx.presolve(val_node), fdata_val)
         ctx.icall!(_rr_set_tangent_field!, TF, (ctx.fdtype(P), Int, TF), mt, fieldidx, zt)
     end
     p = ctx.emit!(Expr(:call, _setfieldg, ctx.presolve(obj), name_node, ctx.presolve(val_node)), Ti)
@@ -657,7 +729,8 @@ function builtin_rrule_comms(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     notangent = ctx.tt(_widen(elt)) === NoTangent
     if !notangent
         if ctx.fdtype(elt) !== NoFData
-            if !_bi_tracked(val_node, ctx)
+            # Inactive: the fwds pass zeroes the element's shadow instead.
+            if !_bi_tracked(val_node, ctx) && !ctx.inactive(val_node)
                 ctx.reason[] = "reverse mode `memoryrefset!` of a non-bits element ($(elt)) requires the " *
                                "assigned value's own fdata to be traceable to a function argument at " *
                                "%$(ctx.ssa.id)"
@@ -733,10 +806,15 @@ function apply_builtin_rrule_fwds!(::Val{Base.memoryrefset!}, actual, Ti, ctx)
     # `zero_tangent(p, f)` embeds `f` (the assigned value's own fdata) directly rather than
     # fabricating a fresh zero when the element carries fdata — the alias that makes later in-place
     # accumulation into this element flow into the assigned value's own shadow. `f = NoFData()` for
-    # a pure-rdata element collapses to the original fresh-zero behavior.
+    # a pure-rdata element collapses to the original fresh-zero behavior — also what an inactive
+    # `val_node` forces, since it has no real shadow to embed. `normalize_shadow!`, not a bare
+    # `sresolve`: the assigned value's own shadow can be a mixed-activity tuple (narrower than
+    # `FTi`), which must be widened to `FTi` before it reaches this `:invoke`.
     FTi = ctx.fdtype(Ti)
-    fdata_val = FTi === NoFData ? NoFData() : ctx.sresolve(val_node)
-    zt = ctx.icall!(_rr_zero_tangent2, TT, (Ti, FTi), ctx.presolve(val_node), fdata_val)
+    inact = ctx.inactive(val_node)
+    fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.normalize_shadow!(val_node, FTi)
+    FTarg = (FTi === NoFData || inact) ? NoFData : FTi
+    zt = ctx.icall!(_rr_zero_tangent2, TT, (Ti, FTarg), ctx.presolve(val_node), fdata_val)
     ctx.emit!(Expr(:call, Base.memoryrefset!, sref, zt, (ctx.presolve(a) for a in rest)...), TT)
     p = ctx.emit!(Expr(:call, Base.memoryrefset!, pref, ctx.presolve(val_node), (ctx.presolve(a) for a in rest)...), Ti)
     saved = Dict{Any,Any}((:old_tangent, ctx.ssa) => old_tangent)

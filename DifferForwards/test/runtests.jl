@@ -6,6 +6,7 @@ using SafeTestsets
 @safetestset "forward: pointers & GC.@preserve" begin include("test_forward_pointers.jl") end
 @safetestset "forward: foreigncall (ccall)" begin include("test_forward_foreigncall.jl") end
 @safetestset "forward: dispatch" begin include("test_forward_dispatch.jl") end
+@safetestset "forward: activity" begin include("test_forward_activity.jl") end
 @safetestset "forward: closures & higher-order" begin include("test_forward_closures_higher_order.jl") end
 @safetestset "forward: recursion" begin include("test_forward_recursion.jl") end
 @safetestset "forward-over-reverse" begin include("test_forward_over_reverse.jl") end
@@ -16,4 +17,5 @@ using SafeTestsets
 @safetestset "rules: broadcast" begin include("test_broadcast_rules.jl") end
 @safetestset "rules: indexing" begin include("test_indexing_rules.jl") end
 @safetestset "rules: linalg" begin include("test_linalg_rules.jl") end
+@safetestset "rules: activity audit" begin include("test_forward_rule_activity.jl") end
 # @safetestset "DifferentiationInterface.jl integration" begin include("test_differentiation_interface.jl") end

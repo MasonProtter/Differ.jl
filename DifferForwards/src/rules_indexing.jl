@@ -20,6 +20,7 @@ function frule!!(
     a, da = extract(Acd)
     mask = primal(maskcd)
     n = count(mask)
+    aactive = isactive(da)
     y = Vector{T}(undef, n)
     dy = Vector{tangent_type(T)}(undef, n)
     k = 0
@@ -27,7 +28,7 @@ function frule!!(
         if mask[i]
             k += 1
             y[k] = a[i]
-            dy[k] = da[i]
+            dy[k] = aactive ? da[i] : zero_tangent(a[i])
         end
     end
     return Dual(y, dy)
@@ -44,12 +45,13 @@ function frule!!(
     a, da = extract(Acd)
     idxvec = primal(idxcd)
     n = length(idxvec)
+    aactive = isactive(da)
     y = Vector{T}(undef, n)
     dy = Vector{tangent_type(T)}(undef, n)
     for k in eachindex(idxvec)
         i = idxvec[k]
         y[k] = a[i]
-        dy[k] = da[i]
+        dy[k] = aactive ? da[i] : zero_tangent(a[i])
     end
     return Dual(y, dy)
 end
@@ -69,12 +71,14 @@ function frule!!(
     mask = primal(maskcd)
     length(v) == count(mask) || throw(DimensionMismatch(
         "setindex!(A, v, mask): length(v) = $(length(v)) does not match count(mask) = $(count(mask))"))
+    _require_active_dest(da, "setindex!")
+    vactive = isactive(dv)
     k = 0
     for i in eachindex(a, mask)
         if mask[i]
             k += 1
             a[i] = v[k]
-            da[i] = dv[k]
+            da[i] = vactive ? dv[k] : zero_tangent(v[k])
         end
     end
     return Dual(a, da)
@@ -89,10 +93,12 @@ function frule!!(
     length(v) == length(idxvec) || throw(DimensionMismatch(
         "setindex!(A, v, idxvec): length(v) = $(length(v)) does not match " *
         "length(idxvec) = $(length(idxvec))"))
+    _require_active_dest(da, "setindex!")
+    vactive = isactive(dv)
     for k in eachindex(idxvec)
         i = idxvec[k]
         a[i] = v[k]
-        da[i] = dv[k]
+        da[i] = vactive ? dv[k] : zero_tangent(v[k])
     end
     return Dual(a, da)
 end

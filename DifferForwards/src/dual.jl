@@ -19,19 +19,35 @@ Used to pair together a `primal` value and a `tangent` to it. In the context of 
 AD (aka computing Fréchet derivatives), `primal` governs the point at which the derivative
 is computed, and `tangent` the direction in which it is computed.
 
-Must satisfy `tangent_type(P) == T`.
+`T` is one of two things:
+
+- `tangent_type(P)`, the ordinary case — forward mode carries the whole tangent, not the fdata half.
+- [`Inactive`](@ref), marking the value as held constant by the caller. Legal for any `P`;
+  `tangent_shadow_type(P)` is the pair of them.
+
+`Dual{P,Inactive}` reaches `frule!!` only in argument position, but it does reach it: an inactive
+value consumed by an active call is handed to the rule as-is, so a hand rule can skip the term
+instead of multiplying by a zero. Consumers that read a tangent as a value — intrinsic and builtin
+rules, phi-likes, `%new`, the return — get a materialised zero at the value's definition instead.
+A rule never *returns* `Inactive` (see `dualize_to_ircode`'s `frule_split!`).
 """
 struct Dual{P,T}
     primal::P
     tangent::T
     function Dual{P, T}(x, dx) where {P, T}
+        if T === Inactive
+            return new{P, Inactive}(convert(P, x), Inactive())
+        end
         if !(tangent_type(P) == T)
             @outline P T throw(ArgumentError(
-                "Invalid Dual{P,T} construction for primal type P=$P\n\tgot tangent type T=$T\n\tDiffer requires that tangent_type(P) == T"
+                "Invalid Dual{P,T} construction for primal type P=$P\n\tgot tangent type T=$T\n\tDiffer requires that tangent_type(P) == T, or T === Inactive"
             ))
         end
         new{P, T}(convert(P, x), convert(T, dx))
     end
+    # Must precede the general arm: `as_tangent` below would try to convert an `Inactive` into a
+    # tangent of `P` and then throw, rather than recognising it as a constancy marker.
+    Dual(x::P, dx::Inactive) where {P} = new{P, Inactive}(x, dx)
     function Dual(x::P, dx::T) where {P, T}
         Tproper = tangent_type(P)
         if !(T <: Tproper)
@@ -103,7 +119,8 @@ _primal(x::Dual) = primal(x)
 
 Check that the type of `tangent(x)` is the tangent type of the type of `primal(x)`.
 """
-verify_dual_type(x::Dual) = tangent_type(_typeof(primal(x))) == typeof(tangent(x))
+verify_dual_type(x::Dual) =
+    tangent(x) isa Inactive || tangent_type(_typeof(primal(x))) == typeof(tangent(x))
 
 function error_if_incorrect_dual_types(duals::Vararg{Dual,N}) where {N}
     correct_types = map(verify_dual_type, duals)
@@ -121,9 +138,20 @@ end
 
 @inline uninit_dual(x::P) where {P} = Dual(x, uninit_tangent(x))
 
+# A shadow that contributes nothing to a derivative, for the two distinct reasons a hand rule has to
+# treat alike: `NoTangent` (the type has no tangent space, e.g. an `Int` exponent) and `Inactive`
+# (the caller declared this particular value constant). `isactive` knows only the second.
+_inert(@nospecialize dx) = isa(dx, NoTangent) || isa(dx, Inactive)
+
+# `_require_active_dest` (destination-activity refusal for a mutating rule) is defined in
+# `DifferCore/src/inactive.jl` and shared with `DifferReverse`.
+
 # Always sharpen the first thing if it's a type so static dispatch remains possible.
 function Dual(x::Type{P}, dx::NoTangent) where {P}
     return Dual{@isdefined(P) ? Type{P} : typeof(x),NoTangent}(x, dx)
+end
+function Dual(x::Type{P}, dx::Inactive) where {P}
+    return Dual{@isdefined(P) ? Type{P} : typeof(x),Inactive}(x, dx)
 end
 
 # ===========================================================================
@@ -161,6 +189,7 @@ _dual_tangent_type(::Type{Dual{P,T}}) where {P,T} = T
 # `typeof(d)`. Rarely reached — Duals are built by the transform, not present as primal constants.
 _carrier_zero(x::IEEEFloat) = zero(x)
 _carrier_zero(::NoTangent) = NoTangent()
+_carrier_zero(::Inactive) = Inactive()
 _carrier_zero(x::Dual) = zero_tangent_internal(x, NoCache())
 # A non-self-tangent type (`tangent_type(X) !== X`, e.g. a struct/closure with a `Float64` field,
 # whose tangent is a `Tangent`) can't be represented in a `Dual`'s same-typed field — no same-typed

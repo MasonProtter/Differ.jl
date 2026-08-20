@@ -982,6 +982,9 @@ end
 Reconstruct the tangent `t` for which `fdata(t) == f` and `rdata(t) == r`.
 """
 tangent(::NoFData, ::NoRData) = NoTangent()
+# An inactive slot: `NoTangent` in the shadow position means the value was held constant, so the
+# reconstruction is `NoTangent()` however differentiable the primal type is.
+tangent(::NoTangent, ::NoRData) = NoTangent()
 tangent(::NoFData, r::IEEEFloat) = r
 tangent(f::Array, ::NoRData) = f
 tangent(f::Ptr, ::NoRData) = f

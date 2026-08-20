@@ -20,7 +20,7 @@ include(joinpath(@__DIR__, "testutils.jl"))
 # Also covered below: `sum`/`mapreduce`-family primals (route through non-inlined nested calls to
 # `Base._mapreduce`/`mapreduce_impl`, each getting a recycled inner tape via `_inner_ctx` — a
 # `Ctx{<:Tape}` context handed to a `reverse_fwds_impl` carrier), a pre-allocated top-level context
-# (`build_ctx(...; prealloc=true)`), and a bulk-saved argument mutation. A directly self-recursive
+# (`build_ctx(f, argtypes)`), and a bulk-saved argument mutation. A directly self-recursive
 # primal (`reverse_fwds_recursive_ci`'s `Ctx{own_TapeT}` self-edge) also works, via forward mode's
 # own general recursion support — see the "self-recursion" testset below. *Mutual* recursion (A→B→A)
 # is a different, still-open reverse-mode gap (its tape types would need a fixed point solved across
@@ -186,7 +186,7 @@ end
 @testset "pre-allocated context (Ctx{<:Tape}) correctness under forward-over-reverse" begin
     # IR level, mirroring the `Ctx{Nothing}` check in staging 3 above: the reverse-mode carrier's own
     # dualized IR must verify on its own, given a pre-allocated context type instead of a fresh one.
-    pctx = build_ctx(sumsq, (Vector{Float64},); prealloc=true)
+    pctx = build_ctx(sumsq, (Vector{Float64},))
     argtypes = (fcodual_type(typeof(sumsq)), typeof(pctx), fcodual_type(Vector{Float64}))
     ir, _ = code_dual_ircode(DifferReverse.reverse_fwds_impl, argtypes)
     Core.Compiler.verify_ir(ir)
@@ -196,7 +196,7 @@ end
     # only reuse the primal tape). This is the case the `Stack.position` shadow mirroring
     # (`src/builtins.jl`) matters for: without it, a reused shadow tape's stack positions would
     # drift out of step with the primal's.
-    ctx = build_ctx(sumsq, (Vector{Float64},); prealloc=true)
+    ctx = build_ctx(sumsq, (Vector{Float64},))
     inner = let c = ctx
         x -> value_and_gradient!(c, zero_fcodual(sumsq), zero_fcodual([x, 2x, 3x]))[2]
     end
@@ -290,7 +290,7 @@ end
 
     # Pre-allocated (recycled) tape — ctx and outer Dual seed both held across two calls, so the
     # bulk-save buffer is reused, not freshly allocated each time.
-    ctx = build_ctx(bulk_sq!, (Vector{Float64},); prealloc=true)
+    ctx = build_ctx(bulk_sq!, (Vector{Float64},))
     inner = let c = ctx
         x -> value_and_gradient!(c, zero_fcodual(bulk_sq!), zero_fcodual([x, 2x, 3x]))[2]
     end

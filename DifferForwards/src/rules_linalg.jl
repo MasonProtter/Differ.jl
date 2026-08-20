@@ -26,7 +26,8 @@ function frule!!(
     Base.length(x) == Base.length(y) ||
         throw(DimensionMismatch("dot: vectors have different lengths"))
     s = LinearAlgebra.dot(x, y)
-    ds = LinearAlgebra.dot(dx, y) + LinearAlgebra.dot(x, dy)
+    ds = (isactive(dx) ? LinearAlgebra.dot(dx, y) : 0.0) +
+         (isactive(dy) ? LinearAlgebra.dot(x, dy) : 0.0)
     return Dual(s, ds)
 end
 
@@ -37,6 +38,7 @@ end
 function frule!!(::Dual{typeof(LinearAlgebra.norm)}, xd::Dual{Vector{Float64}})
     x, dx = xd.x, xd.dx
     nrm = LinearAlgebra.norm(x)
+    isactive(dx) || return Dual(nrm, 0.0)
     dnrm = LinearAlgebra.dot(x, dx) / nrm
     return Dual(nrm, dnrm)
 end
@@ -48,11 +50,12 @@ end
 function frule!!(::Dual{typeof(LinearAlgebra.tr)}, Ad::Dual{Matrix{Float64}})
     A, dA = Ad.x, Ad.dx
     n = Base.size(A, 1)
+    Aactive = isactive(dA)
     s = 0.0
     ds = 0.0
     for i in 1:n
         s += A[i, i]
-        ds += dA[i, i]
+        Aactive && (ds += dA[i, i])
     end
     return Dual(s, ds)
 end
@@ -71,7 +74,11 @@ function frule!!(
     A, dA = Ad.x, Ad.dx
     x, dx = xd.x, xd.dx
     y = Base.:*(A, x)
-    dy = Base.:+(Base.:*(dA, x), Base.:*(A, dx))
+    dy = if isactive(dA)
+        isactive(dx) ? Base.:+(Base.:*(dA, x), Base.:*(A, dx)) : Base.:*(dA, x)
+    else
+        isactive(dx) ? Base.:*(A, dx) : zero(y)
+    end
     return Dual(y, dy)
 end
 
@@ -83,7 +90,11 @@ function frule!!(
     A, dA = Ad.x, Ad.dx
     B, dB = Bd.x, Bd.dx
     Y = Base.:*(A, B)
-    dY = Base.:+(Base.:*(dA, B), Base.:*(A, dB))
+    dY = if isactive(dA)
+        isactive(dB) ? Base.:+(Base.:*(dA, B), Base.:*(A, dB)) : Base.:*(dA, B)
+    else
+        isactive(dB) ? Base.:*(A, dB) : zero(Y)
+    end
     return Dual(Y, dY)
 end
 
@@ -102,9 +113,10 @@ function frule!!(
     y, dy = yd.x, yd.dx
     A, dA = Ad.x, Ad.dx
     x, dx = xd.x, xd.dx
+    _require_active_dest(dy, "mul!")
     LinearAlgebra.mul!(y, A, x)
-    LinearAlgebra.mul!(dy, dA, x)
-    LinearAlgebra.mul!(dy, A, dx, true, true)
+    isactive(dA) ? LinearAlgebra.mul!(dy, dA, x) : fill!(dy, 0.0)
+    isactive(dx) && LinearAlgebra.mul!(dy, A, dx, true, true)
     return yd
 end
 
@@ -117,8 +129,9 @@ function frule!!(
     C, dC = Cd.x, Cd.dx
     A, dA = Ad.x, Ad.dx
     B, dB = Bd.x, Bd.dx
+    _require_active_dest(dC, "mul!")
     LinearAlgebra.mul!(C, A, B)
-    LinearAlgebra.mul!(dC, dA, B)
-    LinearAlgebra.mul!(dC, A, dB, true, true)
+    isactive(dA) ? LinearAlgebra.mul!(dC, dA, B) : fill!(dC, 0.0)
+    isactive(dB) && LinearAlgebra.mul!(dC, A, dB, true, true)
     return Cd
 end

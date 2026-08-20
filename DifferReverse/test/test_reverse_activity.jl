@@ -1,0 +1,1037 @@
+using Test
+using DifferReverse
+using DifferReverse: rev_gradient, value_and_gradient!, increment!!,
+                     _intrinsic_needed_operands, intrinsic_rrule_deps,
+                     code_reverse_fwds_ircode, rrule!!
+using LinearAlgebra: dot
+import DifferentiationInterface as DI
+include("testutils.jl")
+
+# Declaring an argument constant: `Inactive` in a `CoDual`'s shadow slot. Activity propagates from
+# there through the primal IR, so anything reached only through a constant is replayed primally
+# instead of differentiated.
+
+@testset "activity: scalar arguments" begin
+    f(x, y) = x * y + sin(x)
+    fcd = zero_fcodual(f)
+    x, y = 2.0, 3.0
+    dfdx, dfdy = y + cos(x), x
+
+    both = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(y, NoFData()))[2](1.0)
+    @test both == (NoRData(), dfdx, dfdy)
+
+    ycon = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), const_codual(y))[2](1.0)
+    @test ycon == (NoRData(), dfdx, NoRData())
+
+    xcon = rrule!!(fcd, Ctx(), const_codual(x), CoDual(y, NoFData()))[2](1.0)
+    @test xcon == (NoRData(), NoRData(), dfdy)
+
+    # Everything constant: nothing is differentiated at all, and the primal value still comes out.
+    allcon = rrule!!(fcd, Ctx(), const_codual(x), const_codual(y))
+    @test primal(allcon[1]) == f(x, y)
+    @test allcon[2](1.0) == (NoRData(), NoRData(), NoRData())
+
+    for inactive in ((), (1,), (2,), (1, 2))
+        checkverify_rev(f, (Float64, Float64); inactive)
+    end
+end
+
+@testset "activity: an inactive argument is not merely zero-seeded" begin
+    # A constant argument carries no shadow at all, so a rule that reached for one would fail rather
+    # than silently produce a zero. Distinguishes this from passing a zero tangent.
+    g(x, y) = x * y
+    fcd = zero_fcodual(g)
+    ycd = const_codual(3.0)
+    @test tangent(ycd) === Inactive()
+    @test rrule!!(fcd, Ctx(), CoDual(2.0, NoFData()), ycd)[2](1.0) == (NoRData(), 3.0, NoRData())
+end
+
+@testset "activity: array arguments" begin
+    function floop(v, w)
+        s = 0.0
+        for i in eachindex(v)
+            s += v[i] * w[i]
+        end
+        return s
+    end
+    v, w = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
+    at = (Vector{Float64}, Vector{Float64})
+
+    dv = zeros(3)
+    _, pb = rrule!!(zero_fcodual(floop), Ctx(), CoDual(v, dv), const_codual(w))
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData())
+    @test dv == w   # d/dv of sum(v .* w) is w; accumulated in place, no shadow for `w` allocated
+
+    checkverify_rev(floop, at; inactive=(2,))
+
+    # Same answer through the pre-allocated path, and reusable.
+    ctx = build_ctx(floop, at; inactive=(2,))
+    fcd, vcd, wcd = zero_fcodual(floop), CoDual(v, zeros(3)), const_codual(w)
+    y1, g1 = value_and_gradient!(ctx, fcd, vcd, wcd)
+    y2, g2 = value_and_gradient!(ctx, fcd, vcd, wcd)
+    @test y1 == y2 == floop(v, w)
+    @test g1 == g2 == (NoTangent(), w, Inactive())
+
+    # The constant slot reconstructs to `Inactive()` — distinct both from a zero array and from
+    # the `NoTangent()` a genuinely non-differentiable argument would give.
+    @test g1[3] === Inactive()
+end
+
+@testset "activity: matches the full gradient's corresponding slot" begin
+    # Whatever is differentiated must agree with the all-active run, for every activity signature.
+    h(a, b, c) = a * b + b * c + sin(a * c)
+    args = (1.5, 2.5, 0.5)
+    full = rev_gradient(h, args...)
+    fcd = zero_fcodual(h)
+    for inactive in ((1,), (2,), (3,), (1, 2), (1, 3), (2, 3))
+        cds = ntuple(k -> k in inactive ? const_codual(args[k]) : CoDual(args[k], NoFData()), 3)
+        got = rrule!!(fcd, Ctx(), cds...)[2](1.0)
+        @test got[1] === NoRData()
+        for k in 1:3
+            if k in inactive
+                @test got[k + 1] === NoRData()
+            else
+                @test got[k + 1] ≈ full[k + 1]
+            end
+        end
+        checkverify_rev(h, (Float64, Float64, Float64); inactive)
+    end
+end
+
+@testset "activity: loops run more than twice" begin
+    # A control-flow-replay change can be correct for 0 and 1 iterations and still corrupt gradients
+    # from the second onward, so exercise a genuinely repeated ambiguous edge.
+    function powloop(x, n)
+        s = 1.0
+        for _ in 1:n
+            s = s * x + 1.0
+        end
+        return s
+    end
+    for n in 0:4
+        exact = central_diff(t -> powloop(t, n), 1.7)
+        got = rrule!!(zero_fcodual(powloop), Ctx(),
+                      CoDual(1.7, NoFData()), const_codual(n))[2](1.0)
+        @test got[2] ≈ exact rtol = 1e-5
+        @test got[3] === NoRData()
+    end
+    checkverify_rev(powloop, (Float64, Int); inactive=(2,))
+end
+
+@testset "activity: constant-only code is replayed, not differentiated" begin
+    # `_static_recursible_call`'s gates (concrete argtypes, traceable provenance, resolvable callee)
+    # never run for a call reached only through constants — the whole point of the bypass. This
+    # primal bails outright when `d` is active.
+    lookup(d, k) = d[k]
+    f(x, d, k) = x * lookup(d, k)
+    d = Dict("a" => 3.0, "b" => 4.0)
+
+    # Treating the dictionary as differentiable fails — here already at `zero_fcodual`, which cannot
+    # build a shadow for a `Dict` at all. Asserted only as the contrast to the constant case below.
+    @test_throws Exception rrule!!(zero_fcodual(f), Ctx(), CoDual(2.0, NoFData()),
+                                   zero_fcodual(d), zero_fcodual("a"))
+
+    got = rrule!!(zero_fcodual(f), Ctx(), CoDual(2.0, NoFData()),
+                  const_codual(d), const_codual("a"))
+    @test primal(got[1]) == f(2.0, d, "a")
+    @test got[2](1.0) == (NoRData(), 3.0, NoRData(), NoRData())
+end
+
+@testset "activity: shrinks the tape" begin
+    # Correctness tests cannot catch this, and it is the whole point of the feature: a constant
+    # argument must remove real per-iteration comms traffic, not just zero out a result.
+    function floop(v, w)
+        s = 0.0
+        for i in eachindex(v)
+            s += v[i] * w[i]
+        end
+        return s
+    end
+    at = (Vector{Float64}, Vector{Float64})
+    full = comms_element_types(tape_type(floop, at))
+    cut = comms_element_types(tape_type(floop, at; inactive=(2,)))
+    @test sum(fieldcount, full) > sum(fieldcount, cut)
+end
+
+@testset "activity: mutating an inactive object with an active value bails" begin
+    # Unsound to silently drop: the constant array has no shadow to accumulate into. Must be a
+    # located error rather than a wrong number.
+    function writeinto!(buf, x)
+        buf[1] = x * 2.0
+        return sum(buf)
+    end
+    err = try
+        rrule!!(zero_fcodual(writeinto!), Ctx(), const_codual([1.0, 2.0]), CoDual(3.0, NoFData()))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+end
+
+@testset "activity: a pointer traced only through untangented values stays active" begin
+    # `u::UInt` has no tangent space, so without a pointer activity root the `Ptr{Float64}(u)`/
+    # `unsafe_load` chain would be classified inactive and replayed primally with a zero shadow —
+    # silently dropping the gradient instead of hitting the "no reverse rule" bail intrinsics
+    # without a rule reach. What a pointer addresses is outside the analysis, so it must stay active
+    # regardless of what the address was computed from.
+    f(u::UInt, x) = unsafe_load(Ptr{Float64}(u)) * x
+    v = [7.0]
+    u = UInt(pointer(v))
+    err = try
+        rev_gradient(f, u, 2.0)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("pointerref", sprint(showerror, err))
+
+    # Same profile for the atomic pointer intrinsics with no rule (`atomic_pointerswap` here; also
+    # `atomic_pointermodify`/`atomic_pointerreplace`): a declared-constant pointer argument has no
+    # other active operand to inherit activity from, so it must be listed explicitly rather than
+    # relying on the `Ptr`-typed-result root (its own result is the loaded value, not a `Ptr`). The
+    # bail only fires once the pullback itself runs — the fwds carrier replays every intrinsic
+    # primally regardless of activity, and reverse mode's per-intrinsic rule dispatch lives in the
+    # pullback statement loop.
+    swap(p::Ptr{Float64}) = Core.Intrinsics.atomic_pointerswap(p, 3.0, :monotonic)
+    v2 = [9.0]
+    p2 = Ptr{Float64}(pointer(v2))
+    _, pb = rrule!!(zero_fcodual(swap), Ctx(), CoDual(p2, Inactive()))
+    err2 = try
+        pb(1.0)
+        nothing
+    catch e
+        e
+    end
+    @test err2 isa ErrorException
+    @test occursin("atomic_pointerswap", sprint(showerror, err2))
+end
+
+@testset "activity: build_ctx rejects an out-of-range position" begin
+    @test_throws ArgumentError build_ctx((x, y) -> x * y, (Float64, Float64); inactive=(3,))
+    @test_throws ArgumentError build_ctx((x, y) -> x * y, (Float64, Float64); inactive=(0,))
+end
+
+@testset "activity: build_ctx is inferable and steady-state zero-allocation" begin
+    # The point of preallocation is a concrete `Ctx{Tape{…}}` at the call site: an abstract `Ctx`
+    # makes the adjacent `rrule!!` dispatch dynamically, boxing its argument tuple and its return
+    # every call (ISSUES #124). `_inactive_positions` must stay allocation-free, or a literal
+    # `inactive` stops const-folding into the `Val` type parameter and this regresses.
+    f(x, y) = x * y + sin(x)
+    function plain_ctx()
+        build_ctx(f, (Float64, Float64))
+    end
+    function lit_ctx()
+        build_ctx(f, (Float64, Float64); inactive=(2,))
+    end
+    @test isconcretetype(only(Base.return_types(plain_ctx, ())))
+    @test isconcretetype(only(Base.return_types(lit_ctx, ())))
+
+    # Steady-state allocation, in the shape the benchmarks use: the `ctx` the setup block builds
+    # reaches the timed `rrule!!`/pullback call concretely typed (the closure's capture type is
+    # where the type travels), so a warmed round trip allocates nothing.
+    ctx = build_ctx(f, (Float64, Float64); inactive=(2,))
+    @test ctx isa Ctx{<:DifferReverse.Tape}
+    xcd = CoDual(2.0, NoFData())
+    ycd = const_codual(3.0)
+    measure = () -> (rrule!!(zero_fcodual(f), ctx, xcd, ycd)[2])(1.0)
+    measure(); measure()
+    @test @allocated(measure()) == 0
+end
+
+@testset "activity: the carrier-type and carrier-value build_ctx forms" begin
+    # `Tuple{CoDual…}` states everything the tape shape depends on, activity included, as a type
+    # parameter, so the result type is a function of that tuple with no const-folding involved.
+    # The carrier-value form is the same thing spelled with the carriers themselves.
+    f(x, y) = x * y + sin(x)
+    fcd = zero_fcodual(f)
+    xcd = CoDual(2.0, NoFData())
+    ycd = const_codual(3.0)
+
+    ctx_ty = build_ctx(Tuple{typeof(fcd),typeof(xcd),typeof(ycd)})
+    ctx_val = build_ctx(fcd, xcd, ycd)
+    ctx_pos = build_ctx(f, (Float64, Float64); inactive=(2,))
+    # All three describe the same call, so they must land on the same tape.
+    @test typeof(ctx_ty) === typeof(ctx_val) === typeof(ctx_pos)
+    @test ctx_ty isa Ctx{<:DifferReverse.Tape}
+
+    for ctx in (ctx_ty, ctx_val)
+        _, pb = rrule!!(fcd, ctx, xcd, ycd)
+        @test pb(1.0) == (NoRData(), 3.0 + cos(2.0), NoRData())
+    end
+
+    # Inferable without const-folding: the carriers are locals, so `typeof` is exact.
+    function via_type()
+        g = (x, y) -> x * y
+        build_ctx(Tuple{typeof(zero_fcodual(g)),CoDual{Float64,NoFData},CoDual{Float64,Inactive}})
+    end
+    function via_values()
+        g = (x, y) -> x * y
+        build_ctx(zero_fcodual(g), CoDual(2.0, NoFData()), const_codual(3.0))
+    end
+    @test isconcretetype(only(Base.return_types(via_type, ())))
+    @test isconcretetype(only(Base.return_types(via_values, ())))
+end
+
+@testset "activity: returning an argument declared constant" begin
+    # The returned carrier's type is chosen from the shadow type, so its *value* has to be built to
+    # match. A `NoFData` primal used to take the `zero_fcodual` branch, which builds the
+    # primal-derived shadow (`NoFData()`) and blew up with a `TypeError` at the `%new`. `verify_ir`
+    # passes either way — it does not check declared-vs-actual statement types — so nothing in
+    # `checkverify_rev` catches this shape.
+    ret_const(x, c) = c
+    ctx = build_ctx(ret_const, (Float64, Float64); inactive=(2,))
+    ycd, pb = rrule!!(zero_fcodual(ret_const), ctx, zero_fcodual(1.0), const_codual(2.0))
+    @test primal(ycd) == 2.0
+    @test tangent(ycd) === Inactive()
+    @test pb(1.0) == (NoRData(), 0.0, NoRData())
+
+    # The fdata-carrying case routes differently and was already correct; pin it so the two stay
+    # in agreement.
+    ctx_v = build_ctx(ret_const, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    yv, pbv = rrule!!(zero_fcodual(ret_const), ctx_v,
+                      CoDual([1.0, 2.0], zeros(2)), const_codual([3.0, 4.0]))
+    @test primal(yv) == [3.0, 4.0]
+    @test tangent(yv) === Inactive()
+
+    # An active return alongside an inactive argument keeps the ordinary carrier.
+    ret_active(x, c) = x
+    ctx_a = build_ctx(ret_active, (Float64, Float64); inactive=(2,))
+    ya, pba = rrule!!(zero_fcodual(ret_active), ctx_a, zero_fcodual(5.0), const_codual(2.0))
+    @test tangent(ya) === NoFData()
+    @test pba(1.0) == (NoRData(), 1.0, NoRData())
+
+    checkverify_rev(ret_const, (Float64, Float64); inactive=(2,))
+end
+
+@testset "activity: inactive= accepts an Int or a tuple of them, and nothing else" begin
+    # The positions become a `Val` type parameter, so only what is constructible as one is allowed.
+    # A `Vector` used to surface as a `TypeError` from `Val` itself, and a range silently produced a
+    # tape-less `Ctx{Nothing}` — a pre-allocated context degrading to a per-call allocating one with
+    # no error. Both are now refused at the signature, naming the keyword.
+    f(x, y) = x * y + sin(x)
+    @test typeof(build_ctx(f, (Float64, Float64); inactive=2)) ===
+          typeof(build_ctx(f, (Float64, Float64); inactive=(2,)))
+    @test_throws TypeError build_ctx(f, (Float64, Float64); inactive=[2])
+    @test_throws TypeError build_ctx(f, (Float64, Float64); inactive=2:2)
+    # Still inferable in every accepted spelling.
+    c_none() = build_ctx(f, (Float64, Float64))
+    c_int() = build_ctx(f, (Float64, Float64); inactive=2)
+    c_tup() = build_ctx(f, (Float64, Float64); inactive=(2,))
+    for c in (c_none, c_int, c_tup)
+        @test isconcretetype(only(Base.return_types(c, ())))
+    end
+end
+
+@testset "activity: build_ctx rejects a malformed carrier tuple" begin
+    # A `UnionAll` element is not a usable carrier: it names no shadow, so no tape shape follows
+    # from it. Fail rather than guess one.
+    fcd = zero_fcodual((x, y) -> x * y)
+    @test_throws ErrorException build_ctx(Tuple{typeof(fcd),CoDual{Float64},CoDual{Float64,NoFData}})
+    @test_throws ErrorException build_ctx(Tuple{})
+end
+
+@testset "activity: a non-constant inactive still differentiates correctly at run time" begin
+    # Positions the compiler cannot fold (a generator result): the tape is still built correctly at
+    # run time — the generator reads the positions off the `Val`'s runtime type — so the context
+    # works; it is just not inferable, and the adjacent `rrule!!` dispatches dynamically.
+    f(x, y) = x * y + sin(x)
+    inact = Tuple(j for j in 1:2 if j == 2)
+    ctx = build_ctx(f, (Float64, Float64); inactive=inact)
+    @test ctx isa Ctx{<:DifferReverse.Tape}
+    _, pb = rrule!!(zero_fcodual(f), ctx, CoDual(2.0, NoFData()), const_codual(3.0))
+    @test pb(1.0) == (NoRData(), 3.0 + cos(2.0), NoRData())
+end
+
+# A vararg primal's trailing arguments all land in one packed tail slot. A constant trailing
+# argument gives that slot a mixed per-element shadow (`Inactive` in the constant positions), a
+# literal-index read of a constant position is replayed primally, and the pullback's scatter
+# returns `NoRData()` for it. A dynamic index into a genuinely mixed tail stays a located bail —
+# which slot is read is not statically decidable — as does passing the whole mixed tail to a
+# nested call, whose recursion glue declares argument coduals at the uniformly-active type.
+
+@testset "activity: constant vararg-tail elements, scalar tail" begin
+    vscale(x, ys...) = x * ys[1] + 2.0 * ys[2]
+    x, y1, y2 = 3.0, 5.0, 7.0
+    fcd = zero_fcodual(vscale)
+
+    active = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(y1, NoFData()), CoDual(y2, NoFData()))
+    @test primal(active[1]) == vscale(x, y1, y2)
+    @test active[2](1.0) == (NoRData(), y1, x, 2.0)
+
+    # Each constant slot comes back `NoRData()`; the others match the all-active run exactly.
+    mixed = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(y1, NoFData()), const_codual(y2))
+    @test primal(mixed[1]) == vscale(x, y1, y2)
+    @test mixed[2](1.0) == (NoRData(), y1, x, NoRData())
+
+    allcon = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), const_codual(y1), const_codual(y2))
+    @test primal(allcon[1]) == vscale(x, y1, y2)
+    @test allcon[2](1.0) == (NoRData(), y1, NoRData(), NoRData())
+
+    for inactive in ((), (3,), (2, 3))
+        checkverify_rev(vscale, (Float64, Float64, Float64); inactive)
+    end
+
+    # The pre-allocated entry points work and reconstruct the constant slot to `Inactive()`.
+    a1, a2, a3 = CoDual(x, NoFData()), CoDual(y1, NoFData()), const_codual(y2)
+    ctx = build_ctx(fcd, a1, a2, a3)
+    yv, g = value_and_gradient!(ctx, fcd, a1, a2, a3)
+    @test yv == vscale(x, y1, y2)
+    @test g == (NoTangent(), y1, x, Inactive())
+    @test g[4] === Inactive()
+end
+
+@testset "activity: constant vararg-tail elements, fdata-carrying tail" begin
+    vsum2(x, vs...) = sum(vs[1]) + x * sum(vs[2])
+    x = 3.0
+    v1, v2 = [1.0, 2.0], [3.0, 4.0]
+    fcd = zero_fcodual(vsum2)
+
+    dv1a, dv2a = zeros(2), zeros(2)
+    ra = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(v1, dv1a), CoDual(v2, dv2a))
+    @test primal(ra[1]) == vsum2(x, v1, v2)
+    @test ra[2](1.0) == (NoRData(), sum(v2), NoRData(), NoRData())
+    @test dv1a == ones(2)
+    @test dv2a == fill(x, 2)
+
+    # `vs[2]` constant: `vs[1]`'s and `x`'s gradients match the all-active run slot for slot, and
+    # the constant array's (absent) shadow is never touched.
+    dv1 = zeros(2)
+    rm = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(v1, dv1), const_codual(v2))
+    @test primal(rm[1]) == vsum2(x, v1, v2)
+    @test rm[2](1.0) == (NoRData(), sum(v2), NoRData(), NoRData())
+    @test dv1 == ones(2)
+    _assert_tape_balanced(rm[2])
+
+    for inactive in ((2,), (3,), (2, 3))
+        checkverify_rev(vsum2, (Float64, Vector{Float64}, Vector{Float64}); inactive)
+    end
+
+    # A constant trailing array's `:fshadow`/save traffic disappears from the comms tuple.
+    at = (Float64, Vector{Float64}, Vector{Float64})
+    active_bytes = sum(sizeof, comms_element_types(tape_type(vsum2, at)); init=0)
+    mixed_bytes = sum(sizeof, comms_element_types(tape_type(vsum2, at; inactive=(3,))); init=0)
+    @test mixed_bytes <= active_bytes
+end
+
+@testset "activity: constant vararg-tail element read in a loop" begin
+    # Loop-carried, run over >= 2 iterations: per the ISSUES #52 lesson, `verify_ir` plus a
+    # single-pass test cannot validate an activity/comms change on its own.
+    vloop(x, ys...) = begin
+        s = 0.0
+        for i in 1:3
+            s += x * ys[1] + ys[2]
+        end
+        s
+    end
+    x, y1, y2 = 2.0, 5.0, 7.0
+    fcd = zero_fcodual(vloop)
+    active = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(y1, NoFData()), CoDual(y2, NoFData()))
+    @test primal(active[1]) == vloop(x, y1, y2)
+    @test active[2](1.0) == (NoRData(), 3y1, 3x, 3.0)
+    mixed = rrule!!(fcd, Ctx(), CoDual(x, NoFData()), CoDual(y1, NoFData()), const_codual(y2))
+    @test primal(mixed[1]) == vloop(x, y1, y2)
+    @test mixed[2](1.0) == (NoRData(), 3y1, 3x, NoRData())
+    _assert_tape_balanced(mixed[2])
+end
+
+@testset "activity: dynamic index into a vararg tail" begin
+    vdyn(vs...) = begin
+        s = 0.0
+        for j in 1:length(vs)
+            s += vs[j]
+        end
+        s
+    end
+    # All-active: unchanged.
+    ra = rrule!!(zero_fcodual(vdyn), Ctx(), CoDual(1.0, NoFData()), CoDual(2.0, NoFData()))
+    @test ra[2](1.0) == (NoRData(), 1.0, 1.0)
+    # Genuinely mixed: which slot is read is not statically decidable, so neither is its activity.
+    err = try
+        rrule!!(zero_fcodual(vdyn), Ctx(), CoDual(1.0, NoFData()), const_codual(2.0))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("dynamic (non-literal) index into a tuple of mixed activity", err.msg)
+    # All slots constant: it doesn't matter which slot is read — the whole loop replays primally.
+    rc = rrule!!(zero_fcodual(vdyn), Ctx(), const_codual(1.0), const_codual(2.0))
+    @test primal(rc[1]) == 3.0
+    @test rc[2](1.0) == (NoRData(), NoRData(), NoRData())
+end
+
+@testset "activity: passing a whole mixed-shadow tail to a nested call bails" begin
+    tsum(t) = t[1] * t[2]
+    vpass(ys...) = @noinline tsum(ys)
+    # All-active control.
+    ra = rrule!!(zero_fcodual(vpass), Ctx(), CoDual(3.0, NoFData()), CoDual(5.0, NoFData()))
+    @test ra[2](1.0) == (NoRData(), 5.0, 3.0)
+    # Mixed: the recursion glue would declare the tail codual at the uniformly-active fdata type —
+    # a type lie against its mixed shadow — so it is a located bail, not a miscompile.
+    err = try
+        rrule!!(zero_fcodual(vpass), Ctx(), CoDual(3.0, NoFData()), const_codual(5.0))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("shadow is a mixed-activity tuple", err.msg)
+end
+
+# An inactive source is handled by `memmove`/`memcpy` and by `Core.tuple`/`Core.setfield!`/
+# `Base.memoryrefset!`, all gated on `ctx.inactive` rather than `_bi_tracked`.
+#
+# `sum(v .* w)` itself still bails: `Broadcast.unalias` lowers to a `PhiNode` merging the inactive
+# argument with the copied buffer, and `_fdata_tracked`'s `PhiNode` arm has no inactive case. These
+# tests reach the four fixed sites without routing through that phi.
+
+@testset "activity: memmove third mode — destination tracked, source inactive" begin
+    f(v, w) = sum(v) + sum(copy(w))
+    v, w = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    dv = zeros(3)
+    y, pb = rrule!!(zero_fcodual(f), Ctx(), CoDual(copy(v), dv), const_codual(w))
+    @test primal(y) == f(v, w)
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData())
+    @test dv == ones(3)   # the constant `w`'s copy contributes nothing; `v`'s own gradient is unaffected
+
+    checkverify_rev(f, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    check_stack_balance(f, copy(v), copy(w))
+
+    # Tape shrink: dropping the source `:fshadow` item is required, not incidental.
+    full = comms_element_types(tape_type(f, (Vector{Float64}, Vector{Float64})))
+    cut = comms_element_types(tape_type(f, (Vector{Float64}, Vector{Float64}); inactive=(2,)))
+    @test sum(fieldcount, full) > sum(fieldcount, cut)
+
+    # Mode A (both-`NoTangent`) gains its first direct test: unaffected by the third mode. Note
+    # the *ordinary active* carrier — `Vector{Int}` reaches mode A because its element type has no
+    # tangent space, which is a different claim from declaring the argument constant.
+    fA(x) = sum(copy(x))
+    y2, pb2 = rrule!!(zero_fcodual(fA), Ctx(), zero_fcodual([1, 2, 3]))
+    @test primal(y2) == 6
+    @test pb2(1.0) == (NoRData(), NoRData())
+    checkverify_rev(fA, (Vector{Int},))
+
+    # An "active but untraceable source must still bail at memmove specifically" case was attempted
+    # and dropped, not silently omitted: every construction tried either (a) got optimized away before
+    # reaching an untracked state, (b) hit an unrelated bail first (`Vector{Any}`'s element type kills
+    # `copy`'s own inlining into a foreigncall before memmove dispatch ever runs; `Core.typeassert` has
+    # no reverse rule at all, so it bails at its own point of use before reaching `copy`), or (c) turned
+    # out to be *order-dependent* (`Base.inferencebarrier` + a typeassert reaches memmove's bail in
+    # isolation, but a different, unrelated bail once other code in the same file has already
+    # differentiated through `Base.copy`/`Vector{Float64}` for a different activity signature — an
+    # inlining-cost-model artifact, not a property of the fix, and not a reliable regression test).
+    # `Vector{Vector{Float64}}` indexing (the obvious "read out of a container" candidate) turned out
+    # to be already tracked (the nested-array-read chain), not untracked, so it isn't this case either.
+    # The general principle — the gate is an activity test, not a trackedness test — does get a stable,
+    # reproducible demonstration below, via `Core.tuple`'s identical gate and the real (documented,
+    # structural) phi-merge gap: see "broadcast through a constant array still bails" below.
+end
+
+@testset "activity: memmove source read out of a vararg tail" begin
+    # `_inactive_arg_root`'s mixed-activity-tuple arm must read the *packed* codual list (what the
+    # comms scan uses) at every call site, not the flat per-argument list the fwds/pullback carriers
+    # are built from — otherwise the scan and the emitted code disagree about which packed slot
+    # `srcs[1]` names, and the fwds pass tries to resolve an `:fshadow` comms item the scan never
+    # declared.
+    vcopy!(dst, srcs...) = begin
+        copyto!(dst, srcs[1])
+        sum(dst)
+    end
+    dst = zeros(3)
+    src1, src2 = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
+    at = (Vector{Float64}, Vector{Float64}, Vector{Float64})
+
+    ddst = zeros(3)
+    y, pb = rrule!!(zero_fcodual(vcopy!), Ctx(), CoDual(copy(dst), ddst),
+                    const_codual(src1), CoDual(copy(src2), zeros(3)))
+    @test primal(y) == sum(src1)
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData(), NoRData())
+    @test ddst == zeros(3)   # dst's initial content is fully overwritten by the copy
+    _assert_tape_balanced(pb)
+
+    checkverify_rev(vcopy!, at; inactive=(2,))
+
+    ctx = build_ctx(vcopy!, at; inactive=(2,))
+    fcd = zero_fcodual(vcopy!)
+    dstcd, src1cd, src2cd = CoDual(copy(dst), zeros(3)), const_codual(src1), CoDual(copy(src2), zeros(3))
+    yv, g = value_and_gradient!(ctx, fcd, dstcd, src1cd, src2cd)
+    @test yv == sum(src1)
+    @test g == (NoTangent(), zeros(3), Inactive(), zeros(3))
+end
+
+@testset "activity: DI.Constant round trip through memmove's third mode" begin
+    f(x, w) = sum(x) + sum(copy(w))
+    x, w = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    g = DI.gradient(f, AutoDifferReverse(), x, DI.Constant(w))
+    @test g ≈ ones(3)
+    @test g ≈ rev_gradient(f, x, w)[2]   # agrees with `w` treated as an ordinary active argument
+
+    # `DI.Cache` stays active — not made inactive by Part 2's `_ctx_codual`.
+    fcache(x, c) = sum(x .* c)
+    gc = DI.gradient(fcache, AutoDifferReverse(), x, DI.Cache(copy(w)))
+    @test gc ≈ w
+end
+
+@testset "activity: Core.tuple builds no shadow for an inactive operand" begin
+    # `(v, w)` survives optimization as a literal `Core.tuple` when returned directly (SROA otherwise
+    # eliminates an immediately-destructured tuple, which would test nothing).
+    tuple_pair(v, w) = (v, w)
+    v, w = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    dv = zeros(3)
+    y, pb = rrule!!(zero_fcodual(tuple_pair), Ctx(), CoDual(copy(v), dv), const_codual(w))
+    @test primal(y) == (v, w)
+    # The inactive slot holds `Inactive()`, not a synthesised zero: the shadow tuple's type is
+    # narrower than the primal-derived one, so there is no slot to allocate into.
+    @test tangent(y)[1] === dv
+    @test tangent(y)[2] === Inactive()
+    @test typeof(tangent(y)) === Tuple{Vector{Float64},Inactive}
+
+    # Seeding still works even though the caller builds its seed from the primal type and it is
+    # therefore wider than the shadow: accumulation is structural, and the inactive slot discards.
+    increment!!(tangent(y), (ones(3), ones(3)))
+    @test dv == ones(3)   # flows through the aliased slot
+    @test pb(NoRData()) == (NoRData(), NoRData(), NoRData())
+    @test dv == ones(3)   # the inactive slot's increment went nowhere — no leak, no crash
+
+    # Gone from the carrier, not merely unused.
+    ir = code_reverse_fwds_ircode(tuple_pair, (Vector{Float64}, Vector{Float64}); inactive=(2,))[1]
+    @test !occursin("_rr_zero_fdata", string(ir))
+
+    # Destructuring a mixed tuple reads the constant slot back out as `Inactive`, so a consumer
+    # downstream of the aggregate still types correctly.
+    destructure(a, b) = (t = (a, b); sum(t[1]) + sum(t[2]))
+    @test rev_gradient(destructure, [1.0, 2.0], [3.0, 4.0]) == (NoTangent(), ones(2), ones(2))
+    checkverify_rev(destructure, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+
+    checkverify_rev(tuple_pair, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    check_stack_balance(tuple_pair, copy(v), copy(w); seed=NoRData())
+end
+
+@testset "activity: setfield!/memoryrefset! zero the destination shadow, not skip it" begin
+    # Adversarial staleness check: give the destination slot a real, non-zero (aliased) shadow first,
+    # then overwrite with a constant, then read again. A "skip the check" implementation would leave
+    # the stale alias in place and let the second read's contribution leak into the first value's
+    # gradient — 4*ones(3) instead of ones(3). "Zero the shadow" severs it correctly.
+    function stale_element(active_arr::Vector{Float64}, const_arr::Vector{Float64})
+        buf = Vector{Vector{Float64}}(undef, 1)
+        buf[1] = active_arr
+        s1 = sum(buf[1])
+        buf[1] = const_arr
+        s2 = sum(buf[1])
+        return s1 + 3 * s2
+    end
+    av, cv = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    dav = zeros(3)
+    y, pb = rrule!!(zero_fcodual(stale_element), Ctx(), CoDual(copy(av), dav), const_codual(cv))
+    @test primal(y) == sum(av) + 3 * sum(cv)
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData())
+    @test dav == ones(3)
+    checkverify_rev(stale_element, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    check_stack_balance(stale_element, copy(av), copy(cv))
+
+    mutable struct StaleBox113
+        v::Vector{Float64}
+    end
+    function stale_field(active_arr::Vector{Float64}, const_arr::Vector{Float64})
+        b = StaleBox113(zeros(length(active_arr)))
+        b.v = active_arr
+        s1 = sum(b.v)
+        b.v = const_arr
+        s2 = sum(b.v)
+        return s1 + 3 * s2
+    end
+    dav2 = zeros(3)
+    y2, pb2 = rrule!!(zero_fcodual(stale_field), Ctx(), CoDual(copy(av), dav2), const_codual(cv))
+    @test primal(y2) == sum(av) + 3 * sum(cv)
+    @test pb2(1.0) == (NoRData(), NoRData(), NoRData())
+    @test dav2 == ones(3)
+    checkverify_rev(stale_field, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    check_stack_balance(stale_field, copy(av), copy(cv))
+end
+
+@testset "activity: memoryrefset! of a mixed-activity tuple normalizes the constant slot" begin
+    # A `Core.tuple` of mixed operands has a shadow narrower than the primal-derived fdata type
+    # (`Tuple{Vector{Float64},Inactive}`); storing it through `memoryrefset!` used to embed that
+    # narrower value straight into an `:invoke` declared at the full
+    # `Tuple{Vector{Float64},Vector{Float64}}` — a type lie that crashed with an illegal
+    # instruction. The fix widens the constant slot to a real zero before the store.
+    f(dest, x, c) = (t = (x, c); dest[1] = t; sum(x) + sum(c))
+    at = (Vector{Tuple{Vector{Float64},Vector{Float64}}}, Vector{Float64}, Vector{Float64})
+
+    x, c = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    dest = Vector{Tuple{Vector{Float64},Vector{Float64}}}(undef, 1)
+    dx = zeros(3)
+    y, pb = rrule!!(zero_fcodual(f), Ctx(), zero_fcodual(dest), CoDual(x, dx), const_codual(c))
+    @test primal(y) == sum(x) + sum(c)
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData(), NoRData())
+    @test dx == ones(3)   # `x`'s own gradient is unaffected by the mixed store
+    @test dest[1] == (x, c)
+    _assert_tape_balanced(pb)
+
+    checkverify_rev(f, at; inactive=(3,))
+
+    # The stored tuple's active slot still contributes when read back — the store's field-aliasing
+    # scheme threads a mixed-activity element the same way it does a plain one.
+    f2(dest, x, c) = (dest[1] = (x, c); sum(dest[1][1]) + 2sum(dest[1][2]))
+    dest2 = Vector{Tuple{Vector{Float64},Vector{Float64}}}(undef, 1)
+    dx2 = zeros(3)
+    y2, pb2 = rrule!!(zero_fcodual(f2), Ctx(), zero_fcodual(dest2), CoDual(x, dx2), const_codual(c))
+    @test primal(y2) == sum(x) + 2sum(c)
+    @test pb2(1.0) == (NoRData(), NoRData(), NoRData(), NoRData())
+    @test dx2 == ones(3)
+    checkverify_rev(f2, at; inactive=(3,))
+end
+
+@testset "activity: memoryrefset! of a nested mixed-activity tuple normalizes every level" begin
+    # `t2 = (t1, y)` where `t1 = (x, c)` is itself mixed nests one mixed-activity tuple inside
+    # another. Widening `t2` for the store has to recurse into slot 1 rather than declaring it
+    # `Tuple{Vector,Vector}` while it still carries `t1`'s own narrower `Tuple{Vector,Inactive}` —
+    # the same declared-vs-actual lie the flat case fixes, one level down.
+    f(dest, x, y, c) = (t1 = (x, c); t2 = (t1, y); dest[1] = t2; sum(x) + sum(y) + sum(c))
+    TupInner = Tuple{Vector{Float64},Vector{Float64}}
+    at = (Vector{Tuple{TupInner,Vector{Float64}}}, Vector{Float64}, Vector{Float64}, Vector{Float64})
+
+    x, y, c = [1.0, 2.0, 3.0], [7.0, 8.0, 9.0], [10.0, 20.0, 30.0]
+    dest = Vector{Tuple{TupInner,Vector{Float64}}}(undef, 1)
+    dx, dy = zeros(3), zeros(3)
+    yv, pb = rrule!!(zero_fcodual(f), Ctx(), zero_fcodual(dest), CoDual(x, dx), CoDual(y, dy),
+                     const_codual(c))
+    @test primal(yv) == sum(x) + sum(y) + sum(c)
+    @test pb(1.0) == (NoRData(), NoRData(), NoRData(), NoRData(), NoRData())
+    @test dx == ones(3)
+    @test dy == ones(3)
+    @test dest[1] == ((x, c), y)
+    _assert_tape_balanced(pb)
+
+    checkverify_rev(f, at; inactive=(4,))
+end
+
+@testset "activity: broadcast through a constant array" begin
+    # `.`-broadcast's `Broadcast.unalias` builds a `PhiNode` merging one inactive edge (the untouched
+    # constant argument) with one active, tracked edge (the memmove-copied buffer). The merge is
+    # active — any active edge makes it so — and normalises to its own primal-derived shadow type, so
+    # the inactive arm is served by a zero hoisted into the entry block rather than by a shadow that
+    # was never built.
+    f(v, w) = sum(v .* w)
+    v, w = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
+    full = rev_gradient(f, v, w)
+
+    for inact in (1, 2)
+        ctx = build_ctx(f, (Vector{Float64}, Vector{Float64}); inactive=(inact,))
+        d1 = inact == 1 ? Inactive() : zeros(3)
+        d2 = inact == 2 ? Inactive() : zeros(3)
+        y, g = value_and_gradient!(ctx, zero_fcodual(f), CoDual(v, d1), CoDual(w, d2))
+        @test y == f(v, w)
+        @test g[1] === NoTangent()
+        # Whatever is differentiated agrees with the all-active run; the constant slot is `Inactive`.
+        @test g[inact + 1] === Inactive()
+        other = inact == 1 ? 3 : 2
+        @test g[other] ≈ full[other]
+        checkverify_rev(f, (Vector{Float64}, Vector{Float64}); inactive=(inact,))
+    end
+
+    # A loop-carried merge, run well past 2 iterations: a per-edge change to the phi has to survive
+    # the block-stack replay, which N=0/1 would not exercise (see ISSUES #52).
+    function floop(v, w)
+        s = 0.0
+        for k in 1:4
+            s += sum(v .* w) * k
+        end
+        return s
+    end
+    ctx = build_ctx(floop, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+    y, g = value_and_gradient!(ctx, zero_fcodual(floop), CoDual(v, zeros(3)), CoDual(w, Inactive()))
+    @test y == floop(v, w)
+    @test g[2] ≈ rev_gradient(floop, v, w)[2]
+    @test g[3] === Inactive()
+    checkverify_rev(floop, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+end
+
+@testset "activity: an inactive phi edge's zero is reused across calls" begin
+    # The zero serving an inactive `Core.Argument` phi edge lives in the tape's `bufs`, so a
+    # pre-allocated context materializes it once instead of once per call — it used to be rebuilt in
+    # the carrier prologue every call, making steady-state allocation scale with the constant
+    # argument's length. It is re-zeroed on reuse (the pullback can accumulate into it), and rebuilt
+    # when this call's argument no longer fits it.
+    fb(out, v, w) = (out .= v .* w; sum(out))
+    fcd = zero_fcodual(fb)
+
+    # Repeated calls through one context, changing values: every call must match a fresh run.
+    n = 5
+    out, v, w = zeros(n), zeros(n), zeros(n)
+    dout, dv = zeros(n), zeros(n)
+    ocd, vcd, wcd = CoDual(out, dout), CoDual(v, dv), const_codual(w)
+    ctx = build_ctx(fcd, ocd, vcd, wcd)
+    for k in 1:4
+        v .= k .* [1.0, 2.0, 3.0, 4.0, 5.0]
+        w .= [4.0, 5.0, 6.0, 7.0, 8.0] ./ k
+        y, g = value_and_gradient!(ctx, fcd, ocd, vcd, wcd)
+        @test y == fb(out, v, w)
+        @test g[3] ≈ w
+        @test g[4] === Inactive()
+    end
+
+    # Same context, a different-length constant argument: `build_ctx` keys on argument types, not
+    # sizes, so this is a legal call and the cached zero has to be rebuilt for the new shape.
+    m = 9
+    out2, v2, w2 = zeros(m), collect(1.0:m), collect(2.0:(m + 1))
+    ocd2, vcd2 = CoDual(out2, zeros(m)), CoDual(v2, zeros(m))
+    y2, g2 = value_and_gradient!(ctx, fcd, ocd2, vcd2, const_codual(w2))
+    @test y2 == fb(out2, v2, w2)
+    @test g2[3] ≈ w2
+    # Back to the original length: the rebuilt zero must not have stuck.
+    y3, g3 = value_and_gradient!(ctx, fcd, ocd, vcd, wcd)
+    @test y3 == fb(out, v, w)
+    @test g3[3] ≈ w
+
+    # Steady-state allocation no longer scales with the constant argument's length. Measured at two
+    # sizes rather than against a byte count, so unrelated per-call overhead doesn't pin the test.
+    function steady(N)
+        o, a, b = zeros(N), randn(N), randn(N)
+        cds = (CoDual(o, zeros(N)), CoDual(a, zeros(N)), const_codual(b))
+        c = build_ctx(fcd, cds...)
+        run = () -> value_and_gradient!(c, fcd, cds...)
+        run(); run(); run()
+        return @allocated run()
+    end
+    @test steady(1024) == steady(64)
+
+    checkverify_rev(fb, (Vector{Float64}, Vector{Float64}, Vector{Float64}); inactive=(3,))
+end
+
+@testset "activity: a `PhiNode` merging a mixed-activity tuple edge normalizes it" begin
+    # `t = b ? (x, c) : (x, y)` merges two `Core.tuple` results, one mixed (`c` constant) and one
+    # fully active, into a phi declared at the primal-derived `Tuple{Vector,Vector}`. A dynamic
+    # index (`t[i]`) keeps the tuple alive past SROA, so the mixed edge reaches the phi as a real
+    # SSA value rather than being destructured away — this used to embed the narrower shadow
+    # straight into the merge and segfault inside the tape's comms push.
+    phi_dyn(x, y, c, b, i) = (t = b ? (x, c) : (x, y); sum(t[i]))
+    at = (Vector{Float64}, Vector{Float64}, Vector{Float64}, Bool, Int)
+
+    x, y, c = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [10.0, 20.0, 30.0]
+
+    for (b, i, dxexp, dyexp) in ((true, 1, ones(3), zeros(3)), (true, 2, zeros(3), zeros(3)),
+                                 (false, 1, ones(3), zeros(3)), (false, 2, zeros(3), ones(3)))
+        dx, dy = zeros(3), zeros(3)
+        y_, pb = rrule!!(zero_fcodual(phi_dyn), Ctx(), CoDual(x, dx), CoDual(y, dy), const_codual(c),
+                         CoDual(b, NoFData()), CoDual(i, NoFData()))
+        @test primal(y_) == phi_dyn(x, y, c, b, i)
+        @test pb(1.0) == ntuple(_ -> NoRData(), 6)
+        @test dx == dxexp
+        @test dy == dyexp
+        _assert_tape_balanced(pb)
+    end
+
+    checkverify_rev(phi_dyn, at; inactive=(3,))
+end
+
+@testset "activity: a `PhiNode` merging a nested mixed-activity tuple edge normalizes every level" begin
+    # Each branch builds a 2-tuple of 2-tuples — homogeneous at the outer level (both slots
+    # `Tuple{Vector,Vector}` primal-wise), so `t[i]`'s dynamic index survives SROA and reaches the
+    # `getfield` dynamic-index rule's `homog_fdata_tuple` shape. The `true` branch's inner tuples are
+    # themselves mixed (`c` constant); the `false` branch's are fully active (`z`). Widening the
+    # `true` edge up to the phi's own primal-derived type has to recurse into each inner slot rather
+    # than declaring it `Tuple{Vector,Vector}` while it still carries the mixed shadow underneath.
+    function phi_nested(x, z, c, b, i)
+        t = b ? ((x, c), (x, c)) : ((x, z), (x, z))
+        inner = t[i]
+        return sum(inner[1]) + sum(inner[2])
+    end
+    at = (Vector{Float64}, Vector{Float64}, Vector{Float64}, Bool, Int)
+
+    x, z, c = [1.0, 2.0, 3.0], [7.0, 8.0, 9.0], [10.0, 20.0, 30.0]
+
+    for (b, i, dxexp, dzexp) in ((true, 1, ones(3), zeros(3)), (true, 2, ones(3), zeros(3)),
+                                 (false, 1, ones(3), ones(3)), (false, 2, ones(3), ones(3)))
+        dx, dz = zeros(3), zeros(3)
+        y_, pb = rrule!!(zero_fcodual(phi_nested), Ctx(), CoDual(x, dx), CoDual(z, dz),
+                         const_codual(c), CoDual(b, NoFData()), CoDual(i, NoFData()))
+        @test primal(y_) == phi_nested(x, z, c, b, i)
+        @test pb(1.0) == ntuple(_ -> NoRData(), 6)
+        @test dx == dxexp
+        @test dz == dzexp
+        _assert_tape_balanced(pb)
+    end
+
+    checkverify_rev(phi_nested, at; inactive=(3,))
+end
+
+# Intrinsic operand *primal recording* is per-contribution: an operand whose rdata contribution has
+# no sink is not pushed onto the tape.
+
+@testset "activity: mul_float operand recording is per-contribution" begin
+    f(x, y) = x * y
+    checkverify_rev(f, (Float64, Float64); inactive=(2,))
+    x, y = 2.0, 3.0
+    _, pb = rrule!!(zero_fcodual(f), Ctx(), CoDual(x, NoFData()), const_codual(y))
+    @test pb(1.0) == (NoRData(), y, NoRData())
+
+    # Loop form: `x`'s per-iteration value is an SSA (a phi), not the bare `Argument` that
+    # `elide_argument_primal` already elides regardless of activity — this is where the tape shrink
+    # is actually observable (the plain two-argument form above never taped either operand's primal
+    # to begin with).
+    function floop(x, y)
+        acc = 0.0
+        for _ in 1:3
+            acc += x * y
+            x += 1.0
+        end
+        return acc
+    end
+    checkverify_rev(floop, (Float64, Float64); inactive=(2,))
+    full = comms_element_types(tape_type(floop, (Float64, Float64)))
+    cut = comms_element_types(tape_type(floop, (Float64, Float64); inactive=(2,)))
+    @test full == [Tuple{Float64}]   # `x`'s primal, recorded once per iteration
+    @test isempty(cut)                # `y` inactive discards `db`; `da` only needs `y` (free, an argument)
+
+    _, pbloop = rrule!!(zero_fcodual(floop), Ctx(), CoDual(x, NoFData()), const_codual(y))
+    @test pbloop(1.0) == (NoRData(), 3y, NoRData())
+end
+
+@testset "activity: multiply-by-literal records nothing" begin
+    # `x * 2.0` inside a loop, so a per-iteration slot would otherwise be pushed. `da` (routed to
+    # `x`) only reads the literal (free); `db` (routed to the literal) is discarded outright since a
+    # literal has no rdata sink — so neither contribution ever needs `x`'s own primal.
+    function g(x)
+        acc = 0.0
+        for _ in 1:3
+            acc += 3.0 * x
+            x += 1.0
+        end
+        return acc
+    end
+    checkverify_rev(g, (Float64,))
+    ts = comms_element_types(tape_type(g, (Float64,)))
+    @test isempty(ts)
+
+    _, pb = rrule!!(zero_fcodual(g), Ctx(), CoDual(2.0, 0.0))
+    @test pb(1.0) == (NoRData(), 9.0)
+end
+
+@testset "activity: div_float's crossed dependency" begin
+    # `da` (routed to the numerator) reads only the denominator; `db` (routed to the denominator)
+    # reads both. So an inactive numerator still needs the denominator's primal recorded (already
+    # true) *and* keeps the numerator's own primal recorded too, since `db` (wanted, `b` active)
+    # reads it — while an inactive denominator drops the numerator's primal entirely, since only
+    # `da` stays wanted and `da` never reads it. This is exactly the asymmetry a flat "positions
+    # read" declaration could not express.
+    function divloop(a, b)
+        acc = 0.0
+        for _ in 1:3
+            acc += a / b
+            a += 1.0
+        end
+        return acc
+    end
+    full = comms_element_types(tape_type(divloop, (Float64, Float64)))
+    num_inactive = comms_element_types(tape_type(divloop, (Float64, Float64); inactive=(1,)))
+    den_inactive = comms_element_types(tape_type(divloop, (Float64, Float64); inactive=(2,)))
+    @test full == [Tuple{Float64}]      # `a`'s primal; `b` is a bare `Argument`, always elided
+    @test num_inactive == full          # keeps both — `db` (wanted) still reads `a`
+    @test isempty(den_inactive)         # drops `a` — only `da` (wanted) survives, and it needs only `b`
+
+    checkverify_rev(divloop, (Float64, Float64); inactive=(1,))
+    checkverify_rev(divloop, (Float64, Float64); inactive=(2,))
+
+    a0, b0 = 2.0, 5.0
+    _, pb_num = rrule!!(zero_fcodual(divloop), Ctx(), const_codual(a0), CoDual(b0, 0.0))
+    r_num = pb_num(1.0)
+    @test r_num[1] == NoRData() && r_num[2] == NoRData()
+    @test r_num[3] ≈ -(3a0 + 3) / b0^2
+
+    _, pb_den = rrule!!(zero_fcodual(divloop), Ctx(), CoDual(a0, 0.0), const_codual(b0))
+    r_den = pb_den(1.0)
+    @test r_den[1] == NoRData() && r_den[3] == NoRData()
+    @test r_den[2] ≈ 3 / b0
+end
+
+@testset "activity: _intrinsic_needed_operands pins the deps table" begin
+    needed(f, nops, wanted) = _intrinsic_needed_operands(f, nops, wanted)
+    mul = Core.Intrinsics.mul_float
+    dv = Core.Intrinsics.div_float
+    fma = Core.Intrinsics.fma_float
+
+    # mul_float: crossed dependency — `da` (contribution 1, routed to operand 1) reads operand 2,
+    # `db` (contribution 2, routed to operand 2) reads operand 1.
+    @test needed(mul, 2, j -> true) == BitSet([1, 2])
+    @test needed(mul, 2, j -> j == 1) == BitSet([2])
+    @test needed(mul, 2, j -> j == 2) == BitSet([1])
+    @test needed(mul, 2, j -> false) == BitSet()
+
+    # div_float: asymmetric — `da` needs only the denominator, `db` needs both.
+    @test needed(dv, 2, j -> true) == BitSet([1, 2])
+    @test needed(dv, 2, j -> j == 1) == BitSet([2])
+    @test needed(dv, 2, j -> j == 2) == BitSet([1, 2])
+    @test needed(dv, 2, j -> false) == BitSet()
+
+    # fma_float: `da` needs `b`, `db` needs `a`, `dc` needs neither.
+    @test needed(fma, 3, j -> true) == BitSet([1, 2])
+    @test needed(fma, 3, j -> j == 1) == BitSet([2])
+    @test needed(fma, 3, j -> j == 2) == BitSet([1])
+    @test needed(fma, 3, j -> j == 3) == BitSet()
+
+    # No declaration, or an arity mismatch against the declared table: conservative `nothing`.
+    @test intrinsic_rrule_deps(Val(Core.Intrinsics.not_int)) === nothing
+    @test needed(Core.Intrinsics.not_int, 1, j -> true) === nothing
+    @test needed(mul, 3, j -> true) === nothing
+end
+
+# A nested call into a hand-ruled function with a constant argument keeps the closed-form rule: the
+# engine passes a `CoDual{P,Inactive}` through instead of bailing on untraceable provenance.
+
+@testset "activity: nested hand rule with a constant argument" begin
+    f(v, w) = dot(v, w)
+    v, w = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
+    dv = zeros(3)
+    y, dvout = value_and_gradient!(build_ctx(f, (Vector{Float64}, Vector{Float64}); inactive=(2,)),
+                                    zero_fcodual(f), CoDual(v, dv), const_codual(w))
+    @test y == dot(v, w)
+    @test dvout == (NoTangent(), w, Inactive())
+    @test dv == w
+    checkverify_rev(f, (Vector{Float64}, Vector{Float64}); inactive=(2,))
+
+    # Without the assertion below, the test above passes for the wrong reason — silently via the
+    # derived path instead of the hand rule. Checked on the pre-inlining IR (`build_reverse_fwds_ir`,
+    # not `code_reverse_fwds_ircode`): a hand rule's own body is small enough that ordinary inlining
+    # now absorbs it, so its `:invoke rrule!!` only survives before `run_ipo_passes!` runs.
+    interp = DifferReverse.build_reverse_interp()
+    codualtys = Any[DifferReverse.fcodual_type(DifferReverse._typeof(f)),
+                    arg_codual_types(f, (Vector{Float64}, Vector{Float64}); inactive=(2,))...]
+    impl_tt = Tuple{typeof(DifferReverse.reverse_fwds_impl), codualtys[1], Ctx{Nothing}, codualtys[2:end]...}
+    match, _ = Core.Compiler.findsup(impl_tt, Core.Compiler.method_table(interp))
+    impl_mi = Base.specialize_method(match.method, match.spec_types, match.sparams)
+    ir = DifferReverse.build_reverse_fwds_ir(interp, impl_mi)
+    invokes_to_rrule = [stmt for stmt in ir.stmts.stmt
+                        if isa(stmt, Expr) && stmt.head === :invoke &&
+                           length(stmt.args) >= 2 && stmt.args[2] === rrule!!]
+    @test length(invokes_to_rrule) == 1
+end
+
+# `reverse_pullback_recursive_ci`'s arity/slot-type check: a wrong-arity hand pullback must produce
+# a located bail rather than a `getfield` error inside generated IR. The rule is defined here (before
+# anything differentiates `badarity_f`), so the world-age caveat around later rule additions doesn't
+# apply.
+
+badarity_f(x, y) = x + y
+
+function DifferReverse.rrule!!(::CoDual{typeof(badarity_f),NoFData}, ::AbstractCtx,
+                               xcd::CoDual{Float64,NoFData}, ycd::CoDual{Float64,NoFData})
+    z = primal(xcd) + primal(ycd)
+    badarity_pullback(dz) = (NoRData(), dz)   # wrong: should be a 3-tuple (own rdata + 2 arguments)
+    return CoDual(z, NoFData()), badarity_pullback
+end
+
+@testset "activity: recursive-pullback arity check catches a wrong-length hand pullback" begin
+    outer_badarity(x, y) = badarity_f(x, y) + 1.0
+    err = try
+        rev_gradient(outer_badarity, 1.0, 2.0)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    # Pins that the arity check is what fired, not some unrelated error.
+    @test occursin("3-element tuple of rdatas", err.msg)
+end

@@ -15,18 +15,25 @@
 # needs `rdata_type(tangent_type(Y)) == tangent_type(Y)` (a pure-rdata type), which every
 # `IEEEFloat` satisfies.
 
+# Per-element shadow for a hand-built inner `CoDual`, carrying the outer array argument's own
+# activity: an inactive outer array means every element is inactive too, not merely zero.
+_elt_shadow(::Inactive) = Inactive()
+_elt_shadow(_) = NoFData()
+
 # ===========================================================================
 # map(f, x) — unary
 # ===========================================================================
 
 function rrule!!(
-    ::CoDual{typeof(map),NoFData}, ::AbstractCtx, gcd::CoDual{G,FG}, (; x, dx)::CoDual{X,X}
+    ::CoDual{typeof(map),NoFData}, ::AbstractCtx, gcd::CoDual{G,FG},
+    (; x, dx)::CoDual{X,<:Union{X,Inactive}}
 ) where {G,FG,X<:Array{<:IEEEFloat}}
     isconcretetype(G) || error("Differ: map requires a concretely-typed function argument in " *
                                 "reverse mode (see ISSUES.md #43)")
     n = length(x)
     n == 0 && error("Differ: map(f, x) over an empty array is not supported by this rule")
-    y1, pb1 = rrule!!(gcd, Ctx(), CoDual(x[1], NoFData()))
+    xactive = isactive(dx)
+    y1, pb1 = rrule!!(gcd, Ctx(), CoDual(x[1], _elt_shadow(dx)))
     Y = typeof(primal(y1))
     y = Array{Y}(undef, size(x))
     dy = zeros(Y, size(x))
@@ -34,7 +41,7 @@ function rrule!!(
     pbs = Vector{typeof(pb1)}(undef, n)
     pbs[1] = pb1
     for i in 2:n
-        yi, pbi = rrule!!(gcd, Ctx(), CoDual(x[i], NoFData()))
+        yi, pbi = rrule!!(gcd, Ctx(), CoDual(x[i], _elt_shadow(dx)))
         y[i] = primal(yi)
         pbs[i] = pbi
     end
@@ -46,7 +53,7 @@ function rrule!!(
         for i in length(pbs):-1:1
             gi_r, xi_r = pbs[i](dy[i])
             grdata = increment!!(grdata, gi_r)
-            dx[i] = increment!!(dx[i], xi_r)
+            xactive && (dx[i] = increment!!(dx[i], xi_r))
         end
         return (NoRData(), grdata, NoRData())
     end
@@ -59,14 +66,15 @@ end
 
 function rrule!!(
     ::CoDual{typeof(map),NoFData}, ::AbstractCtx,
-    gcd::CoDual{G,FG}, (; x, dx)::CoDual{X,X}, (; y, dy)::CoDual{Y,Y}
+    gcd::CoDual{G,FG}, (; x, dx)::CoDual{X,<:Union{X,Inactive}}, (; y, dy)::CoDual{Y,<:Union{Y,Inactive}}
 ) where {G,FG,X<:Array{<:IEEEFloat},Y<:Array{<:IEEEFloat}}
     isconcretetype(G) || error("Differ: map requires a concretely-typed function argument in " *
                                 "reverse mode (see ISSUES.md #43)")
     size(x) == size(y) || throw(DimensionMismatch("Differ: map(f, x, y) requires same-shape arrays"))
     n = length(x)
     n == 0 && error("Differ: map(f, x, y) over empty arrays is not supported by this rule")
-    r1, pb1 = rrule!!(gcd, Ctx(), CoDual(x[1], NoFData()), CoDual(y[1], NoFData()))
+    xactive, yactive = isactive(dx), isactive(dy)
+    r1, pb1 = rrule!!(gcd, Ctx(), CoDual(x[1], _elt_shadow(dx)), CoDual(y[1], _elt_shadow(dy)))
     R = typeof(primal(r1))
     out = Array{R}(undef, size(x))
     dout = zeros(R, size(x))
@@ -74,7 +82,7 @@ function rrule!!(
     pbs = Vector{typeof(pb1)}(undef, n)
     pbs[1] = pb1
     for i in 2:n
-        ri, pbi = rrule!!(gcd, Ctx(), CoDual(x[i], NoFData()), CoDual(y[i], NoFData()))
+        ri, pbi = rrule!!(gcd, Ctx(), CoDual(x[i], _elt_shadow(dx)), CoDual(y[i], _elt_shadow(dy)))
         out[i] = primal(ri)
         pbs[i] = pbi
     end
@@ -83,8 +91,8 @@ function rrule!!(
         for i in length(pbs):-1:1
             gi_r, xi_r, yi_r = pbs[i](dout[i])
             grdata = increment!!(grdata, gi_r)
-            dx[i] = increment!!(dx[i], xi_r)
-            dy[i] = increment!!(dy[i], yi_r)
+            xactive && (dx[i] = increment!!(dx[i], xi_r))
+            yactive && (dy[i] = increment!!(dy[i], yi_r))
         end
         return (NoRData(), grdata, NoRData(), NoRData())
     end
@@ -97,7 +105,7 @@ end
 
 function rrule!!(
     ::CoDual{typeof(map!),NoFData}, ::AbstractCtx,
-    gcd::CoDual{G,FG}, (; x, dx)::CoDual{D,D}, (; y, dy)::CoDual{X,X}
+    gcd::CoDual{G,FG}, (; x, dx)::CoDual{D,<:Union{D,Inactive}}, (; y, dy)::CoDual{X,<:Union{X,Inactive}}
 ) where {G,FG,D<:Array{<:IEEEFloat},X<:Array{<:IEEEFloat}}
     isconcretetype(G) || error("Differ: map! requires a concretely-typed function argument in " *
                                 "reverse mode (see ISSUES.md #43)")
@@ -105,24 +113,29 @@ function rrule!!(
         throw(DimensionMismatch("Differ: map!(f, dest, x) requires matching shapes"))
     n = length(y)
     n == 0 && error("Differ: map!(f, dest, x) over empty arrays is not supported by this rule")
+    # `dx` carries both the per-element backward seed and the result's shadow, so a constant
+    # destination would silently drop the source's gradient. A write-only buffer needs a zeroed
+    # shadow, not `Inactive`.
+    _require_active_dest(dx, "map!", "gradient flowing to the source")
     old_dx = copy(dx)
-    r1, pb1 = rrule!!(gcd, Ctx(), CoDual(y[1], NoFData()))
+    r1, pb1 = rrule!!(gcd, Ctx(), CoDual(y[1], _elt_shadow(dy)))
     x[1] = primal(r1)
     dx[1] = zero(eltype(dx))
     pbs = Vector{typeof(pb1)}(undef, n)
     pbs[1] = pb1
     for i in 2:n
-        ri, pbi = rrule!!(gcd, Ctx(), CoDual(y[i], NoFData()))
+        ri, pbi = rrule!!(gcd, Ctx(), CoDual(y[i], _elt_shadow(dy)))
         x[i] = primal(ri)
         dx[i] = zero(eltype(dx))
         pbs[i] = pbi
     end
+    yactive = isactive(dy)
     function mapbang_pullback(_)
         grdata = zero_like_rdata_from_type(G)
         for i in length(pbs):-1:1
             gi_r, yi_r = pbs[i](dx[i])
             grdata = increment!!(grdata, gi_r)
-            dy[i] = increment!!(dy[i], yi_r)
+            yactive && (dy[i] = increment!!(dy[i], yi_r))
             # Restore what was in `dx[i]` before this call (same old-tangent restore as the
             # `memoryrefset!` builtin rule): `map!` overwrites rather than accumulates, so gradient
             # contributions from after this call must not reach what was overwritten.
@@ -139,7 +152,8 @@ end
 
 function rrule!!(
     ::CoDual{typeof(map!),NoFData}, ::AbstractCtx,
-    gcd::CoDual{G,FG}, (; x, dx)::CoDual{D,D}, (; y, dy)::CoDual{X,X}, (; z, dz)::CoDual{Y,Y}
+    gcd::CoDual{G,FG}, (; x, dx)::CoDual{D,<:Union{D,Inactive}}, (; y, dy)::CoDual{X,<:Union{X,Inactive}},
+    (; z, dz)::CoDual{Y,<:Union{Y,Inactive}}
 ) where {G,FG,D<:Array{<:IEEEFloat},X<:Array{<:IEEEFloat},Y<:Array{<:IEEEFloat}}
     isconcretetype(G) || error("Differ: map! requires a concretely-typed function argument in " *
                                 "reverse mode (see ISSUES.md #43)")
@@ -147,25 +161,28 @@ function rrule!!(
         throw(DimensionMismatch("Differ: map!(f, dest, x, y) requires matching shapes"))
     n = length(y)
     n == 0 && error("Differ: map!(f, dest, x, y) over empty arrays is not supported by this rule")
+    # See the unary rule above: a constant destination would silently drop the sources' gradients.
+    _require_active_dest(dx, "map!", "gradient flowing to the sources")
     old_dx = copy(dx)
-    r1, pb1 = rrule!!(gcd, Ctx(), CoDual(y[1], NoFData()), CoDual(z[1], NoFData()))
+    r1, pb1 = rrule!!(gcd, Ctx(), CoDual(y[1], _elt_shadow(dy)), CoDual(z[1], _elt_shadow(dz)))
     x[1] = primal(r1)
     dx[1] = zero(eltype(dx))
     pbs = Vector{typeof(pb1)}(undef, n)
     pbs[1] = pb1
     for i in 2:n
-        ri, pbi = rrule!!(gcd, Ctx(), CoDual(y[i], NoFData()), CoDual(z[i], NoFData()))
+        ri, pbi = rrule!!(gcd, Ctx(), CoDual(y[i], _elt_shadow(dy)), CoDual(z[i], _elt_shadow(dz)))
         x[i] = primal(ri)
         dx[i] = zero(eltype(dx))
         pbs[i] = pbi
     end
+    yactive, zactive = isactive(dy), isactive(dz)
     function mapbang2_pullback(_)
         grdata = zero_like_rdata_from_type(G)
         for i in length(pbs):-1:1
             gi_r, yi_r, zi_r = pbs[i](dx[i])
             grdata = increment!!(grdata, gi_r)
-            dy[i] = increment!!(dy[i], yi_r)
-            dz[i] = increment!!(dz[i], zi_r)
+            yactive && (dy[i] = increment!!(dy[i], yi_r))
+            zactive && (dz[i] = increment!!(dz[i], zi_r))
             dx[i] = old_dx[i]
         end
         return (NoRData(), grdata, NoRData(), NoRData(), NoRData())

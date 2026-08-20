@@ -7,6 +7,7 @@ using DifferCore
 using DifferCore: tangent_type, fdata_type, rdata_type, fdata, rdata, tangent, zero_tangent, increment!!
 using DifferCore: Tangent, MutableTangent, NoFData, NoRData, build_tangent
 using DifferCore: NoTangent, require_tangent_cache
+using DifferCore: Inactive, shadow_type, isactive, set_to_zero!!, increment_rdata!!, ZeroRData
 
 struct Point; x::Float64; y::Float64; end
 mutable struct MPoint; x::Float64; y::Float64; end
@@ -81,5 +82,108 @@ mutable struct MPoint; x::Float64; y::Float64; end
         v = [Point(1.0, 2.0), Point(3.0, 4.0)]
         zt = zero_tangent(v)
         @test zt == [zero_tangent(Point(1.0, 2.0)), zero_tangent(Point(3.0, 4.0))]
+
+        # A bare `Memory`/`MemoryRef` primal: same-shape, matching its `tangent_type`. Without these
+        # arms the generic struct fallback tries to build a `Memory{Float64}` out of its own fields'
+        # tangents. Forward mode's activity materialisation asks for exactly this.
+        m = Memory{Float64}(undef, 3); fill!(m, 7.0)
+        zm = zero_tangent(m)
+        @test typeof(zm) === tangent_type(Memory{Float64}) === Memory{Float64}
+        @test all(iszero, zm) && length(zm) == 3
+        @test typeof(zero_tangent(Memory{Int}(undef, 2))) === Memory{NoTangent}
+
+        r = Core.memoryref(m, 2)
+        zr = zero_tangent(r)
+        @test typeof(zr) === tangent_type(Core.MemoryRef{Float64}) === Core.MemoryRef{Float64}
+        @test Base.memoryrefoffset(zr) == 2
+    end
+
+    @testset "Inactive" begin
+        @test Base.issingletontype(Inactive) && sizeof(Inactive) == 0
+
+        @test !isactive(Inactive())
+        @test isactive(NoFData())        # an active scalar's shadow — not inactivity
+        @test isactive(NoTangent())      # "no tangent space" is a different claim
+
+        # `Inactive` survives the fdata/rdata split, which is what `NoTangent` cannot do.
+        @test fdata_type(Inactive) === Inactive
+        @test rdata_type(Inactive) === Inactive
+        @test fdata(Inactive()) === Inactive()
+        @test rdata(Inactive()) === Inactive()
+        @test tangent(Inactive(), Inactive()) === Inactive()
+
+        @test shadow_type(Vector{Float64}) === Union{Vector{Float64},Inactive}
+        @test shadow_type(Float64) === Union{NoFData,Inactive}
+
+        # The mixed-activity tuple arm must not capture homogeneously-typed tuples: those keep the
+        # general entry point's aliasing/circular-reference cache. Uncached, a mutable tangent
+        # reachable through two slots is counted twice.
+        @test which(increment!!, Tuple{Tuple{Float64},Tuple{Float64}}).sig <: Tuple{Any,T,T} where {T<:Tuple}
+        let t = zero_tangent(MPoint(1.0, 2.0)), s = zero_tangent(MPoint(1.0, 2.0))
+            s.fields = (x = 1.0, y = 2.0)
+            @test increment!!((t, t), (s, s))[1].fields == (x = 1.0, y = 2.0)
+        end
+        let a = zero_tangent(MPoint(1.0, 2.0)), b = zero_tangent(MPoint(1.0, 2.0)),
+            s = zero_tangent(MPoint(1.0, 2.0))
+            s.fields = (x = 1.0, y = 2.0)
+            r = increment!!((a, b), (s, s))
+            @test r[1].fields == (x = 1.0, y = 2.0) && r[2].fields == (x = 1.0, y = 2.0)
+        end
+        # A genuinely mixed-activity tuple still goes structurally, slot by slot.
+        @test increment!!((1.0, Inactive()), (10.0, 5.0)) === (11.0, Inactive())
+        @test increment!!((Inactive(), 1.0), (5.0, 10.0)) === (Inactive(), 11.0)
+
+        # The mixed-activity arm needs the same aliasing cache as the homogeneous one: a
+        # `MutableTangent` reachable through two slots of a mixed-activity tuple must not be
+        # incremented twice just because some other slot's type differs between accumulator and
+        # contribution.
+        let t = zero_tangent(MPoint(1.0, 2.0)), s = zero_tangent(MPoint(1.0, 2.0))
+            s.fields = (x = 1.0, y = 2.0)
+            r = increment!!((t, t, 3.0), (s, s, Inactive()))
+            @test r[1].fields == (x = 1.0, y = 2.0)
+            @test r[1] === r[2]
+            @test r[3] === 3.0
+        end
+
+        # Strong zero: absorbing in the accumulator slot, identity in the contribution slot.
+        # Deliberately not commutative — slot 1 owns storage, slot 2 is a contribution.
+        @test increment!!(Inactive(), 3.0) === Inactive()
+        @test increment!!(3.0, Inactive()) === 3.0
+        @test increment!!(Inactive(), Inactive()) === Inactive()
+        let a = [1.0, 2.0]
+            @test increment!!(a, Inactive()) === a && a == [1.0, 2.0]
+            @test increment!!(Inactive(), a) === Inactive() && a == [1.0, 2.0]
+        end
+
+        # `ZeroRData` is the additive identity, so it keeps its own accumulator's meaning.
+        @test increment!!(Inactive(), ZeroRData()) === Inactive()
+        @test increment!!(ZeroRData(), Inactive()) === ZeroRData()
+
+        @test increment_rdata!!(Inactive(), 3.0) === Inactive()
+        @test increment_rdata!!(3.0, Inactive()) === 3.0
+        @test set_to_zero!!(Inactive()) === Inactive()
+
+        # `NoTangent` stays strict: no absorbing arm, so an analysis bug surfaces as a
+        # `MethodError` rather than a silently dropped gradient.
+        @test_throws MethodError increment!!(NoTangent(), 3.0)
+        @test_throws MethodError increment!!(3.0, NoTangent())
+
+        # Aggregates compose: a mixed tuple is an ordinary concrete tangent, and the
+        # `tangent(fdata(t), rdata(t)) === t` round-trip still holds through it.
+        let t = (1.0, Inactive())
+            @test fdata_type(typeof(t)) === Tuple{NoFData,Inactive}
+            @test rdata_type(typeof(t)) === Tuple{Float64,Inactive}
+            @test fdata(t) === (NoFData(), Inactive())
+            @test rdata(t) === (1.0, Inactive())
+            @test tangent(fdata(t), rdata(t)) === t
+            @test increment!!(t, (2.0, Inactive())) === (3.0, Inactive())
+        end
+
+        # An inactive slot costs nothing in an aggregate.
+        @test sizeof(Tuple{Vector{Float64},Inactive}) == sizeof(Tuple{Vector{Float64}})
+
+        # Any shadow is valid fdata/rdata for any primal once it is declared inactive.
+        @test DifferCore.verify_fdata_type(Vector{Float64}, Inactive) === nothing
+        @test DifferCore.verify_rdata_type(Float64, Inactive) === nothing
     end
 end
