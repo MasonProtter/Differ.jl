@@ -174,13 +174,17 @@ _copy(x::P) where {P<:NoPullback} = P(_copy(x.r))
 
 Construct a `NoPullback` from the arguments passed to an `rrule!!`: extracts each argument's
 primal value and wraps it as a `LazyZeroRData`, which the reverse pass instantiates and returns
-as that argument's rdata.
+as that argument's rdata. An argument declared constant gets `NoRData()` instead, which is what
+every other rule hands back for an inactive slot.
 
 If every argument's zero rdata can be constructed lazily, the resulting `NoPullback` is a
 singleton type, so AD can skip allocating a stack to store it.
 """
 function NoPullback(args::Vararg{CoDual,N}) where {N}
-    return NoPullback(tuple_map(lazy_zero_rdata ∘ primal, args))
+    return NoPullback(tuple_map(_no_pullback_rdata, args))
 end
+
+_no_pullback_rdata(x::CoDual) = lazy_zero_rdata(primal(x))
+_no_pullback_rdata(::CoDual{<:Any,Inactive}) = NoRData()
 
 @inline (pb::NoPullback)(_) = tuple_map(instantiate, pb.r)

@@ -33,5 +33,6 @@ export build_tangent, get_tangent_field, set_tangent_field!
 export as_tangent, unit_tangent
 export LazyZeroRData
 export Inactive, fdata_shadow_type, tangent_shadow_type, shadow_type, isactive, @ifactive
+export inactive_constant_type
 
 end # module DifferCore

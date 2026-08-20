@@ -1663,7 +1663,7 @@ end
 # untracked-but-differentiable is a real, located bail at the point of use, never silently
 # mishandled.
 #
-# Which arguments carry a derivative. `NoTangent` in a `CoDual`'s shadow slot is the caller declaring
+# Which arguments carry a derivative. `Inactive` in a `CoDual`'s shadow slot is the caller declaring
 # that argument constant; a primal type with no tangent space says the same from the type alone. A
 # non-concrete `codualparams[k]` yields `Any` here, which reads as active — sound.
 #
@@ -2210,11 +2210,18 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
     # resolves and annotate the `%new(CoDual{...}, ...)` the emission side builds — a node-shaped
     # answer would both misresolve the rule and emit IR whose declared type doesn't match the value.
     argtypes = Any[_optype_w(pir, iworld, a) for a in actual]
-    # `mask[j]`: operand `j` is differentiable but has no rdata sink (an inactive value from this
-    # callsite's perspective) — passed to the callee as `CoDual{P,Inactive}` rather than the real
-    # fdata carrier. Restricted to `SSAValue`/`Argument` operands: a literal/`GlobalRef` operand's
-    # contribution is already discarded by `route!` at no cost (`has_sink` is `false` for those too,
-    # for an unrelated reason — no node to accumulate into — so it must not be read as "inactive").
+    # `mask[j]`: operand `j` is differentiable but carries no gradient at this callsite — passed to
+    # the callee as `CoDual{P,Inactive}` rather than a real fdata carrier. Two disjoint tests, one
+    # per operand kind:
+    #  * `SSAValue`/`Argument`: no rdata sink, i.e. nowhere for a contribution to be routed back to.
+    #  * a statically-known code constant (literal, `QuoteNode`, `const` `GlobalRef`): `has_sink` is
+    #    meaningless for these — it answers `false` for the unrelated reason that there is no node to
+    #    accumulate into — so what qualifies them instead is a tangent with no fdata. Nothing can
+    #    write to such a constant, so its shadow could only ever stay zero. A constant whose tangent
+    #    *does* carry fdata (a `const` global array) stays unmasked deliberately: its shadow is
+    #    aliased storage a write inside the callee updates, so it keeps a real one.
+    # Keep the constant arm in step with `DifferCore.inactive_constant_type`, where that policy
+    # lives; it is asked through the world-age funnels here rather than called directly.
     mask = falses(length(argtypes))
     for (j, P) in enumerate(argtypes)
         if !(P isa DataType && isconcretetype(P))
@@ -2230,8 +2237,15 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
             return nothing
         end
         a = actual[j]
-        mask[j] = isa(a, Union{Core.SSAValue,Core.Argument}) && _tt(iworld, P) !== NoTangent &&
-                  !has_sink(a)
+        mask[j] = if isa(a, Union{Core.SSAValue,Core.Argument})
+            _tt(iworld, P) !== NoTangent && !has_sink(a)
+        else
+            # `_calleeval !== nothing` is what makes `presolve(a)` at the emission site embed a real
+            # value: a non-`const` `GlobalRef` has none (it is already rejected above, since
+            # `_optype_w` reports it as `Any`), and neither does a binding whose lookup throws.
+            _calleeval(a, iworld) !== nothing && _tt(iworld, P) !== NoTangent &&
+                fdtype(iworld, P) === NoFData
+        end
         if !mask[j] && mixed_shadow(a)
             # The recursion glue declares each unmasked argument codual at the primal-derived fdata
             # type; a value whose shadow is a mixed-activity tuple (a packed vararg tail with some

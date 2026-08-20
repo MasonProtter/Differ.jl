@@ -168,3 +168,48 @@ function rrule!!(::CoDual{typeof(f!),NoFData}, ::AbstractCtx,
     return CoDual(nothing, NoFData()), f_pullback
 end
 ```
+
+## Packaging rules for another package
+
+Rules for a package Differ doesn't depend on belong in a package extension, so that loading
+Differ doesn't drag that package in. `DifferForwards` and `DifferReverse` each carry one for
+SpecialFunctions.jl:
+
+```toml
+# DifferForwards/Project.toml
+[weakdeps]
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+
+[extensions]
+DifferForwardsSpecialFunctionsExt = "SpecialFunctions"
+```
+
+```julia
+# DifferForwards/ext/DifferForwardsSpecialFunctionsExt.jl
+module DifferForwardsSpecialFunctionsExt
+
+using SpecialFunctions
+import DifferForwards: Dual, frule!!, isactive, zero_tangent
+
+function frule!!(::Dual{typeof(erf)}, (; x, dx)::Dual)
+    y = erf(x)
+    isactive(dx) || return Dual(y, zero_tangent(y))
+    Dual(y, 2*exp(-x^2)/sqrt(π)*dx)
+end
+
+end
+```
+
+Nothing has to be registered anywhere: whether a hand rule exists is resolved through the ordinary
+method table every time a call is transformed, so rules that only appear part-way through a session
+still invalidate the derivatives compiled before them.
+
+Those two extension files are worth reading in full. Between them they cover most of
+SpecialFunctions' real scalar functions, and they show the two cases a rule for a real library has
+to get right. The first is an argument the caller holds constant (`Inactive`, above). The second is
+an argument no derivative is implemented for — a Bessel order, an incomplete gamma parameter —
+which neither mode reports as a silent zero. Both refuse it the same way and at the same point:
+constancy is visible in the shadow slot by the time a rule runs, so a slot carrying a live shadow is
+a caller genuinely asking for the missing derivative, and the rule raises an error at the forwards
+call. A constant in that slot — a literal, or an argument declared constant — arrives as `Inactive`,
+contributes nothing, and never reaches the refusal.

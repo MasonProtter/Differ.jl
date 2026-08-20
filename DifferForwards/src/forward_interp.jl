@@ -1022,6 +1022,18 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         return Inactive()
     end
 
+    # Whether a statically-known code constant of primal type `P` is minted as `Inactive()` rather
+    # than an active zero. Must be kept in step with `DifferCore.inactive_constant_type`, which is
+    # where the policy lives — asked through the `tt`/`ft` funnels so a later-loaded `tangent_type`/
+    # `fdata_type` method invalidates this carrier. Two engine-side additions: a non-concrete or
+    # non-`Type` `P` has no single answer, and a `Dual` primal is the order ≥ 2 self-tangent nesting
+    # where a shadow must be a `Dual` of that same type (same carve-out `inactive_shadow` has).
+    function const_inactive_type(@nospecialize P)
+        (P isa Type && isconcretetype(P) && !(P <: Dual)) || return false
+        T = tt(P)
+        return T !== NoTangent && T !== Inactive && ft(T) === NoFData
+    end
+
     dualparams = impl_mi.specTypes.parameters[2:end]     # the Dual{…} argument types
     vararg_tt = Tuple{dualparams...}                     # dualargs is one vararg tuple (Argument 2)
 
@@ -1251,6 +1263,8 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                     push!(pvals, presolve(a)); push!(ptys, P)
                     push!(tvals, t); push!(ttys, tt(P))
                 else                                   # statically-known: embed the value + its zero
+                    # A zero even for a constant the static path below would mint `Inactive`: `ttup`
+                    # is declared at the primal-derived tangent types.
                     P = _typeof(v)
                     push!(pvals, v); push!(ptys, P)
                     push!(tvals, zt(v)); push!(ttys, tt(P))
@@ -1266,11 +1280,12 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
         # derivatives must not be silently zeroed just because the call is concrete enough to take
         # this static path.
         fd = dual!(ftype, tt(ftype), fcallee, ftang)
-        # Each argument dual is `Dual{P, tangent_type(P)}`. A statically-known operand (a `GlobalRef`/
-        # `QuoteNode`) must be embedded as its resolved value with `P = _typeof(value)`: e.g. an
-        # intrinsic's leading type argument (`fpext(Base.Float64, …)`) is a `GlobalRef` whose value is
-        # a `DataType` instance, and wrapping the raw node as `Dual{GlobalRef,…}` would TypeError at
-        # the `%new`. `_typeof`, not plain `typeof`, is required: `_typeof(Float64) === Type{Float64}`
+        # Each argument dual is `Dual{P, tangent_type(P)}`, or `Dual{P,Inactive}` for a slot the
+        # caller declared constant or a qualifying code constant. A statically-known operand (a
+        # `GlobalRef`/`QuoteNode`) must be embedded as its resolved value with `P = _typeof(value)`:
+        # e.g. an intrinsic's leading type argument (`fpext(Base.Float64, …)`) is a `GlobalRef` whose
+        # value is a `DataType` instance, and wrapping the raw node as `Dual{GlobalRef,…}` would
+        # TypeError at the `%new`. `_typeof`, not plain `typeof`, is required: `_typeof(Float64) === Type{Float64}`
         # sharpens the type, needed for `Dual{Type{Float64},…}`-keyed `frule!!` dispatch to resolve.
         # Only genuinely dynamic operands fall back to `presolve`/`_optype`/`tresolve`.
         dualtys = Any[]; duals = Any[]
@@ -1286,10 +1301,20 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 T = isactive(t) ? tt(P) : Inactive
                 push!(dualtys, Dual{P,T})
                 push!(duals, dual!(P, T, presolve(a), t))
-            else                                        # statically-known: embed value + its zero tangent
+            else
+                # Statically-known: embed the resolved value. Nothing can write to a code constant
+                # whose tangent is fdata-free, so its shadow could only ever stay zero — hand it on
+                # as `Inactive()` instead, which lets a widened rule skip the term outright rather
+                # than multiply by a zero. Everything else (mutable state behind a `const` global,
+                # `NoTangent` primals) keeps its zero tangent.
                 P = _typeof(v)
-                push!(dualtys, Dual{P,tt(P)})
-                push!(duals, dual!(P, tt(P), v, zt(v)))
+                if const_inactive_type(P)
+                    push!(dualtys, Dual{P,Inactive})
+                    push!(duals, dual!(P, Inactive, v, Inactive()))
+                else
+                    push!(dualtys, Dual{P,tt(P)})
+                    push!(duals, dual!(P, tt(P), v, zt(v)))
+                end
             end
         end
         # Emit the surviving high-level rule as a static `:invoke` to a compiled `CodeInstance` when

@@ -133,6 +133,35 @@ when there was only one shadow half to describe.
 """
 shadow_type(::Type{P}) where {P} = fdata_shadow_type(P)
 
+"""
+    inactive_constant_type(P::Type) -> Bool
+
+Whether a statically-known code constant (IR literal, `QuoteNode`, `const` `GlobalRef`) of primal
+type `P` qualifies to be minted as `Inactive()` by the engines, rather than as an active zero
+tangent.
+
+`true` for primals that have a tangent space whose tangent is fdata-free — scalars, immutable
+float aggregates. Nothing can write to such a constant, so a zero shadow could only ever stay zero,
+and `Inactive` says the same thing for free.
+
+`false` in two cases:
+
+- `NoTangent` primals (`Int`, function singletons, …), which already collapse to `NoTangent` at no
+  cost and gain nothing from `Inactive`.
+- anything with fdata — mutable state such as a global array. Its shadow is aliased storage that a
+  write inside the differentiated function updates, so it keeps a zero shadow and gradients thread
+  through a write-then-read.
+
+This is the single place the policy lives. The engines compute the same predicate through their own
+world-age funnels rather than calling this at transform time, so those call sites must be kept in
+step with this definition.
+"""
+function inactive_constant_type(::Type{P}) where {P}
+    T = tangent_type(P)
+    return T !== NoTangent && T !== Inactive && fdata_type(T) === NoFData
+end
+inactive_constant_type(@nospecialize _) = false
+
 # `Inactive` is its own fdata and its own rdata — that is what lets it survive into an aggregate's
 # shadow, which `NoTangent` cannot do.
 fdata_type(::Type{Inactive}) = Inactive
