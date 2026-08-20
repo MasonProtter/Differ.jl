@@ -78,7 +78,7 @@ const FIXTURES = Fixture[
     Fixture("getindex(A,idx)", getindex, () -> (copy(V), copy(IDX))),
     Fixture("setindex!(A,v,mask)", setindex!, () -> (copy(V), [9.0, 9.0], copy(MASK)); dest=1),
     Fixture("setindex!(A,v,idx)", setindex!, () -> (copy(V), [9.0, 9.0], copy(IDX)); dest=1),
-    # DifferForwardsSpecialFunctionsExt — arguments kept inside each function's real domain.
+    # DifferCoreSpecialFunctionsExt — arguments kept inside each function's real domain.
     unary(airyai, 0.7), unary(airyaix, 0.7), unary(airyaiprime, 0.7), unary(airyaiprimex, 0.7),
     unary(airybi, 0.7), unary(airybiprime, 0.7),
     unary(besselj0, 0.7), unary(besselj1, 0.7), unary(bessely0, 0.7), unary(bessely1, 0.7),
@@ -218,7 +218,7 @@ end
     # several define test-local `frule!!` methods of their own (the world-age and dispatch tests);
     # those are not part of the rule table this audits.
     extmod = Base.get_extension(DifferForwards, :DifferForwardsOverReverseExt)
-    sfmod = Base.get_extension(DifferForwards, :DifferForwardsSpecialFunctionsExt)
+    sfmod = Base.get_extension(DifferCore, :DifferCoreSpecialFunctionsExt)
     owned(m) = m.module === DifferForwards || m.module === extmod || m.module === sfmod
     declared = Set(m for m in methods(frule!!)
                    if owned(m) && !is_generated_frule_fallback(m) && !is_structural(m))

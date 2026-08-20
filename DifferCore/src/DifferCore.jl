@@ -19,10 +19,13 @@ include("shared_ir_helpers.jl")
 """
     primal(x)
 
-The primal value carried by `x` — a `Dual` (forward mode) or a `CoDual` (reverse mode). A bare
-stub here; `DifferForwards`/`DifferReverse` each add their own method.
+The primal value carried by `x` — a `Dual` (forward mode) or a `CoDual` (reverse mode).
 """
 function primal end
+
+include("rules.jl")
+include("dual.jl")
+include("codual.jl")
 
 export tangent_type, fdata_type, rdata_type
 export Tangent, MutableTangent, PossiblyUninitTangent, NoTangent

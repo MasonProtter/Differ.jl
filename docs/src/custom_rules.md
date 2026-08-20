@@ -172,24 +172,25 @@ end
 ## Packaging rules for another package
 
 Rules for a package Differ doesn't depend on belong in a package extension, so that loading
-Differ doesn't drag that package in. `DifferForwards` and `DifferReverse` each carry one for
-SpecialFunctions.jl:
+Differ doesn't drag that package in. Both carriers (`Dual`, `CoDual`) and both rule functions
+(`frule!!`, `rrule!!`) are owned by `DifferCore`, so a single `DifferCore`-keyed extension covers
+both modes. That's how the SpecialFunctions.jl rules are packaged:
 
 ```toml
-# DifferForwards/Project.toml
+# DifferCore/Project.toml
 [weakdeps]
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 
 [extensions]
-DifferForwardsSpecialFunctionsExt = "SpecialFunctions"
+DifferCoreSpecialFunctionsExt = "SpecialFunctions"
 ```
 
 ```julia
-# DifferForwards/ext/DifferForwardsSpecialFunctionsExt.jl
-module DifferForwardsSpecialFunctionsExt
+# DifferCore/ext/DifferCoreSpecialFunctionsExt.jl
+module DifferCoreSpecialFunctionsExt
 
 using SpecialFunctions
-import DifferForwards: Dual, frule!!, isactive, zero_tangent
+import DifferCore: Dual, frule!!, isactive, zero_tangent
 
 function frule!!(::Dual{typeof(erf)}, (; x, dx)::Dual)
     y = erf(x)
@@ -204,8 +205,8 @@ Nothing has to be registered anywhere: whether a hand rule exists is resolved th
 method table every time a call is transformed, so rules that only appear part-way through a session
 still invalidate the derivatives compiled before them.
 
-Those two extension files are worth reading in full. Between them they cover most of
-SpecialFunctions' real scalar functions, and they show the two cases a rule for a real library has
+`DifferCore/ext/DifferCoreSpecialFunctionsExt.jl` is worth reading in full. It covers most of
+SpecialFunctions' real scalar functions, and shows the two cases a rule for a real library has
 to get right. The first is an argument the caller holds constant (`Inactive`, above). The second is
 an argument no derivative is implemented for — a Bessel order, an incomplete gamma parameter —
 which neither mode reports as a silent zero. Both refuse it the same way and at the same point:

@@ -13,17 +13,14 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 [weakdeps]
 DifferReverse = "0c588a63-e2e3-4c17-88ed-37ea1a5468a1"
 DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
-SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 
 [extensions]
 DifferForwardsOverReverseExt = "DifferReverse"
 DifferForwardsDifferentiationInterfaceExt = "DifferentiationInterface"
-DifferForwardsSpecialFunctionsExt = "SpecialFunctions"
 
 [compat]
 ADTypes = "1"
 DifferentiationInterface = "0.7"
-SpecialFunctions = "2"
 julia = "1.13"
 
 [workspace]

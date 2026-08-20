@@ -78,7 +78,7 @@ const FIXTURES = Fixture[
     Fixture("map(f,x,y)", map, () -> (atan, copy(V), copy(W))),
     Fixture("map!(f,d,x)", map!, () -> (sin, zeros(3), copy(V)); dest=2),
     Fixture("map!(f,d,x,y)", map!, () -> (atan, zeros(3), copy(V), copy(W)); dest=2),
-    # DifferReverseSpecialFunctionsExt — arguments kept inside each function's real domain.
+    # DifferCoreSpecialFunctionsExt — arguments kept inside each function's real domain.
     unary(airyai, 0.7), unary(airyaix, 0.7), unary(airyaiprime, 0.7), unary(airyaiprimex, 0.7),
     unary(airybi, 0.7), unary(airybiprime, 0.7),
     unary(besselj0, 0.7), unary(besselj1, 0.7), unary(bessely0, 0.7), unary(bessely1, 0.7),
@@ -184,7 +184,7 @@ end
     # Package-owned rules only. Under the full `runtests.jl` every file shares one process, and
     # several define test-local `rrule!!` methods of their own (the world-age and dispatch tests);
     # those are not part of the rule table this audits.
-    sfmod = Base.get_extension(DifferReverse, :DifferReverseSpecialFunctionsExt)
+    sfmod = Base.get_extension(DifferCore, :DifferCoreSpecialFunctionsExt)
     owned(m) = m.module === DifferReverse || m.module === sfmod
     declared = Set(m for m in methods(rrule!!) if owned(m) && !is_derived_rrule(m))
     @test setdiff(declared, covered) == Set{Method}()

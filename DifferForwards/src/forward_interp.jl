@@ -1934,15 +1934,3 @@ function refresh_frule()
     end
 end
 refresh_frule()
-
-"""
-    frule!!(fdual::Dual, argduals::Dual...) -> Dual
-
-Forward-mode rule for `primal(fdual)(primal.(argduals)...)`, returning the result and its
-directional derivative together as a single `Dual`.
-
-Hand-written primitives (see `src/rules_math.jl` for the shape to follow) are methods with a
-specific `fdual`/`argduals` shape; a composite function is handled by an `@generated` fallback
-that derives the rule from `f`'s IR, so `frule!!` works on anything.
-"""
-frule!!
