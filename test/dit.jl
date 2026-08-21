@@ -14,3 +14,15 @@ DIT.test_differentiation(
     excluded = DIT.SECOND_ORDER,
     logging = !parse(Bool, get(ENV, "CI", "false")),
 )
+
+
+backends2 = [
+    DI.SecondOrder(AutoDifferForwards(), AutoDifferForwards())
+    DI.SecondOrder(AutoDifferForwards(), AutoDifferReverse())
+]
+
+scens2 = filter(x -> DIT.order(x)==2, scens)
+DIT.test_differentiation(
+    backends2, scens2;
+    logging = !parse(Bool, get(ENV, "CI", "false")),
+)

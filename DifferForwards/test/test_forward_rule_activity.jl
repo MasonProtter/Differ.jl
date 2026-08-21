@@ -21,7 +21,8 @@ using DifferReverse: Stack, SingletonStack, _bulk_save!, _bulk_restore!
 # at `tangent_type(R)` before the callee is compiled, so a rule must never hand back an `Inactive()`
 # however inactive its inputs were. That is what the `isactive(tangent(r))` assertion below pins.
 #
-# The forward half of `TODO.org`'s "automated audit" item; reverse's equivalent is still open.
+# The forward half of `TODO.org`'s "automated audit" item; `DifferReverse`'s
+# `test_reverse_rule_activity.jl` is the reverse half, with the same completeness check.
 
 # A fixture is a thunk (mutating rules need fresh buffers per mask), the callee, and the two slots
 # a rule can refuse: `dest`, a destination it must refuse when declared *constant*, and `frozen`, a
@@ -78,6 +79,17 @@ const FIXTURES = Fixture[
     Fixture("getindex(A,idx)", getindex, () -> (copy(V), copy(IDX))),
     Fixture("setindex!(A,v,mask)", setindex!, () -> (copy(V), [9.0, 9.0], copy(MASK)); dest=1),
     Fixture("setindex!(A,v,idx)", setindex!, () -> (copy(V), [9.0, 9.0], copy(IDX)); dest=1),
+    # rules_growable.jl — structure-only mutation, so an inactive array shadow is a legal no-op
+    # rather than a refusal: no `dest` slot.
+    Fixture("_growend!", Base._growend!, () -> (copy(V), 2)),
+    Fixture("_growbeg!", Base._growbeg!, () -> (copy(V), 2)),
+    Fixture("_growat!", Base._growat!, () -> (copy(V), 2, 1)),
+    Fixture("_deleteend!", Base._deleteend!, () -> (copy(V), 1)),
+    Fixture("_deletebeg!", Base._deletebeg!, () -> (copy(V), 1)),
+    Fixture("_deleteat!", Base._deleteat!, () -> (copy(V), 2, 1)),
+    # `sizehint!` returns the array, so a constant one has its zero tangent materialised rather
+    # than refused: there are no sources whose derivative a fresh zero could discard.
+    Fixture("sizehint!", sizehint!, () -> (copy(V), 8)),
     # DifferCoreSpecialFunctionsExt — arguments kept inside each function's real domain.
     unary(airyai, 0.7), unary(airyaix, 0.7), unary(airyaiprime, 0.7), unary(airyaiprimex, 0.7),
     unary(airybi, 0.7), unary(airybiprime, 0.7),

@@ -215,10 +215,13 @@ end
     @test_throws BoundsError rrule!!(zero_fcodual(arr_idx3), Ctx(),
                                      DifferReverse.CoDual([1.0, 2.0, 3.0, 4.0], [1.0]))
 
-    # Regression: growing an existing array (`push!`/`resize!`) is still out of scope, and must bail
-    # cleanly (a located reason, not a crash) rather than miscompile.
-    growvec!(v, x) = push!(v, x)
-    @test_throws ErrorException rev_gradient(growvec!, [1.0, 2.0], 3.0)
+    # Growing an existing array routes through Base's growth helpers, which have hand rules
+    # (`rules_growable.jl`); `test_reverse_growable.jl` covers the family. Asserted numerically
+    # rather than as "it does not throw", so a future bail for an unrelated reason still fails here.
+    growvec!(v, y) = (push!(v, y); sum(v))
+    _, dv, dy = rev_gradient(growvec!, [1.0, 2.0], 3.0)
+    @test dv ≈ [1.0, 1.0]
+    @test dy ≈ 1.0
 end
 
 @testset "reverse mode: nested-array aliasing" begin

@@ -116,6 +116,13 @@ mutable struct CyclicNode; x::Float64; next::CyclicNode; CyclicNode(x::Float64) 
         @test rdata(Inactive()) === Inactive()
         @test tangent(Inactive(), Inactive()) === Inactive()
 
+        # An inactive slot's zero is itself (`tangent_type(Inactive) === Inactive`). Without a
+        # dedicated arm these fall into the generic per-field derivation, which reaches
+        # `Inactive(NamedTuple())` — no such method.
+        @test zero_tangent(Inactive()) === Inactive()
+        @test zero_tangent((1.0, Inactive())) === (0.0, Inactive())
+        @test randn_tangent(Xoshiro(0), Inactive()) === Inactive()
+
         @test shadow_type(Vector{Float64}) === Union{Vector{Float64},Inactive}
         @test shadow_type(Float64) === Union{NoFData,Inactive}
 

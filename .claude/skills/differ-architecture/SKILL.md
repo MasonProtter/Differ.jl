@@ -170,7 +170,9 @@ Inspect dualized/reverse IR directly rather than reasoning from source alone:
 ## Current support status (summary — see the deep-dive skills for specifics)
 
 **Forward mode** (`DifferForwards`) supports: straight-line code, branches/loops, try/catch, array
-element read/write and mutation, mutable-struct field mutation, array allocation, tuples/closures
+element read/write and mutation, growable vectors (`push!`/`pop!`/`insert!`/`deleteat!`/`resize!`/…,
+via hand rules on Base's growth helpers — `rules_growable.jl`), mutable-struct field mutation,
+array allocation, tuples/closures
 (differentiate w.r.t. captures), `GC.@preserve` + raw pointer arithmetic, `Expr(:foreigncall)`
 (`ccall`, registered per-target — `memmove`/`memcpy` today) + `Expr(:loopinfo)` (`@simd`), dynamic
 dispatch (via a runtime `dynamic_frule` dispatcher), higher-order differentiation (both hand-nested
@@ -179,8 +181,8 @@ dispatch (via a runtime `dynamic_frule` dispatcher), higher-order differentiatio
 still unsupported and how to close a gap.
 
 **Reverse mode** (`DifferReverse`) supports: the same core (branches/loops, array indexing/mutation
-via a shadow-chain comms scheme, mutable-struct field mutation, `Core.tuple`, `Core.ifelse`,
-`@simd`/`:loopinfo`), direct self-recursion (closed-form `Tape` type) and argument-position callees,
+via a shadow-chain comms scheme, growable vectors through the same hand rules as forward mode,
+mutable-struct field mutation, `Core.tuple`, `Core.ifelse`, `@simd`/`:loopinfo`), direct self-recursion (closed-form `Tape` type) and argument-position callees,
 but not yet: mutual recursion, dynamic dispatch (no `dynamic_rrule` equivalent), vararg primal
 methods, or `Core.Box`/abstract-field `setfield!`. See `differ-reverse-engine` for the engine and
 `differ-extending-reverse-support` for the exact gap list.

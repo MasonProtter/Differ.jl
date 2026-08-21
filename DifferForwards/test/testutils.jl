@@ -14,6 +14,11 @@ central_diff(f, x; h=1e-6) = (f(x + h) - f(x - h)) / 2h
 central_diff(f, x, y, k::Int; h=1e-6) =
     k == 1 ? (f(x+h, y) - f(x-h, y)) / 2h : (f(x, y+h) - f(x, y-h)) / 2h
 
+# Directional central difference along `dx` for a function of one array argument. Each evaluation
+# gets a freshly allocated array, so this is safe on a mutating `f`.
+central_diff_dir(f, x::AbstractArray, dx::AbstractArray; h=1e-6) =
+    (f(x .+ h .* dx) - f(x .- h .* dx)) / 2h
+
 # A `Dual` carrier for an argument the caller holds constant.
 const_dual(x) = Dual(x, Inactive())
 

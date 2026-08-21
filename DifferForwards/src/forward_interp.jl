@@ -574,6 +574,15 @@ function _each_operand(f, @nospecialize s)
     return nothing
 end
 
+# Whether a call with a `Core.Const` result can skip the callee's rule for the shadow. A pinned
+# result says nothing about what the call writes through its arguments, so this needs the statement
+# to be effect-free, or no operand to carry a shadow the callee could reach.
+function _const_result_shadow_free(flag::UInt32, s::Expr, op_active)
+    CC.has_flag(flag, CC.IR_FLAG_EFFECT_FREE) && return true
+    fpos, actual = _call_parts(s)
+    return !op_active(fpos) && !any(op_active, actual)
+end
+
 # Shadow built out of its operands' shadows rather than computed fresh, so a `zero_shadow` can't
 # stand in when materialised (a `PhiNode` must lead its block): materialise the operands instead.
 _act_phi_like(@nospecialize s) =
@@ -646,8 +655,8 @@ function _activity(pir, iworld::UInt, tt, ft, nslots::Int, arg_active::BitVector
             # gates the alias/merge/`%new` arms and never a call: a generic call routinely returns
             # `Nothing` while writing through an argument (`Base._growend_internal!`, `copyto!`).
             # Reverse mode also exempts a rule-less `Core.Builtin`/intrinsic; forward mode must not —
-            # such a bail is how `push!` (`Core.memoryrefoffset`) is refused, and replaying it
-            # primally walks on into code the transform cannot handle.
+            # such a bail is how splatting a runtime-length container (`Core._apply_iterate`) is
+            # refused, and replaying it primally walks on into code the transform cannot handle.
             notan = tt(stmts[i][:type]) === NoTangent
             # `Union{} <: Ptr` is true, so excluding it keeps `throw`-typed statements from becoming
             # activity roots and dragging their operands into materialisation.
@@ -974,7 +983,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # `verify_ir`'s dominance check.
     function gref_operand!(gr::GlobalRef)
         ok, gv = gref_constval(gr)
-        return ok ? gv : emit!(gr, Any)
+        return ok ? _ir_literal(gv) : emit!(gr, Any)
     end
     # Declared type of what `gref_operand!` produces for `gr` (`Core.Typeof` of a `const` binding's
     # value; `Any` for a load).
@@ -1295,7 +1304,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                     # A zero even for a constant the static path below would mint `Inactive`: `ttup`
                     # is declared at the primal-derived tangent types.
                     P = _typeof(v)
-                    push!(pvals, v); push!(ptys, P)
+                    push!(pvals, _ir_literal(v)); push!(ptys, P)
                     push!(tvals, zt(v)); push!(ttys, tt(P))
                 end
             end
@@ -1339,10 +1348,10 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 P = _typeof(v)
                 if const_inactive_type(P)
                     push!(dualtys, Dual{P,Inactive})
-                    push!(duals, dual!(P, Inactive, v, Inactive()))
+                    push!(duals, dual!(P, Inactive, _ir_literal(v), Inactive()))
                 else
                     push!(dualtys, Dual{P,tt(P)})
-                    push!(duals, dual!(P, tt(P), v, zt(v)))
+                    push!(duals, dual!(P, tt(P), _ir_literal(v), zt(v)))
                 end
             end
         end
@@ -1586,7 +1595,8 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                                 emit!(Core.UpsilonNode(), Ti)
             end
             shadow[i] = inactive_shadow(Ti, primal[i])
-        elseif isa(Ti, Core.Const) && isa(s, Expr) && (s.head === :call || s.head === :invoke)
+        elseif isa(Ti, Core.Const) && isa(s, Expr) && (s.head === :call || s.head === :invoke) &&
+              _const_result_shadow_free(pstmts[i][:flag], s, op_active)
             # Const-prop proved this call's result is always exactly this literal, so its derivative
             # is definitionally zero regardless of the callee. (Only `Core.Const` licenses this — a
             # `PartialStruct` narrows some fields but doesn't pin the whole value.) Still reconstruct
@@ -1646,11 +1656,13 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             pf = Any[vpresolve(a) for a in args]
             primal[i] = emit!(Expr(:new, T, pf...), Ti)
             TT = tt(Ti)
-            if T <: Dual
-                # `Dual` is its own tangent type: shadow is a same-typed `Dual` built via `%new`.
+            if T <: Dual && tt(T) === T
+                # `Dual` is its own tangent type here: shadow is a same-typed `Dual` built via `%new`.
                 # A non-differentiable field (tangent `NoTangent`, can't fill e.g. a `typeof(sin)` or
                 # `Int` slot) carries the primal value through unchanged instead — what lets a
-                # `Dual{typeof(sin),NoTangent}` be re-dualized at higher order.
+                # `Dual{typeof(sin),NoTangent}` be re-dualized at higher order. A `Dual` whose fields
+                # admit no same-typed shadow (`tt(T) !== T`) falls through to the general struct arm
+                # and gets an ordinary `Tangent`.
                 tf = Any[_nondiff_field(interp, edges, fieldtype(T, j)) ? vpresolve(args[j]) : tresolve(args[j])
                          for j in eachindex(args)]
                 # `_widen(Ti)`, not `Ti`: `Ti` is the *primal*'s statement type. If it's a
@@ -1740,16 +1752,16 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             elseif isa(f, Core.Builtin)
                 # Dispatch straight to a per-builtin rule (`apply_builtin_frule!` in
                 # `src/builtins.jl`), mirroring the intrinsic dispatch above. Unregistered builtin
-                # (e.g. `Core.memoryrefoffset`, or a non-bits/undef-checked element access) bails
+                # (e.g. `Core._apply_iterate`, or a non-bits/undef-checked element access) bails
                 # gracefully with a located reason.
                 why = reason[]
                 res = apply_builtin_frule!(Val(f), actual, Ti, builtin_ctx)
                 if res === nothing
                     # As with intrinsics above, a registered rule that declines records its own reason.
                     reason[] = reason[] === why ?
-                        "no dualization rule for builtin `$f` (e.g. `Core.memoryrefoffset` used " *
-                        "by `push!`/`resize!`, or a non-bits/undef-checked array element " *
-                        "access) at %$i: `$(_stmt_str(s))`" :
+                        "no dualization rule for builtin `$f` (e.g. `Core._apply_iterate`, left " *
+                        "behind by splatting a runtime-length container, or a non-bits/" *
+                        "undef-checked array element access) at %$i: `$(_stmt_str(s))`" :
                         "$(reason[]) at %$i: `$(_stmt_str(s))`"
                     return nothing
                 end

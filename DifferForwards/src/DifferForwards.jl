@@ -16,7 +16,7 @@ import DifferCore: DifferCore, NoTangent, Inactive, isactive, NoFData, NoRData, 
     _typeof, _findall, IEEEFloat, always_initialised, _new_, _copy,
     require_tangent_cache, MaybeCache, NoCache, fields_type, zero_tangent_internal,
     uninit_tangent,
-    _globalref_val, _globalref_isconst, _calleeval, _optype, _optype_w, _stmt_str,
+    _globalref_val, _globalref_isconst, _calleeval, _ir_literal, _optype, _optype_w, _stmt_str,
     _bi_literal_index, _bi_homog_tangent_type, _tangent_field_slot, _widen,
     _getfieldg, _setfieldg, _ctupleg, _ifelseg,
     _fc_parse, _fc_stmt, _fc_ptr_origin, _fc_same_stride, _fc_check_extent,
@@ -44,6 +44,7 @@ include("rules_math.jl")
 include("rules_reductions.jl")
 include("rules_broadcast.jl")
 include("rules_indexing.jl")
+include("rules_growable.jl")
 include("rules_linalg.jl")
 include("reflection.jl")
 include("adtypes.jl")

@@ -927,7 +927,11 @@ index (block numbering shifts with unrelated optimizer changes).
   above); a dynamic index into a genuinely *mixed* tail and passing the whole mixed-shadow tail to a
   nested call are the two remaining located bails.
 
-Growable-array mutation (`push!`/`resize!`), non-bits array elements, and any `Core.Builtin` with no
+Growable-array mutation (`push!`/`pop!`/`insert!`/`deleteat!`/`resize!`/…) is supported in both
+modes, via hand rules on Base's six growth helpers (`rules_growable.jl` in each package) rather than
+in the transform: the rules keep `Core.memoryrefoffset` and `setfield!` on an `Array`'s `:ref`/`:size`
+out of carrier IR entirely, and each carrier resizes through its own layout so their capacities and
+offsets never have to agree. `splice!`, non-bits array elements, and any `Core.Builtin` with no
 registered rule remain out of scope for both modes (`differ-extending-ir-support`).
 
 ## Cross-references

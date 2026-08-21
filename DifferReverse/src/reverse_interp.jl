@@ -3216,7 +3216,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
     # hazard `_calleeval` exists to handle for callees (`forward_interp.jl`).
     presolve(@nospecialize x) =
         isa(x, Core.SSAValue) ? primal_map[x.id] : isa(x, Core.Argument) ? parg[x.n] :
-        isa(x, GlobalRef) ? _calleeval(x, iworld) : x
+        isa(x, GlobalRef) ? _ir_literal(_calleeval(x, iworld)) : x
     sresolve(@nospecialize x) =
         isa(x, Core.SSAValue) ? shadow_map[x.id] : isa(x, Core.Argument) ? farg[x.n] : x
 
@@ -4239,7 +4239,7 @@ function reverse_pullback_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int
             (v === nothing && (isa(a, Core.SSAValue) || isa(a, Core.Argument))) &&
                 error("Differ internal error: no primal comms item for $(a) in block $(b) — a rule " *
                       "reads it, but the forwards pass never recorded it")
-            return v
+            return _ir_literal(v)
         end
 
         # Values a rule's own fwds emission stashed (`(:old_primal, ssa)`, `(:old_tangent, ssa)`),

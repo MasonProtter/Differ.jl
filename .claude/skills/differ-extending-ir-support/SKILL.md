@@ -1,6 +1,6 @@
 ---
 name: differ-extending-ir-support
-description: "Playbook for extending DifferForwards' dualization engine to support a new Julia IR construct — the methodology used to add control flow (branches/loops), exception handling (try/catch), array indexing/mutation + mutable-struct setfield!, array allocation, GC.@preserve + raw pointer loads/stores, and foreigncall/ccall + @simd's loopinfo (all implemented), plus what's known about the remaining forward-mode gaps (unregistered ccall targets, non-bits array elements, growable-array mutation). Forward-mode scoped: the sibling `differ-extending-reverse-support` skill covers the same methodology applied to DifferReverse. Use this when asked to make DifferForwards handle more Julia language features, or when dualize_to_ircode bails on something new."
+description: "Playbook for extending DifferForwards' dualization engine to support a new Julia IR construct — the methodology used to add control flow (branches/loops), exception handling (try/catch), array indexing/mutation + mutable-struct setfield!, array allocation, GC.@preserve + raw pointer loads/stores, and foreigncall/ccall + @simd's loopinfo (all implemented), plus what's known about the remaining forward-mode gaps (unregistered ccall targets, non-bits array elements, `Core._apply_iterate`). Forward-mode scoped: the sibling `differ-extending-reverse-support` skill covers the same methodology applied to DifferReverse. Use this when asked to make DifferForwards handle more Julia language features, or when dualize_to_ircode bails on something new."
 ---
 
 # Extending DifferForwards' dualization engine to a new IR construct
@@ -76,8 +76,12 @@ currently works; this skill is about the *process* of growing it further.
 for). The IR-shape notes below are how it works today; they're a good concrete example of applying
 the methodology above. Array indexing/mutation, mutable-struct `setfield!`, and array allocation are
 all implemented too (see the following sections) — the current gap beyond those is non-bits/
-undef-checked array element access and growable-array mutation (`push!`/`resize!`, which route
-through the still-unhandled `Core.memoryrefoffset` builtin).
+undef-checked array element access and `Core._apply_iterate` (left behind by splatting a
+runtime-length container). Growable-array mutation (`push!`/`resize!`/…) is handled, but through
+hand rules on Base's six growth helpers (`rules_growable.jl`) rather than by teaching the transform
+`Core.memoryrefoffset`: the transform decides the capacity/realloc branch on the primal alone, so
+mirroring the length change onto a shadow with a tighter `Memory` would write past its end. Rules
+let each carrier resize through its own layout instead.
 
 `try`/`catch`/`finally` lowers to `EnterNode` (marks the start of a protected region;
 `catch_dest` names the handler block, `0` meaning "no handler needed" once the optimizer proves
@@ -258,9 +262,9 @@ no further construct needed.
 
 ## Remaining gaps (forward mode)
 
-Non-bits/undef-checked array element access (`Vector{Any}`/`Vector{String}`), growable-array
-mutation (`push!`/`resize!`, which route through `Core.memoryrefoffset` — a distinct, still-unhandled
-`Core.Builtin`), any `ccall` target with no registered rule (BLAS, libm, the runtime C API — see the
+Non-bits/undef-checked array element access (`Vector{Any}`/`Vector{String}`), `splice!` (its
+`Core.typeassert`, plus a `Vector{Any}` default argument reverse mode cannot trace), any `ccall`
+target with no registered rule (BLAS, libm, the runtime C API — see the
 section above for why bailing is the right default), `Base`-library array functions (`sum`,
 `map`, `copyto!`, broadcast) beyond a hand-written index loop, `Core._apply_iterate` (left behind by
 splatting something whose length isn't statically known, e.g. `f(xs...)` with `xs::Vector`; a tuple

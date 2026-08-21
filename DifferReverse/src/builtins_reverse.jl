@@ -63,7 +63,9 @@ _bi_tracked(@nospecialize(node), ctx) =
 # tiny body at every emission site.
 @noinline _rr_get_tangent_field(t, i) = get_tangent_field(t, i)
 @noinline _rr_set_tangent_field!(t, i, x) = set_tangent_field!(t, i, x)
-@noinline _rr_get_fdata_field(f, name) = _get_fdata_field(f, name)
+# `Val`-wrapped name, not a bare `Symbol`/`Int` argument: the field name has to stay in the *type*
+# so that dualizing this call for forward-over-reverse still sees a compile-time `getfield` index.
+@noinline _rr_get_fdata_field(f, ::Val{name}) where {name} = _get_fdata_field(f, name)
 @noinline _rr_increment_field_rdata!(dx, dy, v) = increment_field_rdata!(dx, dy, v)
 @noinline _rr_rdata(t) = rdata(t)
 @noinline _rr_fdata(t) = fdata(t)
@@ -269,8 +271,8 @@ function apply_builtin_rrule_fwds!(::Val{Core.getfield}, actual, Ti, ctx)
             # handle, covering an `FData`-wrapped immutable struct and a raw `MutableTangent`
             # uniformly.
             fname = _bi_fieldname(actual[2])
-            shadow = ctx.icall!(_rr_get_fdata_field, ctx.sty(ctx.ssa), (ctx.sty(obj), typeof(fname)),
-                                ctx.sresolve(obj), actual[2])
+            shadow = ctx.icall!(_rr_get_fdata_field, ctx.sty(ctx.ssa), (ctx.sty(obj), Val{fname}),
+                                ctx.sresolve(obj), Val(fname))
         end
     end
     return p, shadow, Dict{Any,Any}()
@@ -602,6 +604,15 @@ function builtin_rrule_comms(::Val{Core.setfield!}, actual, Ti, ctx)
     if !(P isa DataType && ismutabletype(P))
         ctx.reason[] = "reverse mode `setfield!` requires a concrete mutable struct, got $(P) at " *
                        "%$(ctx.ssa.id)"
+        return false
+    end
+    if P <: Array
+        # An `Array`'s shadow is a same-shape array, not a `MutableTangent`, so there is no tangent
+        # field to save and restore. Growable mutation goes through Base's growth helpers, which
+        # have hand rules; anything resizing an array outside them is out of scope.
+        ctx.reason[] = "reverse mode `setfield!` on an `Array`'s own fields is not supported — a " *
+                       "vector that resizes outside Base's growth helpers has no shadow field to " *
+                       "mirror onto, at %$(ctx.ssa.id)"
         return false
     end
     if !_bi_literal_index(actual[2])

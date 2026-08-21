@@ -1,7 +1,7 @@
 using Test
 using DifferForwards
-using DifferForwards: Dual, Inactive, NoTangent, frule!!, zero_tangent, isactive,
-    code_dual_ircode, primal, tangent
+using DifferForwards: Dual, Inactive, NoTangent, NoFData, frule!!, zero_tangent, isactive,
+    code_dual_ircode, primal, tangent, tangent_type, fdata_type, Tangent
 using LinearAlgebra: dot
 import DifferentiationInterface as DI
 using DifferForwards: AutoDifferForwards
@@ -21,10 +21,12 @@ sxy(x, y) = x*y + sin(x)
 sxyz(x, y, z) = x*y + y*z + sin(x*z)
 loopdot(v, w) = (s = 0.0; for i in eachindex(v, w); s += v[i]*w[i]; end; s)
 nested_dot(v, w) = dot(v, w)
-# Growing an array (`Core.memoryrefoffset`) is a construct forward mode cannot dualize at all — the
-# canonical bail. Written inline so it lands in `tagged`'s own IR: behind an `@noinline` call the
-# bail would surface at run time from the callee's own carrier instead of at `code_dual_ircode`.
-tagged(x, v) = x * 2.0 + (push!(v, 1.0); v[1])
+# Splatting a runtime-length container (`Core._apply_iterate`) is a construct forward mode cannot
+# dualize at all — the canonical bail. Written inline so it lands in `tagged`'s own IR: behind an
+# `@noinline` call the bail would surface at run time from the callee's own carrier instead of at
+# `code_dual_ircode`. The `push!` alongside it is supported, and is what the replay assertion below
+# observes.
+tagged(x, v) = x * 2.0 + (push!(v, 1.0); max(v...))
 vtail(x, ys...) = x * ys[1] + ys[2]
 loopdots(v, w, n) = (s = 0.0; for _ in 1:n; s += dot(v, w); end; s)
 mapsin(v, w) = sum(map((a, b) -> a * sin(b), v, w))
@@ -145,7 +147,7 @@ end
     # it is replayed primally and never reaches `frule_split!`.
     r_active = bail_reason(tagged, (Float64, Vector{Float64}))
     @test r_active !== nothing
-    @test occursin("memoryrefoffset", r_active)
+    @test occursin("_apply_iterate", r_active)
     @test bail_reason(tagged, (Float64, Vector{Float64}); inactive=(2,)) === nothing
 
     v = [4.0]
@@ -356,4 +358,31 @@ const inactive_lit_new = r"%new\((\w+\.)?Dual\{Float64, (\w+\.)?Inactive\}, 2\.5
     @test d.x ≈ lit_field(x)
     @test d.dx ≈ 2.5
     checkverify(lit_field, (Float64,))
+end
+
+
+# A code constant whose tangent holds an inner-pass `Dual`: the shape DifferentiationInterface's
+# prep object has at order 2, where it keeps the callee's `Dual` in a field. `@noinline` keeps the
+# constant as an operand of a surviving call, which is where the mint-`Inactive` decision is made.
+struct DualHolder{D}
+    fdual::D
+end
+const DUAL_HOLDER = DualHolder(Dual(sin, NoTangent()))
+@noinline holder_scale(h::DualHolder, x::Float64) = primal(h.fdual)(x)
+holder_apply(x::Float64) = holder_scale(DUAL_HOLDER, x) * x
+
+@testset "activity: a constant whose tangent holds a Dual" begin
+    # A `Dual` slot that carries a primal through contributes no forward-pass storage, so the
+    # holder's tangent is fdata-free and the constant qualifies to be minted `Inactive()`. Without
+    # a `fdata_type` method for `Dual` this query errors and takes the compilation with it.
+    P = typeof(DUAL_HOLDER)
+    @test tangent_type(P) === Tangent{@NamedTuple{fdual::Dual{typeof(sin),NoTangent}}}
+    @test fdata_type(tangent_type(P)) === NoFData
+    @test DifferForwards.DifferCore.inactive_constant_type(P)
+
+    x = 0.75
+    d = frule!!(Dual(holder_apply, NoTangent()), Dual(x, 1.0))
+    @test d.x ≈ sin(x) * x
+    @test d.dx ≈ cos(x) * x + sin(x)
+    checkverify(holder_apply, (Float64,))
 end

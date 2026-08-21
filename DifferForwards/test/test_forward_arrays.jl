@@ -267,17 +267,10 @@ end
     @test r.x ≈ 8.0 && r.dx ≈ 1.0
     checkverify(alloclit, (Float64,))
 
-    # Still out of scope: growing an existing array (`push!`/`resize!`), which calls
-    # `Core.memoryrefoffset` directly, a distinct, still-unhandled builtin (unrelated to
-    # allocation). Should bail gracefully with an `ErrorException`.
-    growvec!(v, x) = push!(v, x)
-    err = try
-        frule!!(Dual(growvec!, NoTangent()), Dual([1.0,2.0], [0.0,0.0]), Dual(3.0, 1.0))
-        nothing
-    catch e
-        e
-    end
-    @test err isa ErrorException
-    @test occursin("memoryrefoffset", err.msg)
-    @test occursin("at %", err.msg)
+    # Growing an existing array routes through Base's growth helpers, which have hand rules
+    # (`rules_growable.jl`); `test_forward_growable.jl` covers the family.
+    growvec!(v, x) = (push!(v, x); sum(v))
+    r = frule!!(Dual(growvec!, NoTangent()), Dual([1.0,2.0], [0.0,0.0]), Dual(3.0, 1.0))
+    @test r.x ≈ 6.0 && r.dx ≈ 1.0
+    checkverify(growvec!, (Vector{Float64}, Float64))
 end

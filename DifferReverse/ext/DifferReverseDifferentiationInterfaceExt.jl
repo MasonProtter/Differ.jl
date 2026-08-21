@@ -9,7 +9,7 @@ DI.check_available(::AutoDifferReverse) = true
 # ===========================================================================
 # Reverse mode: pullback, built on rrule!!/CoDual/Ctx.
 #
-# `build_ctx(f, argtypes)` preallocates a tape-holding `Ctx` once, whose stacks are reset and
+# `build_ctx(fcd, argcds...)` preallocates a tape-holding `Ctx` once, whose stacks are reset and
 # reused on every subsequent `rrule!!` call — that's DI's "prepare once, reuse many times" story.
 # `value_and_pullback!` builds `CoDual(x, tx[i])` directly against the caller's buffer instead of
 # allocating a fresh zero buffer and copying afterward, mirroring Differ's own
@@ -35,17 +35,14 @@ _di_out_copy(y) = y
 _ctx_codual(c::DI.Constant) = CoDual(DI.unwrap(c), Inactive())
 _ctx_codual(c::DI.Context) = zero_fcodual(DI.unwrap(c))
 
-# Context positions among `build_ctx`'s `inactive=` argument list: `offset` is 1 for the one-arg
-# prepare (`x, cargs...`), 2 for the two-arg prepare (`y, x, cargs...`).
-_inactive_ctx_positions(offset::Int, contexts::Tuple) =
-    Tuple(offset + j for (j, c) in enumerate(contexts) if c isa DI.Constant)
-
 function DI.prepare_pullback_nokwarg(
         strict::Val, f::F, backend::AutoDifferReverse, x, ty::NTuple, contexts::Vararg{DI.Context,C}
     ) where {F,C}
     _sig = DI.signature(f, backend, x, ty, contexts...; strict)
-    cargs = map(DI.unwrap, contexts)
-    ctx = build_ctx(f, (typeof(x), map(typeof, cargs)...); inactive=_inactive_ctx_positions(1, contexts))
+    # The carrier form of `build_ctx`, not `inactive=`: activity rides in the coduals' own shadow
+    # slots, so it is a type parameter rather than a value the call site has to const-fold, and the
+    # carriers are the same ones `value_and_pullback!` builds, so prepare cannot disagree with the call.
+    ctx = build_ctx(zero_fcodual(f), zero_fcodual(x), map(_ctx_codual, contexts)...)
     return DifferPullbackPrep(_sig, ctx)
 end
 
@@ -123,9 +120,7 @@ function DI.prepare_pullback_nokwarg(
         strict::Val, f!::F, y, backend::AutoDifferReverse, x, ty::NTuple, contexts::Vararg{DI.Context,C}
     ) where {F,C}
     _sig = DI.signature(f!, y, backend, x, ty, contexts...; strict)
-    cargs = map(DI.unwrap, contexts)
-    ctx = build_ctx(f!, (typeof(y), typeof(x), map(typeof, cargs)...);
-                    inactive=_inactive_ctx_positions(2, contexts))
+    ctx = build_ctx(zero_fcodual(f!), zero_fcodual(y), zero_fcodual(x), map(_ctx_codual, contexts)...)
     dy = tangent(zero_fcodual(y))
     return DifferTwoArgPullbackPrep(_sig, ctx, dy)
 end

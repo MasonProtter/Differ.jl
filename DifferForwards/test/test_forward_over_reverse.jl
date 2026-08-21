@@ -300,6 +300,17 @@ end
     @test r1 == r2 == (NoTangent(), [2.0, 4.0, 6.0])
 end
 
+@testset "struct-field shadow read inside the tape" begin
+    # `hcat` builds a `Base.Generator` whose `.f` closure captures the input vectors, so the tape
+    # reads a differentiable struct field: reverse mode's fwds pass emits
+    # `_rr_get_fdata_field(fdata, Val(:f))`, and dualizing that call has to keep the field name a
+    # compile-time constant both ways. The name used to reach the dualized IR as a bare `Symbol`
+    # operand, which codegen reads as a global load in `DifferForwards`.
+    hcatsum(y) = sum(hcat([y * y, 2y], [3y, 4y]))              # y^2 + 9y
+    @test D(x -> rev_gradient(hcatsum, x)[2], 1.5) ≈ 2.0       # d/dx (2x + 9)
+    checkverify(x -> rev_gradient(hcatsum, x)[2], (Float64,))
+end
+
 @testset "reverse-over-forward and reverse-over-reverse bail, not crash or silently zero" begin
     # Both compositions are non-goals: `rev_gradient` of a function that itself calls `frule!!`
     # (reverse-over-forward) or calls `rev_gradient` (reverse-over-reverse). Both must fail cleanly (a

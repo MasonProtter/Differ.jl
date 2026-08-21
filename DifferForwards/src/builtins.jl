@@ -21,8 +21,8 @@
 #   * `ctx.zero_shadow(Ti, primal_ssa)` — the zero tangent of a computed non-differentiable result
 #
 # The fallback below returns `nothing`, so a builtin with no registered rule (e.g.
-# `Core.memoryrefoffset`, used by `push!`/`resize!`) bails in `dualize_to_ircode` with a clear,
-# located reason instead of silently miscompiling.
+# `Core._apply_iterate`, left behind by splatting a runtime-length container) bails in
+# `dualize_to_ircode` with a clear, located reason instead of silently miscompiling.
 # ===========================================================================
 
 apply_builtin_frule!(::Val{F}, actual, Ti, ctx) where {F} = nothing
@@ -200,8 +200,11 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
         m = ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), idx,
                            (ctx.presolve(a) for a in actual[3:end])...), memfield)
         memfield === TT ? m : ctx.opf(:bitcast, TT, TT, m)
-    elseif Pobj <: Dual || Pobj <: Tuple || Pobj <: NamedTuple || Pobj <: Array
+    elseif (Pobj <: Dual && ctx.tt(Pobj) === Pobj) || Pobj <: Tuple || Pobj <: NamedTuple ||
+           Pobj <: Array
         # Same-shape tangent (Dual/Tuple/NamedTuple/Array): index/name the shadow aggregate directly.
+        # A `Dual` only qualifies when it is its own tangent type; otherwise its shadow is an ordinary
+        # `Tangent` and the general-struct arm below reads the field out of the backing NamedTuple.
         ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), idx,
                        (ctx.presolve(a) for a in actual[3:end])...), TT)
     else
@@ -276,6 +279,16 @@ function apply_builtin_frule!(::Val{Core.setfield!}, actual, Ti, ctx)
         newtan = ctx.tresolve(actual[3])
         ctx.emit!(Expr(:call, _setfieldg, ctx.tresolve(actual[1]), idx, newtan), Fsh)
         return p, newtan
+    end
+
+    # An `Array`'s shadow is a same-shape array, not a `MutableTangent`, so there is no tangent
+    # field to write and the generic path below would raise a `MethodError` at run time. Writes to
+    # `:ref`/`:size` reach here only from code that resizes an array without going through Base's
+    # growth helpers, which have hand rules; bail with a reason instead.
+    if Pobj isa DataType && Pobj <: Array
+        ctx.reason[] = "`setfield!` on an `Array`'s own fields is not dualizable — a vector that " *
+                       "resizes outside Base's growth helpers has no shadow field to mirror onto"
+        return nothing
     end
 
     TT = ctx.tt(Ti)

@@ -27,12 +27,11 @@ This is a project mostly made for fun, and is not something serious to be relied
   and entrypoints, but large sections of the overall codebase are on various points along the
   spectrum from "vibe-coded" to "LLM-assisted". Skepticism is very warranted.
 - Differ has forwards and reverse mode.
-  - Both modes support mutation (though lack supprot for things like `push!`/`pop!`)
-  - Forwards mode is simpler and more robust
+  - Both modes support mutation
   - Reverse mode works on a lot of common programs, but is more liable to choke. It will try to
     tell you what part of your program it doesn't understand.
 - Nested forwards-mode differentiation usually works. Forwards-over-Reverse differentiation works
-  in limited case.
+  in limited cases.
 
 ## Installing Differ
 

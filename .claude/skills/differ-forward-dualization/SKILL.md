@@ -113,7 +113,7 @@ straight off via `compute_ir_rettype` — no re-inference step to get wrong.
 | `Core.isdefined` | Field-definedness check (the boxed-capture `throw_undef_if_not` guard, or a user `isdefined(x,:f)`). Primal passed through; shadow always `NoTangent()` (result is always `Bool`). |
 | `Core.tuple` | Same-shape tangent tuple (mirrors the `Expr(:new, ::Tuple, …)` case). Needed on the live path for ≥2-D array indexing, where the `BoundsError` index tuple is hoisted into a reachable block rather than living only in the unreachable throw block the 1-D case keeps it in. |
 | `Core.ifelse` | A branchless select: primal is `ifelse` on the presolved operands; shadow is the same select applied to the (same-shape) shadow operands, indexed by the same (non-differentiable) condition — `NoTangent()` if the result's tangent type is trivial. Handled inline (like `getfield`) rather than bailing as an unrecognized builtin, so it stays dualizable if this IR is itself re-dualized at a higher order — needed for `max_float`/`min_float`'s rule above, which emits one to pick the surviving operand's tangent without splitting the block (a real Julia `?:` branch would). |
-| any other `Core.Builtin` | **bail** (`return nothing`) — e.g. `Core.memoryrefoffset` (used by `push!`/`resize!`) or non-bits/undef-checked array element access. |
+| any other `Core.Builtin` | **bail** (`return nothing`) — e.g. `Core._apply_iterate` (left behind by splatting a runtime-length container) or non-bits/undef-checked array element access. `Core.memoryrefoffset` is also still unruled, but growable-array mutation no longer reaches it: Base's six growth helpers have hand `frule!!`s (`rules_growable.jl`), which `src_inlining_policy` then keeps un-inlined, so the offset arithmetic never enters dualized IR. |
 | surviving `:call`/`:invoke` (e.g. `sin`, `cos`, or any composite function with no intrinsic-level path), callee + args + result all concrete | `frule_split!`: wrap the callee (`Dual{ftype,NoTangent}`) and each arg (`Dual{P,tangent_type(P)}`) in a fresh `Dual` via `%new`, then emit a static `:invoke` to a *compiled `CodeInstance`* (via `frule_codeinstance`) when resolvable, else a dynamic `:call` to `frule!!`. Result is `Dual{R,tangent_type(R)}`. Self-/mutually-recursive callees are detected first (`dual_recursive_impl_mi`) and routed to a bare-`MethodInstance` self-`:invoke` or an uninlined dynamic `:call` respectively — see "Recursion" below. |
 | surviving call with a non-concrete callee or argument type (a dynamic `apply_generic` dispatch) | `frule_split!` emits a static call to the runtime `dynamic_frule` dispatcher (callee tangent + primals + tangents passed as `Core.tuple`s), which rebuilds concrete `Dual`s and dispatches `frule!!` at run time — see the "Dynamic dispatch" section below. A call with concrete callee+args but an abstract *result* type stays on the static `:invoke` path, typed `dual_type(R)`. |
 | `GotoNode` / `GotoIfNot` | Passed through basically unchanged — see "Control flow" below. |
@@ -234,9 +234,9 @@ value's activity.
 - **Forward mode does *not* copy reverse's exemption for a rule-less `Core.Builtin`/intrinsic.**
   Reverse needs it (`x === y` on active operands would otherwise have no rule and bail); forward
   already has rules for `===`/`isdefined` and the `@inactive_builtin` group, and here a rule-less
-  builtin's bail is load-bearing — it is how growable-array mutation (`push!`, via
-  `Core.memoryrefoffset`) is refused. Marking one inactive replays it primally and walks on into code
-  the transform cannot handle. This was caught by `test_forward_arrays.jl`'s growable-array bail.
+  builtin's bail is load-bearing — it is how splatting a runtime-length container
+  (`Core._apply_iterate`) is refused. Marking one inactive replays it primally and walks on into code
+  the transform cannot handle. This is pinned by `test_forward_activity.jl`'s canonical bail.
 - **A raw pointer is an activity root** — any statement whose type is `<: Ptr`, plus
   `pointerref`/`pointerset`/their atomic forms (`_act_ptr_deref`). Same rationale as `:foreigncall`:
   what a pointer addresses is outside the analysis, so how the *address* was computed does not bound
@@ -320,10 +320,16 @@ pir_arg_offset=offset`. Two shapes reach it:
 `pir_arg_offset` only affects the **vararg argument-reconstruction prologue**: the tuple index reads
 `getfield(Argument(2), j+offset)` (skipping the offset function slots in the outer carrier's vararg
 tuple) while the reconstructed inner tuple is offset-free and must equal `pir.argtypes[2]` (asserted).
-The rest of the engine is offset-agnostic. **Limit:** a `Dual` carrying a struct/closure with
-differentiable fields has no same-typed zero tangent (the self-tangent scheme needs `tangent_type(P)
-=== P`), so composing `D` over such a value at order ≥2 errors clearly in `_carrier_zero`
-(`DifferForwards/src/dual.jl`) rather than miscompiling.
+The rest of the engine is offset-agnostic.
+
+A `Dual` is its own tangent type only when both its fields can live in a same-typed shadow: each
+field's tangent type is either itself or `NoTangent` (the slot then carries the primal through).
+`tangent_type(::Type{Dual{P,T}})` (`DifferCore/src/dual.jl`) tests that with `_dual_selfsim_field`;
+a `Dual` carrying a struct/closure with differentiable fields fails it and gets the ordinary
+two-field `Tangent{@NamedTuple{primal, tangent}}` instead. Consumers that mirror a `Dual` shadow
+field-by-field must check the same thing before doing so — the `%new` arm of `dualize_to_ircode`
+guards on `tt(T) === T`, `getfield`'s same-shape branch on `ctx.tt(Pobj) === Pobj` — or they emit a
+`%new` that `TypeError`s at run time on a `Tangent` in a primal-typed slot.
 
 ## Known `Core.Compiler.verify_ir` gotchas (cost real debugging time — read before you hit them again)
 
