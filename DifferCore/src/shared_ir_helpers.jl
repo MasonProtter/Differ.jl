@@ -35,6 +35,19 @@ _calleeval(@nospecialize(x), world::UInt) =
     isa(x, Core.SSAValue) || isa(x, Core.Argument) ? nothing :
     x
 
+# Re-embed a value resolved by `_calleeval`/`_globalref_val` as an IR operand. Codegen reads a bare
+# `Symbol` as a global load in the *emitting* module (so a field-name literal recovered from a
+# `QuoteNode` becomes an `UndefVarError`), and the other node types below as references rather than
+# data; a `QuoteNode` wrapper makes them literals again. Only for values, never for operand nodes —
+# an `SSAValue` produced by `presolve` must stay a reference.
+_ir_literal(@nospecialize x) =
+    (isa(x, Symbol) || isa(x, Expr) || isa(x, QuoteNode) || isa(x, GlobalRef) ||
+     isa(x, Core.SSAValue) || isa(x, Core.Argument) || isa(x, Core.SlotNumber) ||
+     isa(x, Core.NewvarNode) || isa(x, Core.GotoNode) || isa(x, Core.GotoIfNot) ||
+     isa(x, Core.ReturnNode) || isa(x, Core.EnterNode) || isa(x, Core.PhiNode) ||
+     isa(x, Core.PhiCNode) || isa(x, Core.PiNode) || isa(x, Core.UpsilonNode) ||
+     isa(x, LineNumberNode)) ? QuoteNode(x) : x
+
 # The primal IR's own declared type for operand `x` — taken directly from `pir`, so exact rather
 # than guessed; the fallback (`typeof(x)`) only covers genuine literal constants.
 _optype(pir, @nospecialize x) = isa(x, Core.SSAValue) ? pir.stmts[x.id][:type] :

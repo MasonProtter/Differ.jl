@@ -974,7 +974,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
     # `verify_ir`'s dominance check.
     function gref_operand!(gr::GlobalRef)
         ok, gv = gref_constval(gr)
-        return ok ? gv : emit!(gr, Any)
+        return ok ? _ir_literal(gv) : emit!(gr, Any)
     end
     # Declared type of what `gref_operand!` produces for `gr` (`Core.Typeof` of a `const` binding's
     # value; `Any` for a load).
@@ -1295,7 +1295,7 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                     # A zero even for a constant the static path below would mint `Inactive`: `ttup`
                     # is declared at the primal-derived tangent types.
                     P = _typeof(v)
-                    push!(pvals, v); push!(ptys, P)
+                    push!(pvals, _ir_literal(v)); push!(ptys, P)
                     push!(tvals, zt(v)); push!(ttys, tt(P))
                 end
             end
@@ -1339,10 +1339,10 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                 P = _typeof(v)
                 if const_inactive_type(P)
                     push!(dualtys, Dual{P,Inactive})
-                    push!(duals, dual!(P, Inactive, v, Inactive()))
+                    push!(duals, dual!(P, Inactive, _ir_literal(v), Inactive()))
                 else
                     push!(dualtys, Dual{P,tt(P)})
-                    push!(duals, dual!(P, tt(P), v, zt(v)))
+                    push!(duals, dual!(P, tt(P), _ir_literal(v), zt(v)))
                 end
             end
         end
