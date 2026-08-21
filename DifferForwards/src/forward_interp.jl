@@ -1646,11 +1646,13 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             pf = Any[vpresolve(a) for a in args]
             primal[i] = emit!(Expr(:new, T, pf...), Ti)
             TT = tt(Ti)
-            if T <: Dual
-                # `Dual` is its own tangent type: shadow is a same-typed `Dual` built via `%new`.
+            if T <: Dual && tt(T) === T
+                # `Dual` is its own tangent type here: shadow is a same-typed `Dual` built via `%new`.
                 # A non-differentiable field (tangent `NoTangent`, can't fill e.g. a `typeof(sin)` or
                 # `Int` slot) carries the primal value through unchanged instead — what lets a
-                # `Dual{typeof(sin),NoTangent}` be re-dualized at higher order.
+                # `Dual{typeof(sin),NoTangent}` be re-dualized at higher order. A `Dual` whose fields
+                # admit no same-typed shadow (`tt(T) !== T`) falls through to the general struct arm
+                # and gets an ordinary `Tangent`.
                 tf = Any[_nondiff_field(interp, edges, fieldtype(T, j)) ? vpresolve(args[j]) : tresolve(args[j])
                          for j in eachindex(args)]
                 # `_widen(Ti)`, not `Ti`: `Ti` is the *primal*'s statement type. If it's a

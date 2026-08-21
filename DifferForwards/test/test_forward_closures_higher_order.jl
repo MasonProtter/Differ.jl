@@ -256,6 +256,14 @@ end
     mkquad(a) = x -> a*(x*x)
     @test Dop(z -> Dop(mkquad(3.0), z), 1.7) ≈ 6.0
     @test Dop(z -> Dop(mkquad(-1.5), z), 0.3) ≈ -3.0     # d²/dx²[-1.5 x²] = -3
+
+    # A `Dual` whose primal is not its own tangent type. `hcat`'s comprehension builds a
+    # `Base.Generator` over a closure capturing the input vectors, so the inner pass wraps it in a
+    # `Dual{Generator,Tangent{…}}`; re-dualizing that `%new` must produce an ordinary `Tangent`, not
+    # a same-typed `Dual` (which would put a `Tangent` in the `Generator`-typed primal slot).
+    hc(x) = hcat(sin.([1.0, 2.0] .* x), sin.([3.0, 6.0] .* x))
+    @test Dop(z -> Dop(hc, z), 2.0) ≈ hcat(-[1.0, 4.0] .* sin.([1.0, 2.0] .* 2.0),
+                                           -[9.0, 36.0] .* sin.([3.0, 6.0] .* 2.0))
 end
 
 @testset "user function with a hand-written frule!! (world-age callee resolution)" begin

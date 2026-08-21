@@ -200,8 +200,11 @@ function apply_builtin_frule!(::Val{Core.getfield}, actual, Ti, ctx)
         m = ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), idx,
                            (ctx.presolve(a) for a in actual[3:end])...), memfield)
         memfield === TT ? m : ctx.opf(:bitcast, TT, TT, m)
-    elseif Pobj <: Dual || Pobj <: Tuple || Pobj <: NamedTuple || Pobj <: Array
+    elseif (Pobj <: Dual && ctx.tt(Pobj) === Pobj) || Pobj <: Tuple || Pobj <: NamedTuple ||
+           Pobj <: Array
         # Same-shape tangent (Dual/Tuple/NamedTuple/Array): index/name the shadow aggregate directly.
+        # A `Dual` only qualifies when it is its own tangent type; otherwise its shadow is an ordinary
+        # `Tangent` and the general-struct arm below reads the field out of the backing NamedTuple.
         ctx.emit!(Expr(:call, _getfieldg, ctx.tresolve(actual[1]), idx,
                        (ctx.presolve(a) for a in actual[3:end])...), TT)
     else

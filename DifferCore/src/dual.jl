@@ -173,38 +173,78 @@ function Base.getproperty(d::Dual, s::Symbol)
 end
 Base.propertynames(::Dual) = (:primal, :tangent, :x, :y, :z, :dx, :dy, :dz)
 
-# A `Dual` is its own tangent type: peeling one `Dual` level off a primal that is itself a `Dual`
-# must again produce a `Dual`, by definition, for higher-order nesting to work. Satisfies Mooncake's
-# invariant `Dual{P,T} ⟹ T == tangent_type(P)`. Unlike a general struct, a `Dual` keeps
-# same-typed-shadow semantics rather than stripping to a `Tangent`/`MutableTangent`.
-tangent_type(::Type{P}) where {P<:Dual} = P
+# A `Dual` is its own tangent type whenever both of its fields can live in a same-typed shadow:
+# peeling one `Dual` level off a primal that is itself a `Dual` must again produce a `Dual` for
+# higher-order nesting to work. A field qualifies when its tangent type is itself (the shadow slot
+# holds the tangent) or when it has no tangent space at all (the shadow slot carries the primal
+# through unchanged — what lets a `Dual{typeof(sin),NoTangent}` be re-dualized at higher order).
+#
+# A field that is neither — a closure with differentiable captures, whose tangent is a `Tangent` —
+# has no same-typed representation, so that `Dual` gets the ordinary two-field struct tangent
+# instead. Reached at order >= 2, where the outer pass dualizes inner-pass code that builds such a
+# `Dual`. Either way the result satisfies Mooncake's invariant `Dual{P,T} ⟹ T == tangent_type(P)`.
+@foldable _dual_selfsim_field(::Type{F}) where {F} = (T = tangent_type(F); T === F || T === NoTangent)
+
+@foldable function tangent_type(::Type{Dual{P,T}}) where {P,T}
+    isconcretetype(Dual{P,T}) || return Dual{P,T}
+    (_dual_selfsim_field(P) && _dual_selfsim_field(T)) && return Dual{P,T}
+    return Tangent{NamedTuple{(:primal, :tangent),Tuple{tangent_type(P),tangent_type(T)}}}
+end
+tangent_type(::Type{D}) where {D<:Dual} = D
+
+# A `Dual` can sit inside an ordinary tangent — DifferentiationInterface keeps an inner-pass `Dual`
+# in its prep object, which the outer pass meets as a code constant — so `fdata_type` is asked about
+# one (via `inactive_constant_type`) and must answer rather than aborting the whole compilation with
+# "Unhandled type". Every slot of a self-similar `Dual` holds either a tangent or a primal carried
+# through a `NoTangent` slot, the latter contributing no forward-pass storage.
+#
+# A `Dual` that does hold fdata has no answer: `FData`/`RData` are `Tangent`-shaped, so a split one
+# could not be told apart from a `Tangent` with the same two field names on the way back. It stays
+# loud, as does `rdata_type`, which is left undefined — a `Dual` has no usable reverse half.
+_dual_slot_fdata_type(::Type{F}) where {F} = tangent_type(F) === NoTangent ? NoFData : fdata_type(F)
+
+function fdata_type(::Type{Dual{P,T}}) where {P,T}
+    tangent_type(Dual{P,T}) === Dual{P,T} ||
+        error("Differ: `$(Dual{P,T})` is not a tangent type (its tangent is " *
+              "`$(tangent_type(Dual{P,T}))`), so it has no fdata.")
+    Fp = _dual_slot_fdata_type(P)
+    Ft = _dual_slot_fdata_type(T)
+    (Fp === NoFData && Ft === NoFData) && return NoFData
+    (Fp === Any || Ft === Any) && return Any        # abstract slot: unknown, as elsewhere
+    error("Differ: `$(Dual{P,T})` is a tangent holding fdata ($Fp, $Ft), which has no " *
+          "`FData`/`RData` split.")
+end
 
 # Type-level field accessors used by the dualization engine (replacing the old
 # `primal_type`/`tangent_type`-on-`Dual` accessors).
 _dual_primal_type(::Type{Dual{P,T}}) where {P,T} = P
 _dual_tangent_type(::Type{Dual{P,T}}) where {P,T} = T
 
-# Same-typed zero tangent for a `Dual` carrier: differentiable leaves are zeroed, non-differentiable
-# singletons pass through unchanged, so the result stays a value of the same tangent type
+# Same-typed zero tangent for a `Dual` carrier: differentiable leaves are zeroed, values with no
+# tangent space pass through unchanged, so the result stays a value of the same tangent type
 # `typeof(d)`. Rarely reached — Duals are built by the transform, not present as primal constants.
 _carrier_zero(x::IEEEFloat) = zero(x)
 _carrier_zero(::NoTangent) = NoTangent()
 _carrier_zero(::Inactive) = Inactive()
 _carrier_zero(x::Dual) = zero_tangent_internal(x, NoCache())
-# A non-self-tangent type (`tangent_type(X) !== X`, e.g. a struct/closure with a `Float64` field,
-# whose tangent is a `Tangent`) can't be represented in a `Dual`'s same-typed field — no same-typed
-# zero exists. Fundamental limit of the self-tangent `Dual` scheme; error clearly here (e.g. a
-# closure with differentiable captures under a nested `D` at order ≥2) rather than a cryptic `%new`
-# `TypeError` downstream.
+# A field with no tangent space carries its primal value through, matching what the same-typed
+# shadow `%new` does. Anything else has no same-typed zero, and only `_dual_selfsim_field` decides
+# which `Dual`s take this path at all, so reaching the error means those two disagree.
 _carrier_zero(x::X) where {X} =
-    Base.issingletontype(X) ? x :
-    tangent_type(X) === X    ? zero_tangent(x) :
-    error("Differ: cannot build a higher-order zero tangent for a `Dual` carrying a value of type ",
-          X, " (whose tangent type ", tangent_type(X), " differs from itself). The self-tangent ",
-          "`Dual` scheme used for higher-order forward mode requires each carried type to be its own ",
-          "tangent type — true for scalars and arrays, but not for a struct/closure with ",
-          "differentiable fields — so differentiating such a value at order ≥2 is unsupported.")
+    Base.issingletontype(X)       ? x :
+    tangent_type(X) === X         ? zero_tangent(x) :
+    tangent_type(X) === NoTangent ? x :
+    error("Differ: cannot build a same-typed zero tangent for a `Dual` carrying a value of type ",
+          X, " (whose tangent type ", tangent_type(X), " is neither itself nor `NoTangent`).")
 
-@generated function zero_tangent_internal(d::D, ::MaybeCache) where {D<:Dual}
-    return Expr(:new, :D, (:(_carrier_zero(getfield(d, $i))) for i in 1:fieldcount(D))...)
+@generated function zero_tangent_internal(d::D, c::MaybeCache) where {D<:Dual}
+    # The `tangent_type(D) === D` test stays in the emitted code, not the generator body: a
+    # generator's world is pinned, and this must see whatever `tangent_type` methods exist at the
+    # call site. It folds away during inference.
+    selfsim = Expr(:new, :D, (:(_carrier_zero(getfield(d, $i))) for i in 1:fieldcount(D))...)
+    return quote
+        tangent_type(D) === D && return $selfsim
+        return tangent_type(D)(backing_type(D)((zero_tangent_internal(getfield(d, 1), c),
+                                                zero_tangent_internal(getfield(d, 2), c))))
+    end
 end

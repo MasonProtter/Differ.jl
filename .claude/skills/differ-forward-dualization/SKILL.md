@@ -320,10 +320,16 @@ pir_arg_offset=offset`. Two shapes reach it:
 `pir_arg_offset` only affects the **vararg argument-reconstruction prologue**: the tuple index reads
 `getfield(Argument(2), j+offset)` (skipping the offset function slots in the outer carrier's vararg
 tuple) while the reconstructed inner tuple is offset-free and must equal `pir.argtypes[2]` (asserted).
-The rest of the engine is offset-agnostic. **Limit:** a `Dual` carrying a struct/closure with
-differentiable fields has no same-typed zero tangent (the self-tangent scheme needs `tangent_type(P)
-=== P`), so composing `D` over such a value at order ≥2 errors clearly in `_carrier_zero`
-(`DifferForwards/src/dual.jl`) rather than miscompiling.
+The rest of the engine is offset-agnostic.
+
+A `Dual` is its own tangent type only when both its fields can live in a same-typed shadow: each
+field's tangent type is either itself or `NoTangent` (the slot then carries the primal through).
+`tangent_type(::Type{Dual{P,T}})` (`DifferCore/src/dual.jl`) tests that with `_dual_selfsim_field`;
+a `Dual` carrying a struct/closure with differentiable fields fails it and gets the ordinary
+two-field `Tangent{@NamedTuple{primal, tangent}}` instead. Consumers that mirror a `Dual` shadow
+field-by-field must check the same thing before doing so — the `%new` arm of `dualize_to_ircode`
+guards on `tt(T) === T`, `getfield`'s same-shape branch on `ctx.tt(Pobj) === Pobj` — or they emit a
+`%new` that `TypeError`s at run time on a `Tangent` in a primal-typed slot.
 
 ## Known `Core.Compiler.verify_ir` gotchas (cost real debugging time — read before you hit them again)
 
