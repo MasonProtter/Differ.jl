@@ -574,6 +574,15 @@ function _each_operand(f, @nospecialize s)
     return nothing
 end
 
+# Whether a call with a `Core.Const` result can skip the callee's rule for the shadow. A pinned
+# result says nothing about what the call writes through its arguments, so this needs the statement
+# to be effect-free, or no operand to carry a shadow the callee could reach.
+function _const_result_shadow_free(flag::UInt32, s::Expr, op_active)
+    CC.has_flag(flag, CC.IR_FLAG_EFFECT_FREE) && return true
+    fpos, actual = _call_parts(s)
+    return !op_active(fpos) && !any(op_active, actual)
+end
+
 # Shadow built out of its operands' shadows rather than computed fresh, so a `zero_shadow` can't
 # stand in when materialised (a `PhiNode` must lead its block): materialise the operands instead.
 _act_phi_like(@nospecialize s) =
@@ -1586,7 +1595,8 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                                 emit!(Core.UpsilonNode(), Ti)
             end
             shadow[i] = inactive_shadow(Ti, primal[i])
-        elseif isa(Ti, Core.Const) && isa(s, Expr) && (s.head === :call || s.head === :invoke)
+        elseif isa(Ti, Core.Const) && isa(s, Expr) && (s.head === :call || s.head === :invoke) &&
+              _const_result_shadow_free(pstmts[i][:flag], s, op_active)
             # Const-prop proved this call's result is always exactly this literal, so its derivative
             # is definitionally zero regardless of the callee. (Only `Core.Const` licenses this — a
             # `PartialStruct` narrows some fields but doesn't pin the whole value.) Still reconstruct

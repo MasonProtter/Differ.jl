@@ -149,3 +149,20 @@ _pairfirst(x) = _mkpair(x)[1] * 2
     @test primal(d) ≈ 6.0
     @test tangent(d) ≈ 2.0
 end
+
+# Returns a pinned literal but mutates an active array: the shadow store must still happen.
+@noinline function _const_zero!(v::Vector{Float64})
+    @inbounds v[1] = 0.0
+    return 0.0
+end
+_const_zero_use(v) = _const_zero!(v) + @inbounds(v[1]) + @inbounds(v[2])
+
+@testset "Core.Const-narrowed call that writes an active operand" begin
+    ir, rt = code_dual_ircode(_const_zero_use, (Vector{Float64},))
+    Core.Compiler.verify_ir(ir)
+    v, dv = [3.0, 5.0], [1.0, 10.0]
+    d = frule!!(Dual(_const_zero_use, NoTangent()), Dual(v, dv))
+    @test primal(d) ≈ 5.0
+    @test dv[1] == 0.0
+    @test tangent(d) ≈ 10.0
+end
