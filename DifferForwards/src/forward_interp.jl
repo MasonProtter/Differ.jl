@@ -655,8 +655,8 @@ function _activity(pir, iworld::UInt, tt, ft, nslots::Int, arg_active::BitVector
             # gates the alias/merge/`%new` arms and never a call: a generic call routinely returns
             # `Nothing` while writing through an argument (`Base._growend_internal!`, `copyto!`).
             # Reverse mode also exempts a rule-less `Core.Builtin`/intrinsic; forward mode must not —
-            # such a bail is how `push!` (`Core.memoryrefoffset`) is refused, and replaying it
-            # primally walks on into code the transform cannot handle.
+            # such a bail is how splatting a runtime-length container (`Core._apply_iterate`) is
+            # refused, and replaying it primally walks on into code the transform cannot handle.
             notan = tt(stmts[i][:type]) === NoTangent
             # `Union{} <: Ptr` is true, so excluding it keeps `throw`-typed statements from becoming
             # activity roots and dragging their operands into materialisation.
@@ -1752,16 +1752,16 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
             elseif isa(f, Core.Builtin)
                 # Dispatch straight to a per-builtin rule (`apply_builtin_frule!` in
                 # `src/builtins.jl`), mirroring the intrinsic dispatch above. Unregistered builtin
-                # (e.g. `Core.memoryrefoffset`, or a non-bits/undef-checked element access) bails
+                # (e.g. `Core._apply_iterate`, or a non-bits/undef-checked element access) bails
                 # gracefully with a located reason.
                 why = reason[]
                 res = apply_builtin_frule!(Val(f), actual, Ti, builtin_ctx)
                 if res === nothing
                     # As with intrinsics above, a registered rule that declines records its own reason.
                     reason[] = reason[] === why ?
-                        "no dualization rule for builtin `$f` (e.g. `Core.memoryrefoffset` used " *
-                        "by `push!`/`resize!`, or a non-bits/undef-checked array element " *
-                        "access) at %$i: `$(_stmt_str(s))`" :
+                        "no dualization rule for builtin `$f` (e.g. `Core._apply_iterate`, left " *
+                        "behind by splatting a runtime-length container, or a non-bits/" *
+                        "undef-checked array element access) at %$i: `$(_stmt_str(s))`" :
                         "$(reason[]) at %$i: `$(_stmt_str(s))`"
                     return nothing
                 end

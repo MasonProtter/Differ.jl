@@ -7,6 +7,7 @@ using SafeTestsets
 @safetestset "reverse: implied-merge predecessor recovery" begin include("test_reverse_implied_merges.jl") end
 @safetestset "reverse: dispatch & recursion" begin include("test_reverse_dispatch_recursion.jl") end
 @safetestset "reverse: arrays" begin include("test_reverse_arrays.jl") end
+@safetestset "reverse: growable arrays" begin include("test_reverse_growable.jl") end
 @safetestset "reverse: `.`-broadcast" begin include("test_reverse_broadcast.jl") end
 @safetestset "reverse: mutation & aliasing" begin include("test_reverse_mutation_aliasing.jl") end
 @safetestset "reverse: tuples" begin include("test_reverse_tuples.jl") end

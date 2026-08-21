@@ -69,6 +69,7 @@ include("rules_math.jl")
 include("rules_reductions.jl")
 include("rules_broadcast.jl")
 include("rules_indexing.jl")
+include("rules_growable.jl")
 include("rules_linalg.jl")
 include("reflection.jl")
 

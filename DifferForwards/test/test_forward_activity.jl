@@ -21,10 +21,12 @@ sxy(x, y) = x*y + sin(x)
 sxyz(x, y, z) = x*y + y*z + sin(x*z)
 loopdot(v, w) = (s = 0.0; for i in eachindex(v, w); s += v[i]*w[i]; end; s)
 nested_dot(v, w) = dot(v, w)
-# Growing an array (`Core.memoryrefoffset`) is a construct forward mode cannot dualize at all — the
-# canonical bail. Written inline so it lands in `tagged`'s own IR: behind an `@noinline` call the
-# bail would surface at run time from the callee's own carrier instead of at `code_dual_ircode`.
-tagged(x, v) = x * 2.0 + (push!(v, 1.0); v[1])
+# Splatting a runtime-length container (`Core._apply_iterate`) is a construct forward mode cannot
+# dualize at all — the canonical bail. Written inline so it lands in `tagged`'s own IR: behind an
+# `@noinline` call the bail would surface at run time from the callee's own carrier instead of at
+# `code_dual_ircode`. The `push!` alongside it is supported, and is what the replay assertion below
+# observes.
+tagged(x, v) = x * 2.0 + (push!(v, 1.0); max(v...))
 vtail(x, ys...) = x * ys[1] + ys[2]
 loopdots(v, w, n) = (s = 0.0; for _ in 1:n; s += dot(v, w); end; s)
 mapsin(v, w) = sum(map((a, b) -> a * sin(b), v, w))
@@ -145,7 +147,7 @@ end
     # it is replayed primally and never reaches `frule_split!`.
     r_active = bail_reason(tagged, (Float64, Vector{Float64}))
     @test r_active !== nothing
-    @test occursin("memoryrefoffset", r_active)
+    @test occursin("_apply_iterate", r_active)
     @test bail_reason(tagged, (Float64, Vector{Float64}); inactive=(2,)) === nothing
 
     v = [4.0]

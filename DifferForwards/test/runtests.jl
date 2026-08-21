@@ -3,6 +3,7 @@ using SafeTestsets
 @safetestset "forward: scalar" begin include("test_forward_scalar.jl") end
 @safetestset "forward: control flow" begin include("test_forward_control_flow.jl") end
 @safetestset "forward: arrays" begin include("test_forward_arrays.jl") end
+@safetestset "forward: growable arrays" begin include("test_forward_growable.jl") end
 @safetestset "forward: pointers & GC.@preserve" begin include("test_forward_pointers.jl") end
 @safetestset "forward: foreigncall (ccall)" begin include("test_forward_foreigncall.jl") end
 @safetestset "forward: dispatch" begin include("test_forward_dispatch.jl") end

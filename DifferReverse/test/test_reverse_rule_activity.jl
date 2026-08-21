@@ -62,6 +62,16 @@ const FIXTURES = Fixture[
     # rules_indexing.jl
     Fixture("getindex(A,mask)", getindex, () -> (copy(V), copy(MASK))),
     Fixture("getindex(A,idx)", getindex, () -> (copy(V), copy(IDX))),
+    # rules_growable.jl — structure-only mutation, so an inactive array shadow is a legal no-op
+    # rather than a refusal: no `dest` slot. `sizehint!` returns the array, so a constant one has its
+    # zero tangent materialised rather than refused — there are no sources a fresh zero could discard.
+    Fixture("_growend!", Base._growend!, () -> (copy(V), 2)),
+    Fixture("_growbeg!", Base._growbeg!, () -> (copy(V), 2)),
+    Fixture("_growat!", Base._growat!, () -> (copy(V), 2, 1)),
+    Fixture("_deleteend!", Base._deleteend!, () -> (copy(V), 1)),
+    Fixture("_deletebeg!", Base._deletebeg!, () -> (copy(V), 1)),
+    Fixture("_deleteat!", Base._deleteat!, () -> (copy(V), 2, 1)),
+    Fixture("sizehint!", sizehint!, () -> (copy(V), 8)),
     # rules_linalg.jl
     Fixture("dot", dot, () -> (copy(V), copy(W))),
     Fixture("norm", norm, () -> (copy(V),)),

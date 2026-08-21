@@ -606,6 +606,15 @@ function builtin_rrule_comms(::Val{Core.setfield!}, actual, Ti, ctx)
                        "%$(ctx.ssa.id)"
         return false
     end
+    if P <: Array
+        # An `Array`'s shadow is a same-shape array, not a `MutableTangent`, so there is no tangent
+        # field to save and restore. Growable mutation goes through Base's growth helpers, which
+        # have hand rules; anything resizing an array outside them is out of scope.
+        ctx.reason[] = "reverse mode `setfield!` on an `Array`'s own fields is not supported — a " *
+                       "vector that resizes outside Base's growth helpers has no shadow field to " *
+                       "mirror onto, at %$(ctx.ssa.id)"
+        return false
+    end
     if !_bi_literal_index(actual[2])
         # Dynamic (non-literal) write index unsupported: unlike a read, `set_tangent_field!` needs a
         # statically-known field to place the new value into the right slot type, and this file's
