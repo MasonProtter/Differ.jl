@@ -1,6 +1,7 @@
 using Test
 using DifferReverse
-using DifferReverse: rev_gradient
+using DifferReverse: rev_gradient, Ctx
+using DifferForwards: AutoDifferForwards
 using LinearAlgebra: Diagonal
 import DifferentiationInterface as DI
 
@@ -117,4 +118,31 @@ end
         xm = copy(x); xm[k] -= 1e-6
         @test dx[k] ≈ (arr_to_num_linalg_literal(xp) - arr_to_num_linalg_literal(xm)) / 2e-6 rtol = 1e-4
     end
+end
+
+@testset "DI reverse: a Constant context still gets a preallocated tape" begin
+    # The context's activity has to reach `build_ctx` as a type parameter. Stating it through the
+    # argument coduals does that; the old `inactive=`-position spelling built its position tuple
+    # with `Tuple(::Generator)`, which neither const-folds (so the tape fell back to `Ctx{Nothing}`,
+    # reallocating every call) nor optimizes away (its `Core._apply_iterate` is a construct forward
+    # mode refuses, which broke forward-over-reverse through DI preparation).
+    f(x, a) = a * sin(x)
+    x, a = 0.7, 2.5
+
+    prep = DI.prepare_pullback(f, AutoDifferReverse(), x, (1.0,), DI.Constant(a))
+    @test prep.ctx isa Ctx{<:DifferReverse.Tape}
+    @test isconcretetype(Base.infer_return_type(
+        DI.prepare_pullback_nokwarg,
+        (Val{true}, typeof(f), AutoDifferReverse, Float64, Tuple{Float64}, DI.Constant{Float64})))
+
+    y, (dx,) = DI.value_and_pullback(f, prep, AutoDifferReverse(), x, (1.0,), DI.Constant(a))
+    @test y ≈ f(x, a)
+    @test dx ≈ a * cos(x)
+end
+
+@testset "DI: forward-over-reverse second derivative with a Constant context" begin
+    f(x, a) = a * sin(x)
+    x, a = 0.7, 2.5
+    backend = DI.SecondOrder(AutoDifferForwards(), AutoDifferReverse())
+    @test DI.second_derivative(f, backend, x, DI.Constant(a)) ≈ -a * sin(x)
 end

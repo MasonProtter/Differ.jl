@@ -231,6 +231,12 @@ increment_field_rdata!(dx::MutableTangent, ::Inactive, ::Int) = dx
 increment_field_rdata!(::Inactive, @nospecialize(_), ::Val) = Inactive()
 increment_field_rdata!(::Inactive, @nospecialize(_), ::Int) = Inactive()
 
+# `tangent_type(Inactive) === Inactive`, so an inactive slot's zero is itself. Without this the
+# generic per-field fallback in `tangents.jl` reaches `Inactive(NamedTuple())`, which has no
+# method. Reached whenever a carrier with a constant slot needs a runtime zero tangent — a
+# `CoDual{P,Inactive}` argument to a reverse carrier under forward-over-reverse.
+zero_tangent_internal(::Inactive, ::MaybeCache) = Inactive()
+
 set_to_zero_internal!!(::SetToZeroCache, ::Inactive) = Inactive()
 
 instantiate(::Inactive) = Inactive()
@@ -248,3 +254,4 @@ _dot_internal(::MaybeCache, ::Inactive, @nospecialize(_)) = 0.0
 _dot_internal(::MaybeCache, @nospecialize(_), ::Inactive) = 0.0
 _dot_internal(::MaybeCache, ::Inactive, ::Inactive) = 0.0
 _add_to_primal_internal(::MaybeCache, x, ::Inactive, ::Bool) = x
+randn_tangent_internal(::AbstractRNG, ::Inactive, ::MaybeCache) = Inactive()
