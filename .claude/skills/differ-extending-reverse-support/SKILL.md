@@ -189,6 +189,26 @@ Combined with reverse mode's `Expr(:loopinfo)` support (below), this is what mak
 `sum(abs2, v)`, and `sum(transpose(M))` all compose through the generic path, including past
 `Base.pairwise_blocksize`'s self-recursive split.
 
+**Callees with differentiable captures** (a closure calling a closure — ISSUES #134, 2026-08-22).
+`_static_recursible_call` used to reject any callee whose `tangent_type` wasn't `NoTangent`. It now
+admits one on exactly the terms an fdata-carrying *argument* already gets: the fdata threads through
+as the caller's real shadow (provenance traceable to a function argument, same check, same reason),
+and the callee's own rdata — slot 1 of the inner rdatas tuple, previously asserted `NoRData` and
+discarded — routes to the callee operand via `route!` like any argument's. A captured scalar
+therefore works, provided the operand has a sink to route to; if it hasn't, the call still bails.
+This is what unblocked `Threads.@threads`, whose worker is exactly this shape (a default/keyword
+argument splits `threadsfor_fun` into a wrapper holding a body function holding the loop's captures),
+but it is a general gain, not a threading-specific one.
+
+**Four sites have to agree on the callee's carrier type**, and this is the trap: the comms scan
+(`_scan_block_comms`), `reverse_fwds_recursive_ci`'s three signatures (`tt`, `tt_self`, `tt2`, plus
+the one `hand_reverse_rule_match` builds), and the fwds emission site. All now take the type
+`_static_recursible_call` returns as its fifth element. A scan/emission mismatch does not fail
+`verify_ir` — it surfaces much later as an `UndefRefError` out of `sresolve`, because the callee's
+build was resolved with `NoFData` and so never populated `farg` for the slot the getfield chain then
+reads. Same lesson as ISSUES #52's two-sided push/pop: if you change what one side declares about a
+recursive edge, change every side in the same pass.
+
 A hand-written `rrule!!` (`src/rrules.jl`) always takes priority over raw recursion into a callee,
 mirroring `frules.jl`'s treatment of `frule!!` — check `hand_reverse_rule_match` before assuming a
 call needs the recursion path at all.
@@ -206,6 +226,28 @@ it covers mutual recursion too, not just self-recursion — precisely because `D
 never needs a closed-form-type trick: it doesn't grow with recursion depth, so there's no fixed point
 to solve. That asymmetry is inherent to the two designs (a `Tape`'s type genuinely depends on which
 primal it's for), not a gap reverse mode is expected to close the same way.
+
+## Threading (`Threads.@threads`, 2026-08-22)
+
+Supported, via a hand `rrule!!` on `Base.Threads.threading_run` (`src/rules_threads.jl`) rather than
+any engine change: a `@threads` loop leaves exactly one non-inlined `invoke` in optimized IR, with the
+whole body inside its closure argument, so ruling that call runs the scheduler as primal code and
+differentiates only the worker. One `Ctx` per worker (a `Tape`'s stacks are unguarded
+read-modify-writes), and the workers' pullbacks replayed **sequentially** in reverse worker order —
+the pullback read-modify-writes shadow slots and restores saved primal values, so a shared *read* in
+the primal is a shared *write* in reverse and a parallel replay would race even on a race-free
+primal. Sequential replay is order-insensitive (rdata comes back by value and folds with
+`increment!!`; fdata lands in per-worker-disjoint slots), which is what makes it sound.
+
+The contract, which nothing checks and nothing can: the parallel region's result must not depend on
+how the workers interleave. Each worker's pullback replays that worker's operations in that worker's
+own reverse order; the cross-worker interleaving is never recorded. A lock-protected
+*non-commutative* shared update gets a wrong gradient from a primal that runs fine.
+
+`Threads.@spawn`/`@async`/`@sync`, bare `Task`/`fetch`, `@threads :greedy` and `Threads.Atomic`
+remain unsupported. See ISSUES' "`Threads.@threads` support, both modes" entry for the full picture,
+including the `threadpoolsize`→`cglobal` trap that only appears once the worker body itself is
+transformed.
 
 ## Three explicitly-deferred gaps
 

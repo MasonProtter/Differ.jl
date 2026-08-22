@@ -174,17 +174,23 @@ element read/write and mutation, growable vectors (`push!`/`pop!`/`insert!`/`del
 via hand rules on Base's growth helpers — `rules_growable.jl`), mutable-struct field mutation,
 array allocation, tuples/closures
 (differentiate w.r.t. captures), `GC.@preserve` + raw pointer arithmetic, `Expr(:foreigncall)`
-(`ccall`, registered per-target — `memmove`/`memcpy` today) + `Expr(:loopinfo)` (`@simd`), dynamic
+(`ccall`, registered per-target — `memmove`/`memcpy`/`jl_in_threaded_region` today) +
+`Expr(:loopinfo)` (`@simd`), dynamic
 dispatch (via a runtime `dynamic_frule` dispatcher), higher-order differentiation (both hand-nested
-`Dual` seeds and composed `D`-of-`D`), and both self- and mutual recursion. See
+`Dual` seeds and composed `D`-of-`D`), both self- and mutual recursion, and `Threads.@threads`
+(`rules_threads.jl` — dualized IR carries no per-call state, so one `Dual` closure runs on every
+worker at once). See
 `differ-forward-dualization` for the engine and `differ-extending-ir-support` for exactly what's
 still unsupported and how to close a gap.
 
 **Reverse mode** (`DifferReverse`) supports: the same core (branches/loops, array indexing/mutation
 via a shadow-chain comms scheme, growable vectors through the same hand rules as forward mode,
-mutable-struct field mutation, `Core.tuple`, `Core.ifelse`, `@simd`/`:loopinfo`), direct self-recursion (closed-form `Tape` type) and argument-position callees,
+mutable-struct field mutation, `Core.tuple`, `Core.ifelse`, `@simd`/`:loopinfo`), direct
+self-recursion (closed-form `Tape` type), argument-position callees, callees with differentiable
+captures (a closure calling a closure), and `Threads.@threads` (`rules_threads.jl` — one `Tape` per
+worker, pullbacks replayed sequentially in reverse worker order),
 but not yet: mutual recursion, dynamic dispatch (no `dynamic_rrule` equivalent), vararg primal
-methods, or `Core.Box`/abstract-field `setfield!`. See `differ-reverse-engine` for the engine and
+methods, `Core.Box`/abstract-field `setfield!`, or `Threads.@spawn`/`@async`/`@sync`/bare `Task`. See `differ-reverse-engine` for the engine and
 `differ-extending-reverse-support` for the exact gap list.
 
 **Known limitations, documented in `ISSUES.md`, not being actively chased right now:**

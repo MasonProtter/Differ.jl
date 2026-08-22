@@ -260,6 +260,24 @@ Tests: `DifferForwards/test/test_forward_foreigncall.jl` (47). Result: unmodifie
 dualizes — single array, array-with-scalar, and two-array broadcast `x .* y` and fused chains, with
 no further construct needed.
 
+## Threading (`Threads.@threads`, 2026-08-22)
+
+Supported by a hand `frule!!` on `Base.Threads.threading_run` (`src/rules_threads.jl`), no engine
+change: a `@threads` loop leaves exactly one non-inlined `invoke` in optimized IR with the whole body
+inside its closure argument, so ruling that call runs the scheduler as primal code and dualizes only
+the worker. Forward mode needs no per-worker state at all — dualized IR is an ordinary
+`CodeInstance` with no per-call state, so one `Dual` closure is safely invoked from every worker at
+once. (Mooncake copies its rule per thread; there is nothing here to copy.)
+
+Two traps worth knowing. `Threads.threadpoolsize()` is called from *inside* every worker body
+(`default_func`'s `divrem(lenr, threadpoolsize())`) and inlines to
+`cglobal(:jl_n_threads_per_pool, Ptr{Cint})` — an unregistered *intrinsic*, not a foreigncall, and it
+only appears once the worker body itself is dualized, so ruling `threading_run` alone is not enough.
+And `@threads :static` emits a bare `ccall(:jl_in_threaded_region, Cint, ())` in the *enclosing*
+function, out of reach of any Julia-level rule; it is registered as an inactive foreigncall in
+`foreigncalls.jl`. `Threads.@spawn`/`@async`/`@sync`, bare `Task`/`fetch`, `@threads :greedy` and
+`Threads.Atomic` remain unsupported. See ISSUES' "`Threads.@threads` support, both modes" entry.
+
 ## Remaining gaps (forward mode)
 
 Non-bits/undef-checked array element access (`Vector{Any}`/`Vector{String}`), `splice!` (its

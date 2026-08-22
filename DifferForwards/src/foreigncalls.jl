@@ -28,6 +28,16 @@
 
 apply_foreigncall_frule!(::Val{F}, fc, Ti, ctx) where {F} = nothing
 
+# `@threads :static` emits a bare `ccall(:jl_in_threaded_region, Cint, ())` in the *enclosing*
+# function, where no `frule!!` on a Julia-level function can reach it. It reads a scheduler flag,
+# takes no operands and writes through no pointer, so the primal alone plus a zero shadow is exact —
+# the reason the blanket bail exists (native code writing through a handed-over pointer) doesn't
+# apply to a nullary query.
+function apply_foreigncall_frule!(::Val{:jl_in_threaded_region}, fc, Ti, ctx)
+    p = ctx.emit!(_fc_stmt(fc, (), map(ctx.presolve, fc.roots)), Ti)
+    return p, ctx.zero_shadow(Ti, p)
+end
+
 for op in (:memmove, :memcpy)
     @eval function apply_foreigncall_frule!(::Val{$(QuoteNode(op))}, fc, Ti, ctx)
         what = $(string(op))

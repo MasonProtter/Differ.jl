@@ -50,6 +50,18 @@ Reverse(; nested_forward::Bool=false) = Reverse(nested_forward)
 # up why a cached carrier bailed without re-running the transform.
 const REVERSE_BAIL_REASONS = IdDict{MethodInstance,String}()
 
+# `IdDict` mutation is not atomic, and a build can start inside a worker task (a `Threads.@threads`
+# region whose loop body has not been differentiated before), so concurrent first-call compilation
+# can reach this table from two tasks at once. A lock rather than task-local storage: a reason is
+# written by the build that bailed and read later by a *different* call that recursed into it, so the
+# two ends are not on one task the way `cfg_ir.jl`'s `ID` counter is.
+const REVERSE_BAIL_REASONS_LOCK = ReentrantLock()
+
+record_bail_reason!(table, mi::MethodInstance, msg::String) =
+    @lock REVERSE_BAIL_REASONS_LOCK (table[mi] = msg)
+lookup_bail_reason(table, mi::MethodInstance) =
+    @lock REVERSE_BAIL_REASONS_LOCK get(table, mi, nothing)
+
 function build_reverse_interp(; world::UInt=Base.get_world_counter(),
                               inf_params::CC.InferenceParams=CC.InferenceParams(),
                               opt_params::CC.OptimizationParams=CC.OptimizationParams(),
@@ -71,6 +83,7 @@ include("rules_broadcast.jl")
 include("rules_indexing.jl")
 include("rules_growable.jl")
 include("rules_linalg.jl")
+include("rules_threads.jl")
 include("reflection.jl")
 
 """

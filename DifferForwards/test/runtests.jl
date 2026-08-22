@@ -19,5 +19,6 @@ using SafeTestsets
 @safetestset "rules: indexing" begin include("test_indexing_rules.jl") end
 @safetestset "rules: linalg" begin include("test_linalg_rules.jl") end
 @safetestset "rules: special functions" begin include("test_specialfunctions_rules.jl") end
+@safetestset "forward: threads" begin include("test_forward_threads.jl") end
 @safetestset "rules: activity audit" begin include("test_forward_rule_activity.jl") end
 # @safetestset "DifferentiationInterface.jl integration" begin include("test_differentiation_interface.jl") end

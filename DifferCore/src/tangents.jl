@@ -396,6 +396,20 @@ tangent_type(::Type{<:IOStream}) = NoTangent
 
 tangent_type(::Type{<:Base.LibuvStream}) = NoTangent
 
+# A `Task`'s own fields are scheduler infrastructure — the wait queue, the thread id, the RNG
+# state. What a task computes reaches AD through its closure's captures and through the value it
+# returns, both of which are tangent-carrying in their own right. Without this the generic
+# derivation walks `next`/`queue`/`donenotify` into the whole scheduler object graph, and drags
+# `ReentrantLock`/`Base.Event`/`Base.Semaphore`/`GenericCondition` along with it.
+tangent_type(::Type{Task}) = NoTangent
+
+# Every `ReentrantLock` field is non-differentiable once `Task` is (`locked_by`, the counters,
+# the `GenericCondition` wait queue, and a padding tuple). The generic derivation still can't
+# collapse it to `NoTangent`, because the padding field is possibly-uninitialised and so derives
+# a `PossiblyUninitTangent` wrapper — which then makes constructing one inside a differentiated
+# function a partially-initialised `%new` neither engine will transform.
+tangent_type(::Type{ReentrantLock}) = NoTangent
+
 tangent_type(::Type{<:Base.CoreLogging.AbstractLogger}) = NoTangent
 
 tangent_type(::Type{Core.CodeInstance}) = NoTangent
