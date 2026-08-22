@@ -275,8 +275,27 @@ Two traps worth knowing. `Threads.threadpoolsize()` is called from *inside* ever
 only appears once the worker body itself is dualized, so ruling `threading_run` alone is not enough.
 And `@threads :static` emits a bare `ccall(:jl_in_threaded_region, Cint, ())` in the *enclosing*
 function, out of reach of any Julia-level rule; it is registered as an inactive foreigncall in
-`foreigncalls.jl`. `Threads.@spawn`/`@async`/`@sync`, bare `Task`/`fetch`, `@threads :greedy` and
-`Threads.Atomic` remain unsupported. See ISSUES' "`Threads.@threads` support, both modes" entry.
+`foreigncalls.jl` (as is `jl_set_task_tid`, `@spawnat`'s pinning call).
+
+## Tasks (`Threads.@spawn`/`@async`/`@sync`/`Task`/`fetch`, 2026-08-22)
+
+`@spawn` expands *inline* — `Task(thunk)`, `task.sticky = false`, `_spawn_set_thrpool`, an
+optional `put!` into `@sync`'s channel, `schedule` — so `Task` itself is the interception point
+(the rule is also what keeps `jl_new_task` out of dualized IR). Hand rules in `rules_threads.jl`
+for `Task`/`schedule`/`wait`/`fetch`/`istask*`/`_spawn_set_thrpool`/`yield`/`current_task` and
+`@sync`'s `Channel`/`put!`/`take!`/`sync_end` (a `Channel` has no tangent space; moving a
+differentiable value through one is refused loudly). The spawned thunk runs dualized; its `Dual`
+result is parked in the task's own task-local storage and the task's *primal* result is the
+primal half, so by-value `fetch` transports the tangent and an escaped task still fetches an
+ordinary value. Engine changes this needed: the inactive-`%new` replay renumbers a
+runtime-computed type operand (kwargs `NamedTuple`s) instead of embedding it raw, and a
+`Core.typeassert` builtin rule narrows the shadow with the asserted primal (`fetch(t)::Float64`).
+(An effect-bit activity shortcut was tried alongside and reverted — it silently zeroed
+forward-over-reverse Hessians; see the ISSUES entry.) OhMyThreads works
+downstream through StableTasks with **no extension** (`test_forward_ohmythreads.jl`); its
+`tmap`/`tmap!` still bail on a heterogeneous-capture dynamic `getfield`, and `StaticScheduler` on
+the `@warn` logging (`invokelatest`) in StableTasks' pinning retry loop. `@threads :greedy` and
+`Threads.Atomic` remain unsupported. See ISSUES' two threading entries.
 
 ## Remaining gaps (forward mode)
 

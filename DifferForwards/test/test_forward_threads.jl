@@ -248,4 +248,88 @@ end
     @test tangent_type(Task) === NoTangent
     @test tangent_type(ReentrantLock) === NoTangent
     @test tangent_type(Base.Threads.SpinLock) === NoTangent
+    @test tangent_type(Channel{Any}) === NoTangent
+end
+
+# --- `Threads.@spawn` / `@async` / `@sync` / bare `Task` + `fetch` ------------------------------
+#
+# The spawned thunk runs dualized; its `Dual` result is parked in the task's own storage and
+# `fetch`'s rule hands it back, so a value fetched by value carries its tangent. Effects through
+# captures (a `Ref`/array written inside the task) flow through the shared shadow as in any other
+# mutation. The interleaving contract is `@threads`'s: the region's result may not depend on how
+# the task interleaves with the code between spawn and join.
+
+function spawn_fetch_value(x)
+    t = Threads.@spawn sum(abs2, x)
+    return 2.0 * (fetch(t)::Float64)
+end
+
+function spawn_ref_out(x)
+    out = Ref(0.0)
+    t = Threads.@spawn begin
+        out[] = sum(abs2, x)
+        nothing
+    end
+    wait(t)
+    return out[]
+end
+
+function sync_two_spawns(x)
+    y = zeros(2)
+    Base.@sync begin
+        Threads.@spawn (y[1] = 2.0 * x[1]; nothing)
+        Threads.@spawn (y[2] = 3.0 * x[2]; nothing)
+    end
+    return y[1] + y[2]
+end
+
+function async_fetch(x)
+    t = @async sum(abs2, x)
+    return fetch(t)::Float64
+end
+
+@testset "spawn/fetch value transport" begin
+    x = collect(1.0:3.0)
+    d = frule!!(zero_dual(spawn_fetch_value), Dual(copy(x), [1.0, 0.0, 0.0]))
+    @test primal(d) ≈ 2.0 * sum(abs2, x)
+    @test tangent(d) ≈ 2.0 * 2.0 * x[1]
+end
+
+@testset "spawn with a captured Ref" begin
+    x = collect(1.0:3.0)
+    d = frule!!(zero_dual(spawn_ref_out), Dual(copy(x), [1.0, 0.0, 0.0]))
+    @test primal(d) ≈ sum(abs2, x)
+    @test tangent(d) ≈ 2.0 * x[1]
+end
+
+@testset "@sync with two spawns" begin
+    x = collect(1.0:3.0)
+    d = frule!!(zero_dual(sync_two_spawns), Dual(copy(x), ones(3)))
+    @test primal(d) ≈ 2.0 * x[1] + 3.0 * x[2]
+    @test tangent(d) ≈ 5.0
+end
+
+@testset "@async" begin
+    x = collect(1.0:3.0)
+    d = frule!!(zero_dual(async_fetch), Dual(copy(x), ones(3)))
+    @test tangent(d) ≈ sum(2.0 .* x)
+end
+
+@testset "fetch of a foreign task with a differentiable result is refused" begin
+    # A task created outside the differentiated region has no recorded `Dual`; handing back its
+    # `Float64` as a constant would silently drop the derivative.
+    t = Task(() -> 1.0)
+    schedule(t); wait(t)
+    fetch_foreign(tk) = 2.0 * (fetch(tk)::Float64)
+    @test_throws ErrorException frule!!(zero_dual(fetch_foreign), Dual(t, NoTangent()))
+    # A non-differentiable result from the same shape is fine.
+    t2 = Task(() -> 41); schedule(t2); wait(t2)
+    fetch_int(tk) = fetch(tk)::Int + 1
+    d = frule!!(zero_dual(fetch_int), Dual(t2, NoTangent()))
+    @test primal(d) === 42
+end
+
+@testset "put! of a differentiable value is refused" begin
+    putfloat(x) = (c = Channel(2); put!(c, x); take!(c))
+    @test_throws ErrorException frule!!(zero_dual(putfloat), Dual(1.0, 1.0))
 end

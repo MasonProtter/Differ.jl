@@ -24,4 +24,5 @@ using SafeTestsets
 @safetestset "rules: linalg" begin include("test_linalg_rules.jl") end
 @safetestset "rules: special functions" begin include("test_specialfunctions_rules.jl") end
 @safetestset "reverse: threads" begin include("test_reverse_threads.jl") end
+@safetestset "reverse: OhMyThreads" begin include("test_reverse_ohmythreads.jl") end
 @safetestset "DifferentiationInterface.jl integration" begin include("test_differentiation_interface.jl") end

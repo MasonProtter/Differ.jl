@@ -34,6 +34,23 @@ apply_foreigncall_rrule_fwds!(::Val{:jl_in_threaded_region}, fc, Ti, ctx) =
     (ctx.emit!(_fc_stmt(fc, (), map(ctx.presolve, fc.roots)), Ti), nothing, Dict{Any,Any}())
 apply_foreigncall_rrule!(::Val{:jl_in_threaded_region}, fc, Ti, ctx) = ()
 
+# `jl_set_task_tid` — `@spawnat`'s pinning call, inlined into the enclosing function by
+# StableTasks' retry loop. Task and tid are non-differentiable and it writes only scheduler
+# state: nothing to communicate forward, nothing flows back.
+foreigncall_rrule_comms(::Val{:jl_set_task_tid}, fc, Ti, ctx) = Tuple{Any,Any}[]
+apply_foreigncall_rrule_fwds!(::Val{:jl_set_task_tid}, fc, Ti, ctx) =
+    (ctx.emit!(_fc_stmt(fc, map(ctx.presolve, fc.args), map(ctx.presolve, fc.roots)), Ti),
+     nothing, Dict{Any,Any}())
+apply_foreigncall_rrule!(::Val{:jl_set_task_tid}, fc, Ti, ctx) = ()
+
+# `jl_object_id` — object-identity hash, what `IdDict`/`ScopedValues` lookups bottom out in. Reads
+# the object's identity, never differentiable memory; a `UInt` result has no tangent.
+foreigncall_rrule_comms(::Val{:jl_object_id}, fc, Ti, ctx) = Tuple{Any,Any}[]
+apply_foreigncall_rrule_fwds!(::Val{:jl_object_id}, fc, Ti, ctx) =
+    (ctx.emit!(_fc_stmt(fc, map(ctx.presolve, fc.args), map(ctx.presolve, fc.roots)), Ti),
+     nothing, Dict{Any,Any}())
+apply_foreigncall_rrule!(::Val{:jl_object_id}, fc, Ti, ctx) = ()
+
 # ---------------------------------------------------------------------------
 # `memmove`/`memcpy`: `dst = copy(src)` in reverse is `src̄ += d̄st`, not a mirrored copy. Destination
 # tangent starts at zero after the call; the pullback walks the accumulated destination cotangent

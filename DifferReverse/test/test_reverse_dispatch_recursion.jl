@@ -373,7 +373,7 @@ end
     end
     @test err_dyncall isa ErrorException
     @test !(err_dyncall isa MethodError)
-    @test occursin("is not a concrete DataType", err_dyncall.msg)
+    @test occursin("is not dispatch-exact", err_dyncall.msg)
 end
 
 @testset "reverse mode: build_ctx reports the recorded bail reason" begin
@@ -387,7 +387,7 @@ end
         e
     end
     @test err isa ErrorException
-    @test occursin("is not a concrete DataType", err.msg)
+    @test occursin("is not dispatch-exact", err.msg)
     @test occursin("dyncallee", err.msg)
 end
 

@@ -244,10 +244,35 @@ how the workers interleave. Each worker's pullback replays that worker's operati
 own reverse order; the cross-worker interleaving is never recorded. A lock-protected
 *non-commutative* shared update gets a wrong gradient from a primal that runs fine.
 
-`Threads.@spawn`/`@async`/`@sync`, bare `Task`/`fetch`, `@threads :greedy` and `Threads.Atomic`
-remain unsupported. See ISSUES' "`Threads.@threads` support, both modes" entry for the full picture,
-including the `threadpoolsize`→`cglobal` trap that only appears once the worker body itself is
-transformed.
+See ISSUES' "`Threads.@threads` support, both modes" entry for the full picture, including the
+`threadpoolsize`→`cglobal` trap that only appears once the worker body itself is transformed.
+
+## Tasks (`Threads.@spawn`/`@async`/`@sync`/`Task`, 2026-08-22)
+
+Hand rules in `rules_threads.jl` for `Task`/`schedule`/`wait`/`fetch`/`istask*`/
+`_spawn_set_thrpool`/`yield`/`current_task` and `@sync`'s `Channel`/`put!`/`take!`/`sync_end`.
+The design decision that makes reverse mode work: the task's pullback replays at the **spawn
+site's** reverse position (`TaskPullback` — the spawned thunk's `rrule!!` runs inside the task,
+its `(ycd, pb)` parked in the task's own storage). Spawn dominates every use, so its reverse turn
+runs after every fetch's and after the caller finished accumulating into any shared shadow the
+thunk's captures alias; a never-scheduled task hands back the zero seed. What `fetch` moves *by
+value* has no rdata channel back to the spawn site (the `Task` carrier has no tangent), so a
+differentiable fetched value is **refused at runtime** — a captured `Ref` written inside the task
+(StableTasks' `AtomicRef{T}` shape, hence OhMyThreads with **no extension**) is the supported
+transport.
+
+Engine changes this needed, all general (see the ISSUES entry for each): atomic-field
+`getfield`/`setfield!` (primal ops keep their ordering operand; a `PossiblyUninitTangent`-slot or
+atomic field takes `setfield!`'s raw-slot save/restore arm, `_sf_raw_arm`); partially-initialised
+mutable `%new` (`build_tangent` leaves trailing slots uninitialised); `setfield!` on a `NoTangent`
+mutable struct (`task.sticky = false`) as guarded primal replay; dispatch-exact (`isdispatchtuple`)
+callee typing so constructor callees (`Type{Task}`) resolve, plus the loose-probe arm in
+`has_hand_reverse_rule` for `@nospecialize` methods; `:invoke`-signature argtype refinement; and
+the inactive-`%new` replay arm for runtime-computed type operands. (An effect-bit activity
+shortcut was tried alongside and reverted — see the ISSUES entry.) Still bailing loudly: the array-form chunked `tmapreduce` (a genuinely dynamic
+`Core.kwcall` over a `Union`-field kwargs `NamedTuple` — the dynamic-dispatch gap), `tmap`/`tmap!`
+(`BangBang.append!!` into an untracked fresh buffer), `StaticScheduler` (try/catch in StableTasks'
+pinning retry loop), `@threads :greedy`, and `Threads.Atomic`.
 
 ## Three explicitly-deferred gaps
 

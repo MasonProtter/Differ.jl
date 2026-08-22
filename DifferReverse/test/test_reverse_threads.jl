@@ -311,6 +311,114 @@ end
     @test tangent_type(Task) === NoTangent
     @test tangent_type(ReentrantLock) === NoTangent
     @test tangent_type(Base.Threads.SpinLock) === NoTangent
+    @test tangent_type(Channel{Any}) === NoTangent
+end
+
+# --- `Threads.@spawn` / `@async` / `@sync` / bare `Task` ----------------------------------------
+#
+# A task's pullback replays at the *spawn site's* reverse position: spawn dominates every use, so
+# its reverse turn runs after every fetch's and after the caller finished accumulating into any
+# shared shadow the thunk's captures alias. What `fetch` moves *by value* has no rdata channel
+# back to the spawn site (the `Task` carrier has no tangent), so a differentiable fetched value is
+# refused loudly; a captured `Ref` written inside the task is the supported transport.
+
+function spawn_ref_out(x)
+    out = Ref(0.0)
+    t = Threads.@spawn begin
+        out[] = sum(abs2, x)
+        nothing
+    end
+    wait(t)
+    return out[]
+end
+
+function sync_two_spawns(x)
+    y = zeros(2)
+    Base.@sync begin
+        Threads.@spawn (y[1] = 2.0 * x[1]; nothing)
+        Threads.@spawn (y[2] = 3.0 * x[2]; nothing)
+    end
+    return y[1] + y[2]
+end
+
+# A scalar read by both tasks: its gradient is the sum of per-task contributions, routed through
+# each spawn's own pullback — the case that distinguishes real cross-task accumulation.
+function spawn_shared_scalar(a, x)
+    o1, o2 = Ref(0.0), Ref(0.0)
+    t1 = Threads.@spawn (o1[] = a * x[1]; nothing)
+    t2 = Threads.@spawn (o2[] = a * x[2]; nothing)
+    wait(t1); wait(t2)
+    return o1[] + o2[]
+end
+
+@testset "spawn with a captured Ref" begin
+    x = collect(1.0:3.0)
+    _, dx = rev_gradient(spawn_ref_out, copy(x))
+    @test dx ≈ 2.0 .* x
+end
+
+@testset "@sync with two spawns" begin
+    x = collect(1.0:3.0)
+    _, dx = rev_gradient(sync_two_spawns, copy(x))
+    @test dx ≈ [2.0, 3.0, 0.0]
+end
+
+@testset "shared captured scalar accumulates across tasks" begin
+    x = collect(1.0:3.0)
+    _, da, dx = rev_gradient(spawn_shared_scalar, 3.0, copy(x))
+    @test da ≈ x[1] + x[2]
+    @test dx ≈ [3.0, 3.0, 0.0]
+end
+
+@testset "fetch of a differentiable value is refused" begin
+    fetch_val(x) = fetch(Threads.@spawn sum(abs2, x))::Float64
+    @test_throws Exception rev_gradient(fetch_val, collect(1.0:3.0))
+end
+
+@testset "put! of a differentiable value is refused" begin
+    putfloat(x) = (c = Channel(2); put!(c, x); take!(c))
+    @test_throws Exception rev_gradient(putfloat, 1.0)
+end
+
+@testset "Task rule handles a never-scheduled task" begin
+    # The thunk never ran, so its pullback hands back the zero seed rather than waiting forever.
+    x, dx = collect(1.0:3.0), zeros(3)
+    w = () -> (x[1] * 2.0)
+    wcd = CoDual(w, fdata(zero_tangent(w)))
+    tcd, pb = rrule!!(zero_fcodual(Task), Ctx(), wcd)
+    @test primal(tcd) isa Task
+    rds = pb(NoRData())
+    @test rds[1] === NoRData()
+end
+
+# --- Engine regressions the task work needed --------------------------------------------------
+
+mutable struct ARef{T}
+    @atomic x::T
+    ARef{T}() where {T} = new{T}()
+    ARef(x::T) where {T} = new{T}(x)
+end
+
+# Atomic field write + read: the primal ops keep an atomic ordering, the shadow ops stay plain.
+function atomic_rw(x)
+    r = ARef(0.0)
+    @atomic r.x = 2.0 * x
+    return (@atomic r.x) * 3.0
+end
+
+# Partially-initialised `%new` of a tangent-carrying mutable struct, then an atomic write into the
+# still-uninitialised slot — the StableTasks `AtomicRef{T}()` shape.
+function undef_new_rw(x)
+    r = ARef{Float64}()
+    @atomic r.x = x
+    return (@atomic r.x) * 2.0
+end
+
+@testset "atomic mutable-struct fields" begin
+    _, dx = rev_gradient(atomic_rw, 1.5)
+    @test dx ≈ 6.0
+    _, dx = rev_gradient(undef_new_rw, 1.5)
+    @test dx ≈ 2.0
 end
 
 # --- Concurrent first-call compilation ---------------------------------------------------------

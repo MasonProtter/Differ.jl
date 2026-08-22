@@ -410,6 +410,24 @@ tangent_type(::Type{Task}) = NoTangent
 # function a partially-initialised `%new` neither engine will transform.
 tangent_type(::Type{ReentrantLock}) = NoTangent
 
+# A `Channel` is synchronization infrastructure like `Task`: its `data::Vector{Any}` would derive a
+# real tangent, but a tangent-carrying channel would oblige every `put!`/`take!` to mirror the
+# queue onto a shadow queue. Values moved through a channel are constants instead; `put!` of a
+# differentiable value is refused by the rules, never silently zeroed.
+tangent_type(::Type{<:Channel}) = NoTangent
+
+# A `Scope` chains to its parent scope and holds a persistent HAMT dict whose nodes are
+# self-referential, so the generic derivation does not terminate on it (the `Tape`/`Stack` class of
+# type — see the `@assume_effects` warning above). Scopes are scheduler infrastructure every task
+# captures, never data — and so are the `ScopedValue`s used as keys into them.
+tangent_type(::Type{Base.ScopedValues.Scope}) = NoTangent
+tangent_type(::Type{<:Base.ScopedValues.AbstractScopedValue}) = NoTangent
+
+# The HAMT node type is self-referential on its own (`data::Vector{Union{HAMT,Leaf}}`), and every
+# task's captured scope reaches it. No persistent-dict operation has a rule, so an active use
+# bails at the operation rather than being silently constant.
+tangent_type(::Type{<:Base.HashArrayMappedTries.HAMT}) = NoTangent
+
 tangent_type(::Type{<:Base.CoreLogging.AbstractLogger}) = NoTangent
 
 tangent_type(::Type{Core.CodeInstance}) = NoTangent

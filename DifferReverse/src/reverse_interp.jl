@@ -346,11 +346,24 @@ function has_hand_reverse_rule(interp::ContextualInterpreter, callee_mi::MethodI
     params = callee_mi.specTypes.parameters
     isempty(params) && return false
     ftype = params[1]
-    (ftype isa Type && isconcretetype(ftype)) || return false
+    # `isdispatchtuple`, not `isconcretetype`: a constructor callee's ftype is `Type{Task}` —
+    # abstract as a type, but dispatch-exact, which is all a rule match needs. Rejects the
+    # identity-erased `DataType`/`Type`/`Function`.
+    (ftype isa DataType && Base.isdispatchtuple(Tuple{ftype})) || return false
     msg = _composition_bail_message(interp.world, ftype)
     msg === nothing || error(msg)
     argtypes = params[2:end]
-    all(P -> P isa Type && isconcretetype(P), argtypes) || return false
+    if !all(P -> P isa Type && isconcretetype(P), argtypes)
+        # An `@nospecialize` method (`Task(f)`) keeps abstract argument slots in its
+        # `MethodInstance` even when every real call site's operands are concrete, so the strict
+        # per-argument match below can't be built. The loose ftype probe decides instead — but
+        # only for a *constructor* callee: `Type{Task}` is dispatch-exact on its own, and blocking
+        # its inlining is what keeps `jl_new_task` out of the primal. A non-constructor with
+        # abstract slots keeps the old answer (inline freely) — blocking those turned inlined,
+        # provenance-transparent helpers in `push!`'s growth chain into opaque calls and broke
+        # array-write provenance.
+        return ftype <: Type && _hand_rule_ftype_candidate(interp, ftype)
+    end
     # A `Dual` argument (not just a `Dual` callee) is reverse-over-forward too, and the more common
     # shape in practice: `frule!!`'s hand rules are small enough that ordinary inlining absorbs the
     # `frule!!` call itself before this function ever sees it as a callee, leaving a surviving call
@@ -1738,6 +1751,10 @@ function _activity(pir, iworld, n::Int, codualparams::Vector{Any})
                     false
                 elseif notan && (isa(f, Core.Builtin) || isa(f, Core.IntrinsicFunction))
                     false
+                # No effect-bit shortcut here, deliberately — same reason as forward mode's
+                # `_activity`: "proved `:effect_free` and rettype has no tangent space ⇒ inactive"
+                # was tried and reverted, because under mode composition the derivative state
+                # itself lives in values whose *types* are tangent-free (`Tuple{NoRData,…}`).
                 else
                     operand_active(fpos) || any(operand_active, actual)
                 end
@@ -2148,8 +2165,11 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
     # (`_optype_w`) rather than bailing — what lets `sum(sin, v)` recurse even though `sin`'s value
     # isn't statically known inside `mapreduce_impl`'s body.
     ftype = fval === nothing ? _optype_w(pir, iworld, fpos) : _typeof(fval)
-    if !(ftype isa DataType && isconcretetype(ftype))
-        reason[] = "callee type $(ftype) is not a concrete DataType at %$i: `$(_stmt_str(s))`"
+    # `isdispatchtuple`, not `isconcretetype`: a constructor callee's ftype is `Type{Task}` —
+    # abstract as a type, but dispatch-exact, which is what rule resolution and the carrier
+    # `%new(CoDual{ftype,…})` both need.
+    if !(ftype isa DataType && Base.isdispatchtuple(Tuple{ftype}))
+        reason[] = "callee type $(ftype) is not dispatch-exact at %$i: `$(_stmt_str(s))`"
         return nothing
     end
     # A composite inner function survives dualization as a genuine recursive call to `rrule!!`, not
@@ -2207,6 +2227,32 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
     # resolves and annotate the `%new(CoDual{...}, ...)` the emission side builds — a node-shaped
     # answer would both misresolve the rule and emit IR whose declared type doesn't match the value.
     argtypes = Any[_optype_w(pir, iworld, a) for a in actual]
+    # An `:invoke`'s own signature can pin a slot more tightly than the operand's SSA type — a
+    # `Type`-valued argument whose SSA type erased to `DataType` (a phi over type literals) is
+    # still `Type{Any}` in the target's `specTypes`, and an `Any`-typed operand into a concrete
+    # slot is pinned the same way. Refine whenever the operand's type is not dispatch-exact but
+    # the signature slot is: dispatch guarantees the value inhabits the slot.
+    if s.head === :invoke
+        smi = s.args[1]
+        smi isa CodeInstance && (smi = smi.def)
+        smi isa MethodInstance || (smi = nothing)
+        if smi !== nothing && smi.specTypes isa DataType && smi.def isa Method
+            sps = smi.specTypes.parameters
+            # For a vararg target only the fixed prefix maps one-to-one onto operands.
+            nfixsig = smi.def.isva ? length(sps) - 1 : length(sps)
+            if (smi.def.isva && length(actual) + 1 >= nfixsig) ||
+               (!smi.def.isva && length(actual) + 1 == length(sps))
+                for (j, P) in enumerate(argtypes)
+                    j + 1 > nfixsig && break
+                    (P isa DataType && Base.isdispatchtuple(Tuple{P})) && continue
+                    Psig = sps[j + 1]
+                    if Psig isa DataType && Base.isdispatchtuple(Tuple{Psig})
+                        argtypes[j] = Psig
+                    end
+                end
+            end
+        end
+    end
     # `mask[j]`: operand `j` is differentiable but carries no gradient at this callsite — passed to
     # the callee as `CoDual{P,Inactive}` rather than a real fdata carrier. Two disjoint tests, one
     # per operand kind:
@@ -2221,7 +2267,9 @@ function _static_recursible_call(pir, iworld, i::Int, s::Expr, reason::Ref{Strin
     # lives; it is asked through the world-age funnels here rather than called directly.
     mask = falses(length(argtypes))
     for (j, P) in enumerate(argtypes)
-        if !(P isa DataType && isconcretetype(P))
+        # `isdispatchtuple` admits a dispatch-exact `Type{X}` slot (`Type{Any}` from the invoke
+        # signature refinement above) alongside ordinary concrete types.
+        if !(P isa DataType && (isconcretetype(P) || Base.isdispatchtuple(Tuple{P})))
             reason[] = "recursive call has a non-concrete argument type $(P) at %$i: `$(_stmt_str(s))`"
             return nothing
         end
@@ -3458,16 +3506,24 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
             # e.g. `%new(Main.MPoint, ...)`) at the inference world; a literal `DataType` passes
             # through unchanged.
             T = _calleeval(s.args[1], iworld)
+            if !active[i]
+                # Every operand is held constant, so no shadow is built — which is what makes a
+                # runtime-computed type operand (an `apply_type` result, e.g. a kwarg
+                # `NamedTuple`'s) legal here: it renumbers like any other operand.
+                primal_map[i] = emit!(Expr(:new, T isa DataType ? T : presolve(s.args[1]),
+                                           (presolve(a) for a in s.args[2:end])...), Ti)
+            else
             if !(T isa DataType)
                 reason[] = "reverse mode `%new` needs a statically-resolvable type at %$i: " *
                            "`$(_stmt_str(s))`"
                 return nothing
             end
-            # Only a struct with a tangent needs the arity guard: the shadow branches below build a
-            # `MutableTangent`/`FData` field by field, which a short argument list can't fill. A
-            # `NoTangent` struct (a `ReentrantLock`, say) builds no shadow at all, so a
-            # partially-initialised `%new` of one is ordinary primal replay.
-            if _tt(iworld, T) !== NoTangent && !is_always_fully_initialised(T) &&
+            # Only an immutable struct with a tangent needs the arity guard: its `FData` shadow is
+            # built field by field, which a short argument list can't fill. A `NoTangent` struct
+            # (a `ReentrantLock`, say) builds no shadow at all, and a mutable struct's shadow is a
+            # `MutableTangent` whose trailing slots `build_tangent` leaves uninitialised
+            # (`PossiblyUninitTangent`), matching the primal's own undef fields.
+            if _tt(iworld, T) !== NoTangent && !ismutabletype(T) && !is_always_fully_initialised(T) &&
                length(s.args) - 1 != fieldcount(T)
                 reason[] = "reverse mode does not support a partially-initialised `%new` of a " *
                            "struct with possibly-undef fields ($(T)) at %$i: `$(_stmt_str(s))`"
@@ -3526,6 +3582,7 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                 tangent_ssa = icall!(_rr_build_tangent, _tt(iworld, T), argtys, T, field_tangents...)
                 shadow_map[i] = icall!(_rr_fdata, fdtype(iworld, T), (_tt(iworld, T),), tangent_ssa)
             end
+            end   # !active[i] replay / active emission
         elseif isa(s, Expr) && s.head === :boundscheck
             primal_map[i] = emit!(Expr(:boundscheck, s.args...), Ti)
         elseif isa(s, Expr) && s.head === :throw_undef_if_not
@@ -3721,9 +3778,13 @@ function reverse_fwds_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int, nf
                 primal_map[i] = emit!(Expr(:call, getf, result_cd, 1), Ti)
                 if fdtype(iworld, Ti) !== NoFData
                     # Route the callee's returned shadow so a caller can accumulate into it; bail
-                    # if its declared fdata type doesn't match this call's inferred one.
+                    # if its declared fdata type doesn't match this call's inferred one. An
+                    # abstractly-inferred call (`Ti === Any`, e.g. an `@nospecialize` callee) is
+                    # exempt: the resolved carrier's concrete fdata *refines* the inferred `Any`,
+                    # and the shadow is declared at that sharper type.
                     InnerFT = InnerFCoDualT.parameters[2]
-                    if InnerFT !== fdtype(iworld, Ti)
+                    WTi = _widen(Ti)
+                    if InnerFT !== fdtype(iworld, Ti) && WTi isa DataType && isconcretetype(WTi)
                         reason[] = "recursive call's resolved result fdata type ($(InnerFT)) does " *
                                    "not match this call's own inferred fdata type " *
                                    "($(fdtype(iworld, Ti))) at %$i: `$(_stmt_str(s))`"

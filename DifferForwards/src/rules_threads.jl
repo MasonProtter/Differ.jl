@@ -70,3 +70,92 @@ function frule!!(::Dual{typeof(Base.lock)}, fd::Dual, ld::Dual{<:_Lock})
         Base.unlock(l)
     end
 end
+
+# ---------------------------------------------------------------------------
+# Tasks: `Threads.@spawn` / `@async` / bare `Task` + `schedule`/`wait`/`fetch`, and the
+# `Channel`/`put!`/`sync_end` trio `@sync` expands to.
+#
+# `@spawn` expands *inline* in the enclosing function — `Task(thunk)`, `task.sticky = false`,
+# `_spawn_set_thrpool(task, tp)`, an optional `put!` into `@sync`'s channel, `schedule(task)` — so
+# there is no single function to rule the way `threading_run` was. Ruling `Task` itself is what
+# keeps `jl_new_task` out of dualized IR; the other steps get the rules below.
+#
+# The spawned thunk runs dualized. Its `Dual` result is parked in the task's own task-local
+# storage, and the task's *primal* result is the primal half — so a task that escapes the
+# differentiated region still fetches an ordinary value.
+# ---------------------------------------------------------------------------
+
+const _TASK_RESULT_KEY = :__differ_task_result__
+
+struct _DualTaskThunk{F<:Dual}
+    thunk::F
+end
+function (w::_DualTaskThunk)()
+    d = frule!!(w.thunk)
+    task_local_storage(_TASK_RESULT_KEY, d)
+    return primal(d)
+end
+
+frule!!(::Dual{Type{Task}}, thunk::Dual) = Dual(Task(_DualTaskThunk(thunk)), NoTangent())
+
+function frule!!(::Dual{typeof(Base.schedule)}, td::Dual{Task})
+    return Dual(Base.schedule(primal(td)), NoTangent())
+end
+
+function frule!!(::Dual{typeof(Base.wait)}, td::Dual{Task})
+    Base.wait(primal(td))
+    return Dual(nothing, NoTangent())
+end
+
+function frule!!(::Dual{typeof(Base.fetch)}, td::Dual{Task})
+    t = primal(td)
+    y = Base.fetch(t)
+    store = t.storage
+    if store !== nothing && haskey(store, _TASK_RESULT_KEY)
+        return store[_TASK_RESULT_KEY]::Dual
+    end
+    # A task created outside the differentiated region carries no recorded `Dual`; only a result
+    # with no tangent space is safe to hand back as a constant.
+    tangent_type(typeof(y)) === NoTangent && return Dual(y, NoTangent())
+    error("`fetch` of a `Task` not spawned inside the differentiated region would drop the " *
+          "derivative of its `$(typeof(y))` result")
+end
+
+for f in (:istaskdone, :istaskstarted, :istaskfailed)
+    @eval frule!!(::Dual{typeof(Base.$f)}, td::Dual{Task}) = Dual(Base.$f(primal(td)), NoTangent())
+end
+
+function frule!!(::Dual{typeof(Base.Threads._spawn_set_thrpool)}, td::Dual{Task}, tp::Dual{Symbol})
+    Base.Threads._spawn_set_thrpool(primal(td), primal(tp))
+    return Dual(nothing, NoTangent())
+end
+
+frule!!(::Dual{typeof(Base.yield)}) = (Base.yield(); Dual(nothing, NoTangent()))
+frule!!(::Dual{typeof(Base.yield)}, td::Dual{Task}) = (Base.yield(primal(td)); Dual(nothing, NoTangent()))
+frule!!(::Dual{typeof(Base.current_task)}) = Dual(Base.current_task(), NoTangent())
+
+# `@sync` expands to `Channel(Inf)` + `put!(chan, task)` per `@spawn`/`@async` + `sync_end(chan)`.
+# A `Channel` has no tangent space (`DifferCore/src/tangents.jl`), so a value moved through one is
+# a constant; `put!`/`take!` refuse a differentiable value loudly rather than zeroing it.
+frule!!(::Dual{Type{Channel}}, sz::Dual) = Dual(Channel(primal(sz)), NoTangent())
+frule!!(::Dual{Type{Channel{T}}}, sz::Dual) where {T} = Dual(Channel{T}(primal(sz)), NoTangent())
+
+function frule!!(::Dual{typeof(Base.put!)}, cd::Dual{<:Channel}, vd::Dual)
+    v = primal(vd)
+    tangent_type(typeof(v)) === NoTangent ||
+        error("`put!` of a differentiable value (`$(typeof(v))`) into a `Channel` is not supported")
+    Base.put!(primal(cd), v)
+    return Dual(v, NoTangent())
+end
+
+function frule!!(::Dual{typeof(Base.take!)}, cd::Dual{<:Channel})
+    y = Base.take!(primal(cd))
+    tangent_type(typeof(y)) === NoTangent ||
+        error("`take!` of a differentiable value (`$(typeof(y))`) from a `Channel` is not supported")
+    return Dual(y, NoTangent())
+end
+
+function frule!!(::Dual{typeof(Base.sync_end)}, cd::Dual{<:Channel})
+    Base.sync_end(primal(cd))
+    return Dual(nothing, NoTangent())
+end

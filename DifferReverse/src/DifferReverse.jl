@@ -28,7 +28,7 @@ import DifferCore: DifferCore, NoTangent, Inactive, NoFData, NoRData, FData, RDa
     increment_rdata!!, is_always_fully_initialised, split_union_tuple_type, ZeroRData,
     CannotProduceZeroRDataFromType, can_produce_zero_rdata_from_type,
     _globalref_val, _globalref_isconst, _calleeval, _ir_literal, _optype, _optype_w, _stype, _stype_invoke, _stmt_str,
-    _bi_literal_index, _bi_homog_tangent_type, _tangent_field_slot, _widen,
+    _bi_literal_index, _bi_homog_tangent_type, _tangent_field_slot, _raw_tangent_slot, _widen,
     _getfieldg, _setfieldg, _ctupleg, _ifelseg,
     _fc_parse, _fc_stmt, _fc_ptr_origin, _fc_same_stride, _fc_check_extent,
     _fc_copy_sig_ok, _FC_COPY_ATS, isactive, @ifactive, _require_active_dest, _inactive_positions,

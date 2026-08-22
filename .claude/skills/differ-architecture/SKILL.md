@@ -177,9 +177,12 @@ array allocation, tuples/closures
 (`ccall`, registered per-target — `memmove`/`memcpy`/`jl_in_threaded_region` today) +
 `Expr(:loopinfo)` (`@simd`), dynamic
 dispatch (via a runtime `dynamic_frule` dispatcher), higher-order differentiation (both hand-nested
-`Dual` seeds and composed `D`-of-`D`), both self- and mutual recursion, and `Threads.@threads`
+`Dual` seeds and composed `D`-of-`D`), both self- and mutual recursion, `Threads.@threads`
 (`rules_threads.jl` — dualized IR carries no per-call state, so one `Dual` closure runs on every
-worker at once). See
+worker at once), and general task parallelism — `Threads.@spawn`/`@async`/`@sync`/bare
+`Task`/`schedule`/`wait`/`fetch` (same file: the spawned thunk runs dualized, its `Dual` result
+parked in the task's own storage, so by-value `fetch` transports the tangent; OhMyThreads.jl works
+downstream through StableTasks with no extension). See
 `differ-forward-dualization` for the engine and `differ-extending-ir-support` for exactly what's
 still unsupported and how to close a gap.
 
@@ -187,10 +190,15 @@ still unsupported and how to close a gap.
 via a shadow-chain comms scheme, growable vectors through the same hand rules as forward mode,
 mutable-struct field mutation, `Core.tuple`, `Core.ifelse`, `@simd`/`:loopinfo`), direct
 self-recursion (closed-form `Tape` type), argument-position callees, callees with differentiable
-captures (a closure calling a closure), and `Threads.@threads` (`rules_threads.jl` — one `Tape` per
-worker, pullbacks replayed sequentially in reverse worker order),
-but not yet: mutual recursion, dynamic dispatch (no `dynamic_rrule` equivalent), vararg primal
-methods, `Core.Box`/abstract-field `setfield!`, or `Threads.@spawn`/`@async`/`@sync`/bare `Task`. See `differ-reverse-engine` for the engine and
+captures (a closure calling a closure), `Threads.@threads` (`rules_threads.jl` — one `Tape` per
+worker, pullbacks replayed sequentially in reverse worker order), atomic (`@atomic`) mutable-struct
+fields and partially-initialised mutable `%new`, and general task parallelism —
+`Threads.@spawn`/`@async`/`@sync`/bare `Task`/`schedule`/`wait` (same file: each spawn site's
+pullback replays its task's tape; gradients transport through captures — a `Ref` written inside
+the task, the StableTasks shape, which is what makes OhMyThreads work downstream with no
+extension — while a *differentiable* value fetched by value is refused loudly),
+but not yet: mutual recursion, dynamic dispatch (no `dynamic_rrule` equivalent), or vararg primal
+methods and `Core.Box`/abstract-field `setfield!`. See `differ-reverse-engine` for the engine and
 `differ-extending-reverse-support` for the exact gap list.
 
 **Known limitations, documented in `ISSUES.md`, not being actively chased right now:**
