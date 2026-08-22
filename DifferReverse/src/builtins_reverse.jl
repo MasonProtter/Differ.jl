@@ -122,6 +122,30 @@ end
 end
 _rr_saved_slot_type(@nospecialize T) = isbitstype(T) ? T : Union{Nothing,T}
 
+# Save/restore of a struct field that may be uninitialised, mirroring the memoryref pair above:
+# `nothing` marks "was undefined", and restoring it leaves the field as-is — correct for the same
+# reason. `ord` is `:monotonic` for an atomic field and `:not_atomic` otherwise; the primal's own
+# ordering matters only for the replayed store itself, which keeps its original operand.
+@noinline _rr_field_get_or_nothing(obj, ::Val{f}, ::Val{ord}) where {f,ord} =
+    isdefined(obj, f, ord) ? getfield(obj, f, ord) : nothing
+@noinline function _rr_field_restore!(obj, ::Val{f}, ::Val{ord}, v) where {f,ord}
+    v === nothing || setfield!(obj, f, v, ord)
+    return nothing
+end
+
+# `setfield!` shapes the fast paths can't serve: an atomic field (every primal access needs an
+# ordering operand), or one whose `MutableTangent` slot is a `PossiblyUninitTangent` (the slot must
+# be saved/restored as stored, never unwrapped — it may wrap nothing). One predicate consulted by
+# all three phases so the comms tuple, fwds emission and pullback agree.
+function _sf_raw_arm(tt, @nospecialize(P), fieldidx::Int)
+    Base.isfieldatomic(P, fieldidx) && return true
+    slot = _raw_tangent_slot(tt, P, fieldidx)
+    slot === nothing && return false
+    return fieldtype(slot[1], slot[2]) <: PossiblyUninitTangent
+end
+_sf_field_order(@nospecialize(P), fieldidx::Int) =
+    Base.isfieldatomic(P, fieldidx) ? :monotonic : :not_atomic
+
 # Direct-emission fast paths for `get_tangent_field`/`set_tangent_field!` (reverse-mode analogue of
 # forward mode's `_tangent_field_slot`). For the common case — a concrete struct whose
 # `MutableTangent` field is not a `PossiblyUninitTangent` — the equivalent instructions are emitted
@@ -257,8 +281,11 @@ function apply_builtin_rrule_fwds!(::Val{Core.getfield}, actual, Ti, ctx)
     obj = actual[1]
     # `actual[2]` is usually a literal, for which `presolve` is a no-op — but a homogeneous-tuple
     # `getfield` with a dynamic index is a genuine SSAValue/Argument operand that must be resolved
-    # to this pass's own numbering like any other operand.
-    p = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(obj), ctx.presolve(actual[2])), Ti)
+    # to this pass's own numbering like any other operand. Trailing operands (an atomic ordering,
+    # a boundscheck flag) are forwarded on the primal only — a `MutableTangent`'s own fields are
+    # never atomic, so the shadow reads below stay orderless.
+    p = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(obj), ctx.presolve(actual[2]),
+                       (ctx.presolve(a) for a in actual[3:end])...), Ti)
     shadow = nothing
     if _bi_tracked(ctx.ssa, ctx)
         P = ctx.optype(obj)
@@ -606,6 +633,18 @@ function builtin_rrule_comms(::Val{Core.setfield!}, actual, Ti, ctx)
                        "%$(ctx.ssa.id)"
         return false
     end
+    if ctx.tt(P) === NoTangent
+        # A shadowless mutable struct (a `Task`'s `.sticky`, say): the write replays primally,
+        # provided the assigned value can't carry a gradient either — storing an active value into
+        # a shadowless container would silently drop it.
+        VT = ctx.optype(actual[3])
+        if !(ctx.tt(_widen(VT)) === NoTangent || ctx.inactive(actual[3]))
+            ctx.reason[] = "reverse mode `setfield!` cannot store a differentiable value ($(VT)) " *
+                           "into a `$(P)`, whose tangent type is `NoTangent`, at %$(ctx.ssa.id)"
+            return false
+        end
+        return Tuple{Any,Any}[]
+    end
     if P <: Array
         # An `Array`'s shadow is a same-shape array, not a `MutableTangent`, so there is no tangent
         # field to save and restore. Growable mutation goes through Base's growth helpers, which
@@ -639,6 +678,19 @@ function builtin_rrule_comms(::Val{Core.setfield!}, actual, Ti, ctx)
                        "function argument at %$(ctx.ssa.id) (object type $(P))"
         return false
     end
+    fieldidx = fname isa Symbol ? findfirst(==(fname), fieldnames(P)) : fname
+    if _sf_raw_arm(ctx.tt, P, fieldidx)
+        slot = _raw_tangent_slot(ctx.tt, P, fieldidx)
+        if slot === nothing
+            ctx.reason[] = "reverse mode `setfield!` on an atomic field of a struct whose tangent " *
+                           "is not a `MutableTangent` ($(ctx.tt(P))) is not supported at %$(ctx.ssa.id)"
+            return false
+        end
+        SLT = fieldtype(slot[1], slot[2])
+        return Tuple{Any,Any}[((:fshadow, obj), ctx.fdtype(P)), ((:primal, obj), P),
+                              ((:old_primal, ctx.ssa), _rr_saved_slot_type(_widen(Ti))),
+                              ((:old_tangent, ctx.ssa), SLT)]
+    end
     return Tuple{Any,Any}[((:fshadow, obj), ctx.fdtype(P)), ((:primal, obj), P),
                           ((:old_primal, ctx.ssa), Ti), ((:old_tangent, ctx.ssa), ctx.tt(_widen(Ti)))]
 end
@@ -646,12 +698,40 @@ end
 function apply_builtin_rrule_fwds!(::Val{Core.setfield!}, actual, Ti, ctx)
     obj, name_node, val_node = actual[1], actual[2], actual[3]
     P = ctx.optype(obj)
+    if ctx.tt(P) === NoTangent
+        p = ctx.emit!(Expr(:call, _setfieldg, (ctx.presolve(a) for a in actual)...), Ti)
+        return p, nothing, Dict{Any,Any}()
+    end
     mt = ctx.sresolve(obj)
     TF = ctx.tt(_widen(Ti))
-    old_primal = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(obj), name_node), Ti)
     fname = _bi_fieldname(name_node)
     fieldidx = fname isa Symbol ? findfirst(==(fname), fieldnames(P)) : fname
     FTi = ctx.fdtype(Ti)
+    if _sf_raw_arm(ctx.tt, P, fieldidx)
+        rslot = _raw_tangent_slot(ctx.tt, P, fieldidx)
+        SLT = fieldtype(rslot[1], rslot[2])
+        ord = _sf_field_order(P, fieldidx)
+        if isbitstype(_widen(Ti))
+            old_primal = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(obj), name_node,
+                                        QuoteNode(ord)), Ti)
+        else
+            old_primal = ctx.icall!(_rr_field_get_or_nothing, _rr_saved_slot_type(_widen(Ti)),
+                                    (P, Val{fname}, Val{ord}), ctx.presolve(obj), Val(fname), Val(ord))
+        end
+        old_tangent = _emit_gtf!(ctx, mt, rslot)
+        inact = ctx.inactive(val_node)
+        fdata_val = (FTi === NoFData || inact) ? NoFData() : ctx.normalize_shadow!(val_node, FTi)
+        FTarg = (FTi === NoFData || inact) ? NoFData : FTi
+        zt = ctx.icall!(_rr_zero_tangent2, TF, (Ti, FTarg), ctx.presolve(val_node), fdata_val)
+        ztw = SLT <: PossiblyUninitTangent ? ctx.emit!(Expr(:new, SLT, zt), SLT) : zt
+        _emit_stf!(ctx, mt, rslot, ztw)
+        p = ctx.emit!(Expr(:call, _setfieldg, ctx.presolve(obj), name_node, ctx.presolve(val_node),
+                           (ctx.presolve(a) for a in actual[4:end])...), Ti)
+        saved = Dict{Any,Any}((:old_primal, ctx.ssa) => old_primal,
+                              (:old_tangent, ctx.ssa) => old_tangent)
+        return p, nothing, saved
+    end
+    old_primal = ctx.emit!(Expr(:call, _getfieldg, ctx.presolve(obj), name_node), Ti)
     slot = _tangent_field_slot(ctx.tt, P, name_node)
     if slot !== nothing
         # Emit the field read/write directly instead of the `_rr_*` `:invoke` barriers.
@@ -696,6 +776,7 @@ end
 function apply_builtin_rrule!(::Val{Core.setfield!}, actual, Ti, ctx)
     obj, name_node = actual[1], actual[2]
     P = ctx.optype(obj)
+    ctx.tt(P) === NoTangent && return ntuple(_ -> nothing, length(actual))
     mt = ctx.fetch_shadow(obj)
     primal_obj = ctx.fetch_primal(obj)
     old_primal = ctx.fetch_saved((:old_primal, ctx.ssa))
@@ -708,6 +789,27 @@ function apply_builtin_rrule!(::Val{Core.setfield!}, actual, Ti, ctx)
     # the same (possibly wider) `RT` is harmless.
     RT = zero_like_rdata_type(_widen(Ti))
     acc = ctx.deref_and_zero!(Ti)
+    if _sf_raw_arm(ctx.tt, P, fieldidx)
+        rslot = _raw_tangent_slot(ctx.tt, P, fieldidx)
+        SLT = fieldtype(rslot[1], rslot[2])
+        ord = _sf_field_order(P, fieldidx)
+        cur_raw = _emit_gtf!(ctx, mt, rslot)
+        # The slot is always initialised at its own undo point: this write's fwds emission stored
+        # a wrapped zero there.
+        cur_tangent = SLT <: PossiblyUninitTangent ?
+            ctx.emit!(Expr(:call, _getfieldg, cur_raw, QuoteNode(:tangent)), TF) : cur_raw
+        cur_rdata = _emit_rdata!(ctx, TF, RT, cur_tangent)
+        new_dx = ctx.emit!(ctx.icall(increment!!, (RT, RT), acc, cur_rdata), RT)
+        if isbitstype(_widen(Ti))
+            ctx.emit!(Expr(:call, _setfieldg, primal_obj, name_node, old_primal, QuoteNode(ord)), Any)
+        else
+            ctx.emit!(ctx.icall(_rr_field_restore!,
+                                (P, Val{fname}, Val{ord}, _rr_saved_slot_type(_widen(Ti))),
+                                primal_obj, Val(fname), Val(ord), old_primal), Nothing)
+        end
+        _emit_stf!(ctx, mt, rslot, old_tangent)
+        return ntuple(j -> j == 3 ? new_dx : nothing, length(actual))
+    end
     slot = _tangent_field_slot(ctx.tt, P, name_node)
     if slot !== nothing
         # Emit the read, rdata extract, increment, and restore directly, avoiding the `_rr_*` barriers.

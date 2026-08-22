@@ -26,8 +26,11 @@ arg_codual_types(f, at; inactive=()) =
 # `@generated` fallback rather than a hand-written rule. Mirrors the engine's own query
 # (`hand_reverse_rule_match`): the ctx slot is `Ctx{Nothing}`, and every method declares that slot
 # `::AbstractCtx`, so only the callee and argument carriers select the method.
+# `_typeof`, not `typeof`: a constructor fixture's `f` is a `Type` (`Task`, `Channel`), whose
+# carrier is keyed `CoDual{Type{Task},…}`, not `CoDual{DataType,…}`.
 rrule_method(f, argcds) =
-    which(rrule!!, Tuple{CoDual{typeof(f),NoFData},Ctx{Nothing},map(typeof, argcds)...})
+    which(rrule!!, Tuple{CoDual{DifferReverse.DifferCore._typeof(f),NoFData},Ctx{Nothing},
+                         map(typeof, argcds)...})
 is_derived_rrule(m::Method) = DifferReverse.is_generated_reverse_fwds_fallback(m)
 
 # Central finite difference, one argument.

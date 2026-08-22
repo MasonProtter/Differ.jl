@@ -39,6 +39,47 @@ const IDX = [1, 3]
 
 unary(f, x) = Fixture(string(f), f, () -> (x,))
 
+# `Threads.@threads`'s worker, reproduced without the macro: a closure with a default positional
+# argument, which Julia splits into a wrapper holding a body function that holds the loop's
+# captures. `threading_run`'s rule is handed exactly this shape.
+# A lock that is actually held, for `unlock`'s fixture.
+held_lock() = (l = ReentrantLock(); lock(l); l)
+
+# A completed task, for the fixtures whose rule would otherwise block on a fresh one.
+done_task() = (t = Task(() -> nothing); schedule(t); wait(t); t)
+
+# A zero-argument thunk with differentiable captures — the shape `Task`'s rule is handed.
+audit_task_thunk(x, y) = () -> (y[1] = 2.0 * x[1]; nothing)
+
+function audit_worker(x::Vector{Float64}, y::Vector{Float64})
+    range = eachindex(y, x)
+    function threadsfor_fun(tid=1; onethread=false)
+        r = range
+        len, rem = onethread ? (length(r), 0) : divrem(length(r), Threads.threadpoolsize())
+        if len == 0
+            tid > rem && return nothing
+            len, rem = 1, 0
+        end
+        f = firstindex(r) + ((tid - 1) * len)
+        l = f + len - 1
+        if rem > 0
+            if tid <= rem
+                f += tid - 1
+                l += tid
+            else
+                f += rem
+                l += rem
+            end
+        end
+        for i in f:l
+            j = @inbounds r[i]
+            y[j] = sin(x[j])
+        end
+        return nothing
+    end
+    return threadsfor_fun
+end
+
 const FIXTURES = Fixture[
     # rrules.jl
     unary(sin, 0.7), unary(cos, 0.7),
@@ -120,6 +161,46 @@ const FIXTURES = Fixture[
     Fixture("expint(ν,x)", expint, () -> (2, 0.7)),
     Fixture("expintx(ν,x)", expintx, () -> (2, 0.7)),
     unary(ellipk, 0.7), unary(ellipe, 0.7),
+    # rules_threads.jl — the parallel-region rule plus the thread/lock queries. A lock has no
+    # tangent space at all (`tangent_type(ReentrantLock) === NoTangent`), so the lock slots carry no
+    # activity mask; `unlock` needs a lock that is actually held.
+    Fixture("threading_run", Base.Threads.threading_run,
+            () -> (audit_worker(copy(V), zeros(3)), false)),
+    Fixture("threadid", Threads.threadid, () -> ()),
+    Fixture("threadid(::Task)", Threads.threadid, () -> (Task(() -> 1),)),
+    Fixture("nthreads", Threads.nthreads, () -> ()),
+    Fixture("nthreads(pool)", Threads.nthreads, () -> (:default,)),
+    Fixture("threadpoolsize", Threads.threadpoolsize, () -> ()),
+    Fixture("threadpoolsize(pool)", Threads.threadpoolsize, () -> (:default,)),
+    Fixture("threadpool", Threads.threadpool, () -> ()),
+    Fixture("threadpool(tid)", Threads.threadpool, () -> (Threads.threadid(),)),
+    Fixture("maxthreadid", Threads.maxthreadid, () -> ()),
+    Fixture("nthreadpools", Threads.nthreadpools, () -> ()),
+    Fixture("lock", lock, () -> (ReentrantLock(),)),
+    Fixture("unlock", unlock, () -> (held_lock(),)),
+    Fixture("trylock", trylock, () -> (ReentrantLock(),)),
+    Fixture("islocked", islocked, () -> (ReentrantLock(),)),
+    Fixture("lock(f,l)", lock, () -> (() -> 1.0, ReentrantLock())),
+    # rules_threads.jl — tasks & the `@sync` plumbing. `Task`'s thunk is the only differentiable
+    # slot in the family; the fixtures' tasks are pre-completed wherever the rule would otherwise
+    # block, and channel payloads carry no tangent (a differentiable one is refused by the rule).
+    Fixture("Task(thunk)", Task, () -> (audit_task_thunk(copy(V), zeros(3)),)),
+    Fixture("schedule", schedule, () -> (Task(() -> nothing),)),
+    Fixture("wait(::Task)", wait, () -> (done_task(),)),
+    Fixture("fetch(::Task)", fetch, () -> (done_task(),)),
+    Fixture("istaskdone", istaskdone, () -> (done_task(),)),
+    Fixture("istaskstarted", istaskstarted, () -> (done_task(),)),
+    Fixture("istaskfailed", istaskfailed, () -> (done_task(),)),
+    Fixture("_spawn_set_thrpool", Base.Threads._spawn_set_thrpool,
+            () -> (Task(() -> nothing), :default)),
+    Fixture("yield()", yield, () -> ()),
+    Fixture("yield(::Task)", yield, () -> (Task(() -> nothing),)),
+    Fixture("current_task", current_task, () -> ()),
+    Fixture("Channel(sz)", Channel, () -> (2,)),
+    Fixture("Channel{T}(sz)", Channel{Any}, () -> (2,)),
+    Fixture("put!(::Channel)", put!, () -> (Channel(2), Task(() -> nothing))),
+    Fixture("take!(::Channel)", take!, () -> ((c = Channel(2); put!(c, 1); c),)),
+    Fixture("sync_end", Base.sync_end, () -> (Channel(Inf),)),
 ]
 
 # Slots with a tangent space are the ones an activity mask ranges over; the rest can only ever carry

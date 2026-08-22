@@ -12,20 +12,26 @@
 # ID: a unique name for a block or statement in the working IR, independent of position.
 # ---------------------------------------------------------------------------
 
-const _id_count = Dict{Int,Int32}()
+# Task-local rather than a global keyed by `Threads.threadid()`, for the same two reasons forward
+# mode's recursion guard is (`dualized_impl_in_progress`, `DifferForwards/src/forward_interp.jl`): a
+# plain global `Dict` is corruptible by concurrent compilation, and a task may migrate between
+# threads mid-build, so `threadid()` is not a stable identity to key on. One build stays on one
+# task, so per-task is exactly the scope an `ID` needs to be unique within.
+_id_counter() = get!(() -> Base.RefValue(Int32(0)), task_local_storage(),
+                     :differ_cfg_ir_id_count)::Base.RefValue{Int32}
 
 """
     ID()
 
 An `ID` (read: unique name) is just a wrapper around an `Int32`. Uniqueness is ensured via a
-global (per-thread) counter, incremented each time an `ID` is created.
+per-task counter, incremented each time an `ID` is created.
 """
 struct ID
     id::Int32
     function ID()
-        tid = Threads.threadid()
-        n = get(_id_count, tid, Int32(0))
-        _id_count[tid] = n + Int32(1)
+        c = _id_counter()
+        n = c[]
+        c[] = n + Int32(1)
         return new(n)
     end
 end
@@ -35,10 +41,10 @@ Base.copy(id::ID) = id
 """
     seed_id!()
 
-Reset the global `ID`-uniqueness counter to `0`. Useful for deterministic `ID`s across runs (e.g.
+Reset this task's `ID`-uniqueness counter to `0`. Useful for deterministic `ID`s across runs (e.g.
 in tests).
 """
-seed_id!() = (global _id_count[Threads.threadid()] = 0)
+seed_id!() = (_id_counter()[] = Int32(0); nothing)
 
 # ---------------------------------------------------------------------------
 # Instructions: reuse `Core.Compiler.NewInstruction` as the per-statement representation

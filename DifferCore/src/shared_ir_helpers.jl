@@ -136,6 +136,21 @@ function _tangent_field_slot(tt, @nospecialize(Pobj), @nospecialize(name))
     return (NT, i)
 end
 
+# Like `_tangent_field_slot`, but serves a `PossiblyUninitTangent` slot too: the caller gets the
+# slot as stored (the wrapper itself), for save/restore paths that must not unwrap an
+# uninitialised one.
+function _raw_tangent_slot(tt, @nospecialize(Pobj), @nospecialize(name))
+    (Pobj isa DataType && isconcretetype(Pobj)) || return nothing
+    Tobj = tt(Pobj)
+    (Tobj isa DataType && Tobj <: Union{Tangent,MutableTangent}) || return nothing
+    NT = fields_type(Tobj)
+    (NT isa DataType && isconcretetype(NT)) || return nothing
+    sym = name isa QuoteNode ? name.value : name
+    i = sym isa Int ? sym : findfirst(==(sym), fieldnames(Pobj))
+    (i isa Int && 1 <= i <= fieldcount(NT)) || return nothing
+    return (NT, i)
+end
+
 # Widen a lattice element (`Core.Const`/`Core.PartialStruct`/…) to a real `Type`, or pass a real
 # `Type` through unchanged.
 _widen(@nospecialize T) = T isa Type ? T : CC.widenconst(T)
