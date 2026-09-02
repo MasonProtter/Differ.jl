@@ -90,6 +90,7 @@ const _memrefgetg = GlobalRef(Core, :memoryrefget)
 const _memrefsetg = GlobalRef(Core, :memoryrefset!)
 const _eqeqg      = GlobalRef(Core, :(===))
 const _isdefinedg = GlobalRef(Core, :isdefined)
+const _typeassertg = GlobalRef(Core, :typeassert)
 
 # getfield(obj, name[, ordering][, boundscheck]) — trailing operands beyond (obj, name) are forwarded
 # verbatim (faithful primal reconstruction; harmless on the same-shape shadow branches too, since no
@@ -409,6 +410,22 @@ end
 function apply_builtin_frule!(::Val{Core.isdefined}, actual, Ti, ctx)
     p = ctx.emit!(Expr(:call, _isdefinedg, (ctx.presolve(a) for a in actual)...), Ti)
     p, NoTangent()
+end
+
+# The shadow narrows with the asserted primal. When the operand's declared type already matches
+# the asserted one the shadow passes through untouched (the `PiNode` treatment); otherwise — an
+# `Any`-typed value out of a dynamic call, e.g. `fetch(t)::Float64` — it is narrowed at runtime,
+# materialising a zero for an `Inactive` shadow so the declared type stays concrete.
+@noinline _ta_shadow(t, ::Type{TT}, p) where {TT} = isactive(t) ? t::TT : zero_tangent(p)::TT
+
+function apply_builtin_frule!(::Val{Core.typeassert}, actual, Ti, ctx)
+    p = ctx.emit!(Expr(:call, _typeassertg, ctx.presolve(actual[1]), ctx.vpresolve(actual[2])), Ti)
+    W = _widen(Ti)
+    TT = ctx.tt(W)
+    TT === NoTangent && return p, NoTangent()
+    Pi = _widen(ctx.optype(actual[1]))
+    Pi === W && return p, ctx.tresolve(actual[1])
+    return p, ctx.emit_invoke!(_ta_shadow, TT, (Any, Type{TT}, W), ctx.tresolve(actual[1]), TT, p)
 end
 
 # Same-shape tangent tuple: a non-differentiable slot holds NoTangent(), a differentiable slot holds

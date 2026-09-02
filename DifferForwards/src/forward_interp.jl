@@ -705,6 +705,11 @@ function _activity(pir, iworld::UInt, tt, ft, nslots::Int, arg_active::BitVector
                     # matching arm — see the comment at its `:call`/`:invoke` arm for why the gap is
                     # harmless there (`_fdata_tracked`'s own, narrower root set already gates this).
                     true
+                # No effect-bit shortcut here, deliberately: "inference proved `:effect_free` and
+                # the rettype has no tangent space ⇒ inactive" was tried and reverted — under
+                # forward-over-reverse the derivative state itself lives in values whose *types*
+                # are tangent-free (an rdata tuple is `Tuple{NoRData,…}`), so the implication
+                # silently zeroed gradients. Operand activity only.
                 else
                     operand_active(fpos) || any(operand_active, actual)
                 end
@@ -1565,7 +1570,11 @@ function dualize_to_ircode(interp, impl_mi::MethodInstance, pir, n::Int;
                         Expr(:call, fcallee, (presolve(a) for a in actual)...)
                 primal[i] = emit!(ex, Ti)
             elseif isa(s, Expr) && s.head === :new
-                primal[i] = emit!(Expr(:new, resolve_new_type(s.args[1]),
+                # The type operand can be a runtime-computed `SSAValue` (an `apply_type` result —
+                # legal for a replayed `%new`, since no shadow is built for it); it must then be
+                # renumbered like any other operand, never embedded raw.
+                T0 = resolve_new_type(s.args[1])
+                primal[i] = emit!(Expr(:new, isa(T0, Type) ? T0 : vpresolve(s.args[1]),
                                        (vpresolve(a) for a in s.args[2:end])...), Ti)
             elseif isa(s, GlobalRef)
                 primal[i] = emit!(s, Ti)          # a global load, not a pure alias

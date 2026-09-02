@@ -21,6 +21,9 @@ jobs:
     name: ${{ matrix.package.name }} - julia ${{ matrix.version }} - ${{ matrix.os }} - check-bounds=${{ matrix.check_bounds }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      # The threads test files refuse to pass vacuously on a single-threaded session.
+      JULIA_NUM_THREADS: '4'
     strategy:
       fail-fast: false
       matrix:

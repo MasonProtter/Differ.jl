@@ -169,20 +169,30 @@ end
     @test dsum4 == [4.0, 32.0]
 end
 
-@testset "reverse mode: partially-initialised `%new` still bails" begin
-    # The gate change only widens the fully-initialised case; a genuine partial `%new` (fewer operands
-    # than fields) must still bail, with the more precise message. `Partial2`'s inner constructor
-    # supplies only `a`, leaving `b` undef; returning `p` itself (rather than a field read) keeps the
-    # `%new` from being optimised away by SROA.
+@testset "partially-initialised `%new`: mutable builds, immutable still bails" begin
+    # A *mutable* partial `%new` is supported (the StableTasks `AtomicRef{T}()` shape):
+    # `build_tangent` leaves the trailing tangent slots uninitialised, matching the primal's own
+    # undef fields. Pinned here as "the carrier builds"; the numeric case is
+    # `test_reverse_threads.jl`'s `undef_new_rw`. Returning `p` itself (rather than a field read)
+    # keeps the `%new` from being optimised away by SROA.
     mutable struct Partial2_9
         a::Float64
         b::Float64
         Partial2_9(x) = new(x)
     end
     f_partial(x) = Partial2_9(x)
+    @test code_reverse_fwds_ircode(f_partial, (Float64,)) !== nothing
 
+    # An *immutable* partial `%new` still bails, with the located message: its `FData` shadow is
+    # built field by field, which a short argument list can't fill.
+    struct IPartial_9
+        a::Vector{Float64}
+        b::Vector{Float64}
+        IPartial_9(a) = new(a)
+    end
+    f_ipartial(x) = IPartial_9(x)
     err = try
-        rev_gradient(f_partial, 3.0)
+        rev_gradient(f_ipartial, [1.0, 2.0])
         nothing
     catch e
         e
@@ -190,7 +200,7 @@ end
     @test err isa ErrorException
     @test occursin("partially-initialised", err.msg)
     @test occursin("possibly-undef fields", err.msg)
-    @test occursin("Partial2_9", err.msg)
+    @test occursin("IPartial_9", err.msg)
 end
 
 gb_global9 = [1.0, 2.0, 3.0]

@@ -46,6 +46,7 @@ include("rules_broadcast.jl")
 include("rules_indexing.jl")
 include("rules_growable.jl")
 include("rules_linalg.jl")
+include("rules_threads.jl")
 include("reflection.jl")
 include("adtypes.jl")
 

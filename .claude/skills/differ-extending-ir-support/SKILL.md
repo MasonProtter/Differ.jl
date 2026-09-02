@@ -260,6 +260,43 @@ Tests: `DifferForwards/test/test_forward_foreigncall.jl` (47). Result: unmodifie
 dualizes — single array, array-with-scalar, and two-array broadcast `x .* y` and fused chains, with
 no further construct needed.
 
+## Threading (`Threads.@threads`, 2026-08-22)
+
+Supported by a hand `frule!!` on `Base.Threads.threading_run` (`src/rules_threads.jl`), no engine
+change: a `@threads` loop leaves exactly one non-inlined `invoke` in optimized IR with the whole body
+inside its closure argument, so ruling that call runs the scheduler as primal code and dualizes only
+the worker. Forward mode needs no per-worker state at all — dualized IR is an ordinary
+`CodeInstance` with no per-call state, so one `Dual` closure is safely invoked from every worker at
+once. (Mooncake copies its rule per thread; there is nothing here to copy.)
+
+Two traps worth knowing. `Threads.threadpoolsize()` is called from *inside* every worker body
+(`default_func`'s `divrem(lenr, threadpoolsize())`) and inlines to
+`cglobal(:jl_n_threads_per_pool, Ptr{Cint})` — an unregistered *intrinsic*, not a foreigncall, and it
+only appears once the worker body itself is dualized, so ruling `threading_run` alone is not enough.
+And `@threads :static` emits a bare `ccall(:jl_in_threaded_region, Cint, ())` in the *enclosing*
+function, out of reach of any Julia-level rule; it is registered as an inactive foreigncall in
+`foreigncalls.jl` (as is `jl_set_task_tid`, `@spawnat`'s pinning call).
+
+## Tasks (`Threads.@spawn`/`@async`/`@sync`/`Task`/`fetch`, 2026-08-22)
+
+`@spawn` expands *inline* — `Task(thunk)`, `task.sticky = false`, `_spawn_set_thrpool`, an
+optional `put!` into `@sync`'s channel, `schedule` — so `Task` itself is the interception point
+(the rule is also what keeps `jl_new_task` out of dualized IR). Hand rules in `rules_threads.jl`
+for `Task`/`schedule`/`wait`/`fetch`/`istask*`/`_spawn_set_thrpool`/`yield`/`current_task` and
+`@sync`'s `Channel`/`put!`/`take!`/`sync_end` (a `Channel` has no tangent space; moving a
+differentiable value through one is refused loudly). The spawned thunk runs dualized; its `Dual`
+result is parked in the task's own task-local storage and the task's *primal* result is the
+primal half, so by-value `fetch` transports the tangent and an escaped task still fetches an
+ordinary value. Engine changes this needed: the inactive-`%new` replay renumbers a
+runtime-computed type operand (kwargs `NamedTuple`s) instead of embedding it raw, and a
+`Core.typeassert` builtin rule narrows the shadow with the asserted primal (`fetch(t)::Float64`).
+(An effect-bit activity shortcut was tried alongside and reverted — it silently zeroed
+forward-over-reverse Hessians; see the ISSUES entry.) OhMyThreads works
+downstream through StableTasks with **no extension** (`test_forward_ohmythreads.jl`); its
+`tmap`/`tmap!` still bail on a heterogeneous-capture dynamic `getfield`, and `StaticScheduler` on
+the `@warn` logging (`invokelatest`) in StableTasks' pinning retry loop. `@threads :greedy` and
+`Threads.Atomic` remain unsupported. See ISSUES' two threading entries.
+
 ## Remaining gaps (forward mode)
 
 Non-bits/undef-checked array element access (`Vector{Any}`/`Vector{String}`), `splice!` (its

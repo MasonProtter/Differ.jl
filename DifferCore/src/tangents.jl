@@ -396,6 +396,38 @@ tangent_type(::Type{<:IOStream}) = NoTangent
 
 tangent_type(::Type{<:Base.LibuvStream}) = NoTangent
 
+# A `Task`'s own fields are scheduler infrastructure — the wait queue, the thread id, the RNG
+# state. What a task computes reaches AD through its closure's captures and through the value it
+# returns, both of which are tangent-carrying in their own right. Without this the generic
+# derivation walks `next`/`queue`/`donenotify` into the whole scheduler object graph, and drags
+# `ReentrantLock`/`Base.Event`/`Base.Semaphore`/`GenericCondition` along with it.
+tangent_type(::Type{Task}) = NoTangent
+
+# Every `ReentrantLock` field is non-differentiable once `Task` is (`locked_by`, the counters,
+# the `GenericCondition` wait queue, and a padding tuple). The generic derivation still can't
+# collapse it to `NoTangent`, because the padding field is possibly-uninitialised and so derives
+# a `PossiblyUninitTangent` wrapper — which then makes constructing one inside a differentiated
+# function a partially-initialised `%new` neither engine will transform.
+tangent_type(::Type{ReentrantLock}) = NoTangent
+
+# A `Channel` is synchronization infrastructure like `Task`: its `data::Vector{Any}` would derive a
+# real tangent, but a tangent-carrying channel would oblige every `put!`/`take!` to mirror the
+# queue onto a shadow queue. Values moved through a channel are constants instead; `put!` of a
+# differentiable value is refused by the rules, never silently zeroed.
+tangent_type(::Type{<:Channel}) = NoTangent
+
+# A `Scope` chains to its parent scope and holds a persistent HAMT dict whose nodes are
+# self-referential, so the generic derivation does not terminate on it (the `Tape`/`Stack` class of
+# type — see the `@assume_effects` warning above). Scopes are scheduler infrastructure every task
+# captures, never data — and so are the `ScopedValue`s used as keys into them.
+tangent_type(::Type{Base.ScopedValues.Scope}) = NoTangent
+tangent_type(::Type{<:Base.ScopedValues.AbstractScopedValue}) = NoTangent
+
+# The HAMT node type is self-referential on its own (`data::Vector{Union{HAMT,Leaf}}`), and every
+# task's captured scope reaches it. No persistent-dict operation has a rule, so an active use
+# bails at the operation rather than being silently constant.
+tangent_type(::Type{<:Base.HashArrayMappedTries.HAMT}) = NoTangent
+
 tangent_type(::Type{<:Base.CoreLogging.AbstractLogger}) = NoTangent
 
 tangent_type(::Type{Core.CodeInstance}) = NoTangent
